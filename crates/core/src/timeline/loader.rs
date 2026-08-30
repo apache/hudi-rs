@@ -280,6 +280,17 @@ impl TimelineLoader {
     /// Layout Version 2 (v8+): Avro format
     ///
     /// Returns the metadata as a JSON Map for uniform processing.
+    /// The raw bytes of one instant file.
+    ///
+    /// `load_instant_metadata` decodes commit metadata; a rollback, restore or
+    /// plan is a different Avro record, so its reader needs the bytes rather
+    /// than a decoded commit.
+    pub(crate) async fn load_instant_bytes(&self, instant: &Instant) -> Result<Vec<u8>> {
+        let timeline_dir = self.get_timeline_dir();
+        let path = instant.relative_path_with_base(&timeline_dir)?;
+        Ok(self.storage.get_file_data(path.as_str()).await?.to_vec())
+    }
+
     pub(crate) async fn load_instant_metadata(
         &self,
         instant: &Instant,

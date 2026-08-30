@@ -41,7 +41,7 @@ pub(crate) mod test_support;
 
 use crate::config::HudiConfigs;
 use crate::storage::Storage;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -54,11 +54,14 @@ use crate::config::table::HudiTableConfig::{
 use crate::error::CoreError;
 use crate::expr::filter::from_str_tuples;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
+use crate::metadata::rollback::{RestoreMetadata, RollbackMetadata, RollbackPlan};
 use crate::storage::util::join_url_segments;
 use crate::table::ReadOptions;
 use crate::table::Table;
 use crate::table::file_pruner::FilePruner;
 use crate::table::partition::PartitionPruner;
+use crate::timeline::instant::{Action, Instant, State};
+use crate::timeline::selector::TimelineSelector;
 
 use records::FilesPartitionRecord;
 
@@ -403,6 +406,163 @@ impl Table {
             v2_reader::MetadataTableV2Reader::new(configs, storage),
             file_slices,
         )))
+        // NOTE: the valid-instant set is attached by `partition_reader_with_valid_instants`,
+        // which has the data table in hand; this constructor does not.
+    }
+}
+
+/// Hudi's sentinel prefix for a metadata delta commit written outside the data
+/// timeline (`HoodieTableMetadata.SOLO_COMMIT_TIMESTAMP`).
+const SOLO_COMMIT_TIMESTAMP: &str = "00000000000000";
+
+// Built and tested, not yet wired into a read. The set is assembled by the
+// *data* table, while `read_files_partition` runs on the *metadata* table, so
+// attaching it means threading it down that chain — the next step, and a change
+// to the read path rather than to this builder. Marked rather than given a
+// synthetic caller, so the gap stays visible in the code and not only in a note.
+#[allow(dead_code)]
+impl Table {
+    /// The instants whose metadata log blocks may be read.
+    ///
+    /// Mirrors Java's `HoodieTableMetadataUtil.getValidInstantTimestamps` (:2081).
+    /// This is a **set, not a window**: it has holes -- a pending data instant is
+    /// excluded while instants either side of it are included -- and members from
+    /// outside the data timeline entirely. See
+    /// [`InstantRange::exact_match`](crate::timeline::selector::InstantRange::exact_match)
+    /// for why a bounded range cannot stand in for it.
+    ///
+    /// `self` is the data table; `mdt` its metadata table. Both timelines are
+    /// needed, which is why this lives here rather than on either one alone.
+    pub(crate) async fn valid_instant_timestamps(&self, mdt: &Table) -> Result<HashSet<String>> {
+        let mut valid: HashSet<String> = self.valid_from_completed_data_instants();
+        valid.extend(self.valid_from_mdt_delta_commits(mdt));
+        valid.extend(Self::valid_from_sentinel_commits(mdt));
+
+        // 3. Commits rolled back by the data table's rollbacks and restores.
+        //    Their log blocks were written, rolled back, and re-applied, so
+        //    excluding them drops records that are genuinely present.
+        //
+        //    Only rollbacks newer than the earliest valid instant can have
+        //    rolled back anything we hold a log block for; Java bounds the scan
+        //    the same way, falling back to the sentinel when the set is empty.
+        let earliest = valid
+            .iter()
+            .min()
+            .cloned()
+            .unwrap_or_else(|| SOLO_COMMIT_TIMESTAMP.to_string());
+        for instant in self.rollback_and_restore_instants().await? {
+            if instant.timestamp > earliest {
+                valid.extend(self.commits_rolled_back_by(&instant).await?);
+            }
+        }
+
+        // 4. The metadata table's own rollback and restore instants.
+        for instant in mdt.rollback_and_restore_instants().await? {
+            valid.insert(instant.timestamp.clone());
+        }
+
+        Ok(valid)
+    }
+
+    /// Source 1 — every completed data instant.
+    ///
+    /// The metadata table is written before the data instant commits, so a log
+    /// block whose instant never completed must not be read.
+    fn valid_from_completed_data_instants(&self) -> HashSet<String> {
+        self.timeline
+            .completed_commits
+            .iter()
+            .map(|instant| instant.timestamp.clone())
+            .collect()
+    }
+
+    /// Source 2 — completed metadata delta commits with no *pending* data
+    /// instant of the same name.
+    ///
+    /// An indexing delta commit has no data instant at all and is valid. One
+    /// whose data instant is still pending is the case where the data write
+    /// failed after the metadata write committed, and must not be read — that
+    /// exclusion is the whole content of this source.
+    fn valid_from_mdt_delta_commits(&self, mdt: &Table) -> HashSet<String> {
+        let pending = &self.timeline.pending_instants;
+        mdt.timeline
+            .completed_commits
+            .iter()
+            .filter(|i| i.action == Action::DeltaCommit && !pending.contains(&i.timestamp))
+            .map(|i| i.timestamp.clone())
+            .collect()
+    }
+
+    /// Source 5 — metadata delta commits written outside the data timeline.
+    fn valid_from_sentinel_commits(mdt: &Table) -> HashSet<String> {
+        mdt.timeline
+            .completed_commits
+            .iter()
+            .filter(|i| i.timestamp.starts_with(SOLO_COMMIT_TIMESTAMP))
+            .map(|i| i.timestamp.clone())
+            .collect()
+    }
+
+    /// Completed rollback and restore instants on this table's timeline.
+    ///
+    /// Loaded with a selector naming those actions, because they are not in
+    /// `DEFAULT_LOADING_ACTIONS` -- a rollback is not a commit, and putting it
+    /// there would change every existing read.
+    async fn rollback_and_restore_instants(&self) -> Result<Vec<Instant>> {
+        let selector = TimelineSelector::actions_in_range(
+            &[Action::Rollback, Action::Restore],
+            &[State::Completed],
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        self.timeline.load_instants(&selector, false).await
+    }
+
+    /// The commits one rollback or restore instant rolled back.
+    ///
+    /// A rollback names them in its own metadata, falling back to its
+    /// `.requested` plan when the completed file is empty -- Java does the same
+    /// (`getRollbackedCommits`, HoodieTableMetadataUtil:2158). A restore is
+    /// several rollbacks, so its commits are the union of theirs.
+    ///
+    /// An unreadable instant yields nothing rather than failing the read: a
+    /// rollback we cannot parse should not make the whole table unreadable, and
+    /// the cost is the same conservative exclusion that existed before.
+    async fn commits_rolled_back_by(&self, instant: &Instant) -> Result<Vec<String>> {
+        let bytes = match self.timeline.load_instant_bytes(instant).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                log::debug!("rollback instant {} unreadable: {e}", instant.timestamp);
+                return Ok(Vec::new());
+            }
+        };
+
+        match instant.action {
+            Action::Restore => Ok(RestoreMetadata::from_avro_bytes(&bytes)
+                .map(|r| r.commits_rolled_back())
+                .unwrap_or_default()),
+            Action::Rollback => {
+                if let Ok(rollback) = RollbackMetadata::from_avro_bytes(&bytes)
+                    && !rollback.commits_rollback.is_empty()
+                {
+                    return Ok(rollback.commits_rollback);
+                }
+                // The completed file was empty or unreadable: the plan names it.
+                let plan = Instant {
+                    state: State::Requested,
+                    ..instant.clone()
+                };
+                let Ok(plan_bytes) = self.timeline.load_instant_bytes(&plan).await else {
+                    return Ok(Vec::new());
+                };
+                Ok(RollbackPlan::from_avro_bytes(&plan_bytes)
+                    .ok()
+                    .and_then(|p| p.commit_rolled_back().map(|c| vec![c.to_string()]))
+                    .unwrap_or_default())
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 }
 
@@ -1015,6 +1175,105 @@ mod tests {
             picked[0].file_id(),
             expected,
             "selection must follow shard order recovered from Hudi's own file ids"
+        );
+        Ok(())
+    }
+
+    /// Each source is tested on its **own** output, not on the union.
+    ///
+    /// Testing the union does not work on this fixture and the reason is worth
+    /// recording: sources 1, 2 and 5 overlap almost entirely — a data commit and
+    /// the metadata delta commit that records it share a timestamp — so every
+    /// member survives dropping any single source, and a membership assertion
+    /// over the union cannot fail. Three mutations, one per source, all passed
+    /// against exactly such a test before it was replaced by this one.
+    #[tokio::test]
+    async fn each_source_contributes_what_it_claims() -> Result<()> {
+        let data_table = get_data_table().await;
+        let mdt = data_table.get_or_init_metadata_table().await?;
+
+        // Source 1 — exactly the completed data instants, no more.
+        let from_data = data_table.valid_from_completed_data_instants();
+        let expected: HashSet<String> = data_table
+            .timeline
+            .completed_commits
+            .iter()
+            .map(|i| i.timestamp.clone())
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "the fixture must have completed data instants"
+        );
+        assert_eq!(
+            from_data, expected,
+            "source 1 is exactly the completed data instants"
+        );
+
+        // Source 5 — exactly the sentinel-prefixed metadata commits, and every
+        // one of them really carries the prefix.
+        let from_sentinel = Table::valid_from_sentinel_commits(mdt);
+        assert!(
+            !from_sentinel.is_empty(),
+            "the fixture must have sentinel-prefixed metadata commits"
+        );
+        assert!(
+            from_sentinel
+                .iter()
+                .all(|t| t.starts_with(SOLO_COMMIT_TIMESTAMP)),
+            "source 5 must contain only sentinel-prefixed instants"
+        );
+
+        // Source 2 — every metadata delta commit whose data instant is not
+        // pending, and none whose data instant is.
+        let from_mdt = data_table.valid_from_mdt_delta_commits(mdt);
+        for instant in &mdt.timeline.completed_commits {
+            let pending = data_table
+                .timeline
+                .pending_instants
+                .contains(&instant.timestamp);
+            let is_delta = instant.action == Action::DeltaCommit;
+            assert_eq!(
+                from_mdt.contains(&instant.timestamp),
+                is_delta && !pending,
+                "source 2 disagreed on {} (delta={is_delta}, pending={pending})",
+                instant.timestamp
+            );
+        }
+        Ok(())
+    }
+
+    /// Source 2's exclusion, on a case the fixture does not contain.
+    ///
+    /// The fixture has **zero** pending data instants, so its exclusion branch is
+    /// never exercised by real data — which is precisely why dropping the
+    /// exclusion passed every test written against the fixture alone. The
+    /// pending set is injected here so the branch has an input that reaches it.
+    #[tokio::test]
+    async fn source_two_excludes_a_metadata_commit_whose_data_instant_is_pending() -> Result<()> {
+        let mut data_table = get_data_table().await;
+        let mdt_owned = data_table.new_metadata_table().await?;
+
+        let victim = mdt_owned
+            .timeline
+            .completed_commits
+            .iter()
+            .find(|i| i.action == Action::DeltaCommit)
+            .map(|i| i.timestamp.clone())
+            .expect("the fixture must have a completed metadata delta commit");
+
+        assert!(
+            data_table
+                .valid_from_mdt_delta_commits(&mdt_owned)
+                .contains(&victim),
+            "with nothing pending, {victim} must be included — or the next assertion proves nothing"
+        );
+
+        data_table.timeline.pending_instants.insert(victim.clone());
+        assert!(
+            !data_table
+                .valid_from_mdt_delta_commits(&mdt_owned)
+                .contains(&victim),
+            "{victim} has a pending data instant and must be excluded"
         );
         Ok(())
     }

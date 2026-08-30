@@ -29,6 +29,7 @@
 //! one is wrong.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
@@ -60,6 +61,10 @@ const FILE_IS_DELETED_FIELD: &str = "isDeleted";
 pub(crate) struct MetadataTableV2Reader {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    /// The instants whose log blocks may be read. `None` keeps the window the
+    /// reader resolved from config, which is what every caller did before the
+    /// set existed.
+    valid_instants: Option<HashSet<String>>,
 }
 
 impl MetadataTableV2Reader {
@@ -67,7 +72,22 @@ impl MetadataTableV2Reader {
         Self {
             hudi_configs,
             storage,
+            valid_instants: None,
         }
+    }
+
+    /// The instants whose log blocks this reader may read.
+    ///
+    /// Hudi filters metadata log blocks by set membership, not by a window: the
+    /// set has holes and members outside the data timeline, so a bounded range
+    /// cannot express it. Without this the reader falls back to the window,
+    /// which admits blocks written for a still-pending instant -- harmless for
+    /// `files`, whose records are gated again downstream, and a silently wrong
+    /// query result for the partitions that are not.
+    #[allow(dead_code)] // no caller until the set is threaded down the read chain
+    pub(crate) fn with_valid_instants(mut self, instants: HashSet<String>) -> Self {
+        self.valid_instants = Some(instants);
+        self
     }
 
     /// Read the `files` partition's records from one file slice.
@@ -128,6 +148,12 @@ impl MetadataTableV2Reader {
             .then(|| KeyPredicate::Keys(keys.iter().map(|k| (*k).to_string()).collect()));
 
         reader_context.key_predicate = key_predicate;
+        // Set membership replaces the window when the caller supplied one.
+        if let Some(valid) = &self.valid_instants {
+            reader_context.instant_range = Some(
+                crate::timeline::selector::InstantRange::exact_match(valid.iter().cloned(), "UTC"),
+            );
+        }
 
         let base_file_commit_time = file_slice
             .base_file
