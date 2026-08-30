@@ -125,6 +125,62 @@ impl RestoreMetadata {
     }
 }
 
+/// One instant named by a rollback plan.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InstantInfo {
+    /// The instant's requested time.
+    pub commit_time: String,
+    /// Its action, as written on the timeline.
+    pub action: String,
+}
+
+/// The fields of `HoodieRollbackPlan` this crate reads.
+///
+/// Read only as a **fallback**. Java prefers the completed rollback instant's
+/// metadata and falls back to its `.requested` plan when that file is empty
+/// (`HoodieTableMetadataUtil.java:2165-2172`), taking
+/// `getInstantToRollback().getCommitTime()`. A plan names one instant, where the
+/// completed metadata can name several, which is why it is the fallback rather
+/// than the primary source.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RollbackPlan {
+    /// The instant the rollback was planned against. Optional in the schema, so
+    /// a plan that names none yields nothing rather than failing.
+    pub instant_to_rollback: Option<InstantInfo>,
+}
+
+impl RollbackPlan {
+    /// Decode the bytes of a `.rollback.requested` plan.
+    pub fn from_avro_bytes(bytes: &[u8]) -> Result<Self> {
+        let reader = AvroReader::new(Cursor::new(bytes)).map_err(|e| {
+            CoreError::CommitMetadata(format!(
+                "Failed to create Avro reader for rollback plan: {e}"
+            ))
+        })?;
+        let mut records = reader;
+        let value = records
+            .next()
+            .ok_or_else(|| {
+                CoreError::CommitMetadata("Rollback plan contains no records".to_string())
+            })?
+            .map_err(|e| {
+                CoreError::CommitMetadata(format!("Failed to read rollback plan record: {e}"))
+            })?;
+        from_value::<Self>(&value).map_err(|e| {
+            CoreError::CommitMetadata(format!("Failed to deserialize rollback plan: {e}"))
+        })
+    }
+
+    /// The commit this plan rolls back, if it names one.
+    pub fn commit_rolled_back(&self) -> Option<&str> {
+        self.instant_to_rollback
+            .as_ref()
+            .map(|i| i.commit_time.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +374,73 @@ mod tests {
             vec!["20250101000000000", "20250102000000000"],
             "a restore must yield every commit across all of its rollbacks"
         );
+        Ok(())
+    }
+
+    /// The fallback path: a plan names the instant its rollback was planned
+    /// against.
+    ///
+    /// Java reads this only when the completed rollback file is empty, so a
+    /// reader that could not parse a plan would turn that recoverable case into
+    /// a lost set of commits.
+    #[test]
+    fn a_rollback_plan_names_the_instant_it_rolls_back() -> Result<()> {
+        let text = inline_named_types("HoodieRollbackPlan.avsc", &["HoodieInstantInfo.avsc"]);
+        let schema = Schema::parse_str(&text).expect("the plan schema must parse once inlined");
+
+        let mut writer = Writer::new(&schema, Vec::new());
+        writer
+            .append(Value::Record(vec![
+                (
+                    "instantToRollback".into(),
+                    Value::Union(
+                        1,
+                        Box::new(Value::Record(vec![
+                            (
+                                "commitTime".into(),
+                                Value::String("20250101000000000".into()),
+                            ),
+                            ("action".into(), Value::String("commit".into())),
+                        ])),
+                    ),
+                ),
+                (
+                    "RollbackRequests".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                ("version".into(), Value::Union(0, Box::new(Value::Int(1)))),
+            ]))
+            .expect("append plan");
+        let bytes = writer.into_inner().expect("container bytes");
+
+        let parsed = RollbackPlan::from_avro_bytes(&bytes)?;
+        assert_eq!(parsed.commit_rolled_back(), Some("20250101000000000"));
+        Ok(())
+    }
+
+    /// A plan naming no instant yields nothing rather than failing: the field is
+    /// nullable in Hudi's schema, so a reader that errored would reject a
+    /// timeline Hudi considers valid.
+    #[test]
+    fn a_plan_without_an_instant_yields_nothing() -> Result<()> {
+        let text = inline_named_types("HoodieRollbackPlan.avsc", &["HoodieInstantInfo.avsc"]);
+        let schema = Schema::parse_str(&text).expect("the plan schema must parse once inlined");
+        let mut writer = Writer::new(&schema, Vec::new());
+        writer
+            .append(Value::Record(vec![
+                (
+                    "instantToRollback".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                (
+                    "RollbackRequests".into(),
+                    Value::Union(0, Box::new(Value::Null)),
+                ),
+                ("version".into(), Value::Union(0, Box::new(Value::Int(1)))),
+            ]))
+            .expect("append plan");
+        let parsed = RollbackPlan::from_avro_bytes(&writer.into_inner().expect("bytes"))?;
+        assert_eq!(parsed.commit_rolled_back(), None);
         Ok(())
     }
 }
