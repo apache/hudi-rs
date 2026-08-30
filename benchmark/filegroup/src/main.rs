@@ -144,6 +144,11 @@ struct ReadConfig {
     use_record_position: bool,
     /// How many slices to read concurrently.
     slice_concurrency: usize,
+    /// Where the merge map spills (`hoodie.memory.spillable.map.path`). Passed
+    /// to the reader, not only watched: the reader's own default is `/tmp`, and
+    /// on a host where anything else lives under `/tmp` a watcher pointed there
+    /// measures that instead of spill.
+    spill_dir: String,
 }
 
 /// A global allocator that refuses to exceed a byte ceiling.
@@ -288,6 +293,7 @@ async fn run(args: &Args) -> Result<()> {
             async_stream: args.async_stream,
             use_record_position: args.use_record_position,
             slice_concurrency: args.slice_concurrency,
+            spill_dir: args.spill_dir.clone(),
         };
         let spill_watch = SpillWatcher::start(spill_dir.clone());
         let rows =
@@ -486,6 +492,13 @@ async fn read_all_slices(
     if let Some(n) = cfg.merge_max_size {
         options.push(("hoodie.memory.merge.max.size".to_string(), n.to_string()));
     }
+    // Point the reader at the directory the harness watches. Without this the
+    // reader spills to its `/tmp` default while the watcher looks elsewhere, and
+    // `spilled` reports the watched directory rather than the read.
+    options.push((
+        "hoodie.memory.spillable.map.path".to_string(),
+        cfg.spill_dir.clone(),
+    ));
     if cfg.use_record_position {
         options.push((
             "hoodie.merge.use.record.positions".to_string(),
