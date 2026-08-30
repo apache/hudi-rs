@@ -20,6 +20,7 @@ pub mod commit;
 pub mod merger;
 pub mod meta_field;
 pub mod replace_commit;
+pub mod rollback;
 pub mod table;
 pub use table::records as table_record;
 
