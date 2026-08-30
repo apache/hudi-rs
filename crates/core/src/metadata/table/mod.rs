@@ -267,8 +267,11 @@ impl Table {
         // with no merge rule needed. Bounded fan-out, the same ceiling the data
         // read uses, so a sharded partition cannot open more readers at once than
         // a table scan would.
+        // Only the shards the keys route to. On a partition with ten file
+        // groups a single-key lookup opens one slice, not ten.
+        let targets = routing::slices_for_keys(&file_slices, keys);
         let per_slice = crate::util::concurrency::bounded_in_order(
-            &file_slices,
+            &targets,
             self.file_slice_read_concurrency(),
             |file_slice| reader.read_files_partition(file_slice, keys),
         )
@@ -292,8 +295,9 @@ impl Table {
                 Schema::empty(),
             )));
         };
+        let targets = routing::slices_for_keys(&file_slices, keys);
         let batches = crate::util::concurrency::bounded_in_order(
-            &file_slices,
+            &targets,
             self.file_slice_read_concurrency(),
             |file_slice| reader.read_files_partition_batch(file_slice, keys),
         )

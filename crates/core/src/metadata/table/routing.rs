@@ -59,6 +59,39 @@ pub(crate) fn file_group_index(key: &str, num_file_groups: usize) -> usize {
     folded.wrapping_abs() as usize
 }
 
+/// The slices a key lookup has to open, in file-group order.
+///
+/// An empty `keys` means a full scan, which opens every slice. Otherwise each
+/// key routes to exactly one shard, so only the distinct shards among the keys
+/// are opened -- the difference between one read and ten on a record index.
+///
+/// A **prefix** lookup must not use this. Sharding is by the full key, so a
+/// prefix says nothing about which shard a match lives in; Java says the same at
+/// `getRecordsByKeyPrefixes:239`. Such a caller passes no keys and scans.
+///
+/// Slices are ordered by file id before indexing, because `file_group_index`
+/// returns a position among the shards and the listing order is the storage's,
+/// not the shard numbering's. Hudi embeds the shard number in the file id
+/// (`record-index-0003-0`), so a lexicographic sort recovers it.
+pub(crate) fn slices_for_keys<'a>(
+    slices: &'a [crate::file_group::file_slice::FileSlice],
+    keys: &[&str],
+) -> Vec<&'a crate::file_group::file_slice::FileSlice> {
+    if keys.is_empty() || slices.len() <= 1 {
+        return slices.iter().collect();
+    }
+    let mut ordered: Vec<&crate::file_group::file_slice::FileSlice> = slices.iter().collect();
+    ordered.sort_by(|a, b| a.file_id().cmp(b.file_id()));
+
+    let mut wanted: Vec<usize> = keys
+        .iter()
+        .map(|k| file_group_index(k, ordered.len()))
+        .collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    wanted.into_iter().map(|i| ordered[i]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +170,102 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Builds `n` slices whose file ids sort into shard order, so a test can ask
+    /// which ones a key set selects.
+    fn shards(n: usize) -> Vec<crate::file_group::file_slice::FileSlice> {
+        (0..n)
+            .map(|i| {
+                crate::file_group::file_slice::FileSlice::new_log_only(
+                    format!("record-index-{i:04}-0"),
+                    "20250101000000000".to_string(),
+                    "record_index".to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// A full-key lookup opens one slice per distinct shard among the keys --
+    /// measured as slices selected, not inferred from rows returned.
+    #[test]
+    fn a_key_lookup_opens_only_the_shards_its_keys_route_to() {
+        let slices = shards(10);
+        let key = "some-record-key";
+        let expected = file_group_index(key, 10);
+
+        let picked = slices_for_keys(&slices, &[key]);
+        assert_eq!(picked.len(), 1, "one key routes to exactly one shard");
+        assert_eq!(
+            picked[0].file_id(),
+            slices[expected].file_id(),
+            "and it must be the shard the hash names, not merely some shard"
+        );
+    }
+
+    /// Keys landing on different shards open each of them, once.
+    #[test]
+    fn distinct_shards_are_opened_once_each() {
+        let slices = shards(10);
+        // Chosen by asking the routing function, so the test does not encode a
+        // hash it would then be checking against itself.
+        let mut a = None;
+        let mut b = None;
+        for i in 0..500 {
+            let k = format!("k{i}");
+            match file_group_index(&k, 10) {
+                idx if a.is_none() => a = Some((k, idx)),
+                idx if b.is_none() && Some(idx) != a.as_ref().map(|(_, i)| *i) => {
+                    b = Some((k, idx))
+                }
+                _ => {}
+            }
+            if a.is_some() && b.is_some() {
+                break;
+            }
+        }
+        let (ka, _) = a.expect("a key");
+        let (kb, _) = b.expect("a key on a different shard");
+
+        let picked = slices_for_keys(&slices, &[ka.as_str(), kb.as_str()]);
+        assert_eq!(picked.len(), 2, "two shards, two slices opened");
+
+        // The same key twice is still one slice: shards are deduplicated.
+        let repeated = slices_for_keys(&slices, &[ka.as_str(), ka.as_str()]);
+        assert_eq!(
+            repeated.len(),
+            1,
+            "a repeated key must not open its shard twice"
+        );
+    }
+
+    /// No keys means a full scan: every slice, because a prefix or listing read
+    /// cannot know which shard holds a match.
+    #[test]
+    fn an_empty_key_set_opens_every_slice() {
+        let slices = shards(10);
+        assert_eq!(
+            slices_for_keys(&slices, &[]).len(),
+            10,
+            "a scan must open every shard"
+        );
+    }
+
+    /// Selection follows shard order, not listing order. Storage may list file
+    /// groups in any order; indexing an unsorted list sends a key to the wrong
+    /// shard, which returns no rows rather than an error.
+    #[test]
+    fn selection_does_not_depend_on_listing_order() {
+        let mut forward = shards(10);
+        let key = "some-record-key";
+        let from_forward = slices_for_keys(&forward, &[key])[0].file_id().to_string();
+
+        forward.reverse();
+        let from_reversed = slices_for_keys(&forward, &[key])[0].file_id().to_string();
+
+        assert_eq!(
+            from_forward, from_reversed,
+            "the shard a key selects must not change with listing order"
+        );
     }
 }
