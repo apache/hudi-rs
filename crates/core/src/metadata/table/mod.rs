@@ -1290,4 +1290,73 @@ mod tests {
         );
         Ok(())
     }
+
+    /// Sources 3 and 4, on a timeline the fixture does not have.
+    ///
+    /// The fixture carries zero rollback and zero restore instants, so both
+    /// sources run on every metadata read today while being exercised by
+    /// nothing. A rollback instant is written into a copy of the table — real
+    /// Avro `HoodieRollbackMetadata`, written against Hudi's own schema — so the
+    /// paths have an input that reaches them.
+    ///
+    /// The rolled-back commit is a timestamp that appears **nowhere else on
+    /// either timeline**. That is what makes the assertion attributable: no
+    /// other source can supply it, so its presence in the set can only have come
+    /// from source 3. The same trap as the union test — overlapping sources make
+    /// membership prove nothing about origin.
+    #[tokio::test]
+    async fn sources_three_and_four_admit_rolled_back_and_rollback_instants() -> Result<()> {
+        use crate::metadata::rollback::tests::container_bytes;
+
+        let src = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let src_root = std::path::Path::new(src.trim_start_matches("file://"));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("table");
+        copy_tree(src_root, &root);
+
+        // Later than every instant in the fixture, so the "newer than the
+        // earliest valid instant" bound admits it.
+        const ROLLBACK_TS: &str = "20260101000000000";
+        const ROLLED_BACK: &str = "20259999000000000";
+        const MDT_ROLLBACK_TS: &str = "20260102000000000";
+
+        let write_rollback = |dir: &std::path::Path, ts: &str, rolls: &[&str]| {
+            std::fs::write(
+                dir.join(format!("{ts}_{ts}.rollback")),
+                container_bytes(ts, rolls),
+            )
+            .unwrap();
+        };
+        write_rollback(&root.join(".hoodie/timeline"), ROLLBACK_TS, &[ROLLED_BACK]);
+        write_rollback(
+            &root.join(".hoodie/metadata/.hoodie/timeline"),
+            MDT_ROLLBACK_TS,
+            &[],
+        );
+
+        let table = Table::new(root.to_str().unwrap()).await?;
+        let mdt = table.get_or_init_metadata_table().await?;
+
+        // The premise: neither synthetic timestamp is otherwise present, or the
+        // assertions below would pass without either source doing anything.
+        for ts in [ROLLED_BACK, MDT_ROLLBACK_TS] {
+            assert!(
+                !table.valid_from_completed_data_instants().contains(ts)
+                    && !table.valid_from_mdt_delta_commits(mdt).contains(ts)
+                    && !Table::valid_from_sentinel_commits(mdt).contains(ts),
+                "{ts} must not be reachable from sources 1, 2 or 5, or this test proves nothing"
+            );
+        }
+
+        let valid = table.valid_instant_timestamps(mdt).await?;
+        assert!(
+            valid.contains(ROLLED_BACK),
+            "source 3: a commit rolled back by a data-table rollback must be valid"
+        );
+        assert!(
+            valid.contains(MDT_ROLLBACK_TS),
+            "source 4: the metadata table's own rollback instant must be valid"
+        );
+        Ok(())
+    }
 }
