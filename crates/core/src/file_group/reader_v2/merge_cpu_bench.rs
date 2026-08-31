@@ -79,9 +79,7 @@ use crate::file_group::log_file::log_block::{
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader_v2::buffer::key_based::KeyBasedFileGroupRecordBuffer;
-use crate::file_group::reader_v2::merge_iterator::{
-    FileGroupMergeIterator, new_stream_stats_handle,
-};
+use crate::file_group::reader_v2::merge_iterator::{FileGroupMergeStream, new_stream_stats_handle};
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
 use crate::file_group::record_batches::RecordBatches;
@@ -224,25 +222,37 @@ fn run(case: &Case) -> Measurement {
     let batches: Vec<RecordBatch> = (0..TOTAL_ROWS / case.rows_per_chunk)
         .map(|c| contiguous_batch(&schema, c * case.rows_per_chunk, case.rows_per_chunk, 1))
         .collect();
-    let src = arrow_array::RecordBatchIterator::new(batches.into_iter().map(Ok), schema.clone());
-    buffer.set_base_file_source(Box::new(src));
+    // The base source is handed to the stream rather than set on the buffer:
+    // one batch per simulated parquet row group, so the merge pulls them the way
+    // a streaming read would.
+    use futures::StreamExt;
+    let base: crate::file_group::reader_v2::merge_iterator::BaseBatchStream =
+        futures::stream::iter(batches.into_iter().map(Ok)).boxed();
 
-    let mut iter = FileGroupMergeIterator::new_buffered(
+    let mut iter = FileGroupMergeStream::new_buffered(
         Box::new(buffer),
+        base,
         schema.clone(),
         schema,
         None,
-        case.rows_per_chunk,
         new_stream_stats_handle(),
     );
 
     // Timed per call, not in aggregate: the per-chunk figure is the one that decides
     // which thread may run the merge.
+    //
+    // `block_on` per chunk because the merge is a stream now, not an iterator.
+    // The measurement is a comparison across cases and the parking cost is the
+    // same in each, so it shifts every number by the same small constant rather
+    // than changing which case is dearer. There is no I/O in this fixture, so the
+    // future is always immediately ready and never actually parks.
     let mut per_chunk_us: Vec<f64> = Vec::new();
     let mut rows = 0usize;
     loop {
         let started = Instant::now();
-        let Some(next) = iter.next() else { break };
+        let Some(next) = futures::executor::block_on(iter.next_chunk()) else {
+            break;
+        };
         per_chunk_us.push(started.elapsed().as_secs_f64() * 1e6);
         rows += next.unwrap().num_rows();
     }
