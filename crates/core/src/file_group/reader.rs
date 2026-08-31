@@ -128,6 +128,33 @@ impl FileGroupReader {
     ///
     /// # Notes
     /// This API uses [`OptionResolver`] that loads table properties from storage to resolve options.
+    /// Refuse a scan-wide memory budget on a reader that reads one file slice.
+    ///
+    /// `hoodie.read.scan.max.memory.size` bounds a scan by deciding how many slices
+    /// may be open at once. This reader is handed one slice per call and has no
+    /// fan-out for the budget to divide, so setting it here cannot do anything.
+    ///
+    /// It is refused rather than ignored because the caller who set it is asking to
+    /// be bounded, and a config that is accepted and silently inert is worse than an
+    /// absent one — the caller sees success and believes the bound applies. The C++
+    /// bridge forwards arbitrary `key=value` pairs to this constructor
+    /// (`cpp/src/lib.rs:77-83`), so it is reachable from outside Rust.
+    ///
+    /// `Table`'s own readers are built through [`Self::new_with_overrides`], which
+    /// does not run this check: there the budget is honoured one level up, by the
+    /// fan-out that decides how many of these readers run at once.
+    fn reject_scan_budget(hudi_configs: &HudiConfigs) -> Result<()> {
+        let key = HudiReadConfig::ScanMaxMemorySize.as_ref();
+        if hudi_configs.as_options().contains_key(key) {
+            return Err(CoreError::InvalidValue(format!(
+                "{key} bounds how many file slices a scan opens at once, and a \
+                 FileGroupReader reads one slice per call — there is no fan-out here \
+                 for it to bound. Set it on the table read instead, or drop it."
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -137,6 +164,7 @@ impl FileGroupReader {
         let mut resolver = OptionResolver::new_with_options(base_uri, options);
         resolver.resolve_options().await?;
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
+        Self::reject_scan_budget(&hudi_configs)?;
         let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
         let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
@@ -1619,6 +1647,56 @@ mod tests {
             filtered, 40,
             "the base file's commit is outside the range, so only the log records \
              remain; {unbounded} means the whole base survived the gate"
+        );
+        Ok(())
+    }
+
+    /// A scan-wide memory budget is refused by the single-slice reader, and still
+    /// honoured by the table read that has a fan-out to apply it to.
+    ///
+    /// The budget decides how many slices a scan opens at once. A
+    /// `FileGroupReader` is handed one slice per call, so setting it there cannot
+    /// do anything — and the C++ bridge forwards arbitrary `key=value` pairs into
+    /// this constructor, which is how a caller could set it and believe they were
+    /// bounded.
+    ///
+    /// The second half is the one that makes this test worth having: refusing
+    /// everywhere would break `Table::read`, which sets the same key on the readers
+    /// it builds internally through `new_with_overrides`. The check has to
+    /// distinguish the two constructors, and this asserts that it does.
+    #[tokio::test]
+    async fn a_scan_budget_is_refused_by_a_single_slice_reader_and_kept_by_the_table() -> Result<()>
+    {
+        let table_path = hudi_test::SampleTable::V6Nonpartitioned.path_to_cow();
+        let budget = [(HudiReadConfig::ScanMaxMemorySize.as_ref(), "134217728")];
+
+        let err = FileGroupReader::new_with_options(&table_path, budget)
+            .await
+            .expect_err("a single-slice reader must refuse a scan-wide budget");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("no fan-out here"),
+            "the error must say why, not merely fail: {msg}"
+        );
+
+        FileGroupReader::new_with_options(&table_path, empty_options())
+            .await
+            .expect("without the budget the same construction must succeed");
+
+        // The table read owns a fan-out, so the same key is valid there. It must
+        // actually **read**: `Table::new_with_options` builds no reader, so
+        // constructing alone would pass even if the check rejected everywhere —
+        // which it did, until a mutation caught this line asserting nothing.
+        let table = crate::table::Table::new_with_options(&table_path, budget)
+            .await
+            .expect("a table may carry the budget");
+        let batches = table
+            .read(&ReadOptions::new())
+            .await
+            .expect("the table read builds its readers internally, where the budget is honoured");
+        assert!(
+            batches.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+            "the budgeted read must return rows, not merely avoid erroring"
         );
         Ok(())
     }
