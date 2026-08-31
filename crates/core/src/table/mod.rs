@@ -1192,6 +1192,20 @@ impl Table {
         });
 
         // Chain all file slice streams together, propagating errors to the caller.
+        // Sequential, and deliberately so: `.then` awaits each slice's future
+        // before starting the next, so exactly one slice is in flight however many
+        // the table has.
+        //
+        // `hoodie.read.file.slice.read.concurrency` therefore does **not** apply
+        // here, unlike [`Self::read`], which fans out through
+        // `read_file_slices_bounded`. That is not an oversight: a streaming read
+        // exists so the whole result is never resident, and fanning out N ways
+        // would hold N slices' batches in flight at once — spending the memory the
+        // caller chose this API to avoid. A caller who wants the slices read
+        // concurrently wants `read`.
+        //
+        // The consequence worth stating: peak memory here does not grow with slice
+        // count, so a scan memory budget has nothing to bound on this path.
         let combined_stream = stream::iter(streams_iter)
             .then(|fut| fut)
             .flat_map(|result| match result {
@@ -1439,6 +1453,58 @@ mod tests {
             1,
             "a 128 MiB budget must admit one 65 MiB slice, not the ceiling of 4"
         );
+    }
+
+    /// `read_stream` returns exactly what `read` returns, and the slice
+    /// concurrency ceiling changes neither.
+    ///
+    /// The invariant this pins is the documented contract at
+    /// `read_snapshot_stream_inner`: the streaming path reads slices sequentially,
+    /// so `hoodie.read.file.slice.read.concurrency` does not apply to it. Setting
+    /// the ceiling to 1 and to 8 must produce the same rows as the eager read —
+    /// if a future change made the stream fan out, the row totals would still
+    /// match, but the config would start mattering, and this test is where that
+    /// divergence gets noticed.
+    ///
+    /// It does not prove sequentiality. Nothing observable from outside
+    /// distinguishes one slice in flight from four; the contract is asserted by
+    /// the doc comment and by `.then`, and this test pins the consequence a caller
+    /// can actually check.
+    #[tokio::test]
+    async fn read_stream_matches_read_and_ignores_the_slice_ceiling() -> Result<()> {
+        use futures::StreamExt;
+
+        // A partitioned fixture, because the point is several file slices: on a
+        // single-slice table this test cannot tell "read every slice" from "read
+        // the first", and a `.take(1)` mutation passes it.
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let eager = Table::new(base_url.path())
+            .await?
+            .read(&ReadOptions::new())
+            .await?;
+        let expected: usize = eager.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            expected > 0,
+            "the fixture must return rows, or nothing is pinned"
+        );
+
+        for ceiling in ["1", "8"] {
+            let table = Table::new_with_options(
+                base_url.path(),
+                [(HudiReadConfig::FileSliceReadConcurrency.as_ref(), ceiling)],
+            )
+            .await?;
+            let mut stream = table.read_stream(&ReadOptions::new()).await?;
+            let mut rows = 0usize;
+            while let Some(batch) = stream.next().await {
+                rows += batch?.num_rows();
+            }
+            assert_eq!(
+                rows, expected,
+                "read_stream at concurrency={ceiling} must return the eager row count"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
