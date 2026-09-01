@@ -107,6 +107,7 @@ const EXPECTED_OPTION_FIXTURES: &[&str] = &[
     "table_delete_ord_long [MorAvro]",
     "table_delete_ord_string [MorAvro]",
     "table_delete_ord_timestamp [MorAvro]",
+    "table_event_time_stale [MorAvro]",
     "table_evo_add_col [MorAvro]",
     "table_evo_promotion [MorAvro]",
     "table_log_compaction [MorAvro]",

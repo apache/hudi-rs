@@ -309,6 +309,25 @@ pub enum QuickstartTripsTable {
     /// `hoodie.merge.use.record.positions=true`.
     #[strum(serialize = "table_duplicate_keys")]
     MorLayoutDuplicateKeys,
+    /// v9 MOR non-partitioned, EVENT_TIME_ORDERING, where a log update and a
+    /// delete each LOSE to the live row on ordering value.
+    ///
+    /// Provenance: `table_event_time_stale.sql` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT).
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Layout: base .parquet (4 rows, all at ts 100) + one log file per write:
+    /// `a` updated at ts 50, `b` updated at ts 200, `c` deleted at ts 50,
+    /// `d` deleted at ts 300.
+    /// Semantics: `a` keeps the base row and `c` survives its delete, both
+    /// because the log side's ordering value sits below the live row; `b` takes
+    /// its update and `d` is removed, because theirs sit above. Everywhere else
+    /// the corpus only ever writes at or above the live ordering value, so
+    /// nothing else in it notices if event-time ordering degrades to
+    /// last-writer-wins. Both directions of both shapes live in this one
+    /// fixture, so inverting a comparison does not pass either.
+    /// gold_data = Spark `SELECT *` snapshot, 3 rows.
+    #[strum(serialize = "table_event_time_stale")]
+    MorEventTimeStale,
 
     // -------------------------------------------------------------------------
     // Delete-block orderingVal wrapper-type fixtures (Task 7).
