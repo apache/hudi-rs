@@ -1,0 +1,23 @@
+[package]
+name = "hudi-jvm-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Plain C ABI over hudi-rs, so a JVM can call it through the Arrow C Data Interface."
+homepage.workspace = true
+repository.workspace = true
+
+[lib]
+name = "hudi_jvm_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Exports a deliberately panicking function, so a caller can prove a panic does
+# not cross the C ABI. Off by default: it must not exist in a shipped library.
+ffi-test-hooks = []
+
+[dependencies]
+hudi = { path = "../hudi", version = "0.5.0-dev" }
+arrow = { workspace = true, features = ["ffi"] }
+tokio = { workspace = true }
