@@ -27,8 +27,18 @@ description.workspace = true
 homepage.workspace = true
 repository.workspace = true
 
+[features]
+default = ["spill-rocksdb"]
+# Forwarded so a consumer reaching hudi-core through this crate can still drop
+# the merge map's on-disk tier. Taking hudi-core with its defaults here would
+# re-enable that tier through feature unification whatever the umbrella crate
+# asked for.
+spill-rocksdb = ["hudi-core/spill-rocksdb"]
+
 [dependencies]
-hudi-core = { version = "0.5.0-dev", path = "../core", features = ["datafusion"] }
+hudi-core = { version = "0.5.0-dev", path = "../core", default-features = false, features = [
+    "datafusion",
+] }
 # arrow
 arrow = { workspace = true }
 arrow-arith = { workspace = true }

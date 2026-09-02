@@ -28,10 +28,21 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-hudi-core = { version = "0.5.0-dev", path = "../core" }
-hudi-datafusion = { version = "0.5.0-dev", path = "../datafusion", optional = true }
+hudi-core = { version = "0.5.0-dev", path = "../core", default-features = false }
+hudi-datafusion = { version = "0.5.0-dev", path = "../datafusion", optional = true, default-features = false }
 
 [features]
+default = ["spill-rocksdb"]
+# On by default, so this crate and everything downstream of it keep the merge
+# map's on-disk tier unless they say otherwise. Forwarded rather than left to
+# hudi-core's own default because a consumer can only opt out of a feature its
+# direct dependency exposes: without this, `default-features = false` here would
+# still get the tier back through hudi-core. Dropping it removes the tier, and a
+# merge exceeding `hoodie.memory.merge.max.size` then fails rather than spilling.
+spill-rocksdb = [
+    "hudi-core/spill-rocksdb",
+    "hudi-datafusion?/spill-rocksdb",
+]
 datafusion = [
     "hudi-datafusion",
 ]
