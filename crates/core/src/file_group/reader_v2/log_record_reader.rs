@@ -527,6 +527,14 @@ impl BaseHoodieLogRecordReader {
                     .await?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
+                // A file inside one fetch window costs a single request whose
+                // blocking read can complete before this task is ever suspended,
+                // and Pass 3 then decodes resident bytes with no I/O at all — so
+                // nothing in the scan is guaranteed to reach the scheduler. On a
+                // single-worker runtime that starves every task sharing it for
+                // the whole scan; one explicit yield per file keeps the walk
+                // cooperative whatever the I/O timing.
+                tokio::task::yield_now().await;
             }
         });
 
