@@ -31,7 +31,7 @@ use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
 use crate::storage::error::Result;
 use crate::storage::file_metadata::FileMetadata;
-use crate::storage::{RowFilterBuilder, Storage};
+use crate::storage::{RowFilterBuilder, RowGroupSelector, Storage};
 
 /// Which record keys a read is interested in.
 ///
@@ -130,6 +130,18 @@ pub struct BaseFileReadOptions {
     /// excluded from [`projection`](Self::projection) matching, since the column
     /// is not one of the file's own.
     pub row_index_column: Option<String>,
+    /// Picks which row groups to read, from the file's footer statistics.
+    ///
+    /// Only the Parquet reader honors this; other formats ignore it. Unlike
+    /// [`row_filter`](Self::row_filter), which discards rows once they have been
+    /// decoded, a row group this excludes is never fetched — so the two are
+    /// complementary, and this is the one that saves IO. It runs against the
+    /// footer the reader has already read, so consulting it costs nothing.
+    ///
+    /// It carries the same safety obligation as `row_filter`, and a stronger
+    /// one: pruning removes base rows before a log merge could have updated them
+    /// into a match. The caller installs it only when that cannot happen.
+    pub row_group_selector: Option<RowGroupSelector>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -143,6 +155,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
             .field("key_predicate", &self.key_predicate)
             .field("row_filter", &self.row_filter.is_some())
             .field("row_index_column", &self.row_index_column)
+            .field("row_group_selector", &self.row_group_selector.is_some())
             .finish()
     }
 }
@@ -155,6 +168,13 @@ impl BaseFileReadOptions {
     /// Sets a predicate to push into the read. See [`Self::row_filter`].
     pub fn with_row_filter(mut self, row_filter: RowFilterBuilder) -> Self {
         self.row_filter = Some(row_filter);
+        self
+    }
+
+    /// Read only the row groups a selector keeps. See
+    /// [`Self::row_group_selector`].
+    pub fn with_row_group_selector(mut self, selector: RowGroupSelector) -> Self {
+        self.row_group_selector = Some(selector);
         self
     }
 
@@ -250,6 +270,25 @@ pub trait BaseFileReader: Send + Sync {
             }
 
             Ok(concat_batches(&schema, &batches)?)
+        })
+    }
+
+    /// The schema of a base file, without reading its data.
+    ///
+    /// The default opens a stream and takes the schema it reports, which is what
+    /// a caller would otherwise write by hand. A format that can answer from
+    /// metadata alone should override it: the caller wants the schema in order to
+    /// decide what to read next, so the read that follows is a second open, and
+    /// only the override keeps this one from setting up a decode nobody polls.
+    fn read_schema<'a>(
+        &'a self,
+        relative_path: &'a str,
+    ) -> BoxFuture<'a, Result<arrow_schema::SchemaRef>> {
+        Box::pin(async move {
+            let stream = self
+                .read_stream(relative_path, BaseFileReadOptions::new())
+                .await?;
+            Ok(stream.schema().clone())
         })
     }
 

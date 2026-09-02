@@ -97,8 +97,10 @@ pub(crate) fn resolve_reader_context(
         needs_bootstrap_merge: false,
         enable_logical_timestamp_field_repair: false,
         // Predicate pushdown into the merge path has no caller here, so no
-        // filter is installed and the primary-key-safety gate is irrelevant.
+        // filter is installed, nothing prunes row groups, and the
+        // primary-key-safety gate is irrelevant.
         row_filter_builder: None,
+        row_group_selector: None,
         key_predicate: None,
         mor_pk_safe: false,
         // The table-version < 8 completion gate needs a timeline the caller

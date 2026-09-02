@@ -28,7 +28,7 @@
 use super::record_context::RecordContext;
 use super::schema_handler::FileGroupReaderSchemaHandler;
 use crate::config::table::HudiTableConfig;
-use crate::storage::RowFilterBuilder;
+use crate::storage::{RowFilterBuilder, RowGroupSelector};
 use crate::timeline::selector::InstantRange;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -144,6 +144,15 @@ pub struct ReaderContext {
     /// Groundwork for a caller that supplies one; no performance claim about this
     /// crate's reads rests on it.
     pub row_filter_builder: Option<RowFilterBuilder>,
+    /// Optional row-group selector for pruning base parquet reads from footer
+    /// statistics; `None` when no caller supplied one.
+    ///
+    /// Gated by the same "does this read merge?" condition as
+    /// [`Self::row_filter_builder`], and for a stronger reason: pruning drops
+    /// base rows before the log merge runs, so on a merging read it could remove
+    /// a row the merge would have updated into a match. The row filter at least
+    /// sees every row.
+    pub row_group_selector: Option<RowGroupSelector>,
     /// Record keys or key prefixes the read is interested in, pushed into the base
     /// file reader so a key-ordered format seeks instead of scanning.
     ///
@@ -215,6 +224,10 @@ impl std::fmt::Debug for ReaderContext {
             .field(
                 "row_filter_builder",
                 &self.row_filter_builder.as_ref().map(|_| "<closure>"),
+            )
+            .field(
+                "row_group_selector",
+                &self.row_group_selector.as_ref().map(|_| "<closure>"),
             )
             .field("mor_pk_safe", &self.mor_pk_safe)
             .field("completion_gate_inputs", &self.completion_gate_inputs)
@@ -322,6 +335,7 @@ impl ReaderContext {
             table_config: HashMap::new(),
             hoodie_reader_config: HashMap::new(),
             row_filter_builder: None,
+            row_group_selector: None,
             key_predicate: None,
             mor_pk_safe: false,
             completion_gate_inputs: None,

@@ -60,6 +60,23 @@ pub type RowFilterBuilder = Arc<
         + Sync,
 >;
 
+/// Chooses which row groups a read fetches, from the file's parsed footer.
+/// Returning `None` means "no opinion, read them all".
+///
+/// This is the only mechanism on the read path that can avoid reading bytes: a
+/// [`RowFilterBuilder`] decides per row after the predicate columns are decoded,
+/// so it saves decode, never IO, while a row group excluded here is never
+/// fetched.
+///
+/// The selector must be CONSERVATIVE. Keeping a row group that cannot match
+/// costs only time; dropping one that can match silently loses rows, and nothing
+/// downstream can restore them.
+///
+/// `Arc` for the same reason as [`RowFilterBuilder`]: options holding it stay
+/// `Clone`, and it may run on any worker thread.
+pub type RowGroupSelector =
+    Arc<dyn Fn(&parquet::file::metadata::ParquetMetaData) -> Option<Vec<usize>> + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
@@ -105,6 +122,24 @@ pub struct ReadVolume {
     pub row_groups_read: AtomicU64,
     /// Row groups the file contains. Denominator for the line above.
     pub file_row_groups: AtomicU64,
+    /// Times the row-group selector closure actually RAN.
+    ///
+    /// Separate from its outcome on purpose. A selector returns `None` when it
+    /// cannot prune anything, so `row_groups_read == file_row_groups` reads the
+    /// same whether the selector ran and found nothing or was never installed.
+    /// Only this counter separates them.
+    pub row_group_selector_calls: AtomicU64,
+    /// Times a selector WAS installed by the caller but the merge-safety gate
+    /// refused to pass it down.
+    ///
+    /// Without this the gate silently defeats the counter above: a suppressed
+    /// selector is a third state that also reads zero calls. Read the two
+    /// together:
+    ///   calls > 0                   the selector ran
+    ///   calls == 0, suppressed > 0  the gate refused it (the read merges, and
+    ///                               the predicate is not primary-key-safe)
+    ///   calls == 0, suppressed == 0 no caller ever installed one
+    pub row_group_selector_suppressed: AtomicU64,
     /// Rows the file contains, from parquet metadata.
     pub file_rows: AtomicU64,
     /// Rows the stream actually yielded, after any row filter. `file_rows -
@@ -129,6 +164,18 @@ impl ReadVolume {
 
     pub(crate) fn add_row_groups_read(&self, n: u64) {
         self.row_groups_read.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The selector ran. Counted whether or not it managed to prune.
+    pub(crate) fn record_selector_call(&self) {
+        self.row_group_selector_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A caller installed a selector and the safety gate declined to pass it on.
+    pub(crate) fn record_selector_suppressed(&self) {
+        self.row_group_selector_suppressed
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn add_rows_out(&self, n: u64) {

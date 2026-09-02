@@ -20,7 +20,6 @@
 
 use std::sync::Arc;
 
-use crate::storage::ReadVolume;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use object_store::path::Path as ObjPath;
@@ -32,14 +31,12 @@ use parquet::file::metadata::ParquetMetaData;
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use crate::statistics::StatisticsContainer;
+use crate::storage::ReadVolume;
 use crate::storage::Storage;
 use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::util::join_url_segments;
 
-/// Parquet implementation of [`BaseFileReader`].
-///
-/// Reads Parquet files directly via `object_store` and the `parquet` crate.
 /// `AsyncFileReader` wrapper that accumulates read volume into a shared
 /// [`ReadVolume`].
 ///
@@ -93,6 +90,9 @@ impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
 /// read-volume counters wrapped around it.
 type CountedBuilder = ParquetRecordBatchStreamBuilder<CountingReader<ParquetObjectReader>>;
 
+/// Parquet implementation of [`BaseFileReader`].
+///
+/// Reads Parquet files directly via `object_store` and the `parquet` crate.
 pub struct ParquetBaseFileReader {
     storage: Arc<Storage>,
 }
@@ -149,19 +149,9 @@ impl ParquetBaseFileReader {
             Self::arrow_reader_options(row_index_column)?,
         )?;
 
-        // What the file holds, recorded before a single data byte is read, so the
-        // volume counters have a denominator. It comes off the footer that has
-        // already been fetched, so it costs no extra IO.
-        let volume = self.storage.read_volume.clone();
-        let metadata = arrow_metadata.metadata();
-        volume.record_file_shape(
-            metadata.num_row_groups() as u64,
-            metadata.file_metadata().num_rows().max(0) as u64,
-        );
-
         let reader = CountingReader {
             inner: reader,
-            volume,
+            volume: self.storage.read_volume.clone(),
         };
         Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
             reader,
@@ -184,9 +174,16 @@ impl ParquetBaseFileReader {
         mut builder: CountedBuilder,
         options: &BaseFileReadOptions,
     ) -> Result<CountedBuilder> {
-        self.storage
-            .read_volume
-            .add_row_groups_read(builder.metadata().num_row_groups() as u64);
+        // What the file holds, taken from the footer that has already been
+        // fetched, so it costs no extra IO. Recorded here rather than at every
+        // builder open so it counts once per read OF THE DATA: opening the same
+        // file again for its schema alone would otherwise inflate the
+        // denominator that `row_groups_read` and `rows_out` are read against.
+        let metadata = builder.metadata();
+        self.storage.read_volume.record_file_shape(
+            metadata.num_row_groups() as u64,
+            metadata.file_metadata().num_rows().max(0) as u64,
+        );
 
         if let Some(batch_size) = options.batch_size {
             builder = builder.with_batch_size(batch_size);
@@ -223,6 +220,32 @@ impl ParquetBaseFileReader {
             );
             builder = builder.with_projection(projection_mask);
         }
+
+        // Prune row groups from footer statistics, BEFORE the row filter is
+        // installed: a group excluded here is never fetched, so the filter only
+        // ever sees groups that survived.
+        let volume = &self.storage.read_volume;
+        let total_row_groups = builder.metadata().num_row_groups();
+        let mut row_groups_read = total_row_groups;
+        if let Some(keep) = options.row_group_selector.as_ref().and_then(|select| {
+            // Count the CALL, not just a successful prune, so "ran and found
+            // nothing" stays distinguishable from "never installed".
+            volume.record_selector_call();
+            select(builder.metadata())
+        }) {
+            // A selector that names a row group the file does not have is a bug
+            // in the selector, and parquet-rs ignores such an index rather than
+            // failing, so it would go unnoticed. `debug_assert!` catches it in
+            // tests without adding a release-mode check for a case that cannot
+            // lose rows.
+            debug_assert!(
+                keep.iter().all(|&i| i < total_row_groups),
+                "selector returned an out-of-range row-group index"
+            );
+            row_groups_read = keep.len();
+            builder = builder.with_row_groups(keep);
+        }
+        volume.add_row_groups_read(row_groups_read as u64);
 
         // Built here rather than by the caller because the predicate has to be
         // resolved against the file's own schema, which only exists once the
@@ -325,6 +348,15 @@ impl BaseFileReader for ParquetBaseFileReader {
 
             Ok(BaseFileStream::new(schema, mapped_stream))
         })
+    }
+
+    /// Answered from the footer alone: no stream is built, and no read-volume
+    /// counter moves for a call that reads no data.
+    fn read_schema<'a>(
+        &'a self,
+        relative_path: &'a str,
+    ) -> BoxFuture<'a, Result<arrow_schema::SchemaRef>> {
+        Box::pin(async move { Ok(Arc::new(self.get_schema(relative_path).await?)) })
     }
 
     fn get_metadata_and_stats<'a>(
