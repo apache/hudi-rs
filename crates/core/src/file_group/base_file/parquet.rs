@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::storage::ReadVolume;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use object_store::path::Path as ObjPath;
@@ -39,6 +40,59 @@ use crate::storage::util::join_url_segments;
 /// Parquet implementation of [`BaseFileReader`].
 ///
 /// Reads Parquet files directly via `object_store` and the `parquet` crate.
+/// `AsyncFileReader` wrapper that accumulates read volume into a shared
+/// [`ReadVolume`].
+///
+/// Delegates everything and changes no behaviour. Counting happens here rather
+/// than inside the object store because the store is shared between readers and
+/// therefore cannot carry per-read counters.
+struct CountingReader<R: AsyncFileReader> {
+    inner: R,
+    volume: Arc<ReadVolume>,
+}
+
+impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
+    fn get_bytes(
+        &mut self,
+        range: std::ops::Range<u64>,
+    ) -> BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        let volume = self.volume.clone();
+        let fut = self.inner.get_bytes(range);
+        Box::pin(async move {
+            let bytes = fut.await?;
+            volume.add_bytes(bytes.len() as u64);
+            Ok(bytes)
+        })
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<std::ops::Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>> {
+        let volume = self.volume.clone();
+        let fut = self.inner.get_byte_ranges(ranges);
+        Box::pin(async move {
+            let chunks = fut.await?;
+            // One call, many ranges: count the call once and every byte it
+            // returned, so `io_calls` stays a count of round trips.
+            let total: u64 = chunks.iter().map(|b| b.len() as u64).sum();
+            volume.add_bytes(total);
+            Ok(chunks)
+        })
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        self.inner.get_metadata(options)
+    }
+}
+
+/// The builder every read here is driven from: a parquet object reader with the
+/// read-volume counters wrapped around it.
+type CountedBuilder = ParquetRecordBatchStreamBuilder<CountingReader<ParquetObjectReader>>;
+
 pub struct ParquetBaseFileReader {
     storage: Arc<Storage>,
 }
@@ -78,7 +132,7 @@ impl ParquetBaseFileReader {
         obj_path: ObjPath,
         file_size: u64,
         row_index_column: Option<&str>,
-    ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>> {
+    ) -> Result<CountedBuilder> {
         let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
             .with_file_size(file_size);
 
@@ -94,6 +148,21 @@ impl ParquetBaseFileReader {
             normalized,
             Self::arrow_reader_options(row_index_column)?,
         )?;
+
+        // What the file holds, recorded before a single data byte is read, so the
+        // volume counters have a denominator. It comes off the footer that has
+        // already been fetched, so it costs no extra IO.
+        let volume = self.storage.read_volume.clone();
+        let metadata = arrow_metadata.metadata();
+        volume.record_file_shape(
+            metadata.num_row_groups() as u64,
+            metadata.file_metadata().num_rows().max(0) as u64,
+        );
+
+        let reader = CountingReader {
+            inner: reader,
+            volume,
+        };
         Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
             reader,
             arrow_metadata,
@@ -104,16 +173,21 @@ impl ParquetBaseFileReader {
         &self,
         relative_path: &str,
         row_index_column: Option<&str>,
-    ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>> {
+    ) -> Result<CountedBuilder> {
         let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
         self.open_builder_with_size(obj_path, file_size, row_index_column)
             .await
     }
 
     fn apply_options(
-        mut builder: ParquetRecordBatchStreamBuilder<ParquetObjectReader>,
+        &self,
+        mut builder: CountedBuilder,
         options: &BaseFileReadOptions,
-    ) -> Result<ParquetRecordBatchStreamBuilder<ParquetObjectReader>> {
+    ) -> Result<CountedBuilder> {
+        self.storage
+            .read_volume
+            .add_row_groups_read(builder.metadata().num_row_groups() as u64);
+
         if let Some(batch_size) = options.batch_size {
             builder = builder.with_batch_size(batch_size);
         }
@@ -229,7 +303,7 @@ impl BaseFileReader for ParquetBaseFileReader {
             let builder = self
                 .open_builder(relative_path, options.row_index_column.as_deref())
                 .await?;
-            let builder = Self::apply_options(builder, &options)?;
+            let builder = self.apply_options(builder, &options)?;
             let full_schema = builder.schema().clone();
             let stream = builder.build()?;
             let schema = Self::schema_with_row_index(
@@ -237,8 +311,16 @@ impl BaseFileReader for ParquetBaseFileReader {
                 &full_schema,
                 options.row_index_column.as_deref(),
             )?;
+            // Rows the stream actually yields — after any row filter. Against
+            // `file_rows` this is the read's selectivity; against `bytes_read`,
+            // what that selectivity cost.
+            let volume = self.storage.read_volume.clone();
             let mapped_stream = stream
-                .map(|result| result.map_err(StorageError::from))
+                .map(move |result| {
+                    let batch = result.map_err(StorageError::from)?;
+                    volume.add_rows_out(batch.num_rows() as u64);
+                    Ok(batch)
+                })
                 .boxed();
 
             Ok(BaseFileStream::new(schema, mapped_stream))
@@ -377,6 +459,76 @@ mod tests {
 
         let batch = reader.read_data("a.parquet", opts).await.unwrap();
         assert_eq!(batch.num_rows(), 0, "the predicate rejected every row");
+    }
+
+    /// The volume counters describe a real read: what the file held, what was
+    /// fetched to read it, and what came back.
+    #[tokio::test]
+    async fn read_volume_counts_what_the_read_actually_moved() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let storage = test_storage();
+        let volume = storage.read_volume();
+        let reader = ParquetBaseFileReader::new(storage);
+
+        let batch = reader
+            .read_data("a.parquet", BaseFileReadOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(batch.num_rows(), 5);
+        assert_eq!(volume.file_rows.load(Relaxed), 5, "footer row count");
+        assert_eq!(volume.rows_out.load(Relaxed), 5, "every row was yielded");
+        let file_row_groups = volume.file_row_groups.load(Relaxed);
+        assert!(file_row_groups >= 1, "the file has at least one row group");
+        assert_eq!(
+            volume.row_groups_read.load(Relaxed),
+            file_row_groups,
+            "nothing prunes, so every row group is scanned"
+        );
+        assert!(volume.bytes_read.load(Relaxed) > 0, "bytes were fetched");
+        assert!(volume.io_calls.load(Relaxed) > 0, "round trips were made");
+    }
+
+    /// Why the counters exist. A `RowFilter` decides per row *after* the
+    /// predicate columns are decoded, so a filter that rejects everything still
+    /// reads the file: `rows_out` collapses to zero while `bytes_read` does not,
+    /// and `row_groups_read` still covers the whole file. A disposition flag
+    /// ("was a predicate pushed?") reports the same thing here as it would for a
+    /// read that skipped the file entirely.
+    #[tokio::test]
+    async fn a_row_filter_that_rejects_everything_still_reads_the_file() {
+        use arrow_array::BooleanArray;
+        use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let storage = test_storage();
+        let volume = storage.read_volume();
+        let reader = ParquetBaseFileReader::new(storage);
+
+        let opts = BaseFileReadOptions::default().with_row_filter(Arc::new(|descr, _| {
+            let mask = ProjectionMask::roots(descr, [0]);
+            Some(RowFilter::new(vec![Box::new(ArrowPredicateFn::new(
+                mask,
+                |batch| Ok(BooleanArray::from(vec![false; batch.num_rows()])),
+            ))]))
+        }));
+
+        let batch = reader.read_data("a.parquet", opts).await.unwrap();
+
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(volume.rows_out.load(Relaxed), 0, "no row survived");
+        assert_eq!(volume.file_rows.load(Relaxed), 5, "the file still held 5");
+        assert_eq!(
+            volume.row_groups_read.load(Relaxed),
+            volume.file_row_groups.load(Relaxed),
+            "a row filter skips no row group"
+        );
+        assert!(
+            volume.bytes_read.load(Relaxed) > 0,
+            "rejecting every row still cost IO"
+        );
     }
 
     /// A builder that declines — typically because the file has none of the

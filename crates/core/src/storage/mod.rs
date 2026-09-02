@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -65,6 +66,74 @@ pub struct Storage {
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
+    /// Read-volume counters for the reads made through this `Storage`.
+    ///
+    /// Here rather than on a read parameter so no read signature changes, and
+    /// because a file-group read constructs its own `Storage` — which makes the
+    /// scope of these counters exactly "this read". The `object_store` inside
+    /// could not carry them: it is shared, so its counts would be everyone's.
+    pub(crate) read_volume: Arc<ReadVolume>,
+}
+
+/// Read-volume counters for one [`Storage`]'s lifetime.
+///
+/// Whether a predicate was pushed is not the same question as what a push
+/// bought: a parquet `RowFilter` can be installed on every file and still read
+/// every byte, because it decides per row after the predicate columns are
+/// decoded. Only pruning avoids IO. These counters separate the two.
+///
+/// `bytes_read` and `io_calls` are counted at the `AsyncFileReader` boundary,
+/// which makes them exact and independent of the OS page cache: a warm re-read
+/// reports the same bytes as a cold one. Wall-clock does not have that property,
+/// which is what makes these the transferable numbers when comparing read paths.
+///
+/// All fields are `AtomicU64` under an `Arc` because the parquet stream is
+/// polled on whichever worker thread drives it, while a consumer may read the
+/// counters from another. `Relaxed` throughout: these are advisory counters, and
+/// the happens-before that makes them visible is the consumer draining the
+/// stream.
+#[derive(Debug, Default)]
+pub struct ReadVolume {
+    /// Bytes actually fetched from the object store, summed over every range read.
+    pub bytes_read: AtomicU64,
+    /// Number of `get_bytes` / `get_byte_ranges` calls — round trips, not ranges.
+    /// A two-pass read (predicate columns, then the selected rows) shows up here
+    /// as roughly double the calls of a single-pass read over the same file.
+    pub io_calls: AtomicU64,
+    /// Row groups the reader was configured to scan. Equal to `file_row_groups`
+    /// until something prunes; the gap between the two is what pruning bought.
+    pub row_groups_read: AtomicU64,
+    /// Row groups the file contains. Denominator for the line above.
+    pub file_row_groups: AtomicU64,
+    /// Rows the file contains, from parquet metadata.
+    pub file_rows: AtomicU64,
+    /// Rows the stream actually yielded, after any row filter. `file_rows -
+    /// rows_out` is what filtering removed; `bytes_read` says what it cost to
+    /// remove it.
+    pub rows_out: AtomicU64,
+}
+
+impl ReadVolume {
+    /// One completed fetch: its bytes, and the round trip that carried them.
+    pub(crate) fn add_bytes(&self, n: u64) {
+        self.bytes_read.fetch_add(n, Ordering::Relaxed);
+        self.io_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What the file holds, read off the footer the reader has already fetched.
+    pub(crate) fn record_file_shape(&self, row_groups: u64, rows: u64) {
+        self.file_row_groups
+            .fetch_add(row_groups, Ordering::Relaxed);
+        self.file_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_row_groups_read(&self, n: u64) {
+        self.row_groups_read.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_rows_out(&self, n: u64) {
+        self.rows_out.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 impl Storage {
@@ -93,9 +162,16 @@ impl Storage {
                 object_store: Arc::new(object_store),
                 options,
                 hudi_configs,
+                read_volume: Arc::new(ReadVolume::default()),
             })),
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
+    }
+
+    /// Clone of this `Storage`'s read-volume counters, for a consumer that
+    /// outlives the read and reports them once the stream has drained.
+    pub fn read_volume(&self) -> Arc<ReadVolume> {
+        self.read_volume.clone()
     }
 
     /// Build storage over a caller-supplied object store.
@@ -116,6 +192,7 @@ impl Storage {
             object_store,
             options: Arc::new(HashMap::new()),
             hudi_configs,
+            read_volume: Arc::new(ReadVolume::default()),
         })
     }
 
