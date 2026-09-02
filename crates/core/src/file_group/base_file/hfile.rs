@@ -1584,4 +1584,230 @@ mod tests {
         );
         Ok(())
     }
+
+    /// One metadata-table file slice: the partition it lives in, its base file if
+    /// the slice has one, and the log files written after it.
+    struct MdtSlice {
+        label: &'static str,
+        partition: &'static str,
+        base_file: Option<&'static str>,
+        log_files: &'static [&'static str],
+        /// The base instant the slice is read as of.
+        instant: &'static str,
+    }
+
+    /// Every metadata partition in the fixture that has a merge-reachable slice.
+    ///
+    /// `column_stats`, `partition_stats` and `record_index` compact to a base file
+    /// written *after* all their log files, so their pre-compaction slice has log
+    /// files and no base file at all. That is the sharper case for this change: an
+    /// HFile log block that is skipped contributes nothing, so the read has no
+    /// records and no schema to build an output from, and fails outright.
+    const MDT_SLICES: &[MdtSlice] = &[
+        MdtSlice {
+            label: "files",
+            partition: "files",
+            base_file: Some("files-0000-0_0-955-2690_00000000000000000.hfile"),
+            log_files: &[
+                ".files-0000-0_20251220210108078.log.1_10-999-2838",
+                ".files-0000-0_20251220210123755.log.1_3-1032-2950",
+                ".files-0000-0_20251220210125441.log.1_5-1057-3024",
+                ".files-0000-0_20251220210127080.log.1_3-1082-3100",
+                ".files-0000-0_20251220210128625.log.1_5-1107-3174",
+                ".files-0000-0_20251220210129235.log.1_3-1118-3220",
+                ".files-0000-0_20251220210130911.log.1_3-1149-3338",
+            ],
+            instant: "00000000000000000",
+        },
+        MdtSlice {
+            label: "column_stats",
+            partition: "column_stats",
+            base_file: None,
+            log_files: &[
+                ".col-stats-0000-0_20251220210108078.log.1_7-999-2835",
+                ".col-stats-0000-0_20251220210123755.log.1_0-1032-2947",
+                ".col-stats-0000-0_20251220210125441.log.1_2-1057-3021",
+                ".col-stats-0000-0_20251220210127080.log.1_0-1082-3097",
+                ".col-stats-0000-0_20251220210128625.log.1_2-1107-3171",
+                ".col-stats-0000-0_20251220210129235.log.1_0-1118-3217",
+                ".col-stats-0000-0_20251220210130911.log.1_0-1149-3335",
+            ],
+            instant: "00000000000000001",
+        },
+        MdtSlice {
+            label: "partition_stats",
+            partition: "partition_stats",
+            base_file: None,
+            log_files: &[
+                ".partition-stats-0000-0_20251220210108078.log.1_9-999-2837",
+                ".partition-stats-0000-0_20251220210123755.log.1_2-1032-2949",
+                ".partition-stats-0000-0_20251220210125441.log.1_4-1057-3023",
+                ".partition-stats-0000-0_20251220210127080.log.1_2-1082-3099",
+                ".partition-stats-0000-0_20251220210128625.log.1_4-1107-3173",
+                ".partition-stats-0000-0_20251220210129235.log.1_2-1118-3219",
+                ".partition-stats-0000-0_20251220210130911.log.1_2-1149-3337",
+            ],
+            instant: "00000000000000003",
+        },
+        MdtSlice {
+            label: "record_index",
+            partition: "record_index",
+            base_file: None,
+            log_files: &[".record-index-0001-0_20251220210108078.log.1_0-999-2828"],
+            instant: "00000000000000002",
+        },
+        MdtSlice {
+            label: "secondary_index",
+            partition: "secondary_index_rider_idx",
+            base_file: Some("secondary-index-rider-idx-0002-0_2-1008-2876_00000000000000004.hfile"),
+            log_files: &[".secondary-index-rider-idx-0002-0_20251220210125441.log.1_0-1057-3019"],
+            instant: "00000000000000004",
+        },
+    ];
+
+    /// Read one slice through the v2 reader, optionally without its log files.
+    async fn read_mdt_slice(slice: &MdtSlice, with_logs: bool) -> crate::Result<RecordBatch> {
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let logs: Vec<String> = if with_logs {
+            slice
+                .log_files
+                .iter()
+                .map(|f| format!("{}/{f}", slice.partition))
+                .collect()
+        } else {
+            vec![]
+        };
+        // The base file's path is threaded in so the format resolves per path rather
+        // than from config alone; the metadata table's base files are HFile.
+        let base_file_path = slice.base_file.map(|b| format!("{}/{b}", slice.partition));
+        let mut context =
+            resolve_reader_context(&configs, !logs.is_empty(), base_file_path.as_deref())?;
+        context.rebuild_record_context(slice.partition.to_string());
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(context),
+            storage,
+            InputSplit::new(
+                base_file_path.clone(),
+                Some(slice.instant.to_string()),
+                logs,
+                slice.partition.to_string(),
+            ),
+            ReaderParameters::default(),
+            None,
+            None,
+        )?;
+        reader.read().await
+    }
+
+    /// The record keys of a metadata read.
+    fn record_keys(batch: &RecordBatch) -> HashSet<String> {
+        batch
+            .column_by_name("key")
+            .expect("the metadata record key column, decoded from the HFile's values")
+            .as_string::<i32>()
+            .iter()
+            .flatten()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Every metadata partition in the fixture reads through the v2 reader with its
+    /// HFile log blocks contributing.
+    ///
+    /// One case per partition rather than the `files` partition alone, because a
+    /// skipped log block is silent: the read succeeds and returns the base file's
+    /// rows, so a `files`-only test would pass on four of the five partitions
+    /// regardless.
+    ///
+    /// Two shapes of assertion, chosen by what the slice can prove:
+    ///
+    /// - **No base file** (`column_stats`, `partition_stats`, `record_index`). Every
+    ///   record comes from a log block, so a skipped block leaves the read with no
+    ///   records and no schema to build an output from, and it fails. Returning any
+    ///   row is the assertion.
+    /// - **Base file and log files** (`files`, `secondary_index`). A skipped block
+    ///   makes the merged read identical to a base-file-only read, so the two must
+    ///   differ.
+    ///
+    /// What this pins is that the blocks are **decoded and reach the merge**, not
+    /// what the merge then does with them. The rule the merge applies is the
+    /// metadata payload's own, asserted separately by
+    /// `v2_folds_a_metadata_files_slice_like_the_metadata_table_reader`, which
+    /// compares the folded values rather than the key set.
+    #[tokio::test]
+    async fn v2_reads_every_metadata_partition_with_its_log_blocks() -> crate::Result<()> {
+        for slice in MDT_SLICES {
+            let merged = read_mdt_slice(slice, true).await.map_err(|e| {
+                StorageError::Creation(format!(
+                    "{}: reading with log files failed: {e:?}",
+                    slice.label
+                ))
+            })?;
+            let merged_keys = record_keys(&merged);
+            assert!(
+                !merged_keys.is_empty(),
+                "{}: a read whose log blocks contribute must return records",
+                slice.label
+            );
+
+            match slice.base_file {
+                None => {
+                    // Nothing but log blocks, so the rows are proof on their own.
+                }
+                Some(_) => {
+                    let base_only = read_mdt_slice(slice, false).await?;
+                    assert_ne!(
+                        (record_keys(&base_only), base_only.num_rows()),
+                        (merged_keys.clone(), merged.num_rows()),
+                        "{}: adding log files changed nothing, so the blocks were skipped",
+                        slice.label
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The `files` partition, checked against an oracle rather than against itself.
+    ///
+    /// `MetadataTableFileGroupReader` reads the same slice through a separate
+    /// implementation that decodes to Rust structs instead of Arrow, so agreeing
+    /// with it is evidence about the records rather than about this code path.
+    /// It is the only metadata partition that reader serves, which is why the
+    /// other four are covered by the weaker assertions above.
+    #[tokio::test]
+    async fn v2_reads_a_files_slice_matching_the_metadata_table_reader() -> crate::Result<()> {
+        let slice = &MDT_SLICES[0];
+        assert_eq!(slice.label, "files", "this case reads the files partition");
+
+        let configs = mdt_configs();
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let mut fg = FileGroup::new(
+            MDT_FILES_FILE_GROUP.to_string(),
+            MDT_FILES_PARTITION.to_string(),
+        );
+        fg.add_base_file_from_name(slice.base_file.expect("the files slice has a base file"))?;
+        fg.add_log_files_from_names(slice.log_files.iter().copied())?;
+        let expected: HashSet<String> = MetadataTableFileGroupReader::new(configs, storage)
+            .read_files_partition(
+                fg.get_file_slice_as_of(MAX_INSTANT_TIME)
+                    .expect("the file group has a slice"),
+                &[],
+            )
+            .await?
+            .into_keys()
+            .collect();
+        assert!(
+            !expected.is_empty(),
+            "the oracle must return keys, or the comparison is vacuous"
+        );
+
+        assert_eq!(
+            record_keys(&read_mdt_slice(slice, true).await?),
+            expected,
+            "the v2 read of a files slice must return the metadata-table reader's keys"
+        );
+        Ok(())
+    }
 }
