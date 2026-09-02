@@ -493,42 +493,19 @@ impl BaseHoodieLogRecordReader {
         let hudi_configs = Arc::new(crate::config::HudiConfigs::new(
             self.reader_context.table_config.clone(),
         ));
-        let unbounded_range =
-            InstantRange::new(self.reader_context.timezone(), None, None, false, true);
         profile_once!(self.log_block_read_ms, {
             for path in &self.log_file_paths.clone() {
-                // The sweep reads each log file whole, so blocks arrive with
-                // their content already read — same block set as a bounded
-                // sweep, more memory, but no more than the existing read path
-                // already uses. The bounded-window streaming tier
-                // (`LogFileReader::new_streaming` +
-                // `read_all_blocks_metadata_only`) walks headers only and lets
-                // each admitted block fetch its content in Pass 3; it is not
-                // wired here yet. The range is left unbounded so
-                // the gates below decide what is admitted, rather than filtering
-                // twice with different rules.
-                // A log record can update a row, so a predicate may only be
-                // evaluated before the merge when the merge cannot change its
-                // answer. Log blocks exist only on merge-on-read, so the gate
-                // reduces to a predicate over primary keys, which are immutable
-                // across upserts. Anything else is left for the post-merge
-                // filter.
-                let row_filter = if self.reader_context.can_push_row_filter() {
-                    self.reader_context.row_filter_builder.clone()
-                } else {
-                    None
-                };
+                // Walk headers only, out of a bounded fetch window. Passes 1 and 2
+                // read nothing but a block's header, so the gates below decide what
+                // is admitted before any content is fetched or decoded, and Pass 3
+                // reads each admitted block's own content. A block the gates discard
+                // therefore costs no bytes and cannot fail the read by being
+                // undecodable. No instant range is applied here: the gates decide,
+                // rather than filtering twice with different rules.
                 let mut reader =
-                    LogFileReader::new(hudi_configs.clone(), self.storage.clone(), path)
-                        .await?
-                        .with_row_filter(row_filter)
-                        .with_reader_schema(
-                            self.reader_context
-                                .schema_handler
-                                .reader_schema_json
-                                .clone(),
-                        );
-                let blocks = reader.read_all_blocks(&unbounded_range)?;
+                    LogFileReader::new_streaming(hudi_configs.clone(), self.storage.clone(), path)
+                        .await?;
+                let blocks = reader.read_all_blocks_metadata_only().await?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
             }
@@ -568,9 +545,20 @@ impl BaseHoodieLogRecordReader {
         // Mirrors Java: if (!currentInstantLogBlocks.isEmpty() && !skipProcessingBlocks) { ... }
         if !pass2.current_instant_log_blocks.is_empty() && !skip_processing_blocks {
             log::debug!("Merging the final data blocks");
+            // Oldest first, matching the pop_back the deque was built for. Taking
+            // the order up front is what lets the content be fetched a window at a
+            // time: the fetch happens in async code and the merge under it is
+            // synchronous, because the record buffer's `process_data_block` is a
+            // sync trait method and cannot await.
+            let mut ordered: Vec<LogBlock> =
+                Vec::with_capacity(pass2.current_instant_log_blocks.len());
+            while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
+                ordered.push(block);
+            }
             profile_once!(
                 self.merge_insert_ms,
-                self.process_queued_blocks_for_instant(&mut pass2.current_instant_log_blocks)
+                self.fetch_and_merge_windows(&hudi_configs, &mut ordered)
+                    .await
             )?;
         }
 
@@ -637,24 +625,192 @@ impl BaseHoodieLogRecordReader {
         &self.valid_block_instants
     }
 
-    /// Mirrors Java's `processQueuedBlocksForInstant(Deque<HoodieLogBlock>, ...)`.
+    /// Fetch and merge the admitted blocks, one window at a time.
     ///
-    /// Drains the deque from the back (oldest→newest via `pop_back`/`pollLast`).
-    /// Dispatches each block to the record buffer — the buffer is responsible for
-    /// inflating, extracting records, and deflating (matching Java's design where
-    /// `processQueuedBlocksForInstant` does NOT call `inflate()`).
-    fn process_queued_blocks_for_instant(
+    /// Peak content residency is one window rather than the slice's whole
+    /// admitted content: a window's bytes are dropped before the next window is
+    /// fetched. Fetching everything up front would hand back the bound the
+    /// header walk was added to buy — on a slice with a gigabyte of admitted log
+    /// content, every byte of it would be resident before the first record was
+    /// merged. The budget is `hoodie.memory.dfs.buffer.max.size`, the same knob
+    /// that bounds how much of a log file the header walk holds.
+    ///
+    /// The fetch is the only await here, and the record buffer is borrowed only
+    /// inside the synchronous merge below it, so nothing is held across it.
+    async fn fetch_and_merge_windows(
         &mut self,
-        log_blocks: &mut VecDeque<LogBlock>,
+        hudi_configs: &crate::config::HudiConfigs,
+        ordered: &mut [LogBlock],
     ) -> Result<()> {
+        let budget = crate::storage::reader::stream_window_size(hudi_configs)
+            .map_err(crate::error::CoreError::ReadLogFileError)?;
+        let decoder = self.block_decoder();
+        let windows = Self::plan_content_windows(ordered, budget);
         log::debug!(
-            "[Pass3] processQueuedBlocksForInstant: {} blocks to process (pop_back = oldest first)",
-            log_blocks.len(),
+            "[Pass3] {} block(s) to merge in {} window(s), budget {budget} bytes",
+            ordered.len(),
+            windows.len(),
         );
+
         let mut block_num = 0u64;
-        // The same settings the sweep would have decoded with, so an inflated
-        // block is identical to one that was read eagerly.
-        let block_decoder = crate::file_group::log_file::content::Decoder::new(Arc::new(
+        let mut cursor = 0usize;
+        for window in windows {
+            let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
+            Self::fetch_window(ordered, &window, &mut fetched).await?;
+            // Merge everything up to and including this window's last block, so
+            // blocks with nothing to fetch (command, corrupt, already-decoded)
+            // keep their place in the oldest-first order.
+            let through = *window
+                .last()
+                .expect("plan_content_windows never emits an empty window");
+            self.merge_blocks(
+                ordered,
+                cursor..=through,
+                &mut fetched,
+                &decoder,
+                &mut block_num,
+            )?;
+            cursor = through + 1;
+            // `fetched` drops here: the next window is fetched against a fresh budget.
+        }
+        if cursor < ordered.len() {
+            let mut none = HashMap::new();
+            let last = ordered.len() - 1;
+            self.merge_blocks(ordered, cursor..=last, &mut none, &decoder, &mut block_num)?;
+        }
+        Ok(())
+    }
+
+    /// Group the admitted blocks' content reads into windows, in consumption order.
+    ///
+    /// A window is a run of *consecutive* blocks that share a file and whose
+    /// content fits the budget. Consecutiveness is what makes a window safe to
+    /// fetch and merge before the next one is fetched: Pass 3 merges oldest-first
+    /// and a later block overwrites an earlier one for the same key, so a plan
+    /// that reordered blocks would change the merged result. Grouping by file
+    /// first is enough for a bulk prefetch, whose result is keyed by index and
+    /// consumed in the caller's order, but it cannot be interleaved with merging
+    /// for exactly that reason.
+    ///
+    /// Windows never span files, because a `LogBlockFetcher` reads one file. A
+    /// window stops before it would exceed `budget`; a block bigger than the
+    /// budget still goes out alone rather than being split, since its content
+    /// has to be whole to decode.
+    ///
+    /// Blocks that carry no content, or nothing deferred, are left out: they
+    /// have nothing to fetch. They are still merged in order — see
+    /// [`Self::fetch_and_merge_windows`], which walks the gaps between windows.
+    fn plan_content_windows(blocks: &[LogBlock], budget: u64) -> Vec<Vec<usize>> {
+        use crate::file_group::log_file::log_block::DeferredContent;
+
+        let mut windows: Vec<Vec<usize>> = Vec::new();
+        let mut current: Vec<usize> = Vec::new();
+        let mut current_file: Option<&object_store::path::Path> = None;
+        let mut current_bytes: u64 = 0;
+
+        for (idx, block) in blocks.iter().enumerate() {
+            if !matches!(
+                block.block_type,
+                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete
+            ) {
+                continue;
+            }
+            let Some(DeferredContent { fetcher, location }) = block.deferred_content.as_ref()
+            else {
+                continue;
+            };
+            let len = location.content_length;
+            let file = fetcher.location();
+
+            let spans_files = current_file.is_some_and(|f| f != file);
+            let over_budget = !current.is_empty() && current_bytes.saturating_add(len) > budget;
+            if spans_files || over_budget {
+                windows.push(std::mem::take(&mut current));
+                current_bytes = 0;
+                current_file = None;
+            }
+            if current.is_empty() {
+                current_file = Some(file);
+            }
+            current_bytes = current_bytes.saturating_add(len);
+            current.push(idx);
+        }
+        if !current.is_empty() {
+            windows.push(current);
+        }
+        windows
+    }
+
+    /// Issue one batched read for `window` and record the bytes against each index.
+    ///
+    /// `get_ranges` coalesces ranges that sit close together, so a run of
+    /// adjacent blocks costs one round trip instead of one each; reading them one
+    /// at a time is the same bytes and many more round trips, which is what
+    /// dominates on object storage.
+    async fn fetch_window(
+        blocks: &[LogBlock],
+        batch: &[usize],
+        out: &mut HashMap<usize, bytes::Bytes>,
+    ) -> Result<()> {
+        use crate::file_group::log_file::log_block::DeferredContent;
+
+        let Some(DeferredContent { fetcher, .. }) = blocks[batch[0]].deferred_content.as_ref()
+        else {
+            return Ok(());
+        };
+        let ranges: Vec<std::ops::Range<u64>> = batch
+            .iter()
+            .map(|idx| {
+                let loc = &blocks[*idx]
+                    .deferred_content
+                    .as_ref()
+                    .expect("filtered above to blocks with deferred content")
+                    .location;
+                loc.content_position..loc.content_position + loc.content_length
+            })
+            .collect();
+        let bytes = fetcher
+            .read_contents(&ranges)
+            .await
+            .map_err(crate::error::CoreError::ReadLogFileError)?;
+        for (idx, b) in batch.iter().zip(bytes) {
+            out.insert(*idx, b);
+        }
+        Ok(())
+    }
+
+    /// Which bytes a queued block decodes from, given what the prefetch
+    /// returned for it. `None` means it needs none: it already holds content.
+    ///
+    /// The prefetch admits exactly the block types Pass 3 decodes, so a block
+    /// holding neither fetched bytes nor content of its own never recorded where
+    /// to read it from. That is refused rather than passed on as a silently
+    /// empty block. Answering it here, instead of having the block fetch its own
+    /// bytes, is what keeps Pass 3 free of I/O and therefore synchronous.
+    fn queued_block_content(
+        block: &LogBlock,
+        fetched: Option<bytes::Bytes>,
+    ) -> Result<Option<bytes::Bytes>> {
+        match fetched {
+            Some(bytes) => Ok(Some(bytes)),
+            None if !block.content.is_empty() => Ok(None),
+            None => Err(crate::error::CoreError::LogBlockError(format!(
+                "no content was fetched for the {:?} block at instant {}, and it carries none: \
+                 nothing recorded where to read it from",
+                block.block_type,
+                block.instant_time().unwrap_or("unknown"),
+            ))),
+        }
+    }
+
+    /// The decoder Pass 3 inflates a window's blocks with.
+    ///
+    /// The same settings the sweep would have decoded with, so an inflated block
+    /// is identical to one that was read eagerly. Built once per scan rather than
+    /// per window: it carries the row filter and reader schema, neither of which
+    /// varies by block.
+    fn block_decoder(&self) -> crate::file_group::log_file::content::Decoder {
+        crate::file_group::log_file::content::Decoder::new(Arc::new(
             crate::config::HudiConfigs::new(self.reader_context.table_config.clone()),
         ))
         .with_row_filter(if self.reader_context.can_push_row_filter() {
@@ -667,35 +823,57 @@ impl BaseHoodieLogRecordReader {
                 .schema_handler
                 .reader_schema_json
                 .clone(),
-        );
+        )
+    }
 
-        while let Some(mut block) = log_blocks.pop_back() {
-            block_num += 1;
+    /// Merge `range` of the queued blocks, oldest first.
+    ///
+    /// Mirrors Java's `processQueuedBlocksForInstant` over one window's worth of
+    /// the deque. `fetched` holds the bytes for the blocks in this window only,
+    /// keyed by their position in `ordered`; each is removed as it is decoded so
+    /// the window's memory is released across the merge rather than at the end.
+    ///
+    /// Synchronous, and must stay so: the record buffer's `process_data_block` is
+    /// a sync trait method, which is why the fetch happens in
+    /// [`Self::fetch_and_merge_windows`] above rather than here.
+    fn merge_blocks(
+        &mut self,
+        ordered: &mut [LogBlock],
+        range: std::ops::RangeInclusive<usize>,
+        fetched: &mut HashMap<usize, bytes::Bytes>,
+        block_decoder: &crate::file_group::log_file::content::Decoder,
+        block_num: &mut u64,
+    ) -> Result<()> {
+        for idx in range {
+            let block = &mut ordered[idx];
+            *block_num += 1;
             let instant_time = block.instant_time().unwrap_or("unknown").to_string();
             log::debug!(
                 "[Pass3] block #{block_num}: type={:?} instant={instant_time}",
                 block.block_type,
             );
 
-            // Read this block's content now that it is known to be admitted. A
+            // Decode this block's content now that it is known to be admitted. A
             // block that already has content passes straight through.
             match block.block_type {
                 BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
-                    block.load_content(&block_decoder)?;
+                    if let Some(bytes) = Self::queued_block_content(block, fetched.remove(&idx))? {
+                        block.decode_fetched(block_decoder, bytes)?;
+                    }
                 }
                 _ => {}
             }
 
             match block.block_type {
                 BlockType::AvroData | BlockType::ParquetData => {
-                    self.record_buffer.process_data_block(&mut block)?;
+                    self.record_buffer.process_data_block(block)?;
                     log::debug!(
                         "[Pass3] after processing data block #{block_num}: buffer size={}",
                         self.record_buffer.size(),
                     );
                 }
                 BlockType::Delete => {
-                    self.record_buffer.process_delete_block(&mut block)?;
+                    self.record_buffer.process_delete_block(block)?;
                 }
                 BlockType::Corrupted => {
                     log::warn!("Found corrupt block not rolled back");
@@ -719,6 +897,239 @@ mod tests {
     use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 
     // ── Helpers ──────────────────────────────────────────────────────────
+
+    /// A block with deferred content of `len` bytes in `file`, for planning tests.
+    fn block_with_content(file: &str, position: u64, len: u64) -> LogBlock {
+        use crate::file_group::log_file::log_block::{DeferredContent, LogBlockContentLocation};
+        use crate::storage::reader::LogBlockFetcher;
+
+        let mut block = make_data_block("20250101000000000");
+        block.deferred_content = Some(DeferredContent {
+            location: LogBlockContentLocation {
+                content_position: position,
+                content_length: len,
+            },
+            fetcher: LogBlockFetcher::new(
+                std::sync::Arc::new(object_store::memory::InMemory::new()),
+                object_store::path::Path::from(file),
+            ),
+        });
+        block
+    }
+
+    /// A batch stops before it would exceed the budget. Without this the prefetch
+    /// reads a whole slice's admitted content at once, which hands back the peak
+    /// memory the header walk was added to bound.
+    #[test]
+    fn test_plan_content_windows_stops_at_the_byte_budget() {
+        let blocks = vec![
+            block_with_content("a.log", 0, 40),
+            block_with_content("a.log", 40, 40),
+            block_with_content("a.log", 80, 40),
+        ];
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_windows(&blocks, 100),
+            vec![vec![0, 1], vec![2]],
+            "two blocks fit in 100 bytes, the third starts a new batch"
+        );
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_windows(&blocks, 1_000),
+            vec![vec![0, 1, 2]],
+            "a budget above the total is one batch"
+        );
+    }
+
+    /// A block bigger than the whole budget still goes out, alone. Content has to
+    /// be whole to decode, so splitting it is not an option and skipping it would
+    /// lose data.
+    #[test]
+    fn test_plan_content_windows_sends_an_oversized_block_alone() {
+        let blocks = vec![
+            block_with_content("a.log", 0, 10),
+            block_with_content("a.log", 10, 5_000),
+            block_with_content("a.log", 5_010, 10),
+        ];
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_windows(&blocks, 100),
+            vec![vec![0], vec![1], vec![2]],
+            "the oversized block neither merges with its neighbours nor disappears"
+        );
+    }
+
+    /// Windows never span files: a fetcher reads one file, so mixing them would
+    /// read the wrong bytes for every range after the first.
+    ///
+    /// A file change therefore closes the window even when the budget is nowhere
+    /// near spent, and the two `a.log` blocks do **not** regroup across the
+    /// `b.log` block between them. Regrouping them would be free bytes-wise and
+    /// wrong: the window is merged before the next one is fetched, so a plan that
+    /// pulled block 2 forward would merge it before block 1 and let an older
+    /// write win. See `test_plan_content_windows_follow_consumption_order`.
+    #[test]
+    fn test_plan_content_windows_never_span_files() {
+        let blocks = vec![
+            block_with_content("a.log", 0, 10),
+            block_with_content("b.log", 0, 10),
+            block_with_content("a.log", 10, 10),
+        ];
+        let windows = BaseHoodieLogRecordReader::plan_content_windows(&blocks, 1_000);
+        assert_eq!(
+            windows,
+            vec![vec![0], vec![1], vec![2]],
+            "each file change closes the window; order is never traded for batching"
+        );
+    }
+
+    /// Windows must be emitted in the order Pass 3 merges them.
+    ///
+    /// Pass 3 merges oldest-first, and with COMMIT_TIME_ORDERING a later block
+    /// overwrites an earlier one for the same key. Because each window is fetched
+    /// and merged before the next is fetched, a planner that grouped by file
+    /// first — correct for a bulk prefetch, whose result is keyed by index —
+    /// would merge a slice's interleaved log files out of order and let the wrong
+    /// record win.
+    #[test]
+    fn test_plan_content_windows_follow_consumption_order() {
+        // Instant-major order across two log files: A, B, A, B.
+        let blocks = vec![
+            block_with_content("a.log", 0, 10),
+            block_with_content("b.log", 0, 10),
+            block_with_content("a.log", 10, 10),
+            block_with_content("b.log", 10, 10),
+        ];
+        // A budget far above the total, so any difference is grouping, not budget.
+        let windows = BaseHoodieLogRecordReader::plan_content_windows(&blocks, u64::MAX);
+        let flat: Vec<usize> = windows.into_iter().flatten().collect();
+        assert_eq!(
+            flat,
+            vec![0, 1, 2, 3],
+            "windows must visit blocks in consumption order; got {flat:?}"
+        );
+    }
+
+    /// Command and corrupt blocks have no content to fetch, and a block whose
+    /// content is already present has nothing deferred.
+    #[test]
+    fn test_plan_content_windows_skips_blocks_with_nothing_to_fetch() {
+        let blocks = vec![
+            make_rollback_block("20250101000000000", "20241231000000000"),
+            make_corrupt_block(),
+            make_data_block("20250101000000000"),
+            block_with_content("a.log", 0, 10),
+        ];
+        assert_eq!(
+            BaseHoodieLogRecordReader::plan_content_windows(&blocks, 1_000),
+            vec![vec![3]],
+            "only the block with deferred content is planned"
+        );
+    }
+
+    /// A queued block with nothing prefetched and no content of its own is
+    /// refused. Pass 3 does no I/O, so a block that recorded nowhere to read
+    /// from cannot be recovered there — passing it on would drop its records
+    /// silently, which is exactly what a reader must never do.
+    #[test]
+    fn test_a_queued_block_with_neither_bytes_nor_content_is_refused() {
+        use crate::file_group::record_batches::RecordBatches;
+
+        let block = make_data_block("20250101000000000");
+        let prefetched = bytes::Bytes::from_static(b"content");
+        assert_eq!(
+            BaseHoodieLogRecordReader::queued_block_content(&block, Some(prefetched.clone()))
+                .unwrap(),
+            Some(prefetched),
+            "prefetched bytes are what the block decodes from"
+        );
+
+        let mut decoded = make_data_block("20250101000000000");
+        decoded.content = LogBlockContent::Records(RecordBatches::new());
+        assert_eq!(
+            BaseHoodieLogRecordReader::queued_block_content(&decoded, None).unwrap(),
+            None,
+            "a block that already holds content needs no bytes"
+        );
+
+        let err = BaseHoodieLogRecordReader::queued_block_content(&block, None)
+            .expect_err("a block with neither bytes nor content must be refused");
+        assert!(
+            err.to_string()
+                .contains("nothing recorded where to read it from"),
+            "the error must say why it cannot decode, got: {err}"
+        );
+    }
+
+    /// The prefetch must return bytes for every admitted block, keyed by that
+    /// block's own position. Pass 3 no longer fetches anything for itself, so a
+    /// block the prefetch misses is refused rather than read some other way —
+    /// this is what pins the keying that refusal rests on.
+    #[tokio::test]
+    async fn test_prefetch_returns_content_for_every_admitted_block() {
+        use crate::config::HudiConfigs;
+        use crate::storage::Storage;
+        use crate::storage::util::parse_uri;
+        use std::path::PathBuf;
+
+        // Two concatenated copies of a one-block fixture: a valid two-block file,
+        // and the smallest input for which a batch is a batch.
+        let dir = PathBuf::from("tests/data/log_files/valid_log_avro_data");
+        let file_name =
+            ".ff32ab89-5ad0-4968-83b4-89a34c95d32f-0_20250316025816068.log.1_0-54-122".to_string();
+        let one = std::fs::read(std::fs::canonicalize(&dir).unwrap().join(&file_name)).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut doubled = one.clone();
+        doubled.extend_from_slice(&one);
+        std::fs::write(tmp.path().join(&file_name), &doubled).unwrap();
+
+        let configs = HudiConfigs::new(std::collections::HashMap::<String, String>::new());
+        let storage =
+            Storage::new_with_base_url(parse_uri(tmp.path().to_str().unwrap()).unwrap()).unwrap();
+        let mut reader = crate::file_group::log_file::reader::LogFileReader::new_streaming(
+            std::sync::Arc::new(HudiConfigs::new(
+                std::collections::HashMap::<String, String>::new(),
+            )),
+            storage,
+            &file_name,
+        )
+        .await
+        .unwrap();
+        let blocks = reader.read_all_blocks_metadata_only().await.unwrap();
+        let admitted = blocks
+            .iter()
+            .filter(|b| {
+                matches!(
+                    b.block_type,
+                    BlockType::AvroData | BlockType::ParquetData | BlockType::Delete
+                ) && b.deferred_content.is_some()
+            })
+            .count();
+        assert_eq!(admitted, 2, "the doubled fixture must offer two blocks");
+
+        let budget = crate::storage::reader::stream_window_size(&configs).unwrap();
+        let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
+        for window in BaseHoodieLogRecordReader::plan_content_windows(&blocks, budget) {
+            BaseHoodieLogRecordReader::fetch_window(&blocks, &window, &mut fetched)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            fetched.len(),
+            admitted,
+            "every admitted block must come back with its content prefetched"
+        );
+        for (idx, bytes) in &fetched {
+            let expected = blocks[*idx]
+                .deferred_content
+                .as_ref()
+                .unwrap()
+                .location
+                .content_length;
+            assert_eq!(
+                bytes.len() as u64,
+                expected,
+                "block {idx} must get exactly its own range"
+            );
+        }
+    }
 
     /// Create a data block with given instant time and a tag for identification.
     fn make_data_block(instant_time: &str) -> LogBlock {

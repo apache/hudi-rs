@@ -19,66 +19,61 @@
 
 //! Streaming output for the file-group reader.
 //!
-//! The Java reader's `getClosableIterator()` returns a lazy iterator that
-//! emits merged rows in chunks. `FileGroupMergeIterator` does the same — it
-//! emits one merged chunk per `next()`, so the consumer (Velox
-//! `HudiSplitReader::next()`) can free each chunk before the next is built,
-//! instead of holding the entire merged `RecordBatch` resident at once.
+//! The Java reader's `getClosableIterator()` returns a lazy iterator that emits
+//! merged rows in chunks. [`FileGroupMergeStream`] does the same thing
+//! asynchronously: one merged chunk per `next_chunk`, so a consumer can free
+//! each chunk before the next is built instead of holding the whole merged
+//! result resident.
 //!
-//! [`FileGroupMergeIterator`] is the streaming bridge:
-//! a synchronous [`RecordBatchReader`] that emits one merged chunk per
-//! `next()`. The async I/O (base file decode, log scan) happens once in
-//! `HoodieFileGroupReader::open()`; from then on the iterator is pure
-//! in-memory work (HashMap lookups + Arrow slicing). This matches the
-//! FFI's `FFI_ArrowArrayStream` shape directly — no per-chunk `block_on`.
+//! Demand-driven, so the memory it adds over the merge map is one chunk. The
+//! only await is the base-file pull; the merge kernel, the drain and the output
+//! projection are synchronous work over data already in memory.
 //!
 //! ## Two source modes
 //!
-//! - [`MergeSource::Eager`] — used for the no-merge fast path (CoW or empty
-//!   FG): the base file batches are already materialised, no log scan ran,
-//!   no buffer was built. The iterator just yields each pre-computed batch
-//!   through the [`OutputConverter`].
-//! - [`MergeSource::Buffered`] — the MOR merge path: drives
-//!   `buffer.has_next() / buffer.next()` until `batch_size` rows have
-//!   accumulated, calls [`records_to_batch`] to build the chunk, applies
-//!   the converter, and returns it.
+//! - [`MergeSource::Eager`] — the no-merge path (CoW, or a file group with no
+//!   log files): no log scan ran and no buffer was built, so each base batch
+//!   passes through the [`OutputConverter`] as its own chunk.
+//! - [`MergeSource::Buffered`] — the MOR merge path: pull a base batch, merge it
+//!   against the log map, emit the result; once the base is exhausted, drain the
+//!   log-only inserts. One chunk per non-empty base batch, plus the drain.
 //!
 //! ## Schema lifecycle
 //!
-//! `RecordBatchReader::schema()` must report the schema callers will see in
-//! every batch — so the iterator stores the **post-projection** schema. When
-//! an [`OutputConverter`] is present, that comes from
-//! `OutputConverter::target_schema()`. Otherwise it equals the merge schema
-//! (= base file schema, or required_schema if set), determined in
-//! `HoodieFileGroupReader::open()`.
-//!
-//! ## Default batch size
-//!
-//! [`DEFAULT_BATCH_SIZE`] = 4096 rows, matching Velox's typical operator
-//! batch size. The Velox `HudiSplitReader::next(uint64_t size, ...)` API
-//! exposes a requested size parameter; a follow-up will plumb that through
-//! the FFI. For now the iterator uses its constructor-time `batch_size`.
+//! Every emitted chunk carries the **post-projection** schema: the
+//! [`OutputConverter`]'s `target_schema()` when one is configured, otherwise the
+//! merge schema (the base file's schema, or `required_schema` when set). It is
+//! settled when the stream is built, before any chunk is produced.
 
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader_v2::output_converter::OutputConverter;
-use arrow_array::{RecordBatch, RecordBatchIterator, RecordBatchReader};
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Default chunk size (rows) emitted by [`FileGroupMergeIterator`].
+/// A base file delivered one batch at a time.
 ///
-/// Matches Velox's typical operator batch size; matches Spark Hudi's
-/// `hoodie.parquet.batchsize.default`. Used as the fallback when
-/// `hoodie.read.stream.batch_size` is unset/unparseable.
+/// The base file is the only part of a merge that has to be read rather than
+/// computed, so it is the only part that is a stream.
+pub type BaseBatchStream = BoxStream<'static, Result<RecordBatch>>;
+
+/// Chunk size (rows) the log-only drain emits.
+///
+/// Matches Velox's typical operator batch size, and Spark Hudi's
+/// `hoodie.parquet.batchsize.default`. The merged base chunks are not sized by
+/// this: the base read requests them at the reader's own batch size
+/// (`MERGE_CHUNK_ROWS` in the engine), and one source batch becomes one chunk.
 pub const DEFAULT_BATCH_SIZE: usize = 4096;
 
 /// Stage stats the streaming iterator accumulates as it emits chunks.
 ///
-/// The iterator owns the buffer once `open()` returns, so it accumulates these
-/// per chunk through a shared [`StreamStatsHandle`]. The
+/// The iterator owns the buffer once the stream is built, so it accumulates
+/// these per chunk through a shared [`StreamStatsHandle`]. The
 /// reader drains them into its [`HoodieReadStats`] once the stream is
 /// exhausted — see `HoodieFileGroupReader::drain_stream_stats`.
 ///
@@ -93,8 +88,9 @@ pub struct StreamReadStats {
     /// `records_to_batch` + the per-chunk `OutputConverter` projection.
     pub output_build_ms: u64,
     /// Peak number of entries the merge map held during the log scan. Recorded
-    /// off the buffer by `HoodieFileGroupReader::open` before iteration starts
-    /// (it is finalized at scan time, not during output streaming).
+    /// off the buffer by `HoodieFileGroupReader::init_record_iterators` before
+    /// the stream is returned (it is finalized at scan time, not during output
+    /// streaming).
     pub merge_map_peak_entries: u64,
     /// Insert / update / delete counts the update processor accumulated while
     /// the iterator drove the merge. Snapshotted off the buffer when the
@@ -116,37 +112,38 @@ pub fn new_stream_stats_handle() -> StreamStatsHandle {
     Arc::new(Mutex::new(StreamReadStats::default()))
 }
 
-/// Source of merged records for [`FileGroupMergeIterator`].
+/// Source of merged records for [`FileGroupMergeStream`].
 ///
 /// Variants reflect the two read shapes the FG reader supports:
 /// no-merge (CoW or empty FG) vs full MOR merge.
 enum MergeSource {
-    /// No-merge path: a `RecordBatchReader` that yields the base file
-    /// row-groups directly (lazy parquet stream wrapped as
-    /// `ParquetSyncReader`, or a `RecordBatchIterator` over a pre-built
-    /// `Vec<RecordBatch>` for tests / eager paths). One source batch =
-    /// one emitted chunk.
-    Eager {
-        source: Box<dyn RecordBatchReader + Send>,
-    },
+    /// No-merge path: the base file's batches, forwarded as they arrive. One
+    /// source batch becomes one emitted chunk.
+    Eager { source: BaseBatchStream },
 
     /// MOR merge path. Drives the buffer's vectorized
-    /// `next_merged_base_batch` + `drain_log_only_inserts` methods:
-    /// one emitted chunk per non-empty base source batch, plus a single
-    /// final chunk for log-only inserts (keys never matched by any base row).
+    /// `merge_base_batch` + `drain_log_only_inserts` methods:
+    /// one emitted chunk per non-empty base source batch, then the log-only
+    /// inserts (keys never matched by any base row) in
+    /// [`DEFAULT_BATCH_SIZE`]-row chunks until the drain reports exhaustion.
     ///
-    /// `batch_size` is retained but unused on the merge path — it is kept
-    /// in the public `new_buffered` signature for API compatibility with
-    /// callers that pass `DEFAULT_BATCH_SIZE`. Chunk size is
-    /// determined by the base source's own row-group cadence.
+    /// Chunk size follows the base source's own batches, so there is no
+    /// batch-size knob on this path.
     Buffered {
         buffer: Box<dyn HoodieFileGroupRecordBuffer>,
+        /// The base file, pulled one batch at a time. Owned here rather than by
+        /// the buffer: the buffer's job is to merge a batch, and only whoever
+        /// holds the source can say when the base is exhausted. `None` once it
+        /// is, or when the file group has no base file.
+        base_source: Option<BaseBatchStream>,
         /// Schema the merged chunks conform to (used as `target_schema`
         /// when reconciling base batches with nested-type child field
         /// name drift, and as the schema for `records_to_batch` when the
         /// final drain emits log-only inserts).
         merge_schema: SchemaRef,
-        /// Three-state machine: BaseScanning → DrainingLogInserts → Done.
+        /// Two-state machine: BaseScanning → DrainingLogInserts. The terminal
+        /// state is the stream's own sticky `done` flag, set on exhaustion or
+        /// error.
         state: BufferedState,
     },
 }
@@ -155,22 +152,23 @@ enum MergeSource {
 enum BufferedState {
     /// Pulling base batches from the source and merging against the log map.
     BaseScanning,
-    /// Base source exhausted; flush log-only inserts on the next call.
-    /// (Single transition state — one call produces the final batch, then
-    /// the iterator moves to `Done`.)
+    /// Base source exhausted; drain log-only inserts. Each call to the
+    /// buffer's `drain_log_only_inserts` yields one bounded chunk, and the
+    /// stream stays in this state until the drain returns `Ok(None)` —
+    /// collapsing it to a single call would silently drop every insert past
+    /// the first chunk.
     DrainingLogInserts,
 }
 
 /// Streaming output for the file-group reader.
 ///
-/// Implements [`RecordBatchReader`] so it can be handed directly to
-/// `FFI_ArrowArrayStream::new` for the C++ side, or used as a regular
-/// `Iterator<Item = Result<RecordBatch, ArrowError>>` in Rust callers.
-pub struct FileGroupMergeIterator {
+/// Driven a chunk at a time with [`Self::next_chunk`], or turned into a
+/// `Stream` with [`Self::into_stream`] for a caller that wants to compose it.
+pub struct FileGroupMergeStream {
     source: MergeSource,
-    /// Schema reported via [`RecordBatchReader::schema`]. Equals the
-    /// `target_schema` of the optional [`OutputConverter`], or the merge
-    /// schema if no converter is configured.
+    /// The schema every emitted chunk carries: the optional
+    /// [`OutputConverter`]'s `target_schema`, or the merge schema when there is
+    /// no converter.
     output_schema: SchemaRef,
     output_converter: Option<Box<dyn OutputConverter>>,
     /// Sticky termination — once any `next()` errors or `Eager.cursor`
@@ -183,7 +181,7 @@ pub struct FileGroupMergeIterator {
     stream_stats: StreamStatsHandle,
 }
 
-impl std::fmt::Debug for FileGroupMergeIterator {
+impl std::fmt::Debug for FileGroupMergeStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match &self.source {
             MergeSource::Eager { .. } => "Eager(lazy)".to_string(),
@@ -198,7 +196,7 @@ impl std::fmt::Debug for FileGroupMergeIterator {
                 )
             }
         };
-        f.debug_struct("FileGroupMergeIterator")
+        f.debug_struct("FileGroupMergeStream")
             .field("source", &kind)
             .field("output_schema_cols", &self.output_schema.fields().len())
             .field("has_output_converter", &self.output_converter.is_some())
@@ -207,16 +205,16 @@ impl std::fmt::Debug for FileGroupMergeIterator {
     }
 }
 
-impl FileGroupMergeIterator {
-    /// Build an iterator over a `RecordBatchReader` base source (CoW / empty
-    /// path). One source batch becomes one emitted chunk (after the
-    /// optional `OutputConverter`).
+impl FileGroupMergeStream {
+    /// Build a merge that forwards the base file unchanged (CoW / empty path).
+    /// One source batch becomes one emitted chunk, after the optional
+    /// `OutputConverter`.
     ///
     /// `output_schema` is the schema that will appear on every emitted
     /// `RecordBatch` — must equal the converter's `target_schema` when one
     /// is supplied, or the source's schema otherwise.
     pub fn new_eager(
-        source: Box<dyn RecordBatchReader + Send>,
+        source: BaseBatchStream,
         output_schema: SchemaRef,
         output_converter: Option<Box<dyn OutputConverter>>,
         stream_stats: StreamStatsHandle,
@@ -241,13 +239,8 @@ impl FileGroupMergeIterator {
         output_converter: Option<Box<dyn OutputConverter>>,
         stream_stats: StreamStatsHandle,
     ) -> Self {
-        let source_schema = batches
-            .first()
-            .map(|b| b.schema())
-            .unwrap_or_else(|| output_schema.clone());
-        let iter = RecordBatchIterator::new(batches.into_iter().map(Ok), source_schema);
         Self::new_eager(
-            Box::new(iter),
+            futures::stream::iter(batches.into_iter().map(Ok)).boxed(),
             output_schema,
             output_converter,
             stream_stats,
@@ -258,19 +251,19 @@ impl FileGroupMergeIterator {
     ///
     /// `merge_schema` is the schema [`records_to_batch`] uses while
     /// concatenating BufferedRecords for a chunk (pre-projection).
-    /// `output_schema` is the post-projection schema reported via
-    /// [`RecordBatchReader::schema`].
+    /// `output_schema` is the post-projection schema every chunk carries.
     pub fn new_buffered(
         buffer: Box<dyn HoodieFileGroupRecordBuffer>,
+        base_source: BaseBatchStream,
         merge_schema: SchemaRef,
         output_schema: SchemaRef,
         output_converter: Option<Box<dyn OutputConverter>>,
-        _batch_size: usize,
         stream_stats: StreamStatsHandle,
     ) -> Self {
         Self {
             source: MergeSource::Buffered {
                 buffer,
+                base_source: Some(base_source),
                 merge_schema,
                 state: BufferedState::BaseScanning,
             },
@@ -326,14 +319,11 @@ impl FileGroupMergeIterator {
     /// (drives the iterator to completion and concatenates).
     ///
     /// Backs `HoodieFileGroupReader::read()`'s single-batch return type.
-    pub fn collect_into_one_batch(mut self) -> Result<RecordBatch> {
+    pub async fn collect_into_one_batch(mut self) -> Result<RecordBatch> {
         let output_schema = self.output_schema.clone();
         let mut chunks: Vec<RecordBatch> = Vec::new();
-        for next in &mut self {
-            let batch = next.map_err(|e| {
-                CoreError::ReadFileSliceError(format!("FileGroupMergeIterator yielded error: {e}"))
-            })?;
-            chunks.push(batch);
+        while let Some(next) = self.next_chunk().await {
+            chunks.push(next?);
         }
         if chunks.is_empty() {
             return Ok(RecordBatch::new_empty(output_schema));
@@ -348,21 +338,52 @@ impl FileGroupMergeIterator {
         })
     }
 
-    /// Apply the configured [`OutputConverter`] (if any) and convert the
-    /// internal `CoreError` into `ArrowError` for the
-    /// `RecordBatchReader::next` contract.
-    fn finish_chunk(&self, batch: RecordBatch) -> Result<RecordBatch, ArrowError> {
+    /// Apply the configured [`OutputConverter`], if any.
+    fn finish_chunk(&self, batch: RecordBatch) -> Result<RecordBatch> {
         match &self.output_converter {
-            Some(converter) => converter.apply(batch).map_err(core_to_arrow_err),
+            Some(converter) => converter.apply(batch),
             None => Ok(batch),
         }
     }
 }
 
-impl Iterator for FileGroupMergeIterator {
-    type Item = Result<RecordBatch, ArrowError>;
+impl FileGroupMergeStream {
+    /// The schema every emitted chunk carries, settled before any chunk is
+    /// produced. No production caller needs it — a consumer of the boxed stream
+    /// gets the schema from the table — but it is the invariant the projection
+    /// tests pin, so it is stated here rather than reached for through the
+    /// private field.
+    #[allow(dead_code)]
+    pub fn schema(&self) -> SchemaRef {
+        self.output_schema.clone()
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Produce the next merged chunk, or `None` once the merge is complete.
+    ///
+    /// The only await is the base-file pull. Everything else — the merge kernel,
+    /// the drain, the output projection — is synchronous work on data already in
+    /// memory, so nothing here holds a lock or a borrow across the await beyond
+    /// the source itself.
+    ///
+    /// That synchronous work is deliberately *not* moved to a blocking pool,
+    /// which is the question a reader of this arrives with. It was measured
+    /// rather than assumed: merging one chunk takes 0.4-1.1 ms, and 5.7-6.1 ms
+    /// once the merge map has spilled, so the spill is a ~6x amplifier on work
+    /// that is already synchronous and of the same kind. Handing each chunk to
+    /// `spawn_blocking` would reintroduce the sync/async crossing this type
+    /// exists to remove, and cost a task hop per chunk, to shave a
+    /// single-digit-millisecond poll — which is what a scan or join operator
+    /// costs anyway. What keeps that true is the chunk bound, not this comment:
+    /// see `MERGE_CHUNK_ROWS`, since the cost is linear in a chunk's rows.
+    ///
+    /// The one thing the measurement does not cover: it reads a spill file that
+    /// was just written, so the page cache is warm and the disk component is
+    /// understated. A cold spill file would be slower, though still bounded by
+    /// the same chunk size.
+    ///
+    /// Sticky: after an error, or after the merge completes, every later call
+    /// returns `None`.
+    pub async fn next_chunk(&mut self) -> Option<Result<RecordBatch>> {
         if self.done {
             return None;
         }
@@ -376,92 +397,138 @@ impl Iterator for FileGroupMergeIterator {
         //   Ok(None)                                       — stream exhausted
         //   Err((e, merge_ms, build_ms))                   — terminal error
         type Chunk = (RecordBatch, u64, u64);
-        let produced: Result<Option<Chunk>, (CoreError, u64, u64)> = match &mut self.source {
-            MergeSource::Eager { source } => {
-                // One source batch = one emitted chunk. The
-                // source is a `RecordBatchReader` — lazy (`ParquetSyncReader`
-                // doing block_on per row-group) or eager (`RecordBatchIterator`
-                // over a Vec for tests / instant-range-filter fallback). The
-                // CoW / empty-FG no-merge path never materializes the whole
-                // base file; it pulls one row-group at a time.
-                match source.next() {
-                    None => Ok(None),
-                    // Eager has no merge work; build timing is the converter only.
-                    Some(Ok(batch)) => Ok(Some((batch, 0, 0))),
-                    Some(Err(e)) => Err((CoreError::ArrowError(e), 0, 0)),
+        let produced: std::result::Result<Option<Chunk>, (CoreError, u64, u64)> =
+            match &mut self.source {
+                MergeSource::Eager { source } => {
+                    // One source batch = one emitted chunk. The no-merge path
+                    // (CoW, or a file group with no log files) never
+                    // materialises the whole base file; it pulls one row group
+                    // at a time.
+                    match source.next().await {
+                        None => Ok(None),
+                        // Eager has no merge work; build timing is the converter only.
+                        Some(Ok(batch)) => Ok(Some((batch, 0, 0))),
+                        Some(Err(e)) => Err((e, 0, 0)),
+                    }
                 }
-            }
 
-            MergeSource::Buffered {
-                buffer,
-                merge_schema,
-                state,
-            } => {
-                // Vectorized merge path: pull the next merged base
-                // batch, or drain log-only inserts, then hand it to the shared
-                // timing / projection / exhaustion tail below (Step 2) so the
-                // stream-stats timing is preserved. Loop to skip base
-                // chunks fully eliminated by log deletes.
-                let merge_start = Instant::now();
-                let mut chunk_err: Option<CoreError> = None;
-                let mut out_batch: Option<RecordBatch> = None;
-                loop {
-                    match state {
-                        BufferedState::BaseScanning => {
-                            match buffer.next_merged_base_batch(merge_schema) {
-                                Ok(Some(b)) => {
-                                    if b.num_rows() == 0 {
-                                        // All base rows in this source batch lost
-                                        // to a log delete — pull the next.
+                MergeSource::Buffered {
+                    buffer,
+                    base_source,
+                    merge_schema,
+                    state,
+                } => {
+                    // Vectorized merge path: pull the next base batch and merge
+                    // it, or drain log-only inserts, then hand the result to the
+                    // shared timing / projection / exhaustion tail below
+                    // (Step 2). Loop to skip base batches fully eliminated by
+                    // log deletes.
+                    //
+                    // Only the merge itself is timed. Timing the whole loop
+                    // would fold the base file's read latency into
+                    // `final_merge_ms`, which is meant to measure merging.
+                    let mut merge_ms = 0u64;
+                    let mut chunk_err: Option<CoreError> = None;
+                    let mut out_batch: Option<RecordBatch> = None;
+                    loop {
+                        match state {
+                            BufferedState::BaseScanning => {
+                                // Pull first, merge second. Only the source knows
+                                // when the base is exhausted, so that is the only
+                                // thing that moves the state machine on to the
+                                // drain — a merge that yields no rows just means
+                                // this batch contributed none, and must not be
+                                // read as the end of the base file.
+                                let pulled = match base_source.as_mut() {
+                                    None => None,
+                                    Some(source) => match source.next().await {
+                                        None => {
+                                            *base_source = None;
+                                            None
+                                        }
+                                        Some(b) => Some(b),
+                                    },
+                                };
+                                let base = match pulled {
+                                    None => {
+                                        // Base exhausted — drain log-only inserts
+                                        // on the next loop turn.
+                                        *state = BufferedState::DrainingLogInserts;
                                         continue;
                                     }
-                                    out_batch = Some(b);
-                                    break;
+                                    Some(Ok(b)) => b,
+                                    Some(Err(e)) => {
+                                        // Drop the source: a failed read must not
+                                        // be resumed as if it had merely ended,
+                                        // which would truncate the output
+                                        // silently.
+                                        *base_source = None;
+                                        log::error!("[FileGroupMergeStream] base file source: {e}");
+                                        chunk_err = Some(CoreError::ReadFileSliceError(format!(
+                                            "base file source error: {e}"
+                                        )));
+                                        break;
+                                    }
+                                };
+                                if base.num_rows() == 0 {
+                                    continue; // skip empty source batches
                                 }
-                                Ok(None) => {
-                                    // Base source exhausted — drain log-only
-                                    // inserts on the next loop turn.
-                                    *state = BufferedState::DrainingLogInserts;
-                                    continue;
-                                }
-                                Err(e) => {
-                                    chunk_err = Some(e);
-                                    break;
+                                let merge_start = Instant::now();
+                                let merged = buffer.merge_base_batch(&base, merge_schema);
+                                merge_ms = merge_ms
+                                    .saturating_add(merge_start.elapsed().as_millis() as u64);
+                                match merged {
+                                    Ok(Some(b)) => {
+                                        if b.num_rows() == 0 {
+                                            // All base rows in this source batch
+                                            // lost to a log delete — pull the next.
+                                            continue;
+                                        }
+                                        out_batch = Some(b);
+                                        break;
+                                    }
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        chunk_err = Some(e);
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        BufferedState::DrainingLogInserts => {
-                            // drain_log_only_inserts is idempotent: it returns the
-                            // remaining log-only inserts once, then Ok(None).
-                            match buffer.drain_log_only_inserts(merge_schema) {
-                                Ok(Some(b)) if b.num_rows() > 0 => {
-                                    out_batch = Some(b);
-                                    break;
-                                }
-                                Ok(_) => break,
-                                Err(e) => {
-                                    chunk_err = Some(e);
-                                    break;
+                            BufferedState::DrainingLogInserts => {
+                                // drain_log_only_inserts is idempotent: it returns the
+                                // remaining log-only inserts once, then Ok(None).
+                                let drain_start = Instant::now();
+                                let drained = buffer.drain_log_only_inserts(merge_schema);
+                                merge_ms = merge_ms
+                                    .saturating_add(drain_start.elapsed().as_millis() as u64);
+                                match drained {
+                                    Ok(Some(b)) if b.num_rows() > 0 => {
+                                        out_batch = Some(b);
+                                        break;
+                                    }
+                                    Ok(_) => break,
+                                    Err(e) => {
+                                        chunk_err = Some(e);
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                let merge_ms = merge_start.elapsed().as_millis() as u64;
-                if let Some(e) = chunk_err {
-                    Err((e, merge_ms, 0))
-                } else if let Some(b) = out_batch {
-                    Ok(Some((b, merge_ms, 0)))
-                } else {
-                    // Exhausted. Record the merge probe time before the
-                    // exhaustion handler (Step 2) runs.
-                    if let Ok(mut s) = self.stream_stats.lock() {
-                        s.final_merge_ms = s.final_merge_ms.saturating_add(merge_ms);
+                    if let Some(e) = chunk_err {
+                        Err((e, merge_ms, 0))
+                    } else if let Some(b) = out_batch {
+                        Ok(Some((b, merge_ms, 0)))
+                    } else {
+                        // Exhausted. Record the merge probe time before the
+                        // exhaustion handler (Step 2) runs.
+                        if let Ok(mut s) = self.stream_stats.lock() {
+                            s.final_merge_ms = s.final_merge_ms.saturating_add(merge_ms);
+                        }
+                        Ok(None)
                     }
-                    Ok(None)
                 }
-            }
-        };
+            };
 
         // Step 2: the source borrow has ended — handle timing / projection /
         // exhaustion via `&self` helpers.
@@ -487,20 +554,21 @@ impl Iterator for FileGroupMergeIterator {
             Err((e, merge_ms, build_ms)) => {
                 self.done = true;
                 self.record_chunk_timing(merge_ms, build_ms);
-                Some(Err(core_to_arrow_err(e)))
+                Some(Err(e))
             }
         }
     }
-}
 
-impl RecordBatchReader for FileGroupMergeIterator {
-    fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
+    /// Drive this merge as a `Stream`, for a caller that wants to compose it.
+    ///
+    /// Chunk-at-a-time and demand-driven: nothing is merged until the consumer
+    /// asks, so the extra memory over the merge map itself is one chunk.
+    pub fn into_stream(self) -> BoxStream<'static, Result<RecordBatch>> {
+        futures::stream::unfold(self, |mut merge| async move {
+            merge.next_chunk().await.map(|item| (item, merge))
+        })
+        .boxed()
     }
-}
-
-fn core_to_arrow_err(e: CoreError) -> ArrowError {
-    ArrowError::ExternalError(Box::new(e))
 }
 
 #[cfg(test)]
@@ -553,6 +621,9 @@ mod tests {
         queue: VecDeque<BufferedRecord>,
         stats: UpdateStats,
         empty_map: MergeMap,
+        /// How many base batches merge to nothing before one merges to rows.
+        /// Zero for every test that drives the drain with no base file.
+        merge_yields_nothing_for: usize,
     }
 
     impl MockBuffer {
@@ -560,10 +631,21 @@ mod tests {
             records: Vec<BufferedRecord>,
             stats: UpdateStats,
         ) -> Box<dyn HoodieFileGroupRecordBuffer> {
+            Self::boxed_yielding_nothing_for(records, stats, 0)
+        }
+
+        /// A buffer whose first `n` merges produce no batch at all, so the
+        /// iterator's reading of `Ok(None)` can be pinned.
+        fn boxed_yielding_nothing_for(
+            records: Vec<BufferedRecord>,
+            stats: UpdateStats,
+            n: usize,
+        ) -> Box<dyn HoodieFileGroupRecordBuffer> {
             Box::new(Self {
                 queue: records.into(),
                 stats,
                 empty_map: HashMap::default(),
+                merge_yields_nothing_for: n,
             })
         }
     }
@@ -632,6 +714,17 @@ mod tests {
             // surfaced via `drain_log_only_inserts` (log-only-insert path).
             Ok(None)
         }
+        fn merge_base_batch(
+            &mut self,
+            base: &RecordBatch,
+            _target_schema: &SchemaRef,
+        ) -> Result<Option<RecordBatch>> {
+            if self.merge_yields_nothing_for > 0 {
+                self.merge_yields_nothing_for -= 1;
+                return Ok(None);
+            }
+            Ok(Some(base.clone()))
+        }
         fn drain_log_only_inserts(
             &mut self,
             target_schema: &SchemaRef,
@@ -658,6 +751,34 @@ mod tests {
         }
     }
 
+    /// A base source with no batches — a log-only file group. The merge goes
+    /// straight to the log drain, which is where these mocks keep their records.
+    fn no_base(_schema: &SchemaRef) -> BaseBatchStream {
+        futures::stream::empty().boxed()
+    }
+
+    /// A base source over fixed batches.
+    fn base_of(batches: Vec<Result<RecordBatch>>) -> BaseBatchStream {
+        futures::stream::iter(batches).boxed()
+    }
+
+    /// Drive a merge to exhaustion from a synchronous test. Nothing here does
+    /// I/O — the base sources are in-memory — so a local executor is enough.
+    fn drain(mut merge: FileGroupMergeStream) -> Vec<Result<RecordBatch>> {
+        futures::executor::block_on(async {
+            let mut out = Vec::new();
+            while let Some(chunk) = merge.next_chunk().await {
+                out.push(chunk);
+            }
+            out
+        })
+    }
+
+    /// As [`drain`], unwrapping each chunk.
+    fn drain_ok(merge: FileGroupMergeStream) -> Vec<RecordBatch> {
+        drain(merge).into_iter().map(|c| c.unwrap()).collect()
+    }
+
     /// Drive a Buffered iterator to exhaustion, returning the per-chunk row
     /// counts and the flattened `(key, v)` rows across all chunks (in order).
     fn drain_buffered(
@@ -667,18 +788,18 @@ mod tests {
         stats: UpdateStats,
     ) -> (Vec<usize>, Vec<(String, i32)>, StreamStatsHandle) {
         let handle = new_stream_stats_handle();
-        let it = FileGroupMergeIterator::new_buffered(
+        let _ = batch_size;
+        let it = FileGroupMergeStream::new_buffered(
             MockBuffer::boxed(records, stats),
+            no_base(&schema),
             schema.clone(),
             schema.clone(),
             None,
-            batch_size,
             handle.clone(),
         );
         let mut chunk_rows = Vec::new();
         let mut all_rows = Vec::new();
-        for chunk in it {
-            let b = chunk.unwrap();
+        for b in drain_ok(it) {
             assert_eq!(b.schema(), schema, "every chunk reports the output schema");
             chunk_rows.push(b.num_rows());
             all_rows.extend(rows(&b));
@@ -731,14 +852,14 @@ mod tests {
         let schema = small_schema();
         let b1 = batch(schema.clone(), &["a", "b"], &[1, 2]);
         let b2 = batch(schema.clone(), &["c"], &[3]);
-        let it = FileGroupMergeIterator::new_eager_from_vec(
+        let it = FileGroupMergeStream::new_eager_from_vec(
             vec![b1, b2],
             schema.clone(),
             None,
             new_stream_stats_handle(),
         );
         assert_eq!(it.schema(), schema);
-        let out: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let out: Vec<RecordBatch> = drain_ok(it);
         assert_eq!(out.len(), 2);
         assert_eq!(rows(&out[0]), vec![("a".into(), 1), ("b".into(), 2)]);
         assert_eq!(rows(&out[1]), vec![("c".into(), 3)]);
@@ -750,13 +871,13 @@ mod tests {
         let schema = small_schema();
         let b1 = batch(schema.clone(), &["a", "b"], &[1, 2]);
         let b2 = batch(schema.clone(), &["c"], &[3]);
-        let it = FileGroupMergeIterator::new_eager_from_vec(
+        let it = FileGroupMergeStream::new_eager_from_vec(
             vec![b1, b2],
             schema,
             None,
             new_stream_stats_handle(),
         );
-        let result = it.collect_into_one_batch().unwrap();
+        let result = futures::executor::block_on(it.collect_into_one_batch()).unwrap();
         assert_eq!(
             rows(&result),
             vec![("a".into(), 1), ("b".into(), 2), ("c".into(), 3)]
@@ -767,13 +888,13 @@ mod tests {
     #[test]
     fn eager_empty_yields_zero_rows_via_collect() {
         let schema = small_schema();
-        let it = FileGroupMergeIterator::new_eager_from_vec(
+        let it = FileGroupMergeStream::new_eager_from_vec(
             vec![],
             schema.clone(),
             None,
             new_stream_stats_handle(),
         );
-        let result = it.collect_into_one_batch().unwrap();
+        let result = futures::executor::block_on(it.collect_into_one_batch()).unwrap();
         assert_eq!(result.num_rows(), 0);
         assert_eq!(result.schema(), schema);
     }
@@ -949,6 +1070,221 @@ mod tests {
         }
     }
 
+    /// A merge that yields no batch means *this* batch contributed no rows, not
+    /// that the base file has ended. Only the source says that. Reading the two
+    /// as the same thing would stop the scan at the first fully-deleted batch
+    /// and silently drop every base row after it.
+    #[test]
+    fn buffered_merge_yielding_nothing_is_not_the_end_of_the_base() {
+        let schema = small_schema();
+        let base = base_of(vec![
+            Ok(batch(schema.clone(), &["a"], &[1])),
+            Ok(batch(schema.clone(), &["b"], &[2])),
+        ]);
+        // The first base batch merges to nothing; the second must still be read.
+        let it = FileGroupMergeStream::new_buffered(
+            MockBuffer::boxed_yielding_nothing_for(vec![], UpdateStats::default(), 1),
+            base,
+            schema.clone(),
+            schema,
+            None,
+            new_stream_stats_handle(),
+        );
+        let out: Vec<(String, i32)> = drain_ok(it).iter().flat_map(rows).collect();
+        assert_eq!(
+            out,
+            vec![("b".to_string(), 2)],
+            "the batch after one that merged to nothing must still reach the output"
+        );
+    }
+
+    /// A base source that fails mid-read surfaces the failure. The rows already
+    /// emitted make a truncated read look like a short but successful one, so
+    /// swallowing the error here would report partial data as complete - the
+    /// one failure this path must never produce.
+    #[test]
+    fn buffered_base_source_error_surfaces_rather_than_truncating() {
+        let schema = small_schema();
+        let base = base_of(vec![
+            Ok(batch(schema.clone(), &["a"], &[1])),
+            Err(CoreError::ReadFileSliceError("base read blew up".into())),
+        ]);
+        let it = FileGroupMergeStream::new_buffered(
+            MockBuffer::boxed(vec![], UpdateStats::default()),
+            base,
+            schema.clone(),
+            schema,
+            None,
+            new_stream_stats_handle(),
+        );
+        let chunks = drain(it);
+        assert_eq!(
+            rows(&chunks[0].as_ref().unwrap().clone()),
+            vec![("a".to_string(), 1)],
+            "the batch read before the failure still comes through"
+        );
+        match chunks.get(1) {
+            Some(Err(e)) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("base file source error"),
+                    "the error must name the base source, got: {msg}"
+                );
+            }
+            other => panic!("expected the base source error to surface, got {other:?}"),
+        }
+        assert_eq!(chunks.len(), 2, "the merge stops after the error");
+    }
+
+    /// The two properties that make this a stream rather than a differently-
+    /// shaped batch read, neither of which any output-level assertion can see.
+    ///
+    /// **Lazy.** Asking for one chunk must pull one base batch, not the whole
+    /// base file. A merge that collected the base up front would return exactly
+    /// the same rows in exactly the same order, so row and order assertions
+    /// cannot distinguish it - only counting the pulls can.
+    ///
+    /// **No thread hand-off.** The merge must run on the task that polls it. The
+    /// shape this replaced moved the whole merge loop onto a blocking-pool
+    /// thread and fed batches back through a channel, which also produced the
+    /// right rows; the observable difference is which thread the base pull
+    /// happens on. Asserted on a `current_thread` runtime, where the polling
+    /// task and the test share one thread, so a hand-off shows up as a different
+    /// thread id.
+    #[tokio::test]
+    async fn merge_stream_is_lazy_and_polls_on_the_callers_thread() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let schema = small_schema();
+        let pulls = Arc::new(AtomicUsize::new(0));
+        let pull_threads = Arc::new(std::sync::Mutex::new(Vec::<std::thread::ThreadId>::new()));
+
+        let (p, t) = (pulls.clone(), pull_threads.clone());
+        let base = futures::stream::iter(vec![
+            Ok(batch(schema.clone(), &["a"], &[1])),
+            Ok(batch(schema.clone(), &["b"], &[2])),
+            Ok(batch(schema.clone(), &["c"], &[3])),
+        ])
+        .inspect(move |_| {
+            p.fetch_add(1, Ordering::SeqCst);
+            t.lock().unwrap().push(std::thread::current().id());
+        })
+        .boxed();
+
+        let mut merge = FileGroupMergeStream::new_buffered(
+            MockBuffer::boxed(vec![], UpdateStats::default()),
+            base,
+            schema.clone(),
+            schema,
+            None,
+            new_stream_stats_handle(),
+        );
+
+        // One chunk asked for, one base batch read.
+        let first = merge.next_chunk().await.expect("a first chunk").unwrap();
+        assert_eq!(rows(&first), vec![("a".to_string(), 1)]);
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            1,
+            "one chunk must cost one base batch; a merge that pre-collected the \
+             base would read all three and still return this same chunk"
+        );
+
+        // ...and the rest only when asked for.
+        let second = merge.next_chunk().await.expect("a second chunk").unwrap();
+        assert_eq!(rows(&second), vec![("b".to_string(), 2)]);
+        assert_eq!(pulls.load(Ordering::SeqCst), 2, "still one pull per chunk");
+
+        while merge.next_chunk().await.is_some() {}
+        assert_eq!(
+            pulls.load(Ordering::SeqCst),
+            3,
+            "the whole base is read once"
+        );
+
+        let here = std::thread::current().id();
+        let threads = pull_threads.lock().unwrap();
+        assert!(
+            threads.iter().all(|t| *t == here),
+            "the base pull must happen on the polling task's own thread; saw {threads:?} \
+             from {here:?}, which means the merge was handed to another thread"
+        );
+    }
+
+    /// A concurrent task makes progress *while* the merge runs, chunk by chunk.
+    ///
+    /// This is the non-blocking property, and it is separate from laziness: a
+    /// merge could pull one batch at a time and still hold its executor thread
+    /// for the whole read, which on a single-worker runtime starves everything
+    /// else on it. The base stream here awaits before yielding each batch, which
+    /// is what a ranged read looks like to the runtime; the assertion is that
+    /// the merge propagates that await rather than blocking through it.
+    ///
+    /// `current_thread` on purpose - one worker, so the ticker can only advance
+    /// if the merge actually gives the thread up. On a multi-threaded runtime
+    /// the ticker would run on another worker and prove nothing.
+    ///
+    /// The interleaving is checked per chunk rather than once at the end, and
+    /// that is what makes it discriminating: a merge that awaited the whole base
+    /// up front and then served chunks without awaiting again passes a single
+    /// end-of-read check and fails this one at chunk 2 (`4 -> 4`).
+    ///
+    /// The severe violation - blocking the thread *through* the base await -
+    /// shows up as a deadlock rather than a failed assertion, since on one
+    /// worker the pending read can never be rescheduled. Verified by mutation:
+    /// the test hangs instead of failing. Detected either way, but a hang is a
+    /// worse signal, so the per-chunk check above is what carries this test.
+    #[tokio::test]
+    async fn merge_stream_lets_other_tasks_run_between_chunks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let schema = small_schema();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                t.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let batches: Vec<Result<RecordBatch>> = (0..4)
+            .map(|i| Ok(batch(schema.clone(), &["k"], &[i])))
+            .collect();
+        // Awaits before handing over each batch, standing in for the ranged read
+        // a real base source performs.
+        let base = futures::stream::iter(batches)
+            .then(|b| async move {
+                tokio::task::yield_now().await;
+                b
+            })
+            .boxed();
+
+        let mut merge = FileGroupMergeStream::new_buffered(
+            MockBuffer::boxed(vec![], UpdateStats::default()),
+            base,
+            schema.clone(),
+            schema,
+            None,
+            new_stream_stats_handle(),
+        );
+
+        let mut seen = 0usize;
+        let mut chunks = 0usize;
+        while merge.next_chunk().await.is_some() {
+            chunks += 1;
+            let now = ticks.load(Ordering::SeqCst);
+            assert!(
+                now > seen,
+                "the ticker did not advance while chunk {chunks} was produced ({seen} -> \
+                 {now}); the merge held the only worker thread instead of awaiting"
+            );
+            seen = now;
+        }
+        assert_eq!(chunks, 4, "one chunk per base batch");
+        ticker.abort();
+    }
+
     // ---- Error/termination spine ----
 
     /// A buffer whose `has_next` always errors — pins the iterator's
@@ -1017,6 +1353,15 @@ mod tests {
             // surface-once-then-fuse contract.
             Err(crate::error::CoreError::ReadFileSliceError("boom".into()))
         }
+        fn merge_base_batch(
+            &mut self,
+            _base: &RecordBatch,
+            _target_schema: &SchemaRef,
+        ) -> Result<Option<RecordBatch>> {
+            // Same failure through the batch-at-a-time entry point, so the
+            // fuse contract is exercised whichever way the base is supplied.
+            Err(crate::error::CoreError::ReadFileSliceError("boom".into()))
+        }
         fn drain_log_only_inserts(
             &mut self,
             _target_schema: &SchemaRef,
@@ -1036,26 +1381,29 @@ mod tests {
         let buffer = Box::new(ErrOnHasNext {
             empty_map: HashMap::default(),
         });
-        let mut it = FileGroupMergeIterator::new_buffered(
+        // One base batch, so the buffer is actually asked to merge something:
+        // with an empty base the merge would go straight to the drain and the
+        // failure under test would never be reached.
+        let base = base_of(vec![Ok(batch(schema.clone(), &["a"], &[1]))]);
+        let it = FileGroupMergeStream::new_buffered(
             buffer,
+            base,
             schema.clone(),
             schema,
             None,
-            4,
             new_stream_stats_handle(),
         );
-        // The buffer's `ReadFileSliceError` surfaces once, preserved through the
-        // `ArrowError::ExternalError` wrapper (not swapped for another variant).
-        match it.next() {
-            Some(Err(ArrowError::ExternalError(e))) => match e.downcast_ref::<CoreError>() {
-                Some(CoreError::ReadFileSliceError(msg)) => assert_eq!(msg.as_str(), "boom"),
-                other => panic!("expected CoreError::ReadFileSliceError, got {other:?}"),
-            },
-            other => panic!("expected Some(Err(ArrowError::ExternalError)), got {other:?}"),
+        // The buffer's `ReadFileSliceError` surfaces once, as itself rather
+        // than swapped for another variant, and then the merge stops.
+        let chunks = drain(it);
+        match chunks.first() {
+            Some(Err(CoreError::ReadFileSliceError(msg))) => assert_eq!(msg.as_str(), "boom"),
+            other => panic!("expected CoreError::ReadFileSliceError, got {other:?}"),
         }
-        assert!(
-            it.next().is_none(),
-            "iterator fuses after an error (sticky done)"
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the merge fuses after an error (sticky done)"
         );
     }
 
@@ -1076,12 +1424,12 @@ mod tests {
             &target_schema,
         );
         // 5 records with a converter installed, so per-chunk projection is exercised.
-        let it = FileGroupMergeIterator::new_buffered(
+        let it = FileGroupMergeStream::new_buffered(
             MockBuffer::boxed(batch_ref_seq(&merge_schema, 5), UpdateStats::default()),
-            merge_schema,
+            no_base(&merge_schema),
+            merge_schema.clone(),
             target_schema.clone(),
             Some(Box::new(converter)),
-            2,
             new_stream_stats_handle(),
         );
         // schema() reports the post-projection target BEFORE iterating.
@@ -1091,7 +1439,7 @@ mod tests {
             "schema() reports the converter target before the first chunk"
         );
 
-        let chunks: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let chunks: Vec<RecordBatch> = drain_ok(it);
         // The MockBuffer drains its log-only inserts in one batch, so
         // the projection may land in a single chunk here; assert projection is
         // applied (schema + values below) rather than a specific chunk count.
@@ -1116,23 +1464,21 @@ mod tests {
     }
 
     /// The Eager (no-merge) source works with an arbitrary
-    /// `RecordBatchReader`, not just a Vec. Models the lazy base-file path
-    /// where the FG reader hands a `ParquetSyncReader` (or similar) to
-    /// `new_eager` directly, pulling one row-group per chunk.
+    /// base stream, not just a Vec. Models the real no-merge path, where the
+    /// reader hands `new_eager` the parquet stream directly and one row group
+    /// becomes one chunk.
     #[test]
-    fn eager_accepts_arbitrary_record_batch_reader() {
+    fn eager_accepts_an_arbitrary_base_stream() {
         let schema = small_schema();
         let b1 = batch(schema.clone(), &["a", "b"], &[1, 2]);
         let b2 = batch(schema.clone(), &["c"], &[3]);
-        let reader =
-            arrow_array::RecordBatchIterator::new(vec![Ok(b1), Ok(b2)].into_iter(), schema.clone());
-        let it = FileGroupMergeIterator::new_eager(
-            Box::new(reader),
+        let it = FileGroupMergeStream::new_eager(
+            base_of(vec![Ok(b1), Ok(b2)]),
             schema.clone(),
             None,
             new_stream_stats_handle(),
         );
-        let out: Vec<RecordBatch> = it.map(|r| r.unwrap()).collect();
+        let out: Vec<RecordBatch> = drain_ok(it);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].num_rows() + out[1].num_rows(), 3);
     }

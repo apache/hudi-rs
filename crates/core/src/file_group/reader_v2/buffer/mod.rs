@@ -173,14 +173,14 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Snapshot the insert / update / delete counts the buffer's
     /// `UpdateProcessor` has accumulated so far.
     ///
-    /// With streaming output, the [`FileGroupMergeIterator`] drives
+    /// With streaming output, the [`FileGroupMergeStream`] drives
     /// `has_next/next` and the update processor increments these counters as a
     /// side effect; after the stream is exhausted the iterator reads them back
     /// through this accessor instead of through `merge_and_collect_with_stats`
     /// (which consumes the buffer). Defaults to zero for buffers that don't
     /// track update stats.
     ///
-    /// [`FileGroupMergeIterator`]: crate::file_group::reader_v2::merge_iterator::FileGroupMergeIterator
+    /// [`FileGroupMergeStream`]: crate::file_group::reader_v2::merge_iterator::FileGroupMergeStream
     fn update_stats_snapshot(&self) -> UpdateStats {
         UpdateStats::default()
     }
@@ -284,6 +284,25 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Empty input batches are skipped internally (loop pulls next non-empty
     /// batch from the source).
     fn next_merged_base_batch(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>>;
+
+    /// Merge one base-file batch against the in-buffer log map.
+    ///
+    /// The same work [`Self::next_merged_base_batch`] does, minus the pull: the
+    /// caller supplies the batch. That split is what lets the base file be read
+    /// asynchronously while the merge itself stays synchronous — the buffer
+    /// holds no source, so nothing it owns has to be awaited.
+    ///
+    /// `Ok(None)` means this batch contributed no rows (empty input, or every
+    /// row lost to a log delete). It does **not** mean the base is exhausted:
+    /// only the caller, who owns the source, knows that.
+    ///
+    /// `target_schema` is the schema the returned batch must conform to, as in
+    /// [`Self::next_merged_base_batch`].
+    fn merge_base_batch(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>>;
 
     /// Drain remaining log-only records (keys never matched by any base row)
     /// as merged inserts. Returns `Ok(None)` if no log-only inserts remain

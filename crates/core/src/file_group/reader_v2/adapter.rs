@@ -96,7 +96,7 @@ pub(crate) async fn read_file_slice_stream(
         completion_gate_inputs,
     )?;
 
-    reader.open_blocking_stream().await
+    reader.open_stream().await
 }
 
 /// Assemble the reader both entry points use, so the eager and streaming reads
