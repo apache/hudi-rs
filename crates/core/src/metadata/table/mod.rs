@@ -176,6 +176,29 @@ impl Table {
             .await
     }
 
+    /// The `files` partition as an Arrow batch, undecoded.
+    ///
+    /// Same read as [`Self::read_metadata_table_files_partition`], stopping one
+    /// step earlier. A consumer that wants Arrow — a JVM caller importing through
+    /// the C Data Interface, or an engine that merges this with other batches —
+    /// would otherwise take decoded structs and re-encode them, paying for a
+    /// decode it did not want and an encode that loses nothing but time.
+    ///
+    /// `keys` empty reads every record; otherwise only those keys. Unlike the
+    /// decoded form, keys are matched **as stored**, so a non-partitioned table's
+    /// record is asked for as `"."` and arrives with that key rather than `""`:
+    /// normalisation happens during decode, which this skips.
+    ///
+    /// # Note
+    /// Must be called on a DATA table, not a METADATA table.
+    pub async fn read_metadata_table_files_partition_arrow(
+        &self,
+        keys: &[&str],
+    ) -> Result<arrow_array::RecordBatch> {
+        let metadata_table = self.get_or_init_metadata_table().await?;
+        metadata_table.read_files_partition_batch(keys).await
+    }
+
     /// Fetch records from the `files` partition with optional partition pruning.
     ///
     /// For non-partitioned tables, directly fetches the "." record.
@@ -234,8 +257,48 @@ impl Table {
         &self,
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
+        let Some((reader, file_slice)) = self.files_partition_reader().await? else {
             return Ok(HashMap::new());
+        };
+        reader.read_files_partition(&file_slice, keys).await
+    }
+
+    /// The `files` partition's merged batch, for a caller that wants Arrow.
+    ///
+    /// An empty batch when the metadata table has no commits, matching the empty
+    /// map the decoded form returns in that case.
+    ///
+    /// # Note
+    /// Must be called on a METADATA table instance.
+    pub(crate) async fn read_files_partition_batch(
+        &self,
+        keys: &[&str],
+    ) -> Result<arrow_array::RecordBatch> {
+        let Some((reader, file_slice)) = self.files_partition_reader().await? else {
+            return Ok(arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
+                Schema::empty(),
+            )));
+        };
+        reader.read_files_partition_batch(&file_slice, keys).await
+    }
+
+    /// Resolve the `files` partition's single file slice and build a reader for it.
+    ///
+    /// `None` when the metadata table has no commits, which both callers treat as
+    /// an empty result rather than an error.
+    ///
+    /// # Note
+    /// Must be called on a METADATA table instance.
+    async fn files_partition_reader(
+        &self,
+    ) -> Result<
+        Option<(
+            v2_reader::MetadataTableV2Reader,
+            crate::file_group::file_slice::FileSlice,
+        )>,
+    > {
+        let Some(timestamp) = self.timeline.get_latest_commit_timestamp_as_option() else {
+            return Ok(None);
         };
 
         let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
@@ -294,9 +357,10 @@ impl Table {
         // where per-block fixed cost cannot amortise; on larger blocks it overtakes
         // the reader it replaces. So the ratio above is not the production ratio, and
         // nothing measured here establishes what that is.
-        v2_reader::MetadataTableV2Reader::new(configs, storage)
-            .read_files_partition(&file_slice, keys)
-            .await
+        Ok(Some((
+            v2_reader::MetadataTableV2Reader::new(configs, storage),
+            file_slice,
+        )))
     }
 }
 
