@@ -71,6 +71,10 @@ fn set_error(message: impl Into<String>) {
 /// ABI aborts the process, so catching it here is what keeps a Rust bug from
 /// killing the JVM that called us.
 fn guard<T>(what: &str, body: impl FnOnce() -> Result<*mut T, String>) -> *mut T {
+    // The previous call's message dies here, so `hudi_ffi_last_error` means
+    // "the last call failed", not "some call once failed" — a binding that
+    // checks the message rather than the return value must not see a stale one.
+    LAST_ERROR.with(|slot| *slot.borrow_mut() = None);
     match catch_unwind(AssertUnwindSafe(body)) {
         Ok(Ok(ptr)) => ptr,
         Ok(Err(message)) => {
@@ -372,6 +376,29 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(message, "open: no such table");
+    }
+
+    /// A successful call clears the previous failure's message.
+    ///
+    /// `hudi_ffi_last_error` documents "null if the last call succeeded", and a
+    /// JVM binding that checks the message rather than the return value relies
+    /// on it: without the clear, one failure makes every later success look
+    /// like that same failure.
+    #[test]
+    fn a_success_clears_the_previous_failure() {
+        let _ = guard::<u8>("first", || Err("first failed".to_string()));
+        assert!(
+            !hudi_ffi_last_error().is_null(),
+            "the failure must set a message, or the clearing below is unproven"
+        );
+
+        let ptr = guard::<u8>("second", || Ok(Box::into_raw(Box::new(7u8))));
+        assert!(!ptr.is_null());
+        drop(unsafe { Box::from_raw(ptr) });
+        assert!(
+            hudi_ffi_last_error().is_null(),
+            "a successful call must leave no error to read"
+        );
     }
 
     /// Freeing null is a no-op, on every free.
