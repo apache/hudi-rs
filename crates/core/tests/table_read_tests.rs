@@ -2215,11 +2215,11 @@ mod streaming_queries {
     /// incremental form, and yields the slice as a single batch.
     ///
     /// Deliberately does NOT assert a chunk count for version 2. Its cadence
-    /// follows the base file's row groups, not `batch_size` — which
-    /// `FileGroupMergeStream::new_buffered` accepts and discards (see its
-    /// `_batch_size` parameter). These fixtures are a single row group, so one
-    /// chunk is the correct answer for them, and asserting more would pin the
-    /// fixture's size rather than the reader's behavior.
+    /// follows the base read's own batch size, not `batch_size` —
+    /// `FileGroupMergeStream::new_buffered` no longer takes one. These fixtures
+    /// are a single row group smaller than that bound, so one chunk is the
+    /// correct answer for them, and asserting more would pin the fixture's
+    /// size rather than the reader's behavior.
     ///
     /// What is worth pinning here is that splitting the read into batches does
     /// not change what comes back: nothing else at table level compares the

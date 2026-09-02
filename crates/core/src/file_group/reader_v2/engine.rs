@@ -416,13 +416,17 @@ impl HoodieFileGroupReader {
     /// Stream the merged output.
     ///
     /// [`Self::read`] returns the whole file group as one batch, so peak memory
-    /// tracks the base file. This reads the base file one row group at a time
-    /// instead, merging and emitting a chunk per group.
+    /// tracks the base file. This reads the base file one bounded batch at a
+    /// time instead (`MERGE_CHUNK_ROWS` rows), merging and emitting a chunk
+    /// per batch.
     ///
     /// Demand-driven: nothing is merged until the consumer asks for it, so the
     /// memory this adds over the merge map is one chunk. The previous shape ran
     /// the merge on a blocking thread behind a depth-1 channel to get the same
     /// bound; a `Stream` has it by construction.
+    ///
+    /// Single-use: takes the output converter and, for MOR, moves the record
+    /// buffer into the returned stream. Reading again needs a new reader.
     pub(crate) async fn open_stream(
         &mut self,
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
@@ -436,11 +440,13 @@ impl HoodieFileGroupReader {
     /// `RecordBatch`.
     ///
     /// Same merge as [`Self::open_stream`], collected into one batch. Both
-    /// entry points merge the base a row group at a time and therefore return
+    /// entry points merge the base a batch at a time and therefore return
     /// the same row sequence; this one just concatenates the chunks.
+    /// Single-use, like [`Self::open_stream`].
     pub async fn read(&mut self) -> Result<RecordBatch> {
-        // Stage timing (perf harness): the base file open plus, here, its whole
-        // decode — `collapse_base` drives the stream to completion.
+        // Stage timing (perf harness): only the open, same as `open_stream` —
+        // the decode happens lazily while `collect_into_one_batch` drives the
+        // stream, so it lands in the merge loop rather than in `base_read_ms`.
         let base = profile_once!(self.read_stats.base_read_ms, self.base_file_source().await)?;
         let batch = self
             .init_record_iterators(base)
@@ -684,10 +690,10 @@ impl HoodieFileGroupReader {
     /// Open the base file as a stream of batches, with the schema they carry.
     ///
     /// One shape for every caller: the base file is read asynchronously, one
-    /// row group at a time, and the whole file is never resident. A caller that
-    /// needs it as a single batch collapses it afterwards
-    /// ([`Self::collapse_base`]) — that is a choice about chunking, not about
-    /// what is safe to call from where.
+    /// bounded batch at a time, and the whole file is never resident. A caller
+    /// that needs it as a single batch collapses it afterwards (`read()` does,
+    /// via `collect_into_one_batch`) — that is a choice about chunking, not
+    /// about what is safe to call from where.
     ///
     /// Returns an empty stream when the input split has no base file (log-only
     /// file group), and when the instant range excludes this base file: the
@@ -834,7 +840,7 @@ impl HoodieFileGroupReader {
         }
 
         // Open the base file as a stream. The whole file never lives in memory;
-        // one row group does. The (CoW-gated) RowFilter is threaded through the
+        // one batch does. The (CoW-gated) RowFilter is threaded through the
         // intersection read so row groups can be pruned via column-index stats
         // (the builder resolves predicate columns by name and returns None when
         // any referenced column is absent — safe even for evolved/added cols).

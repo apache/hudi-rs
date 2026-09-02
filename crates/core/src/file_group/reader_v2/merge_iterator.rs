@@ -66,13 +66,14 @@ pub type BaseBatchStream = BoxStream<'static, Result<RecordBatch>>;
 ///
 /// Matches Velox's typical operator batch size, and Spark Hudi's
 /// `hoodie.parquet.batchsize.default`. The merged base chunks are not sized by
-/// this: they follow the base file's own row-group cadence.
+/// this: the base read requests them at the reader's own batch size
+/// (`MERGE_CHUNK_ROWS` in the engine), and one source batch becomes one chunk.
 pub const DEFAULT_BATCH_SIZE: usize = 4096;
 
 /// Stage stats the streaming iterator accumulates as it emits chunks.
 ///
-/// The iterator owns the buffer once `open()` returns, so it accumulates these
-/// per chunk through a shared [`StreamStatsHandle`]. The
+/// The iterator owns the buffer once the stream is built, so it accumulates
+/// these per chunk through a shared [`StreamStatsHandle`]. The
 /// reader drains them into its [`HoodieReadStats`] once the stream is
 /// exhausted — see `HoodieFileGroupReader::drain_stream_stats`.
 ///
@@ -87,8 +88,9 @@ pub struct StreamReadStats {
     /// `records_to_batch` + the per-chunk `OutputConverter` projection.
     pub output_build_ms: u64,
     /// Peak number of entries the merge map held during the log scan. Recorded
-    /// off the buffer by `HoodieFileGroupReader::open` before iteration starts
-    /// (it is finalized at scan time, not during output streaming).
+    /// off the buffer by `HoodieFileGroupReader::init_record_iterators` before
+    /// the stream is returned (it is finalized at scan time, not during output
+    /// streaming).
     pub merge_map_peak_entries: u64,
     /// Insert / update / delete counts the update processor accumulated while
     /// the iterator drove the merge. Snapshotted off the buffer when the
@@ -120,12 +122,13 @@ enum MergeSource {
     Eager { source: BaseBatchStream },
 
     /// MOR merge path. Drives the buffer's vectorized
-    /// `next_merged_base_batch` + `drain_log_only_inserts` methods:
-    /// one emitted chunk per non-empty base source batch, plus a single
-    /// final chunk for log-only inserts (keys never matched by any base row).
+    /// `merge_base_batch` + `drain_log_only_inserts` methods:
+    /// one emitted chunk per non-empty base source batch, then the log-only
+    /// inserts (keys never matched by any base row) in
+    /// [`DEFAULT_BATCH_SIZE`]-row chunks until the drain reports exhaustion.
     ///
-    /// Chunk size is determined by the base source's own row-group cadence,
-    /// so there is no batch-size knob on this path.
+    /// Chunk size follows the base source's own batches, so there is no
+    /// batch-size knob on this path.
     Buffered {
         buffer: Box<dyn HoodieFileGroupRecordBuffer>,
         /// The base file, pulled one batch at a time. Owned here rather than by
@@ -138,7 +141,9 @@ enum MergeSource {
         /// name drift, and as the schema for `records_to_batch` when the
         /// final drain emits log-only inserts).
         merge_schema: SchemaRef,
-        /// Three-state machine: BaseScanning → DrainingLogInserts → Done.
+        /// Two-state machine: BaseScanning → DrainingLogInserts. The terminal
+        /// state is the stream's own sticky `done` flag, set on exhaustion or
+        /// error.
         state: BufferedState,
     },
 }
@@ -147,9 +152,11 @@ enum MergeSource {
 enum BufferedState {
     /// Pulling base batches from the source and merging against the log map.
     BaseScanning,
-    /// Base source exhausted; flush log-only inserts on the next call.
-    /// (Single transition state — one call produces the final batch, then
-    /// the iterator moves to `Done`.)
+    /// Base source exhausted; drain log-only inserts. Each call to the
+    /// buffer's `drain_log_only_inserts` yields one bounded chunk, and the
+    /// stream stays in this state until the drain returns `Ok(None)` —
+    /// collapsing it to a single call would silently drop every insert past
+    /// the first chunk.
     DrainingLogInserts,
 }
 
