@@ -22,6 +22,7 @@ use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore};
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How much of a file a streaming reader keeps resident at once, when the table
 /// does not say.
@@ -49,6 +50,64 @@ pub const DEFAULT_STREAM_WINDOW_SIZE: u64 = 16 * 1024 * 1024;
 /// drops it to 1 MiB under MapReduce for exactly that reason, and this crate
 /// reads file slices concurrently (`hoodie.read.file.slice.read.concurrency`).
 pub const CONFIG_DFS_BUFFER_MAX_SIZE: &str = "hoodie.memory.dfs.buffer.max.size";
+
+/// Size below which an HFile is read whole rather than in ranges.
+///
+/// Hudi's own key and meaning: `HFileReaderFactory.createInputStream` reads the
+/// whole file when it is under this, and only opens a seekable stream above it.
+pub const CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB: &str = "hoodie.metadata.file.cache.max.size.mb";
+
+/// 50 MB, matching Hudi's default for [`CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB`].
+///
+/// Taken from Hudi rather than derived here, deliberately. Measured on a local
+/// filesystem the crossover is about 2 MB for a point lookup and a full scan is a
+/// wash above roughly 512 KB — but a local `head` and range read are nearly free,
+/// where on object storage each is a round trip and a ranged open pays three
+/// before the first data byte. So the local number is a floor, not the answer, and
+/// a constant set from it would be far too low for the deployment that matters.
+pub const DEFAULT_HFILE_WHOLE_READ_MAX_SIZE_MB: u64 = 50;
+
+/// The size below which an HFile is read whole even when the caller named keys.
+///
+/// A separate, much smaller bound because a scan and a seek want opposite things,
+/// and the reader knows which it is doing before it opens the file. Reading whole
+/// never costs a scan anything, since a scan touches every byte either way. A seek
+/// touches one block, so reading whole makes it pay for the file: measured on
+/// generated HFiles, a ranged seek is 1.54x faster at 8 KB (fixed cost dominates)
+/// but a whole-file seek is 1.24x slower at 2 MB, 3.66x at 8 MB and 9.40x at 32 MB.
+/// 512 KB is the largest size measured at which whole does not lose.
+///
+/// This is where Hudi is deliberately not followed. Its single threshold is
+/// `hoodie.metadata.file.cache.max.size.mb` and the name says why it can be coarse:
+/// the whole read populates a cache, so one file read is amortised over many
+/// lookups. There is no such cache here, so the read would be repaid on every
+/// lookup instead.
+///
+/// The number is a local measurement and therefore conservative. A local `head`
+/// and range read are nearly free, where each is a round trip on object storage, so
+/// the real crossover there is higher and this bound gives up part of the available
+/// win rather than risking the regression above.
+pub const HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE: u64 = 512 * 1024;
+
+/// The size below which an HFile should be read whole, in bytes.
+pub fn hfile_whole_read_max_size(hudi_configs: &HudiConfigs) -> Result<u64> {
+    let mb = match hudi_configs
+        .as_options()
+        .get(CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB)
+        .map(|raw| raw.trim().parse::<u64>())
+    {
+        None => DEFAULT_HFILE_WHOLE_READ_MAX_SIZE_MB,
+        // Zero is meaningful: always read in ranges, never whole.
+        Some(Ok(mb)) => mb,
+        Some(Err(_)) => {
+            return Err(Error::other(format!(
+                "{CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB} must be a non-negative integer \
+                 count of megabytes"
+            )));
+        }
+    };
+    Ok(mb.saturating_mul(1024 * 1024))
+}
 
 /// The streaming window size a set of configs asks for.
 ///
@@ -100,6 +159,55 @@ async fn get_range(
 pub struct LogBlockFetcher {
     object_store: Arc<dyn ObjectStore>,
     location: ObjPath,
+    /// What this fetcher has actually read, shared across clones so a caller
+    /// holding one clone can account for reads made through another.
+    reads: Arc<FetchCounts>,
+}
+
+/// What a fetcher read, as opposed to what it was asked for.
+///
+/// Both numbers are what this side of the API can observe, and neither is a
+/// count of what a remote store transferred. Read them with that in mind.
+///
+/// **`bytes` is the total length of the buffers the store returned**, so it is
+/// the number to judge a narrowed read on — but only exactly on a backend that
+/// reads each range as asked. `LocalFileSystem` does
+/// (`object_store::local`, which overrides `get_ranges` to read range by range),
+/// which is why tests measure real reductions against it. The **default**
+/// `get_ranges` runs `coalesce_ranges` with a 1 MiB threshold, merging ranges
+/// closer than that into one GET and slicing the result, so on the cloud
+/// backends `bytes` is the total *asked for* and the transfer can be larger. The
+/// practical consequence is worth stating: selecting blocks only reduces cloud
+/// transfer when the selected blocks sit more than that threshold apart.
+///
+/// **`calls` is not a request count.** It counts calls made into the
+/// object-store API; coalescing and any internal fan-out are invisible from
+/// here. A full scan of a thousand adjacent blocks reports one call, and a
+/// scattered three-block seek also reports one, so `calls` must not be read as
+/// "the seek did not reduce round trips".
+#[derive(Debug, Default)]
+pub struct FetchCounts {
+    calls: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl FetchCounts {
+    /// Calls made into the object-store API. See the type's note: this is not a
+    /// count of GETs.
+    pub fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    /// Total length of the buffers the object store returned. See the type's
+    /// note before treating this as bytes transferred.
+    pub fn bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    fn record(&self, calls: u64, bytes: u64) {
+        self.calls.fetch_add(calls, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
 }
 
 impl LogBlockFetcher {
@@ -107,12 +215,20 @@ impl LogBlockFetcher {
         Self {
             object_store,
             location,
+            reads: Arc::new(FetchCounts::default()),
         }
+    }
+
+    /// What this fetcher has read so far.
+    pub fn reads(&self) -> &FetchCounts {
+        &self.reads
     }
 
     /// Read `[offset, offset + length)` in one ranged request.
     pub async fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
-        get_range(&self.object_store, &self.location, offset, length).await
+        let bytes = get_range(&self.object_store, &self.location, offset, length).await?;
+        self.reads.record(1, bytes.len() as u64);
+        Ok(bytes)
     }
 
     /// The file these ranges are read from, so a caller batching across blocks
@@ -128,7 +244,8 @@ impl LogBlockFetcher {
     /// one each. Reading them one at a time is the same bytes and many more
     /// round trips, which is what dominates on object storage.
     pub async fn read_contents(&self, ranges: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
-        self.object_store
+        let fetched = self
+            .object_store
             .get_ranges(&self.location, ranges)
             .await
             .map_err(|e| {
@@ -137,7 +254,12 @@ impl LogBlockFetcher {
                     ranges.len(),
                     self.location
                 ))
-            })
+            })?;
+        // One call, whatever coalescing and fan-out did underneath, and the
+        // bytes it handed back. Counting `ranges.len()` would count the plan.
+        self.reads
+            .record(1, fetched.iter().map(|b| b.len() as u64).sum());
+        Ok(fetched)
     }
 }
 
@@ -243,6 +365,20 @@ impl StorageReader {
     /// Whether `[start, end)` lies inside the resident window.
     fn window_covers(&self, start: u64, end: u64) -> bool {
         start >= self.window_start && end <= self.window_start + self.window.len() as u64
+    }
+
+    /// Whether `[start, end)` can be handed out without another request.
+    ///
+    /// True for a whole-file reader, and for a streaming one whose current window
+    /// already spans the range. A caller that would otherwise defer a read can ask
+    /// this first and take the bytes it already paid for: a log file smaller than
+    /// one window is fetched entirely by the first fill, so deferring its blocks'
+    /// content buys nothing and costs a second request.
+    pub fn has_resident(&self, start: u64, end: u64) -> bool {
+        if self.whole.is_some() {
+            return end <= self.file_len;
+        }
+        self.window_covers(start, end)
     }
 
     /// Fetch a window starting at the cursor.

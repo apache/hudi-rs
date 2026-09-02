@@ -119,8 +119,6 @@ pub struct FileGroupRecordBuffer {
     pub log_drain_iter: Option<SpillDrainIter>,
 
     // ── Stage timings (perf harness) ──────────────────────
-    /// Cumulative wall ms inflating/decoding log blocks (subset of merge insert).
-    pub stage_decode_ms: u64,
     /// Peak `records` map size observed during the scan.
     pub merge_map_peak_entries: u64,
 }
@@ -165,7 +163,6 @@ impl FileGroupRecordBuffer {
             next_record: None,
             log_record_iter: None,
             log_drain_iter: None,
-            stage_decode_ms: 0,
             merge_map_peak_entries: 0,
         }
     }
@@ -353,7 +350,11 @@ mod tests {
     }
 
     fn buffer_with_erroring_processor() -> FileGroupRecordBuffer {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         FileGroupRecordBuffer::new(
             "COMMIT_TIME_ORDERING".to_string(),
             merger,
@@ -384,7 +385,11 @@ mod tests {
     /// returns `Ok(false)` cleanly (no false-positive error path).
     #[test]
     fn test_has_next_log_record_empty_map_is_ok_false() {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let mut buffer = FileGroupRecordBuffer::new(
             "COMMIT_TIME_ORDERING".to_string(),
             merger,
@@ -403,7 +408,11 @@ mod tests {
     }
 
     fn buffer_with_source(source: Box<dyn RecordBatchReader + Send>) -> FileGroupRecordBuffer {
-        let merger = BufferedRecordMergerFactory::create("COMMIT_TIME_ORDERING").unwrap();
+        let merger = BufferedRecordMergerFactory::create_with(
+            "COMMIT_TIME_ORDERING",
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
         let mut buffer = FileGroupRecordBuffer::new(
             "COMMIT_TIME_ORDERING".to_string(),
             merger,

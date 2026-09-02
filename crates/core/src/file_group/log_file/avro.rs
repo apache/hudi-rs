@@ -38,6 +38,24 @@ use std::sync::Arc;
 /// directly but is not released yet.
 pub struct AvroBlockDecoder {
     decoder: ArrowAvroDecoder,
+    /// What the inner decoder is rebuilt from between batches.
+    ///
+    /// `arrow-avro`'s union decoder drains its offsets on flush but leaves the
+    /// per-branch counts that produced them, so a second batch emits offsets past
+    /// the children it just emptied and `UnionArray::try_new` rejects them. It has
+    /// no reset, so the only way to get a clean decoder is to build one.
+    ///
+    /// Kept here so the rebuild skips **registration**, which is one of the two
+    /// schema-sized halves. It is not free: `build_decoder` parses the writer
+    /// schema again, and the reader schema too when one is set, so a rebuild costs
+    /// more than the registration it avoids. Measured on an 8 KB union-bearing
+    /// schema: register 234us, build with a reader schema 380us. The rebuild fires
+    /// once per batch, so it is a real cost on a block with many records, and
+    /// removing it needs the upstream fix (apache/arrow-rs#10876) rather than more
+    /// caching here.
+    registered: RegisteredWriterSchema,
+    reader_schema_json: Option<String>,
+    batch_size: usize,
     /// Marker plus fingerprint, identical for every record in the block.
     prefix: [u8; 10],
     /// Reused across records so framing costs one copy, not one allocation.
@@ -45,6 +63,31 @@ pub struct AvroBlockDecoder {
     /// When set, each batch is projected to this schema after decoding. See
     /// [`AvroBlockDecoder::with_rewrite_to`].
     rewrite_to: Option<SchemaRef>,
+}
+
+/// A writer schema that has been parsed and fingerprinted once.
+///
+/// Holds only data: a `SchemaStore` is a map from fingerprint to schema, and
+/// cloning it copies that map rather than reparsing. Kept separate from the
+/// decoder because the decoder carries per-stream state and must not be shared,
+/// while this can be.
+#[derive(Debug, Clone)]
+pub struct RegisteredWriterSchema {
+    store: SchemaStore,
+    fingerprint: arrow_avro::schema::Fingerprint,
+}
+
+impl RegisteredWriterSchema {
+    /// Parse and fingerprint `writer_schema_json`.
+    pub fn new(writer_schema_json: &str) -> Result<Self> {
+        let mut store = SchemaStore::new();
+        let fingerprint = store
+            .register(ArrowAvroSchema::new(writer_schema_json.to_string()))
+            .map_err(|e| {
+                CoreError::LogBlockError(format!("Failed to register block writer schema: {e}"))
+            })?;
+        Ok(Self { store, fingerprint })
+    }
 }
 
 impl AvroBlockDecoder {
@@ -64,12 +107,47 @@ impl AvroBlockDecoder {
         reader_schema_json: Option<&str>,
         batch_size: usize,
     ) -> Result<Self> {
-        let mut store = SchemaStore::new();
-        let fingerprint = store
-            .register(ArrowAvroSchema::new(writer_schema_json.to_string()))
-            .map_err(|e| {
-                CoreError::LogBlockError(format!("Failed to register block writer schema: {e}"))
-            })?;
+        let registered = RegisteredWriterSchema::new(writer_schema_json)?;
+        Self::try_new_with_registered(&registered, reader_schema_json, batch_size)
+    }
+
+    /// Build the inner arrow-avro decoder.
+    ///
+    /// Separate so a decoder can be rebuilt between batches without redoing the
+    /// registration, which is the schema-sized half of the cost.
+    fn build_inner(
+        registered: &RegisteredWriterSchema,
+        reader_schema_json: Option<&str>,
+        batch_size: usize,
+    ) -> Result<ArrowAvroDecoder> {
+        let mut builder = ReaderBuilder::new()
+            .with_writer_schema_store(registered.store.clone())
+            .with_active_fingerprint(registered.fingerprint)
+            .with_batch_size(batch_size);
+        if let Some(reader_schema_json) = reader_schema_json {
+            builder =
+                builder.with_reader_schema(ArrowAvroSchema::new(reader_schema_json.to_string()));
+        }
+        builder
+            .build_decoder()
+            .map_err(|e| CoreError::LogBlockError(format!("Failed to build the Avro decoder: {e}")))
+    }
+
+    /// Build a decoder from a writer schema that is already registered.
+    ///
+    /// Registering parses the schema to fingerprint it, which is schema-sized work:
+    /// on the metadata table's 8 KB record schema it measures about 175us against
+    /// 154us to build the decoder from an already-registered schema, so a caller
+    /// decoding many blocks that share one writer schema saves roughly two thirds of
+    /// the per-block cost by registering once and passing the result here. The
+    /// decoder itself is still built per call, since it carries per-stream state and
+    /// cannot be shared.
+    pub fn try_new_with_registered(
+        registered: &RegisteredWriterSchema,
+        reader_schema_json: Option<&str>,
+        batch_size: usize,
+    ) -> Result<Self> {
+        let fingerprint = registered.fingerprint;
 
         let arrow_avro::schema::Fingerprint::Rabin(rabin) = fingerprint else {
             return Err(CoreError::LogBlockError(format!(
@@ -77,17 +155,7 @@ impl AvroBlockDecoder {
             )));
         };
 
-        let mut builder = ReaderBuilder::new()
-            .with_writer_schema_store(store)
-            .with_active_fingerprint(fingerprint)
-            .with_batch_size(batch_size);
-        if let Some(reader_schema_json) = reader_schema_json {
-            builder =
-                builder.with_reader_schema(ArrowAvroSchema::new(reader_schema_json.to_string()));
-        }
-        let decoder = builder.build_decoder().map_err(|e| {
-            CoreError::LogBlockError(format!("Failed to build the Avro decoder: {e}"))
-        })?;
+        let decoder = Self::build_inner(registered, reader_schema_json, batch_size)?;
 
         let mut prefix = [0u8; 10];
         prefix[..2].copy_from_slice(&SINGLE_OBJECT_MAGIC);
@@ -95,10 +163,22 @@ impl AvroBlockDecoder {
 
         Ok(Self {
             decoder,
+            registered: registered.clone(),
+            reader_schema_json: reader_schema_json.map(str::to_string),
+            batch_size,
             prefix,
             framed: Vec::new(),
             rewrite_to: None,
         })
+    }
+
+    /// The Arrow schema decoded records will carry.
+    ///
+    /// Taken from the decoder rather than converted from the Avro JSON, because
+    /// `avro_to_arrow` does not handle named-type references and the metadata
+    /// table's schema uses them.
+    pub fn schema(&self) -> SchemaRef {
+        self.decoder.schema()
     }
 
     /// Project each decoded batch to `schema` instead of resolving during the
@@ -134,7 +214,17 @@ impl AvroBlockDecoder {
         }
 
         if self.decoder.batch_is_full() {
-            return self.flush();
+            let batch = self.flush()?;
+            // A flushed union decoder cannot be decoded into again, so the next
+            // batch gets a fresh one. Only reached when a single block holds more
+            // records than one batch, which is the case that fails outright
+            // without this; a block inside one batch never takes this path.
+            self.decoder = Self::build_inner(
+                &self.registered,
+                self.reader_schema_json.as_deref(),
+                self.batch_size,
+            )?;
+            return Ok(batch);
         }
         Ok(None)
     }
@@ -208,6 +298,153 @@ fn normalize_utc_timestamps(batch: RecordBatch) -> Result<RecordBatch> {
         }
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(CoreError::ArrowError)
+}
+
+#[cfg(test)]
+mod multi_batch_tests {
+    use super::*;
+    use apache_avro::types::Value;
+
+    /// A schema whose union has two or more non-null branches, which Arrow
+    /// represents as a dense union.
+    const UNION_SCHEMA: &str = r#"{"type":"record","name":"R","fields":[
+        {"name":"id","type":"long"},
+        {"name":"v","type":["null","int","string"]}]}"#;
+
+    fn null_union_records(n: usize) -> Vec<Vec<u8>> {
+        let schema = apache_avro::Schema::parse_str(UNION_SCHEMA).unwrap();
+        (0..n as i64)
+            .map(|i| {
+                let mut rec = apache_avro::types::Record::new(&schema).unwrap();
+                rec.put("id", i);
+                rec.put("v", Value::Union(0, Box::new(Value::Null)));
+                apache_avro::to_avro_datum(&schema, rec).unwrap()
+            })
+            .collect()
+    }
+
+    /// More records than one batch holds, with a dense union in the schema.
+    ///
+    /// `arrow-avro`'s union decoder drains its offsets on flush but keeps the
+    /// per-branch counts that produced them, so without a fresh decoder the second
+    /// batch emits offsets past the children it just emptied and fails with
+    /// "Offsets must be non-negative and within the length of the Array". Every
+    /// value here is null, because the schema alone is enough to trigger it.
+    ///
+    /// The batch size is small so the test is fast; the real ceiling was 1024, which
+    /// is what a metadata log block exceeds.
+    #[test]
+    fn a_block_larger_than_one_batch_decodes_with_a_union_in_the_schema() {
+        const BATCH: usize = 16;
+        const N: usize = 100;
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(UNION_SCHEMA, Some(UNION_SCHEMA), BATCH).unwrap();
+
+        let mut rows = 0usize;
+        let mut batches = 0usize;
+        for datum in &null_union_records(N) {
+            if let Some(batch) = decoder
+                .decode(datum)
+                .expect("a record after a full batch must still decode")
+            {
+                batches += 1;
+                rows += batch.num_rows();
+            }
+        }
+        if let Some(batch) = decoder.flush().expect("the final flush must succeed") {
+            batches += 1;
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, N, "every record must come back");
+        assert!(
+            batches > 1,
+            "the batch size must have forced more than one batch, or this proves nothing: \
+             {batches} batch(es) for {N} records at a batch size of {BATCH}"
+        );
+    }
+
+    /// Values survive the batch boundary, not just the row count.
+    ///
+    /// The all-null test above pins the crash but would still pass if a rebuilt
+    /// decoder returned rows carrying the wrong branch or the wrong value, which is
+    /// the failure a corrupt offsets buffer actually produces. This alternates the
+    /// union's branches so every row's identity is checkable.
+    #[test]
+    fn values_survive_the_batch_boundary_with_a_union() {
+        use arrow_array::cast::AsArray;
+
+        const BATCH: usize = 16;
+        const N: i64 = 100;
+        let schema = apache_avro::Schema::parse_str(UNION_SCHEMA).unwrap();
+        let datums: Vec<Vec<u8>> = (0..N)
+            .map(|i| {
+                let mut rec = apache_avro::types::Record::new(&schema).unwrap();
+                rec.put("id", i);
+                // Branch 1 is int, branch 2 is string: alternating them means a
+                // decoder that mixed up offsets returns a detectably wrong row.
+                let v = if i % 2 == 0 {
+                    Value::Union(1, Box::new(Value::Int(i as i32)))
+                } else {
+                    Value::Union(2, Box::new(Value::String(format!("s{i}"))))
+                };
+                rec.put("v", v);
+                apache_avro::to_avro_datum(&schema, rec).unwrap()
+            })
+            .collect();
+
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(UNION_SCHEMA, Some(UNION_SCHEMA), BATCH).unwrap();
+        let mut ids: Vec<i64> = Vec::new();
+        let take = |batch: arrow_array::RecordBatch, ids: &mut Vec<i64>| {
+            let col = batch
+                .column_by_name("id")
+                .expect("the id column")
+                .as_primitive::<arrow_array::types::Int64Type>();
+            ids.extend(col.iter().flatten());
+        };
+        for datum in &datums {
+            if let Some(batch) = decoder.decode(datum).unwrap() {
+                take(batch, &mut ids);
+            }
+        }
+        if let Some(batch) = decoder.flush().unwrap() {
+            take(batch, &mut ids);
+        }
+        assert_eq!(
+            ids,
+            (0..N).collect::<Vec<_>>(),
+            "every row must come back once, in order, across the batch boundary"
+        );
+    }
+
+    /// The same, without a union, so the guard above is not the only thing keeping
+    /// multi-batch decoding honest.
+    #[test]
+    fn a_block_larger_than_one_batch_decodes_without_a_union() {
+        const SCHEMA: &str = r#"{"type":"record","name":"R","fields":[
+            {"name":"id","type":"long"},
+            {"name":"name","type":"string"}]}"#;
+        let schema = apache_avro::Schema::parse_str(SCHEMA).unwrap();
+        let datums: Vec<Vec<u8>> = (0..100i64)
+            .map(|i| {
+                let mut rec = apache_avro::types::Record::new(&schema).unwrap();
+                rec.put("id", i);
+                rec.put("name", format!("n{i}"));
+                apache_avro::to_avro_datum(&schema, rec).unwrap()
+            })
+            .collect();
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(SCHEMA, Some(SCHEMA), 16).unwrap();
+        let mut rows = 0usize;
+        for d in &datums {
+            if let Some(b) = decoder.decode(d).unwrap() {
+                rows += b.num_rows();
+            }
+        }
+        if let Some(b) = decoder.flush().unwrap() {
+            rows += b.num_rows();
+        }
+        assert_eq!(rows, 100);
+    }
 }
 
 #[cfg(test)]

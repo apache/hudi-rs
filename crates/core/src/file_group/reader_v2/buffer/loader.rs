@@ -41,6 +41,7 @@ use crate::file_group::reader_v2::buffer::key_based::KeyBasedFileGroupRecordBuff
 use crate::file_group::reader_v2::buffer::position_based::PositionBasedFileGroupRecordBuffer;
 use crate::file_group::reader_v2::input_split::InputSplit;
 use crate::file_group::reader_v2::merged_log_record_reader::HoodieMergedLogRecordReader;
+use crate::file_group::reader_v2::metadata_merger::resolve_custom_merger;
 use crate::file_group::reader_v2::read_stats::HoodieReadStats;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
@@ -133,13 +134,18 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         // the EventTimeRecordMerger via BufferedRecordMergerFactory and merges
         // base-vs-log by ordering value (the base record carries its ordering
         // value — see KeyBasedFileGroupRecordBuffer::has_next_base_record_at).
-        // CUSTOM still requires a partial-update / custom merger that is not implemented.
+        // CUSTOM is admitted only when the table's payload class names a merger
+        // this crate implements; the same resolution decides the schema handler's
+        // gate and the record-merger factory's, so all three agree or all three
+        // refuse.
         match merge_mode.as_str() {
             "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING" => {}
+            "CUSTOM" if resolve_custom_merger(&reader_context.table_config).is_some() => {}
             unsupported => {
                 return Err(crate::error::CoreError::ReadFileSliceError(format!(
-                    "Unsupported merge mode: '{unsupported}'. Only COMMIT_TIME_ORDERING \
-                     and EVENT_TIME_ORDERING are supported (MOR scan path)."
+                    "Unsupported merge mode: '{unsupported}'. Only COMMIT_TIME_ORDERING, \
+                     EVENT_TIME_ORDERING, and CUSTOM with a supported payload class are \
+                     supported (MOR scan path)."
                 )));
             }
         }
@@ -247,16 +253,18 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         populated_buffer.compact_pinned_batches()?;
 
         // Populate read stats from scan stats
-        read_stats.total_log_read_time_ms = stats.total_time_taken_to_read_and_merge_blocks_ms;
+        read_stats.total_log_read_time_us = stats.total_time_taken_to_read_and_merge_blocks_us;
         read_stats.total_log_records = stats.total_log_records;
         read_stats.total_log_blocks = stats.total_log_blocks;
         read_stats.total_log_files_compacted = stats.total_log_files;
         read_stats.total_corrupt_log_blocks = stats.total_corrupt_blocks;
         read_stats.total_rollback_blocks = stats.total_rollbacks;
         // Stage timings (perf harness).
-        read_stats.log_block_read_ms = stats.log_block_read_ms;
-        read_stats.log_block_decode_ms = stats.log_block_decode_ms;
-        read_stats.merge_insert_ms = stats.merge_insert_ms;
+        read_stats.log_block_read_us = stats.log_block_read_us;
+        read_stats.merge_insert_us = stats.merge_insert_us;
+        read_stats.log_block_fetch_us = stats.log_block_fetch_us;
+        read_stats.log_block_decode_us = stats.log_block_decode_us;
+        read_stats.merge_upsert_us = stats.merge_upsert_us;
         read_stats.merge_map_peak_entries = stats.merge_map_peak_entries;
         // Spillable merge map.
         read_stats.merge_map_spilled = stats.merge_map_spilled;

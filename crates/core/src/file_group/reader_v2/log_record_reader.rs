@@ -44,7 +44,7 @@ use crate::Result;
 use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlock};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
-use crate::file_group::reader_v2::profiling::profile_once;
+use crate::file_group::reader_v2::profiling::{profile_add, profile_once};
 use crate::file_group::reader_v2::reader_context::{CompletionGateInputs, ReaderContext};
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
@@ -238,7 +238,10 @@ pub fn forward_scan_pass1(
 
         // Classify the block
         match block.block_type {
-            BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
+            BlockType::AvroData
+            | BlockType::ParquetData
+            | BlockType::Delete
+            | BlockType::HfileData => {
                 let blocks_list = instant_to_blocks_map
                     .entry(instant_time.clone())
                     .or_default();
@@ -463,10 +466,16 @@ pub struct BaseHoodieLogRecordReader {
     pub progress: f32,
 
     // ── Stage timings (perf harness) ──────────────────────
-    /// Wall ms spent reading log-block metadata + bytes off storage (Pass 1).
-    pub log_block_read_ms: u64,
-    /// Wall ms spent in Pass-3 block dispatch (inflate/decode + merge insert).
-    pub merge_insert_ms: u64,
+    /// Wall us spent walking log-block headers off storage (Pass 1).
+    pub log_block_read_us: u64,
+    /// Wall us spent fetching admitted blocks' content (Pass 3's prefetch).
+    pub log_block_fetch_us: u64,
+    /// Wall us spent decoding fetched bytes into arrow batches.
+    pub log_block_decode_us: u64,
+    /// Wall us spent upserting decoded records into the merge map.
+    pub merge_upsert_us: u64,
+    /// Wall us spent in Pass-3 block dispatch, spanning decode and upsert.
+    pub merge_insert_us: u64,
 }
 
 impl BaseHoodieLogRecordReader {
@@ -493,7 +502,15 @@ impl BaseHoodieLogRecordReader {
         let hudi_configs = Arc::new(crate::config::HudiConfigs::new(
             self.reader_context.table_config.clone(),
         ));
-        profile_once!(self.log_block_read_ms, {
+        // One window's worth of content may be kept from the walk across the whole
+        // scan, not per file. Blocks the walk was already holding bytes for cost no
+        // second request, but keeping them is memory, and Pass 3's budget bounds
+        // only the deferred remainder. Sharing one budget across every log file is
+        // what keeps peak residency at one window, which is the bound the
+        // headers-only walk exists to buy.
+        let mut resident_budget =
+            crate::storage::reader::stream_window_size(&hudi_configs).unwrap_or(0);
+        profile_once!(self.log_block_read_us, {
             for path in &self.log_file_paths.clone() {
                 // Walk headers only, out of a bounded fetch window. Passes 1 and 2
                 // read nothing but a block's header, so the gates below decide what
@@ -505,9 +522,19 @@ impl BaseHoodieLogRecordReader {
                 let mut reader =
                     LogFileReader::new_streaming(hudi_configs.clone(), self.storage.clone(), path)
                         .await?;
-                let blocks = reader.read_all_blocks_metadata_only().await?;
+                let blocks = reader
+                    .read_all_blocks_metadata_only(&mut resident_budget)
+                    .await?;
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
+                // A file inside one fetch window costs a single request whose
+                // blocking read can complete before this task is ever suspended,
+                // and Pass 3 then decodes resident bytes with no I/O at all — so
+                // nothing in the scan is guaranteed to reach the scheduler. On a
+                // single-worker runtime that starves every task sharing it for
+                // the whole scan; one explicit yield per file keeps the walk
+                // cooperative whatever the I/O timing.
+                tokio::task::yield_now().await;
             }
         });
 
@@ -556,7 +583,7 @@ impl BaseHoodieLogRecordReader {
                 ordered.push(block);
             }
             profile_once!(
-                self.merge_insert_ms,
+                self.merge_insert_us,
                 self.fetch_and_merge_windows(&hudi_configs, &mut ordered)
                     .await
             )?;
@@ -656,7 +683,10 @@ impl BaseHoodieLogRecordReader {
         let mut cursor = 0usize;
         for window in windows {
             let mut fetched: HashMap<usize, bytes::Bytes> = HashMap::new();
-            Self::fetch_window(ordered, &window, &mut fetched).await?;
+            profile_add!(
+                self.log_block_fetch_us,
+                Self::fetch_window(ordered, &window, &mut fetched).await
+            )?;
             // Merge everything up to and including this window's last block, so
             // blocks with nothing to fetch (command, corrupt, already-decoded)
             // keep their place in the oldest-first order.
@@ -711,8 +741,15 @@ impl BaseHoodieLogRecordReader {
         for (idx, block) in blocks.iter().enumerate() {
             if !matches!(
                 block.block_type,
-                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete
+                BlockType::AvroData
+                    | BlockType::ParquetData
+                    | BlockType::Delete
+                    | BlockType::HfileData
             ) {
+                continue;
+            }
+            // Holding its own bytes already: nothing to fetch for this one.
+            if block.resident_content.is_some() {
                 continue;
             }
             let Some(DeferredContent { fetcher, location }) = block.deferred_content.as_ref()
@@ -788,15 +825,24 @@ impl BaseHoodieLogRecordReader {
     /// empty block. Answering it here, instead of having the block fetch its own
     /// bytes, is what keeps Pass 3 free of I/O and therefore synchronous.
     fn queued_block_content(
-        block: &LogBlock,
+        block: &mut LogBlock,
         fetched: Option<bytes::Bytes>,
     ) -> Result<Option<bytes::Bytes>> {
+        // Its own bytes first, and always taken rather than borrowed, so the walk's
+        // window allocation is released as each block is decoded instead of being
+        // held to the end of the merge. Checked ahead of `fetched` so the release
+        // happens even if a prefetch ever supplied this block as well: the planner
+        // skips resident blocks, so that cannot happen today, but the ordering
+        // makes it harmless rather than a leak if that ever drifts.
+        if let Some(bytes) = block.resident_content.take() {
+            return Ok(Some(bytes));
+        }
         match fetched {
             Some(bytes) => Ok(Some(bytes)),
             None if !block.content.is_empty() => Ok(None),
             None => Err(crate::error::CoreError::LogBlockError(format!(
-                "no content was fetched for the {:?} block at instant {}, and it carries none: \
-                 nothing recorded where to read it from",
+                "no content was fetched for the {:?} block at instant {}, it holds none \
+                 from the scan, and it carries none: nothing recorded where to read it from",
                 block.block_type,
                 block.instant_time().unwrap_or("unknown"),
             ))),
@@ -813,6 +859,14 @@ impl BaseHoodieLogRecordReader {
         crate::file_group::log_file::content::Decoder::new(Arc::new(
             crate::config::HudiConfigs::new(self.reader_context.table_config.clone()),
         ))
+        // The merge buffer takes Arrow and nothing else, so an HFile block's
+        // records are decoded rather than handed over as key-value pairs.
+        .with_hfile_as_records(true)
+        // The same predicate the base file read seeks with. No gate, unlike the row
+        // filter below: the merge is per key, so a log record whose key nobody asked
+        // for cannot change what the requested keys merge to, and dropping it before
+        // the Avro decode is the whole saving.
+        .with_key_predicate(self.reader_context.key_predicate.clone())
         .with_row_filter(if self.reader_context.can_push_row_filter() {
             self.reader_context.row_filter_builder.clone()
         } else {
@@ -853,27 +907,52 @@ impl BaseHoodieLogRecordReader {
                 block.block_type,
             );
 
+            // Every block type releases what the walk held for it, even the ones
+            // with nothing to decode: a command or corrupt block that kept its
+            // bytes would hold them until the whole deque dropped.
+            if !matches!(
+                block.block_type,
+                BlockType::AvroData
+                    | BlockType::ParquetData
+                    | BlockType::Delete
+                    | BlockType::HfileData
+            ) {
+                block.resident_content = None;
+            }
+
             // Decode this block's content now that it is known to be admitted. A
             // block that already has content passes straight through.
             match block.block_type {
-                BlockType::AvroData | BlockType::ParquetData | BlockType::Delete => {
+                BlockType::AvroData
+                | BlockType::ParquetData
+                | BlockType::Delete
+                | BlockType::HfileData => {
                     if let Some(bytes) = Self::queued_block_content(block, fetched.remove(&idx))? {
-                        block.decode_fetched(block_decoder, bytes)?;
+                        profile_add!(
+                            self.log_block_decode_us,
+                            block.decode_fetched(block_decoder, bytes)
+                        )?;
                     }
                 }
                 _ => {}
             }
 
             match block.block_type {
-                BlockType::AvroData | BlockType::ParquetData => {
-                    self.record_buffer.process_data_block(block)?;
+                BlockType::AvroData | BlockType::ParquetData | BlockType::HfileData => {
+                    profile_add!(
+                        self.merge_upsert_us,
+                        self.record_buffer.process_data_block(block)
+                    )?;
                     log::debug!(
                         "[Pass3] after processing data block #{block_num}: buffer size={}",
                         self.record_buffer.size(),
                     );
                 }
                 BlockType::Delete => {
-                    self.record_buffer.process_delete_block(block)?;
+                    profile_add!(
+                        self.merge_upsert_us,
+                        self.record_buffer.process_delete_block(block)
+                    )?;
                 }
                 BlockType::Corrupted => {
                     log::warn!("Found corrupt block not rolled back");
@@ -1032,10 +1111,10 @@ mod tests {
     fn test_a_queued_block_with_neither_bytes_nor_content_is_refused() {
         use crate::file_group::record_batches::RecordBatches;
 
-        let block = make_data_block("20250101000000000");
+        let mut block = make_data_block("20250101000000000");
         let prefetched = bytes::Bytes::from_static(b"content");
         assert_eq!(
-            BaseHoodieLogRecordReader::queued_block_content(&block, Some(prefetched.clone()))
+            BaseHoodieLogRecordReader::queued_block_content(&mut block, Some(prefetched.clone()))
                 .unwrap(),
             Some(prefetched),
             "prefetched bytes are what the block decodes from"
@@ -1044,12 +1123,12 @@ mod tests {
         let mut decoded = make_data_block("20250101000000000");
         decoded.content = LogBlockContent::Records(RecordBatches::new());
         assert_eq!(
-            BaseHoodieLogRecordReader::queued_block_content(&decoded, None).unwrap(),
+            BaseHoodieLogRecordReader::queued_block_content(&mut decoded, None).unwrap(),
             None,
             "a block that already holds content needs no bytes"
         );
 
-        let err = BaseHoodieLogRecordReader::queued_block_content(&block, None)
+        let err = BaseHoodieLogRecordReader::queued_block_content(&mut block, None)
             .expect_err("a block with neither bytes nor content must be refused");
         assert!(
             err.to_string()
@@ -1092,7 +1171,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let blocks = reader.read_all_blocks_metadata_only().await.unwrap();
+        // A zero residency budget forces every block to defer, which is the only
+        // regime in which the prefetch has anything to do. With a budget the walk
+        // keeps both blocks' bytes, `plan_content_windows` returns nothing, and
+        // this test would pass without ever calling `fetch_window`.
+        let blocks = reader.read_all_blocks_metadata_only(&mut 0).await.unwrap();
         let admitted = blocks
             .iter()
             .filter(|b| {
@@ -1111,6 +1194,11 @@ mod tests {
                 .await
                 .unwrap();
         }
+        assert!(
+            !blocks.iter().any(|b| b.resident_content.is_some()),
+            "the zero budget must have left every block deferred, or the prefetch \
+             below has nothing to do and this test proves nothing"
+        );
         assert_eq!(
             fetched.len(),
             admitted,

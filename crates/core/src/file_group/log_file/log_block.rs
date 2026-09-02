@@ -303,7 +303,17 @@ pub struct LogBlock {
     /// One field rather than two so the pairing is structural: the location and
     /// the fetcher are only ever meaningful together, and a caller that set one
     /// without the other used to compile and fail at read time.
+    ///
     pub deferred_content: Option<DeferredContent>,
+    /// Content bytes the headers-only walk already had in hand, undecoded.
+    ///
+    /// Set alongside `deferred_content` when the walk's reader was holding the
+    /// range anyway, which a log file smaller than one fetch window always is.
+    /// The location stays because the decode still checks the byte count against
+    /// it; what these bytes remove is the second request, not the check.
+    /// Undecoded on purpose: decoding here would cost a block the gates go on to
+    /// discard, which is the property the headers-only walk exists to keep.
+    pub resident_content: Option<bytes::Bytes>,
     pub skipped: bool,
 }
 
@@ -316,14 +326,20 @@ pub struct DeferredContent {
 }
 
 impl LogBlock {
-    /// Fetch and decode the content a headers-only scan skipped past.
+    /// Decode the content a headers-only scan did not decode.
     ///
-    /// Reads only this block's own range, so a scan can walk a file without
+    /// Three cases, in order: a block that already holds decoded content is left
+    /// alone; a block holding undecoded bytes the scan had in hand is decoded from
+    /// those; otherwise its own range is read, so a scan can walk a file without
     /// holding it and each admitted block costs its own content and no more.
-    /// A block that already has content is left alone.
     pub async fn load_content(&mut self, decoder: &Decoder) -> Result<()> {
         if !self.content.is_empty() {
             return Ok(());
+        }
+        // Already in hand: the walk was holding these bytes, so there is nothing
+        // to fetch and only the decode is left.
+        if let Some(bytes) = self.resident_content.take() {
+            return self.decode_fetched(decoder, bytes);
         }
         let Some(DeferredContent { location, fetcher }) = self.deferred_content.as_ref() else {
             return Err(CoreError::LogBlockError(
@@ -403,6 +419,7 @@ impl LogBlock {
             content,
             footer,
             deferred_content: None,
+            resident_content: None,
             skipped: false,
         }
     }
@@ -422,6 +439,7 @@ impl LogBlock {
             content: LogBlockContent::Empty,
             footer: HashMap::new(),
             deferred_content: None,
+            resident_content: None,
             skipped: true,
         }
     }
