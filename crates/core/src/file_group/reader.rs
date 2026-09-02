@@ -31,6 +31,7 @@ use crate::file_group::base_file::reader::{
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
@@ -64,6 +65,15 @@ pub struct FileGroupReader {
     /// base types. A caller holding the timeline knows better; one reading from
     /// paths alone (the cxx bridge) does not, and falls back to the base file.
     data_schema_override: Option<arrow_schema::SchemaRef>,
+    /// The committed/inflight sets the log-block scan gates on.
+    ///
+    /// A log file is admitted to a slice on its own instant, but its blocks
+    /// carry theirs — including a writer still inflight when a later one
+    /// committed. Without these the scan merges such a block, because it sorts
+    /// below the latest instant and passes every other gate. Only a caller
+    /// holding the timeline can supply them; one reading from paths alone (the
+    /// cxx bridge) leaves the gate off, as it always was.
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 }
 
 impl std::fmt::Debug for FileGroupReader {
@@ -105,6 +115,7 @@ impl FileGroupReader {
             base_file_format: format,
             base_file_reader,
             data_schema_override: None,
+            completion_gate_inputs: None,
         })
     }
 
@@ -135,6 +146,7 @@ impl FileGroupReader {
             base_file_format: format,
             base_file_reader,
             data_schema_override: None,
+            completion_gate_inputs: None,
         })
     }
 
@@ -212,6 +224,17 @@ impl FileGroupReader {
             false,
             true,
         ))
+    }
+
+    /// Whether this reader can gate the log scan on instant state.
+    #[cfg(test)]
+    pub(crate) fn has_completion_gate_inputs(&self) -> bool {
+        self.completion_gate_inputs.is_some()
+    }
+
+    /// Gate the log-block scan on these committed/inflight sets.
+    pub(crate) fn set_completion_gate_inputs(&mut self, inputs: CompletionGateInputs) {
+        self.completion_gate_inputs = Some(Arc::new(inputs));
     }
 
     /// Read slices with `schema` rather than whatever the base file carries.
@@ -341,6 +364,7 @@ impl FileGroupReader {
             log_file_paths,
             partition_path,
             Some(data_schema),
+            self.completion_gate_inputs.clone(),
         )
         .await?;
 
@@ -789,6 +813,7 @@ impl FileGroupReader {
             log_file_paths,
             partition_path,
             Some(data_schema),
+            self.completion_gate_inputs.clone(),
         )
         .await?;
 

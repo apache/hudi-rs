@@ -97,8 +97,8 @@ impl<'a> CompletionGate<'a> {
     /// committedness for any instant, so it admits everything (a no-op) rather
     /// than excluding all blocks. Java always builds the gate from a non-empty
     /// active timeline (`filterCompletedInstants()`), so an empty set here means
-    /// the inputs were not populated by the caller (e.g. the FFI bridge forwarded
-    /// an empty list). Excluding on that basis would silently drop EVERY log delta
+    /// the inputs were not populated by the caller — a caller that supplied the
+    /// struct but left the sets empty. Excluding on that basis would silently drop EVERY log delta
     /// — including committed ones — and return base-file-only data (the
     /// C-INFLIGHT silent-wrong: a committed later delta wrongly dropped). Deferring
     /// to the other gates preserves the pre-gate behavior for a mis-wired gate; a
@@ -118,12 +118,12 @@ impl<'a> CompletionGate<'a> {
     /// `completed_instants` set AND no `archived_boundary`. Such a gate cannot establish
     /// committedness for any instant, so [`admits`](Self::admits) degrades to admit-all.
     ///
-    /// When the gate was supplied deliberately (the caller passes `Some` only for a table
-    /// version < 8 snapshot), being unpopulated is a mis-wire signal, not a genuine empty
+    /// When the gate was supplied deliberately (the caller passes `Some` whenever it has a
+    /// timeline to build it from), being unpopulated is a mis-wire signal, not a genuine empty
     /// timeline: Java always builds the gate from a non-empty active timeline
-    /// (`filterCompletedInstants()`), and a v1 snapshot always has >= 1 completed instant.
+    /// (`filterCompletedInstants()`), and a readable table always has >= 1 completed instant.
     /// `forward_scan_pass1` warns once when this holds so a gate whose inputs were dropped
-    /// across the FFI boundary is diagnosable rather than a silent no-op.
+    /// before reaching the scan is diagnosable rather than a silent no-op.
     fn is_unpopulated(&self) -> bool {
         self.completed_instants.is_empty() && self.archived_boundary.is_none()
     }
@@ -164,17 +164,16 @@ pub fn forward_scan_pass1(
         instant_range.is_some(),
     );
 
-    // The completion gate was supplied (table version < 8 snapshot) but carries no positive
-    // completion info — its inputs were not populated across the FFI boundary. Rather than
-    // silently degrade to admit-all (Gate 3 becomes a no-op, so a straddling uncommitted delta
-    // could be merged), warn once so the mis-wire is diagnosable. Behavior is unchanged (still
-    // fail-open); this only makes the condition visible.
+    // The completion gate was supplied but carries no positive completion info — the caller
+    // passed the struct with empty sets. Rather than silently degrade to admit-all (Gate 3
+    // becomes a no-op, so a straddling uncommitted delta could be merged), warn so the mis-wire
+    // is diagnosable. Behavior is unchanged (still fail-open); this only makes it visible.
     if completion_gate.is_some_and(CompletionGate::is_unpopulated) {
         log::warn!(
             "[Pass1] completion gate supplied but unpopulated (empty completed set, no archived \
-             boundary): Gate 3 (C-INFLIGHT) admits all delta blocks. A table version < 8 snapshot \
-             always has >= 1 completed instant, so this indicates the gate inputs were dropped \
-             across the FFI boundary. latest_instant_time={latest_instant_time}"
+             boundary): Gate 3 admits all delta blocks. A readable table always has >= 1 \
+             completed instant, so this indicates the gate inputs were dropped between the \
+             timeline and this scan. latest_instant_time={latest_instant_time}"
         );
     }
 
@@ -449,9 +448,9 @@ pub struct BaseHoodieLogRecordReader {
     pub allow_inflight_instants: bool,
     /// Inputs for the Gate-3 completed/inflight check. `Some` only for
     /// table version < 8 (v1 timeline layout); `None` for v8+ and when no timeline is available,
-    /// in which case Gate 3 is a no-op. Populated by the builder / FFI wiring from the active
-    /// timeline (completed + inflight instant sets + the first active instant).
-    pub completion_gate_inputs: Option<CompletionGateInputs>,
+    /// in which case Gate 3 is a no-op. Populated by `Table` from the active timeline
+    /// (completed + pending instant sets + the first active instant).
+    pub completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 
     // ── Stats / state (mirrors Java's AtomicLong counters + progress) ──
     pub valid_block_instants: Vec<String>,
@@ -536,10 +535,11 @@ impl BaseHoodieLogRecordReader {
         });
 
         // Pass 1: Forward scan with 5 gates. The completed/inflight gate (Gate 3)
-        // is applied only when the timeline sets were supplied (table version < 8).
+        // is applied when the caller supplied the timeline sets — a `Table` read of a
+        // table below version 8. A v8+ read, or a caller with no timeline, leaves it a no-op.
         let completion_gate = self
             .completion_gate_inputs
-            .as_ref()
+            .as_deref()
             .map(CompletionGate::new);
         let mut pass1 = forward_scan_pass1(
             all_blocks,
@@ -855,7 +855,7 @@ mod tests {
         assert_eq!(result.ordered_instants_list, vec!["20250101000000000"]);
     }
 
-    /// Table version < 8: an UNCOMMITTED "straddling" instant -- one whose
+    /// An UNCOMMITTED "straddling" instant -- one whose
     /// time is BELOW the latest completed instant (the high-watermark) and which has NO in-log
     /// rollback command block (a pending/failed write, or a concurrent writer's inflight commit) --
     /// must be EXCLUDED (not merged) once the completed/inflight sets are supplied.
@@ -901,10 +901,10 @@ mod tests {
         );
     }
 
-    /// Without the completion gate (v8+ tables, or no timeline available) Gate 3 is a no-op, so the
-    /// straddling instant is still admitted -- proving the fix is scoped to table version < 8 and is
-    /// purely additive (prior callers pass `None` and see unchanged behavior). v8+ safety is
-    /// enforced elsewhere: per-delta-commit log files are excluded at the completion-time file-slice
+    /// Without the completion gate -- a v8+ read, or a caller with no timeline (the cxx bridge)
+    /// -- Gate 3 is a no-op, so the straddling instant is still admitted, proving the gate is
+    /// purely additive and that such callers see unchanged behavior. On v8+ that is safe for a
+    /// separate reason: per-delta-commit log files are dropped at the completion-time file-slice
     /// level, so the same block never reaches Pass 1.
     #[test]
     fn test_pass1_gate3_absent_gate_admits_straddling_instant() {
@@ -920,6 +920,44 @@ mod tests {
         assert_eq!(
             result.ordered_instants_list,
             vec!["20250101", "20250102", "20250103"]
+        );
+    }
+
+    /// Where the gate is supplied it applies to incremental reads too, not just snapshots, so it
+    /// has to COMPOSE with Gate 4's window rather than widen it. Two claims are pinned here: a
+    /// pending instant inside the incremental window is still excluded (Gate 3 applies even though
+    /// a range is set), and a committed instant outside the window stays excluded (Gate 3 admitting
+    /// it cannot override Gate 4). Together they show the gate only ever subtracts, so arming it
+    /// on a read never costs rows that read should have seen.
+    #[test]
+    fn test_pass1_gate3_and_the_incremental_window_only_ever_subtract() {
+        let blocks = vec![
+            make_data_block("20250101000000000"), // committed, inside the window
+            make_data_block("20250102000000000"), // PENDING, inside the window
+            make_data_block("20250104000000000"), // committed, outside the window
+        ];
+        let range = Some(InstantRange::up_to("20250103000000000", "utc"));
+
+        let gate_inputs = CompletionGateInputs {
+            completed_instants: [
+                "20250101000000000".to_string(),
+                "20250104000000000".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+            inflight_instants: ["20250102000000000".to_string()].into_iter().collect(),
+            archived_boundary: None,
+        };
+        let gate = CompletionGate::new(&gate_inputs);
+
+        let result =
+            forward_scan_pass1(blocks, MAX_INSTANT_TIME, &range, "utc", Some(&gate)).unwrap();
+
+        assert_eq!(
+            result.ordered_instants_list,
+            vec!["20250101000000000"],
+            "pending 20250102 excluded by Gate 3 despite being in range; \
+             committed 20250104 excluded by Gate 4 despite Gate 3 admitting it"
         );
     }
 
@@ -1787,6 +1825,48 @@ mod tests {
         assert!(
             !kv.iter().any(|(k, _)| k == "2"),
             "inflight straddling delta t1 (id=2) must be excluded"
+        );
+    }
+
+    /// REGRESSION: a block from an instant that never completed is admitted when
+    /// no completion gate is supplied, and skipped when one is.
+    ///
+    /// This is the "straddling" case: writer A opens an instant at T1 and is
+    /// still inflight when writer B commits T2 > T1. `latest_instant_time` is
+    /// T2, so A's blocks pass the future gate and the instant-range gate, and
+    /// nothing else looks at whether A ever committed. The log file itself was
+    /// admitted at listing time on its own (committed) instant, so the
+    /// file-level check does not see these blocks either.
+    ///
+    /// The pair is the point: same blocks, same bounds, gate absent vs present.
+    #[test]
+    fn test_pass1_admits_an_uncommitted_instant_without_the_completion_gate() {
+        let blocks = vec![make_data_block("T1_inflight"), make_data_block("T2_done")];
+
+        // No gate — what every production read did before the gate was wired.
+        let ungated = forward_scan_pass1(blocks.clone(), "T2_done", &None, "UTC", None).unwrap();
+        assert!(
+            ungated.instant_to_blocks_map.contains_key("T1_inflight"),
+            "without a gate an inflight instant's blocks are merged: {:?}",
+            ungated.ordered_instants_list
+        );
+
+        // With the timeline's own sets, the inflight instant is excluded.
+        let inputs = CompletionGateInputs {
+            completed_instants: HashSet::from(["T2_done".to_string()]),
+            inflight_instants: HashSet::from(["T1_inflight".to_string()]),
+            archived_boundary: Some("T0".to_string()),
+        };
+        let gate = CompletionGate::new(&inputs);
+        let gated = forward_scan_pass1(blocks, "T2_done", &None, "UTC", Some(&gate)).unwrap();
+
+        assert!(
+            !gated.instant_to_blocks_map.contains_key("T1_inflight"),
+            "the gate must skip an instant that never completed"
+        );
+        assert!(
+            gated.instant_to_blocks_map.contains_key("T2_done"),
+            "the committed instant must still be merged"
         );
     }
 }

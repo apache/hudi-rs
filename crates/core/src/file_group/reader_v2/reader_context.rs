@@ -31,6 +31,7 @@ use crate::config::table::HudiTableConfig;
 use crate::storage::RowFilterBuilder;
 use crate::timeline::selector::InstantRange;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// Owned inputs for the Gate-3 completed/inflight check in the log scan.
 ///
@@ -51,6 +52,12 @@ pub struct CompletionGateInputs {
     /// Active completed-commit instant times (Java `filterCompletedInstants()`).
     pub completed_instants: HashSet<String>,
     /// Active inflight/requested instant times (Java `filterInflights()`).
+    ///
+    /// Carried for parity with Java's two-set check; it cannot change an outcome for the
+    /// producer in this crate. `Table` subtracts the completed set when building this one, and
+    /// the archived boundary is the minimum over *all* active instants including these — so an
+    /// instant listed here fails the committed test already, and the `!inflight` term never
+    /// decides anything. A different producer, supplying sets that overlap, would need it.
     pub inflight_instants: HashSet<String>,
     /// First active-timeline instant. An instant strictly before it is archived; archival only
     /// removes completed instants, so an archived instant is committed. `None` disables the
@@ -149,12 +156,17 @@ pub struct ReaderContext {
     /// the FG reader).
     pub mor_pk_safe: bool,
     /// Gate-3 completed/inflight inputs (completed/inflight/archived sets).
-    /// Carried here mirroring [`Self::instant_range`]; `Some` only for table
-    /// version < 8 snapshot reads (set by the FFI bridge when the planner
-    /// enabled the gate), `None` otherwise (v8+/incremental/no-timeline) which
-    /// leaves Gate 3 a no-op, preserving prior behavior. Consumed by the log
+    /// Carried here mirroring [`Self::instant_range`]. `Some` only when the caller holds a
+    /// timeline *and* the table version is below 8 — see
+    /// [`crate::table::Table::completion_gate_inputs`]. `None` otherwise: for v8+, where the
+    /// whole log file is dropped at slice-build time, and for a caller handed bare paths with
+    /// no timeline (the cxx bridge). Either way Gate 3 becomes a no-op. Consumed by the log
     /// scan builder in `buffer::loader::scan_log_files`.
-    pub completion_gate_inputs: Option<CompletionGateInputs>,
+    ///
+    /// Not scoped to snapshot reads, though: the gate only ever EXCLUDES blocks whose instant
+    /// is pending, so it holds for incremental reads too and cannot admit a block another gate
+    /// rejected.
+    pub completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 }
 
 // Manual Debug — RowFilterBuilder is a closure (Arc<dyn Fn ...>), not Debug.

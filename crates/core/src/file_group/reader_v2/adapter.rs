@@ -36,6 +36,7 @@ use crate::error::CoreError;
 use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
 use crate::file_group::reader_v2::input_split::InputSplit;
+use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use crate::file_group::reader_v2::resolver::resolve_reader_context;
 use crate::storage::Storage;
@@ -56,6 +57,7 @@ pub(crate) async fn read_file_slice(
     log_file_paths: Vec<String>,
     partition_path: String,
     data_schema: Option<SchemaRef>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<RecordBatch> {
     let mut reader = build_reader(
         hudi_configs,
@@ -64,6 +66,7 @@ pub(crate) async fn read_file_slice(
         log_file_paths,
         partition_path,
         data_schema,
+        completion_gate_inputs,
     )?;
 
     reader.read().await
@@ -81,6 +84,7 @@ pub(crate) async fn read_file_slice_stream(
     log_file_paths: Vec<String>,
     partition_path: String,
     data_schema: Option<SchemaRef>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
     let mut reader = build_reader(
         hudi_configs,
@@ -89,6 +93,7 @@ pub(crate) async fn read_file_slice_stream(
         log_file_paths,
         partition_path,
         data_schema,
+        completion_gate_inputs,
     )?;
 
     reader.open_blocking_stream().await
@@ -103,10 +108,15 @@ fn build_reader(
     log_file_paths: Vec<String>,
     partition_path: String,
     data_schema: Option<SchemaRef>,
+    completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
     let hudi_configs = with_unbounded_end_timestamp(hudi_configs);
     let mut context = resolve_reader_context(&hudi_configs, has_log_files)?;
+    // The scan's committed/inflight gate. Supplied by a caller holding the
+    // timeline; `None` leaves the gate a no-op, which is what a caller reading
+    // from paths alone (the cxx bridge) can offer.
+    context.completion_gate_inputs = completion_gate_inputs;
     context.rebuild_record_context(partition_path.clone());
 
     // A slice with no base file reports an empty path; the engine keys its

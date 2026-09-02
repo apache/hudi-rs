@@ -107,6 +107,7 @@ use crate::error::CoreError;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
+use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::keygen::is_timestamp_based_keygen;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
@@ -669,9 +670,56 @@ impl Table {
             Some(opts) => self.prepare_reader_options(opts)?.hudi_options,
             None => HashMap::new(),
         };
-        let mut reader = self.build_file_group_reader(hudi_opts, extra_storage_overrides)?;
+        let reader = self.build_file_group_reader(hudi_opts, extra_storage_overrides)?;
+        self.finish_reader(reader).await
+    }
+
+    /// Carry this table's per-read state onto a freshly built reader.
+    ///
+    /// Every read path needs the same two steps, and a path performing only some
+    /// of them fails silently rather than loudly: without the data schema an
+    /// evolved table reads against the base file's, and without the gate inputs
+    /// the log scan admits uncommitted blocks. Both return plausible rows. So the
+    /// steps live here and each path calls this rather than repeating them.
+    async fn finish_reader(&self, mut reader: FileGroupReader) -> Result<FileGroupReader> {
         reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
+        // This table holds the timeline, so it can tell a committed instant from
+        // one still inflight — the log-block scan cannot work that out from the
+        // slice alone.
+        if let Some(inputs) = self.completion_gate_inputs()? {
+            reader.set_completion_gate_inputs(inputs);
+        }
         Ok(reader)
+    }
+
+    /// Inputs for the log-block scan's completed/inflight gate, or `None` when
+    /// this table does not need one.
+    ///
+    /// Mirrors Java `BaseHoodieLogRecordReader`, which runs the check only below
+    /// table version 8 (`tableVersion.lesserThan(HoodieTableVersion.EIGHT)`).
+    /// From version 8 the timeline records completion times, so a log file whose
+    /// delta commit never completed is already dropped when the file slice is
+    /// built, and asking again per block would be redundant. Below version 8
+    /// there are no completion times to build a slice from, which leaves the
+    /// block scan as the only place the question can be asked.
+    ///
+    /// So from version 8 the exclusion rests entirely on the log file's *name*
+    /// carrying the delta commit that wrote it (`file_group::builder`). A table
+    /// upgraded from version 6 would seem to break that, since a version-6
+    /// writer names log files on the base instant — but the writer's upgrade
+    /// closes it from the other side, two ways: it rolls back failed writes and
+    /// compacts every log file into a new base file before bumping the version,
+    /// and where the pending commit has completed commits after it, rollback is
+    /// refused and the upgrade aborts rather than proceeding. Either way no
+    /// version-6-named log file reaches a version-8 slice. Verified by running
+    /// both paths on Spark 3.5.3 with Hudi 1.2.0-SNAPSHOT.
+    fn completion_gate_inputs(&self) -> Result<Option<CompletionGateInputs>> {
+        let table_version: isize = self
+            .hudi_configs
+            .try_get(HudiTableConfig::TableVersion)?
+            .map(|v| v.into())
+            .unwrap_or(6);
+        Ok((table_version < 8).then(|| self.timeline.completion_gate_inputs()))
     }
 
     /// Build a reader for one of this table's own read paths, carrying the
@@ -681,12 +729,11 @@ impl Table {
     /// performed only the first would read an evolved table with a stale schema —
     /// so they share this rather than repeating it.
     async fn reader_for_read_path(&self, prepared: &ReadOptions) -> Result<FileGroupReader> {
-        let mut reader = self.build_file_group_reader(
+        let reader = self.build_file_group_reader(
             prepared.hudi_options.clone(),
             std::iter::empty::<(&str, &str)>(),
         )?;
-        reader.set_data_schema(std::sync::Arc::new(self.data_schema_for_read().await?));
-        Ok(reader)
+        self.finish_reader(reader).await
     }
 
     /// Convert caller-facing [`ReadOptions`] into the form that
@@ -1801,6 +1848,57 @@ mod tests {
         Ok(())
     }
 
+    /// The streaming read carries the completion gate too.
+    ///
+    /// It reaches the gate through its own pass-through, separate from the eager read's, and
+    /// it is the path DataFusion and the Python binding use. The gold sweep only exercises
+    /// the eager one, so without this a regression that disarmed the gate for every streaming
+    /// read would leave the whole suite green — which is exactly what a mutation of the
+    /// streaming pass-through did before this test existed.
+    ///
+    /// The fixture's orphaned delta commit sets `rider = 'ORPHANED-B'` at `ts = 300`, above
+    /// every other row's ordering value, so an admitted orphan wins the row outright rather
+    /// than losing the merge for an unrelated reason.
+    #[tokio::test]
+    async fn hudi_table_read_stream_excludes_an_uncommitted_instants_blocks() -> Result<()> {
+        use arrow_array::Array;
+        use futures::TryStreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        let base_url = QuickstartTripsTable::MorUncommittedLogV6.url_to_mor_avro();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+
+        let stream = hudi_table.read_stream(&ReadOptions::new()).await.unwrap();
+        let batches = stream.try_collect::<Vec<_>>().await.unwrap();
+
+        let riders: Vec<String> = batches
+            .iter()
+            .filter_map(|b| b.column_by_name("rider").cloned())
+            .flat_map(|c| {
+                let arr = c
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .expect("rider is a string column")
+                    .clone();
+                (0..arr.len()).map(move |i| arr.value(i).to_string())
+            })
+            .collect();
+
+        assert!(
+            !riders.is_empty(),
+            "the streaming read returned no rows, so it cannot show the gate ran"
+        );
+        assert!(
+            !riders.iter().any(|r| r == "ORPHANED-B"),
+            "the streaming read merged a block from an instant that never completed: {riders:?}"
+        );
+        assert!(
+            riders.iter().any(|r| r == "rider-B"),
+            "the base row the orphan would have overwritten must survive: {riders:?}"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn hudi_table_read_snapshot_stream_returns_empty_when_no_file_slices_match_filters()
     -> Result<()> {
@@ -2395,6 +2493,70 @@ mod tests {
     /// fixture rather than a reproduction of the one input that broke: the bound
     /// is an instant the timeline actually contains, so it parses by
     /// construction.
+    /// Regression test: a table-built reader carries the timeline's
+    /// committed/inflight sets, so the log-block scan can gate on them.
+    ///
+    /// The gate exists to skip blocks from an instant that never completed — the
+    /// straddling case where a writer is still inflight when a later one
+    /// commits, so its blocks sort below the latest instant and pass every other
+    /// gate. It was inert for every read through this crate because nothing
+    /// populated its inputs.
+    #[tokio::test]
+    async fn test_table_reader_carries_the_completion_gate_inputs() {
+        use hudi_test::SampleTable;
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let table = Table::new(base_url.path()).await.unwrap();
+
+        let inputs = table.timeline.completion_gate_inputs();
+        assert!(
+            !inputs.completed_instants.is_empty(),
+            "the fixture's completed commits must reach the gate"
+        );
+        assert!(
+            inputs.archived_boundary.is_some(),
+            "the archival boundary is the gate's second half — an archived \
+             instant is committed by definition"
+        );
+
+        // And the reader the read paths use actually receives them.
+        let reader = table
+            .create_file_group_reader_with_options(None, empty_options())
+            .await
+            .unwrap();
+        assert!(
+            reader.has_completion_gate_inputs(),
+            "a reader built from a table must be able to gate the log scan"
+        );
+    }
+
+    /// From table version 8 the timeline records completion times, so a log file
+    /// whose delta commit never completed is already dropped when the file slice
+    /// is built. Java stops applying the per-block gate there
+    /// (`BaseHoodieLogRecordReader`, `tableVersion.lesserThan(EIGHT)`), and so
+    /// does this. Paired with the version-6 test above, the two pin the
+    /// condition rather than only the armed case.
+    #[tokio::test]
+    async fn test_completion_gate_is_not_armed_from_table_version_eight() {
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::V9MorNonpart3Commits.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        assert!(
+            table.completion_gate_inputs().unwrap().is_none(),
+            "a version 9 table must not arm the per-block gate"
+        );
+
+        let reader = table
+            .create_file_group_reader_with_options(None, empty_options())
+            .await
+            .unwrap();
+        assert!(
+            !reader.has_completion_gate_inputs(),
+            "the slice already excludes an uncommitted log file on this layout"
+        );
+    }
+
     #[tokio::test]
     async fn test_resolve_incremental_window_start_bound_is_a_real_instant() {
         use crate::config::internal::HudiInternalConfig;
