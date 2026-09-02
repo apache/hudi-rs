@@ -130,9 +130,11 @@ pub struct ReaderContext {
     /// parquet files and parquet-format log blocks. Set by the FFI bridge from
     /// the decoded substrait predicate; `None` when no predicate was pushed.
     ///
-    /// Whether it actually gets installed is gated by [`Self::mor_pk_safe`] +
-    /// table type (see callers in `file_group::reader::HoodieFileGroupReader`
-    /// and `file_group::log_file::content::Decoder`).
+    /// Whether it actually gets installed is gated by whether the read merges:
+    /// `HoodieFileGroupReader::base_read_pushdown_is_safe` for the base file
+    /// (no log files on the split, or [`Self::mor_pk_safe`]), and
+    /// [`Self::mor_pk_safe`] alone for a parquet log block, which by definition
+    /// only exists on a slice that does merge.
     ///
     /// **Not active for reads through this crate.**
     /// [`resolve_reader_context`](crate::file_group::reader_v2::resolver::resolve_reader_context)
@@ -325,76 +327,11 @@ impl ReaderContext {
             completion_gate_inputs: None,
         }
     }
-
-    /// Returns true iff the table is COPY_ON_WRITE per `hoodie.table.type`.
-    /// Defaults to `false` (treat as MOR) on missing/unparseable values so
-    /// callers err on the side of NOT pushing predicates down.
-    pub fn is_cow(&self) -> bool {
-        use crate::config::table::TableTypeValue;
-        use std::str::FromStr;
-        self.table_config
-            .get("hoodie.table.type")
-            .and_then(|v| TableTypeValue::from_str(v).ok())
-            .map(|t| matches!(t, TableTypeValue::CopyOnWrite))
-            .unwrap_or(false)
-    }
-
-    /// Returns true iff this context allows installing the parquet `RowFilter`
-    /// for the current scan. Either the table is CoW (the merge can't flip
-    /// predicate outcomes) or the filter is PK-safe (PKs are immutable across
-    /// upserts, so the predicate's outcome is stable across the base+log
-    /// merge). Mirrors the gate Java applies via the `morFilters`/`allFilters`
-    /// selection in `SparkFileFormatInternalRowReaderContext`.
-    pub fn can_push_row_filter(&self) -> bool {
-        self.is_cow() || self.mor_pk_safe
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ctx_with_table_type(t: &str) -> ReaderContext {
-        let mut ctx = ReaderContext::empty();
-        ctx.table_config
-            .insert("hoodie.table.type".to_string(), t.to_string());
-        ctx
-    }
-
-    #[test]
-    fn is_cow_true_for_copy_on_write() {
-        assert!(ctx_with_table_type("COPY_ON_WRITE").is_cow());
-    }
-
-    #[test]
-    fn is_cow_false_for_merge_on_read() {
-        assert!(!ctx_with_table_type("MERGE_ON_READ").is_cow());
-    }
-
-    #[test]
-    fn is_cow_false_when_table_type_missing() {
-        // Defaults to MOR (conservative) so non-PK predicates don't sneak in.
-        assert!(!ReaderContext::empty().is_cow());
-    }
-
-    #[test]
-    fn can_push_row_filter_cow_unconditionally() {
-        // CoW: pushdown is always safe regardless of mor_pk_safe.
-        let mut ctx = ctx_with_table_type("COPY_ON_WRITE");
-        ctx.mor_pk_safe = false;
-        assert!(ctx.can_push_row_filter());
-        ctx.mor_pk_safe = true;
-        assert!(ctx.can_push_row_filter());
-    }
-
-    #[test]
-    fn can_push_row_filter_mor_only_when_pk_safe() {
-        let mut ctx = ctx_with_table_type("MERGE_ON_READ");
-        ctx.mor_pk_safe = false;
-        assert!(!ctx.can_push_row_filter());
-        ctx.mor_pk_safe = true;
-        assert!(ctx.can_push_row_filter());
-    }
 
     #[test]
     fn record_key_fields_from_default_meta_field_mode() {

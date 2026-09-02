@@ -867,7 +867,12 @@ impl BaseHoodieLogRecordReader {
         // for cannot change what the requested keys merge to, and dropping it before
         // the Avro decode is the whole saving.
         .with_key_predicate(self.reader_context.key_predicate.clone())
-        .with_row_filter(if self.reader_context.can_push_row_filter() {
+        // The log gate is `mor_pk_safe` and nothing else. A log block only exists
+        // when the slice HAS log files, so the base read's "does this merge?"
+        // disjunct is false here by construction and its condition reduces to
+        // exactly this. Naming it directly says what the log path requires,
+        // instead of relying on a base-read predicate to collapse the same way.
+        .with_row_filter(if self.reader_context.mor_pk_safe {
             self.reader_context.row_filter_builder.clone()
         } else {
             None

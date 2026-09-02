@@ -134,7 +134,7 @@ pub struct RowFilterSpec {
     /// `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`:
     /// only record-key filters are safe to push under merge, because PKs are
     /// immutable across upserts. Sets `builder.with_mor_pk_safe`; the reader's
-    /// per-split gate (`can_push_row_filter_for_split`) decides whether the
+    /// per-split gate (`base_read_pushdown_is_safe`) decides whether the
     /// filter is actually installed on the base parquet + parquet log blocks —
     /// a slice with no log files pushes whatever this says, because nothing
     /// merges.
@@ -772,7 +772,7 @@ async fn read_case_with_filter(
     // here. Every fixture these cases read is a MERGE_ON_READ table, and that is
     // what goes in — a base-only slice of one is no longer declared
     // COPY_ON_WRITE to unlock pushdown. The reader decides that per split now
-    // (`can_push_row_filter_for_split`): no log files, no merge, so nothing can
+    // (`base_read_pushdown_is_safe`): no log files, no merge, so nothing can
     // flip a predicate's outcome. Faking the table type would hide whether that
     // decision works.
     reader_context.table_config.insert(

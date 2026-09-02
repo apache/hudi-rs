@@ -1307,10 +1307,10 @@ fg_case_test!(
 // Java contract (SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey):
 //   - PK-safe filters (record-key columns) may be pushed under MOR merge.
 //   - Data-column filters may be pushed only on the CoW path (no log files).
-//   - The gate `can_push_row_filter_for_split() = no log files on the split ||
-//     is_cow() || mor_pk_safe` blocks unsafe pushes; when blocked, ALL rows
-//     return and the post-merge filter (above the FG reader, e.g. Velox/Spark)
-//     evaluates the predicate.
+//   - The gate `base_read_pushdown_is_safe() = no log files on the split ||
+//     mor_pk_safe` blocks unsafe pushes; when blocked, ALL rows return and the
+//     post-merge filter (above the FG reader, e.g. Velox/Spark) evaluates the
+//     predicate.
 //
 // Record-key format for V9Mor8I4UCommitTime: plain id value ("1", "2", ...)
 // (verified by reading the sf base parquet's _hoodie_record_key column).
@@ -1441,8 +1441,7 @@ fg_case_test!(
 // (5) NEGATIVE gate case: data-column filter under MOR merge with
 // mor_pk_safe=false. `age` Gt "27" — pushing this under merge could DROP a
 // base row (Bob, age 25) whose log update might later have made it match, so
-// the gate (no log files = false, is_cow() = false, mor_pk_safe = false)
-// BLOCKS the push. The post-merge filter (above the FG reader) is responsible instead, so
+// the gate (no log files = false, mor_pk_safe = false) BLOCKS the push. The post-merge filter (above the FG reader) is responsible instead, so
 // the FG reader returns ALL merged rows: Alice-V2(31) AND Bob(25).
 // (Unsafe because the predicate evaluated on BASE values can disagree with post-merge values for
 // the same key: a log update may change the column so a pruned base row would have matched after
