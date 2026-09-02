@@ -659,6 +659,23 @@ impl HoodieFileGroupReader {
         ))
     }
 
+    /// Whether the pushed predicate may be applied during the base read of
+    /// **this** split.
+    ///
+    /// [`ReaderContext::can_push_row_filter`] answers the table-level question
+    /// (CoW, or MOR whose predicate is confined to immutable primary keys).
+    /// This adds the split-level one: a slice with **no log files** has no
+    /// merge, so there are no log records to supersede a base row and no delete
+    /// blocks to remove one — nothing can flip a predicate's outcome, whatever
+    /// the table type says. CoW is really just the table-wide case of this.
+    ///
+    /// Without it, a MOR table whose predicate is not primary-key-safe loses
+    /// pushdown on every base-only slice: the base read returns whole columns
+    /// for a post-merge filter to discard, having read every byte of them.
+    fn can_push_row_filter_for_split(&self) -> bool {
+        self.reader_context.can_push_row_filter() || !self.input_split.has_log_files()
+    }
+
     /// Whether this read should merge base + log records by base-file row
     /// position (rather than by record key). Mirrors Java
     /// `HoodieFileGroupReader`'s `setShouldMergeUseRecordPosition`:
@@ -735,14 +752,16 @@ impl HoodieFileGroupReader {
         }
 
         // gate parquet RowFilter pushdown.
+        //   No log files on this split: always safe (nothing merges).
         //   CoW: always safe (no merge).
-        //   MOR: safe ONLY when every column referenced by the filter is a
-        //        primary key (PKs are immutable across upserts, so the predicate
-        //        outcome doesn't change post-merge — `reader_context.mor_pk_safe`,
-        //        mirroring Java's `filterIsSafeForPrimaryKey`).
+        //   MOR with log files: safe ONLY when every column referenced by the
+        //        filter is a primary key (PKs are immutable across upserts, so
+        //        the predicate outcome doesn't change post-merge —
+        //        `reader_context.mor_pk_safe`, mirroring Java's
+        //        `filterIsSafeForPrimaryKey`).
         //   Otherwise: drop the filter; the post-merge filter (Velox/Spark above
         //        the FG reader) evaluates the predicate after base+log merge.
-        let row_filter = if self.reader_context.can_push_row_filter() {
+        let row_filter = if self.can_push_row_filter_for_split() {
             self.reader_context.row_filter_builder.clone()
         } else {
             if self.reader_context.row_filter_builder.is_some() {
@@ -1638,6 +1657,66 @@ mod tests {
         assert!(
             !reader.reader_context.can_push_row_filter(),
             "MOR without PK-safety must NOT push (mirrors Java's morFilters gate)"
+        );
+    }
+
+    /// The split-level gate. A MOR slice with no log files has no merge, so the
+    /// predicate is safe to push even when the table-level gate says no.
+    /// Parameterized over both `mor_pk_safe` values so the split rule is shown
+    /// to be independent of PK safety.
+    #[test]
+    fn base_only_mor_slice_allows_pushdown_regardless_of_pk_safety() {
+        for mor_pk_safe in [false, true] {
+            let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+            let reader = HoodieFileGroupReader::builder()
+                .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+                .with_storage(storage)
+                .with_input_split(InputSplit::new(
+                    Some("base.parquet".to_string()),
+                    None,
+                    // No log files => no merge => nothing can flip the predicate.
+                    vec![],
+                    "p1".to_string(),
+                ))
+                .with_row_filter_builder(make_row_filter_builder())
+                .with_mor_pk_safe(mor_pk_safe)
+                .build()
+                .unwrap();
+            assert_eq!(
+                reader.reader_context.can_push_row_filter(),
+                mor_pk_safe,
+                "table-level gate must still follow mor_pk_safe ({mor_pk_safe})"
+            );
+            assert!(
+                reader.can_push_row_filter_for_split(),
+                "base-only slice must push regardless of mor_pk_safe ({mor_pk_safe})"
+            );
+        }
+    }
+
+    /// The split rule must not weaken the real MOR case: with log files present
+    /// the merge can supersede or delete a base row, so a non-PK-safe predicate
+    /// still may not be pushed.
+    #[test]
+    fn mor_slice_with_log_files_still_blocks_pushdown_when_not_pk_safe() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(InputSplit::new(
+                Some("base.parquet".to_string()),
+                None,
+                vec![".log.1".to_string()],
+                "p1".to_string(),
+            ))
+            .with_row_filter_builder(make_row_filter_builder())
+            // mor_pk_safe defaults to false
+            .build()
+            .unwrap();
+        assert!(reader.input_split.has_log_files());
+        assert!(
+            !reader.can_push_row_filter_for_split(),
+            "MOR with log files and no PK safety must NOT push"
         );
     }
 

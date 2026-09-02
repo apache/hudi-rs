@@ -133,10 +133,11 @@ pub struct RowFilterSpec {
     /// Marks the filter PK-safe. Mirrors Java's
     /// `SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey`:
     /// only record-key filters are safe to push under merge, because PKs are
-    /// immutable across upserts. Sets `builder.with_mor_pk_safe`; the
-    /// `can_push_row_filter` gate (`is_cow() || mor_pk_safe`) decides whether
-    /// the filter is actually installed on the base parquet + parquet log
-    /// blocks.
+    /// immutable across upserts. Sets `builder.with_mor_pk_safe`; the reader's
+    /// per-split gate (`can_push_row_filter_for_split`) decides whether the
+    /// filter is actually installed on the base parquet + parquet log blocks —
+    /// a slice with no log files pushes whatever this says, because nothing
+    /// merges.
     pub mor_pk_safe: bool,
 }
 
@@ -766,21 +767,17 @@ async fn read_case_with_filter(
     let mut reader_context = base_reader_context(case, has_log_files);
     reader_context.schema_handler = schema_handler;
 
-    // The `can_push_row_filter` gate is `is_cow() || mor_pk_safe`, and
-    // `is_cow()` reads `hoodie.table.type` from the table_config. The FFI/Spark
-    // path populates this from `hoodie.properties`; the harness's
-    // `ReaderContext::empty()` does not, so set it here to match gold's
-    // pushdown gate. A base-only slice (no log files) is read as COPY_ON_WRITE
-    // (no merge can flip the predicate outcome — the CoW gate branch); a slice
-    // with log files is MERGE_ON_READ (only PK-safe filters may push).
-    let table_type = if has_log_files {
-        "MERGE_ON_READ"
-    } else {
-        "COPY_ON_WRITE"
-    };
+    // `hoodie.table.type` reaches the reader from `hoodie.properties` on the
+    // engine path; the harness's `ReaderContext::empty()` has none, so set it
+    // here. Every fixture these cases read is a MERGE_ON_READ table, and that is
+    // what goes in — a base-only slice of one is no longer declared
+    // COPY_ON_WRITE to unlock pushdown. The reader decides that per split now
+    // (`can_push_row_filter_for_split`): no log files, no merge, so nothing can
+    // flip a predicate's outcome. Faking the table type would hide whether that
+    // decision works.
     reader_context.table_config.insert(
         HudiTableConfig::TableType.as_ref().to_string(),
-        table_type.to_string(),
+        "MERGE_ON_READ".to_string(),
     );
 
     let mut reader = HoodieFileGroupReader::builder()
