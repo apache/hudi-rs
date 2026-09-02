@@ -1875,11 +1875,20 @@ mod tests {
     /// so out loud.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_merged_chunk_is_bounded_by_the_readers_own_batch_size() {
-        assert_eq!(
-            base_read_options(None, false).batch_size,
-            Some(MERGE_CHUNK_ROWS),
-            "the base read must ask for the merge's chunk bound rather than inherit one"
-        );
+        // Every argument combination must carry the pin: the position-merge
+        // read (row-index column attached) and the filtered read bound their
+        // polls by the same argument as the plain one, so a refactor that
+        // branched the builder per arm must not lose it on any branch.
+        for use_position in [false, true] {
+            for filter in [None, Some(make_row_filter_builder())] {
+                assert_eq!(
+                    base_read_options(filter, use_position).batch_size,
+                    Some(MERGE_CHUNK_ROWS),
+                    "the base read must ask for the merge's chunk bound rather than \
+                     inherit one (use_position={use_position})"
+                );
+            }
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
@@ -1917,6 +1926,160 @@ mod tests {
         assert!(
             sizes.len() > 1,
             "5000 rows cannot arrive in one chunk under a {MERGE_CHUNK_ROWS}-row bound"
+        );
+    }
+
+    /// Build a reader over a base file plus one real log file, so the read
+    /// takes the Buffered (merge) path rather than the Eager one. The reader
+    /// schema is the single `_hoodie_record_key` column, which is enough to
+    /// decode the shipped log fixtures and extract keys on both sides.
+    async fn test_file_group_reader_for_merged_slice(
+        dir: &std::path::Path,
+        base_name: &str,
+        log_name: &str,
+        required: SchemaRef,
+    ) -> HoodieFileGroupReader {
+        let base_path = dir.to_str().unwrap().to_string();
+        let hudi_configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref(),
+            base_path,
+        )]));
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs).unwrap();
+
+        let input_split = InputSplit::new(
+            Some(base_name.to_string()),
+            None,
+            vec![log_name.to_string()],
+            String::new(),
+        );
+
+        let mut reader_context = ReaderContext::empty();
+        reader_context.latest_commit_time =
+            crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
+        reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+        // Set on purpose: the knob is documented to size base-file-only slices
+        // and to have NO effect on a merged slice. The chunk assertions in the
+        // test below are what hold that, rather than a one-off measurement.
+        reader_context.hoodie_reader_config.insert(
+            crate::config::read::HudiReadConfig::StreamBatchSize
+                .as_ref()
+                .to_string(),
+            "8192".to_string(),
+        );
+        reader_context.rebuild_record_context(String::new());
+        // The log scan decodes blocks and builds the delete context through the
+        // context's own schema handler, so it needs the prepared one.
+        let mut handler =
+            crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler::new()
+                .with_table_schema(required.clone())
+                .with_data_schema(required.clone());
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &reader_context.table_config,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap();
+        reader_context.schema_handler = handler;
+
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(reader_context),
+            storage,
+            input_split,
+            ReaderParameters::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        reader.schema_handler.required_schema = Some(required);
+        reader
+    }
+
+    /// The chunk bound on the path it exists for: a slice WITH log files.
+    ///
+    /// `test_a_merged_chunk_is_bounded_by_the_readers_own_batch_size` above
+    /// drives the Eager (base-only) arm, so it pins the option and the base
+    /// read but never the Buffered state machine. This one merges a 5000-row
+    /// single-row-group base against a real delete-block log file, so every
+    /// chunk it observes came out of `merge_base_batch`: a state machine that
+    /// coalesced source batches, or a base read that lost the bound only on
+    /// the merge route, fails here and nowhere else.
+    ///
+    /// The fixture's delete keys are trips UUIDs and the base keys are
+    /// synthetic, so nothing matches: every base row survives, the drain has
+    /// nothing to emit, and the chunk cadence is exactly what the machine
+    /// produced. `hoodie.read.stream.batch_size=8192` is set in the reader
+    /// config on purpose — the knob must have no effect on a merged slice.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_chunk_bound_holds_on_a_slice_with_log_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log_name = ".6d3d1d6e-2298-4080-a0c1-494877d6f40a-0_20250618054711154.log.1_0-26-85";
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/log_files/valid_log_delete")
+            .join(log_name);
+        std::fs::copy(&fixture, tmp.path().join(log_name)).unwrap();
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "_hoodie_record_key",
+            arrow_schema::DataType::Utf8,
+            false,
+        )]));
+        let base_rows: usize = 5_000;
+        let keys: Vec<String> = (0..base_rows).map(|i| format!("base-{i:05}")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::StringArray::from(
+                keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))],
+        )
+        .unwrap();
+        let base_name = "one-big-group.parquet";
+        // One row group holding every row, so the file's layout cannot be what
+        // bounds the chunk.
+        write_parquet_file_in_row_groups(tmp.path(), base_name, &batch, base_rows);
+
+        let mut eager = test_file_group_reader_for_merged_slice(
+            tmp.path(),
+            base_name,
+            log_name,
+            schema.clone(),
+        )
+        .await;
+        let expected_total = eager.read().await.unwrap().num_rows();
+        assert_eq!(
+            expected_total, base_rows,
+            "no fixture delete key may collide with a synthetic base key"
+        );
+
+        let mut reader = test_file_group_reader_for_merged_slice(
+            tmp.path(),
+            base_name,
+            log_name,
+            schema.clone(),
+        )
+        .await;
+        let mut stream = reader.open_stream().await.unwrap();
+        let mut sizes: Vec<usize> = Vec::new();
+        while let Some(b) = stream.next().await {
+            sizes.push(b.unwrap().num_rows());
+        }
+        assert_eq!(
+            sizes.iter().sum::<usize>(),
+            expected_total,
+            "the streamed merge must return the same rows as the eager read"
+        );
+        assert!(
+            sizes.iter().all(|n| *n <= MERGE_CHUNK_ROWS),
+            "every merged chunk must respect the bound, got {sizes:?}"
+        );
+        assert!(
+            sizes.len() >= base_rows / MERGE_CHUNK_ROWS,
+            "{base_rows} base rows cannot arrive in {} chunk(s) under a \
+             {MERGE_CHUNK_ROWS}-row bound: {sizes:?}",
+            sizes.len()
         );
     }
 
