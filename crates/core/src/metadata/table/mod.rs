@@ -442,8 +442,13 @@ impl Table {
     /// `self` is the data table; `mdt` its metadata table. Both timelines are
     /// needed, which is why this lives here rather than on either one alone.
     pub(crate) async fn valid_instant_timestamps(&self, mdt: &Table) -> Result<HashSet<String>> {
+        // Java's `datasetPendingInstants`: every action, not only the commit
+        // actions the timeline loads by default. Read once and handed down,
+        // because it costs a listing.
+        let data_pending = self.timeline.all_pending_instant_times().await?;
+
         let mut valid: HashSet<String> = self.valid_from_completed_data_instants();
-        valid.extend(self.valid_from_mdt_delta_commits(mdt));
+        valid.extend(self.valid_from_mdt_delta_commits(mdt, &data_pending));
         valid.extend(Self::valid_from_sentinel_commits(mdt));
 
         // 3. Commits rolled back by the data table's rollbacks and restores.
@@ -491,12 +496,23 @@ impl Table {
     /// whose data instant is still pending is the case where the data write
     /// failed after the metadata write committed, and must not be read — that
     /// exclusion is the whole content of this source.
-    fn valid_from_mdt_delta_commits(&self, mdt: &Table) -> HashSet<String> {
-        let pending = &self.timeline.pending_instants;
+    ///
+    /// `data_pending` is the data table's pending instants across **every**
+    /// action, from [`Timeline::all_pending_instant_times`]. Passed in rather
+    /// than read from `self.timeline.pending_instants`, which covers only
+    /// commit, delta commit and replace commit: a metadata delta commit written
+    /// for a compaction or a clean that then crashed mid-commit leaves a
+    /// `.compaction.inflight` or `.clean.inflight` on the data timeline, and the
+    /// narrow set would admit it where Java excludes it.
+    fn valid_from_mdt_delta_commits(
+        &self,
+        mdt: &Table,
+        data_pending: &HashSet<String>,
+    ) -> HashSet<String> {
         mdt.timeline
             .completed_commits
             .iter()
-            .filter(|i| i.action == Action::DeltaCommit && !pending.contains(&i.timestamp))
+            .filter(|i| i.action == Action::DeltaCommit && !data_pending.contains(&i.timestamp))
             .map(|i| i.timestamp.clone())
             .collect()
     }
@@ -534,43 +550,69 @@ impl Table {
     /// (`getRollbackedCommits`, HoodieTableMetadataUtil:2158). A restore is
     /// several rollbacks, so its commits are the union of theirs.
     ///
-    /// An unreadable instant yields nothing rather than failing the read: a
-    /// rollback we cannot parse should not make the whole table unreadable, and
-    /// the cost is the same conservative exclusion that existed before.
+    /// An instant that cannot be read fails the read, as Java's does. Yielding
+    /// an empty list instead would drop the commits that rollback re-applied
+    /// from the valid set, and the read would then serve listings missing
+    /// their log blocks -- wrong results returned as if they were right, which
+    /// is worse than a read that stops. The one tolerated failure is the same
+    /// one Java tolerates: an unreadable *completed* rollback file, which falls
+    /// back to the plan.
     async fn commits_rolled_back_by(&self, instant: &Instant) -> Result<Vec<String>> {
-        let bytes = match self.timeline.load_instant_bytes(instant).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                log::debug!("rollback instant {} unreadable: {e}", instant.timestamp);
-                return Ok(Vec::new());
-            }
-        };
+        let bytes = self
+            .timeline
+            .load_instant_bytes(instant)
+            .await
+            .map_err(|e| Self::rollback_error(instant, e))?;
 
         match instant.action {
             Action::Restore => Ok(RestoreMetadata::from_avro_bytes(&bytes)
-                .map(|r| r.commits_rolled_back())
-                .unwrap_or_default()),
+                .map_err(|e| Self::rollback_error(instant, e))?
+                .commits_rolled_back()),
             Action::Rollback => {
-                if let Ok(rollback) = RollbackMetadata::from_avro_bytes(&bytes)
-                    && !rollback.commits_rollback.is_empty()
-                {
-                    return Ok(rollback.commits_rollback);
+                match RollbackMetadata::from_avro_bytes(&bytes) {
+                    Ok(rollback) if !rollback.commits_rollback.is_empty() => {
+                        return Ok(rollback.commits_rollback);
+                    }
+                    // Java falls back for exactly these two: a completed file
+                    // that will not parse, and one that parsed to nothing.
+                    Ok(_) => log::warn!(
+                        "rollback {} names no commits; reading its plan instead",
+                        instant.timestamp
+                    ),
+                    Err(e) => log::warn!(
+                        "rollback {} is unreadable ({e}); reading its plan instead",
+                        instant.timestamp
+                    ),
                 }
-                // The completed file was empty or unreadable: the plan names it.
                 let plan = Instant {
                     state: State::Requested,
                     ..instant.clone()
                 };
-                let Ok(plan_bytes) = self.timeline.load_instant_bytes(&plan).await else {
-                    return Ok(Vec::new());
-                };
-                Ok(RollbackPlan::from_avro_bytes(&plan_bytes)
-                    .ok()
-                    .and_then(|p| p.commit_rolled_back().map(|c| vec![c.to_string()]))
+                let plan_bytes = self
+                    .timeline
+                    .load_instant_bytes(&plan)
+                    .await
+                    .map_err(|e| Self::rollback_error(instant, e))?;
+                let plan = RollbackPlan::from_avro_bytes(&plan_bytes)
+                    .map_err(|e| Self::rollback_error(instant, e))?;
+                // A plan that names no instant is a rollback of nothing, not a
+                // failure -- there is simply no commit to re-admit.
+                Ok(plan
+                    .commit_rolled_back()
+                    .map(|c| vec![c.to_string()])
                     .unwrap_or_default())
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    /// Java raises `HoodieMetadataException` here; this is its counterpart.
+    fn rollback_error(instant: &Instant, source: impl std::fmt::Display) -> CoreError {
+        CoreError::MetadataTable(format!(
+            "Error retrieving the commits rolled back by {} {}: {source}",
+            instant.action.as_ref(),
+            instant.timestamp
+        ))
     }
 }
 
@@ -1238,12 +1280,10 @@ mod tests {
 
         // Source 2 — every metadata delta commit whose data instant is not
         // pending, and none whose data instant is.
-        let from_mdt = data_table.valid_from_mdt_delta_commits(mdt);
+        let data_pending = data_table.timeline.all_pending_instant_times().await?;
+        let from_mdt = data_table.valid_from_mdt_delta_commits(mdt, &data_pending);
         for instant in &mdt.timeline.completed_commits {
-            let pending = data_table
-                .timeline
-                .pending_instants
-                .contains(&instant.timestamp);
+            let pending = data_pending.contains(&instant.timestamp);
             let is_delta = instant.action == Action::DeltaCommit;
             assert_eq!(
                 from_mdt.contains(&instant.timestamp),
@@ -1263,7 +1303,7 @@ mod tests {
     /// pending set is injected here so the branch has an input that reaches it.
     #[tokio::test]
     async fn source_two_excludes_a_metadata_commit_whose_data_instant_is_pending() -> Result<()> {
-        let mut data_table = get_data_table().await;
+        let data_table = get_data_table().await;
         let mdt_owned = data_table.new_metadata_table().await?;
 
         let victim = mdt_owned
@@ -1274,19 +1314,99 @@ mod tests {
             .map(|i| i.timestamp.clone())
             .expect("the fixture must have a completed metadata delta commit");
 
+        let none_pending = HashSet::new();
         assert!(
             data_table
-                .valid_from_mdt_delta_commits(&mdt_owned)
+                .valid_from_mdt_delta_commits(&mdt_owned, &none_pending)
                 .contains(&victim),
             "with nothing pending, {victim} must be included — or the next assertion proves nothing"
         );
 
-        data_table.timeline.pending_instants.insert(victim.clone());
+        let pending = HashSet::from([victim.clone()]);
         assert!(
             !data_table
-                .valid_from_mdt_delta_commits(&mdt_owned)
+                .valid_from_mdt_delta_commits(&mdt_owned, &pending)
                 .contains(&victim),
             "{victim} has a pending data instant and must be excluded"
+        );
+        Ok(())
+    }
+
+    /// The exclusion must see a data instant pending under an action the
+    /// timeline does not load by default.
+    ///
+    /// This is the case the narrow `Timeline::pending_instants` misses. The
+    /// metadata table commits a delta commit for a data compaction; the
+    /// compaction then crashes, leaving `{ts}.compaction.inflight` and no
+    /// completed file on the data timeline. Java's `filterInflightsAndRequested()`
+    /// runs over the whole active timeline and excludes that delta commit. A
+    /// view built from commit/deltacommit/replacecommit alone cannot represent a
+    /// `compaction` at all, so it sees nothing pending and admits it.
+    ///
+    /// The instant is one the fixture does not have, and is written only as a
+    /// *metadata* delta commit — so no other source can supply it and the
+    /// exclusion is the only thing the assertion can be measuring.
+    #[tokio::test]
+    async fn source_two_excludes_a_data_instant_pending_under_a_non_commit_action() -> Result<()> {
+        let src = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let src_root = std::path::Path::new(src.trim_start_matches("file://"));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("table");
+        copy_tree(src_root, &root);
+
+        // A metadata delta commit for a data compaction, at an instant the
+        // fixture does not otherwise use.
+        const COMPACTION_TS: &str = "20260101000000000";
+        std::fs::write(
+            root.join(format!(
+                ".hoodie/metadata/.hoodie/timeline/{COMPACTION_TS}_{COMPACTION_TS}.deltacommit"
+            )),
+            b"",
+        )
+        .unwrap();
+
+        let table = Table::new(root.to_str().unwrap()).await?;
+        let mdt = table.get_or_init_metadata_table().await?;
+
+        // The premise: with no pending data instant, source 2 admits it. Without
+        // this the exclusion below could be passing for any other reason.
+        assert!(
+            table
+                .valid_instant_timestamps(mdt)
+                .await?
+                .contains(COMPACTION_TS),
+            "{COMPACTION_TS} must start out valid, or the assertion below proves nothing"
+        );
+
+        // Now the data-side compaction that never completed.
+        std::fs::write(
+            root.join(format!(
+                ".hoodie/timeline/{COMPACTION_TS}.compaction.inflight"
+            )),
+            b"",
+        )
+        .unwrap();
+
+        let table = Table::new(root.to_str().unwrap()).await?;
+        let mdt = table.get_or_init_metadata_table().await?;
+        assert!(
+            table
+                .timeline
+                .all_pending_instant_times()
+                .await?
+                .contains(COMPACTION_TS),
+            "a .compaction.inflight must register as pending"
+        );
+        assert!(
+            !table.timeline.pending_instants.contains(COMPACTION_TS),
+            "the commit-action-only set must NOT see it — that is the gap this covers"
+        );
+        assert!(
+            !table
+                .valid_instant_timestamps(mdt)
+                .await?
+                .contains(COMPACTION_TS),
+            "{COMPACTION_TS} has a pending data compaction and must be excluded"
         );
         Ok(())
     }
@@ -1339,10 +1459,13 @@ mod tests {
 
         // The premise: neither synthetic timestamp is otherwise present, or the
         // assertions below would pass without either source doing anything.
+        let data_pending = table.timeline.all_pending_instant_times().await?;
         for ts in [ROLLED_BACK, MDT_ROLLBACK_TS] {
             assert!(
                 !table.valid_from_completed_data_instants().contains(ts)
-                    && !table.valid_from_mdt_delta_commits(mdt).contains(ts)
+                    && !table
+                        .valid_from_mdt_delta_commits(mdt, &data_pending)
+                        .contains(ts)
                     && !Table::valid_from_sentinel_commits(mdt).contains(ts),
                 "{ts} must not be reachable from sources 1, 2 or 5, or this test proves nothing"
             );
@@ -1356,6 +1479,53 @@ mod tests {
         assert!(
             valid.contains(MDT_ROLLBACK_TS),
             "source 4: the metadata table's own rollback instant must be valid"
+        );
+        Ok(())
+    }
+
+    /// A rollback that cannot be read fails the read instead of shrinking the
+    /// valid-instant set behind the caller's back.
+    ///
+    /// Source 3 exists to re-admit commits a rollback rolled back and re-applied.
+    /// Swallowing a read failure drops exactly those commits, and the listing
+    /// that follows is missing their log blocks -- a wrong answer returned as if
+    /// it were right. Java raises `HoodieMetadataException` here for the same
+    /// reason, so the assertion is on the error, not on a degraded set.
+    ///
+    /// The corrupt file is the *completed* rollback with no `.requested` plan
+    /// beside it, which is the one case Java cannot fall back from either.
+    #[tokio::test]
+    async fn an_unreadable_rollback_fails_the_read_rather_than_shrinking_the_set() -> Result<()> {
+        let src = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let src_root = std::path::Path::new(src.trim_start_matches("file://"));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("table");
+        copy_tree(src_root, &root);
+
+        // Newer than every fixture instant, so the scan's lower bound admits it.
+        const ROLLBACK_TS: &str = "20260101000000000";
+        std::fs::write(
+            root.join(format!(
+                ".hoodie/timeline/{ROLLBACK_TS}_{ROLLBACK_TS}.rollback"
+            )),
+            b"not avro, and no .requested plan to fall back to",
+        )
+        .unwrap();
+
+        let table = Table::new(root.to_str().unwrap()).await?;
+        let mdt = table.get_or_init_metadata_table().await?;
+
+        let err = table
+            .valid_instant_timestamps(mdt)
+            .await
+            .expect_err("an unreadable rollback must fail the read");
+        assert!(
+            matches!(err, CoreError::MetadataTable(_)),
+            "expected a metadata-table error, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains(ROLLBACK_TS),
+            "the error must name the instant that could not be read, got {err}"
         );
         Ok(())
     }
