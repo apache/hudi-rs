@@ -1137,6 +1137,13 @@ impl Table {
                 hudi_options: per_slice_hudi_options.clone(),
             };
             async move {
+                // Every await in a small slice's open can resolve without the
+                // task ever suspending — a cached base file's reads complete on
+                // the blocking pool before their first poll — so opening slice
+                // after slice could run without the scheduler once seeing
+                // another task. One yield per slice keeps the stream cooperative
+                // on a single-worker runtime whatever the I/O timing.
+                tokio::task::yield_now().await;
                 fg_reader
                     .read_file_slice_stream(&file_slice, &options)
                     .await
