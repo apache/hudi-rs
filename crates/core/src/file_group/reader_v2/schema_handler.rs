@@ -1,0 +1,1512 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+//! Mirrors `org.apache.hudi.common.table.read.FileGroupReaderSchemaHandler`.
+//!
+//! Manages the various schemas involved in reading a file group:
+//! table schema, requested schema, required schema, and the schema
+//! used for updates (log file merging).
+
+use crate::Result;
+use crate::error::CoreError;
+use crate::file_group::reader_v2::delete_context::DeleteContext;
+use crate::file_group::reader_v2::metadata_merger::{CustomMerger, resolve_custom_merger};
+use crate::file_group::reader_v2::output_converter::{OutputConverter, ProjectionConverter};
+use crate::schema::avro_schema_utils::are_schemas_projection_equivalent;
+use arrow_schema::{Field, Schema, SchemaRef};
+use std::sync::Arc;
+
+/// The `_hoodie_commit_time` meta field name.
+/// Mirrors Java's `HoodieRecord.COMMIT_TIME_METADATA_FIELD`.
+const COMMIT_TIME_FIELD: &str = "_hoodie_commit_time";
+
+/// Schema handler for file group reading.
+///
+/// Manages the different schema views needed during the read pipeline:
+/// - **table_schema**: The full schema of the Hudi table.
+/// - **requested_schema**: The schema requested by the query (column projection).
+/// - **required_schema**: The minimum schema required for reading (includes
+///   merge keys and ordering fields even if not in requested_schema).
+/// - **data_schema**: The schema used for reading base files.
+/// - **schema_for_updates**: Schema for incoming log records (initially == required_schema).
+/// - **delete_context**: Canonical delete detection context (single source of truth).
+///
+/// In Java Hudi, this class also handles internal schema evolution.
+/// That is not yet implemented in hudi-rs.
+#[derive(Debug, Clone, Default)]
+pub struct FileGroupReaderSchemaHandler {
+    /// The full table schema.
+    pub table_schema: Option<SchemaRef>,
+
+    /// The schema requested by the query (column projection).
+    pub requested_schema: Option<SchemaRef>,
+
+    /// The data schema (used for base file reading).
+    pub data_schema: Option<SchemaRef>,
+
+    /// The required schema for merge operations.
+    /// Includes record key and ordering fields even if not requested.
+    pub required_schema: Option<SchemaRef>,
+
+    /// Schema for incoming update records (log file merging).
+    /// Initially equals `required_schema`. May be set to a different schema
+    /// by `StreamingFileGroupRecordBufferLoader` for incoming records
+    /// without metadata fields.
+    ///
+    /// Mirrors Java's `FileGroupReaderSchemaHandler.schemaForUpdates`.
+    schema_for_updates: Option<SchemaRef>,
+
+    /// Which custom merger the table's payload class selects, resolved during
+    /// `prepare_required_schema()`. `None` means CUSTOM stays refused, which is
+    /// also what a handler built by hand gets, so a test that never calls
+    /// `prepare_required_schema` sees the old refusal unchanged.
+    pub(crate) custom_merger: Option<CustomMerger>,
+
+    /// Canonical delete context, created during `prepare_required_schema()`.
+    /// Single source of truth — downstream consumers (record buffer, etc.)
+    /// should use this instead of creating their own.
+    ///
+    /// Mirrors Java's `FileGroupReaderSchemaHandler.deleteContext`.
+    delete_context: Option<DeleteContext>,
+
+    /// Avro JSON of the data/table schema (from FFI). Enables Avro-land
+    /// required-schema computation mirroring gold.
+    pub data_schema_json: Option<String>,
+    /// Avro JSON of the requested schema (from FFI).
+    pub requested_schema_json: Option<String>,
+    /// Avro JSON of the required schema — computed by `prepare_required_schema`
+    /// when the JSONs above are present. Used as the Avro reader schema for
+    /// log-block decode (Java: GenericDatumReader's readerSchema). Named for
+    /// Avro's own term, matching `Decoder`/`LogFileReader::with_reader_schema`.
+    /// CONTRACT: consumers (log-block decode) MUST treat `None` as the
+    /// no-evolution decode path — `None` is normal for non-FFI callers
+    /// and for any failure in the avro-land computation (which falls back to
+    /// the arrow-land required schema with a warning).
+    pub reader_schema_json: Option<String>,
+}
+
+impl FileGroupReaderSchemaHandler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_table_schema(mut self, schema: SchemaRef) -> Self {
+        self.table_schema = Some(schema);
+        self
+    }
+
+    pub fn with_data_schema(mut self, schema: SchemaRef) -> Self {
+        self.data_schema = Some(schema);
+        self
+    }
+
+    pub fn with_requested_schema(mut self, schema: SchemaRef) -> Self {
+        self.requested_schema = Some(schema);
+        self
+    }
+
+    /// Builder parity for the FFI path, which supplies Avro JSON; this crate's
+    /// callers supply Arrow schemas.
+    #[allow(dead_code)]
+    pub fn with_data_schema_json(mut self, json: String) -> Self {
+        self.data_schema_json = Some(json);
+        self
+    }
+
+    /// Builder parity for the FFI path — see `with_data_schema_json`.
+    #[allow(dead_code)]
+    pub fn with_requested_schema_json(mut self, json: String) -> Self {
+        self.requested_schema_json = Some(json);
+        self
+    }
+
+    /// Get the canonical delete context.
+    ///
+    /// Mirrors Java's `FileGroupReaderSchemaHandler.getDeleteContext()`.
+    /// Returns `None` only if `prepare_required_schema()` has not been called.
+    pub fn delete_context(&self) -> Option<&DeleteContext> {
+        self.delete_context.as_ref()
+    }
+
+    /// Get the schema for updates (log record merging).
+    ///
+    /// Mirrors Java's `FileGroupReaderSchemaHandler.getSchemaForUpdates()`.
+    /// Partial-update surface for the FFI path; the merge resolves the update schema
+    /// per block instead.
+    #[allow(dead_code)]
+    pub fn schema_for_updates(&self) -> Option<&SchemaRef> {
+        self.schema_for_updates.as_ref()
+    }
+
+    /// Set the schema for updates.
+    ///
+    /// Mirrors Java's `FileGroupReaderSchemaHandler.setSchemaForUpdates(Schema)`.
+    /// Used by streaming buffer loaders for incoming records without metadata.
+    /// See `schema_for_updates`.
+    #[allow(dead_code)]
+    pub fn set_schema_for_updates(&mut self, schema: SchemaRef) {
+        self.schema_for_updates = Some(schema);
+    }
+
+    /// Generate the required schema for reading files.
+    ///
+    /// Mirrors Java's `FileGroupReaderSchemaHandler.generateRequiredSchema()`
+    /// (lines 187-229).
+    ///
+    /// For COW (no log files): returns `requested_schema` as-is, unless
+    /// `has_instant_range` is true — then adds `_hoodie_commit_time` for
+    /// base file filtering.
+    ///
+    /// For MOR (with log files): adds mandatory fields needed for merging
+    /// (record key, ordering fields, delete markers, commit time) to
+    /// `requested_schema`.
+    ///
+    /// # Arguments
+    /// * `has_log_files` — Whether the file group has log files (MOR gate).
+    /// * `record_key_fields` — All record key field names (single for meta-field
+    ///   tables, potentially multiple for virtual-key composite keys).
+    /// * `ordering_field_names` — Precombine/ordering field names.
+    /// * `delete_context` — Delete detection context.
+    /// * `has_instant_range` — Whether an instant range filter is active.
+    /// * `merge_mode` — The merge mode string (e.g. "COMMIT_TIME_ORDERING").
+    pub fn generate_required_schema(
+        &self,
+        has_log_files: bool,
+        record_key_fields: &[String],
+        ordering_field_names: &[String],
+        delete_context: &DeleteContext,
+        has_instant_range: bool,
+        merge_mode: &str,
+    ) -> Result<Option<SchemaRef>> {
+        // The base schema to start from: requested_schema, or data_schema as fallback.
+        let Some(base_schema) = self.requested_schema.as_ref().or(self.data_schema.as_ref()) else {
+            return Ok(None);
+        };
+
+        // The field source for looking up field definitions.
+        let Some(field_source) = self.table_schema.as_ref().or(self.data_schema.as_ref()) else {
+            return Ok(None);
+        };
+
+        // COW path: no log files.
+        // Mirrors Java lines 190-197:
+        //   if (!readerContext.getHasLogFiles()) {
+        //     if (hasInstantRange && !findNestedField(requestedSchema, COMMIT_TIME_METADATA_FIELD)) {
+        //       addedFields.add(getField(tableSchema, COMMIT_TIME_METADATA_FIELD));
+        //       return appendFields(requestedSchema, addedFields);
+        //     }
+        //     return requestedSchema;
+        //   }
+        if !has_log_files {
+            if has_instant_range
+                && base_schema.column_with_name(COMMIT_TIME_FIELD).is_none()
+                && let Some((_, field)) = field_source.column_with_name(COMMIT_TIME_FIELD)
+            {
+                let mut fields: Vec<Arc<Field>> = base_schema.fields().to_vec();
+                fields.push(Arc::new(field.clone()));
+                return Ok(Some(Arc::new(Schema::new(fields))));
+            }
+            return Ok(Some(base_schema.clone()));
+        }
+
+        // CUSTOM merge mode is served only when the table's payload class names a
+        // merger this crate implements, which `prepare_required_schema` resolved
+        // into `custom_merger`. Any other CUSTOM table is refused loudly rather
+        // than merged by an ordering rule it did not ask for. Reachable via table
+        // config (the merge-mode string flows in from the reader context at
+        // construction time, before the loader's merge-mode gate). Mirrors Java
+        // lines 209-213, which delegate the same decision to the record merger.
+        if merge_mode.eq_ignore_ascii_case("CUSTOM") && self.custom_merger.is_none() {
+            return Err(CoreError::Unsupported(
+                "CUSTOM merge mode is supported only for a payload class this crate \
+                 implements a merger for."
+                    .to_string(),
+            ));
+        }
+
+        // MOR path: collect mandatory fields for merging.
+        // Mirrors Java's getMandatoryFieldsForMerging() (lines 231-278).
+        let mut mandatory_field_names: Vec<&str> = Vec::new();
+
+        // Add _hoodie_commit_time if instant range is active (Java lines 246-248).
+        if has_instant_range {
+            mandatory_field_names.push(COMMIT_TIME_FIELD);
+        }
+
+        // Add record key fields (Java lines 251-258).
+        // Java checks populateMetaFields to decide between _hoodie_record_key
+        // and the configured record key fields. The caller already resolves
+        // this and passes the correct fields.
+        for key_field in record_key_fields {
+            mandatory_field_names.push(key_field.as_str());
+        }
+
+        // Add ordering/precombine fields only for EVENT_TIME_ORDERING
+        // (Java lines 260-263).
+        if merge_mode.eq_ignore_ascii_case("EVENT_TIME_ORDERING") {
+            for ordering_field in ordering_field_names {
+                mandatory_field_names.push(ordering_field.as_str());
+            }
+        }
+
+        // Add _hoodie_is_deleted if it exists in table schema (Java lines 265-267).
+        if delete_context.has_built_in_delete_field {
+            mandatory_field_names.push("_hoodie_is_deleted");
+        }
+
+        // Add custom delete marker field if configured (Java lines 269-271).
+        if let Some((key_field, _)) = &delete_context.custom_delete_marker {
+            mandatory_field_names.push(key_field.as_str());
+        }
+
+        // Add _hoodie_operation if it exists in table schema (Java lines 273-274).
+        if field_source.column_with_name("_hoodie_operation").is_some() {
+            mandatory_field_names.push("_hoodie_operation");
+        }
+
+        // Add whatever the table's custom merger reads. Java delegates the merge
+        // to the payload class and never projects its inputs away; here the
+        // merger names them, so a projection cannot strip a column the merge
+        // dispatches on.
+        if let Some(custom_merger) = &self.custom_merger {
+            mandatory_field_names.extend_from_slice(custom_merger.required_field_names());
+        }
+
+        // Append only fields not already in the base schema (Java line 219).
+        let mut extra_fields: Vec<Arc<Field>> = Vec::new();
+        for &field_name in &mandatory_field_names {
+            if base_schema.column_with_name(field_name).is_none()
+                && let Some((_, field)) = field_source.column_with_name(field_name)
+            {
+                // Deduplicate: only add if not already in extra_fields.
+                if !extra_fields.iter().any(|f| f.name() == field_name) {
+                    extra_fields.push(Arc::new(field.clone()));
+                }
+            }
+        }
+
+        if extra_fields.is_empty() {
+            Ok(Some(base_schema.clone()))
+        } else {
+            let mut fields: Vec<Arc<Field>> = base_schema.fields().to_vec();
+            fields.extend(extra_fields);
+            Ok(Some(Arc::new(Schema::new(fields))))
+        }
+    }
+
+    /// Prepare the required schema: generate it and store it.
+    ///
+    /// Mirrors Java's `prepareRequiredSchema()` (lines 280-288) and the
+    /// constructor body (lines 104-106) which creates `DeleteContext`,
+    /// computes `requiredSchema`, and sets `schemaForUpdates`.
+    ///
+    /// Creates a `DeleteContext` (stored as canonical source of truth),
+    /// calls `generate_required_schema()`, and sets `schema_for_updates`.
+    ///
+    /// # Arguments
+    /// * `has_log_files` — Whether the file group has log files.
+    /// * `record_key_fields` — All record key field names.
+    /// * `ordering_field_names` — Precombine/ordering field names.
+    /// * `props` — Table config properties.
+    /// * `has_instant_range` — Whether an instant range filter is active.
+    /// * `merge_mode` — The merge mode string.
+    pub fn prepare_required_schema(
+        &mut self,
+        has_log_files: bool,
+        record_key_fields: &[String],
+        ordering_field_names: &[String],
+        props: &std::collections::HashMap<String, String>,
+        has_instant_range: bool,
+        merge_mode: &str,
+    ) -> Result<()> {
+        // Create and store the canonical DeleteContext (Java line 104).
+        let delete_context = if let Some(table_schema) = &self.table_schema {
+            DeleteContext::new(props, table_schema)
+        } else {
+            DeleteContext::from_props(props)
+        };
+        self.delete_context = Some(delete_context.clone());
+
+        // Resolve which custom merger, if any, the table selects. The CUSTOM gate
+        // in `generate_required_schema` reads this.
+        self.custom_merger = resolve_custom_merger(props);
+
+        // Compute required schema (Java line 105).
+        self.required_schema = self.generate_required_schema(
+            has_log_files,
+            record_key_fields,
+            ordering_field_names,
+            &delete_context,
+            has_instant_range,
+            merge_mode,
+        )?;
+
+        // Initialize schema_for_updates = required_schema (Java line 106).
+        self.schema_for_updates = self.required_schema.clone();
+
+        // Avro-land mirror (gold computes required schema in Avro). When the
+        // Avro JSONs are available (FFI path), compute reader_schema_json by
+        // appending the SAME mandatory fields, and derive the Arrow required
+        // schema FROM it so decode output and pivot schema agree by construction.
+        self.reader_schema_json = None;
+        if let (Some(data_json), Some(requested_json), Some(required_arrow)) = (
+            self.data_schema_json.clone(),
+            self.requested_schema_json.clone(),
+            self.required_schema.clone(),
+        ) {
+            // Names actually appended = required minus requested (top-level).
+            let requested_names: std::collections::HashSet<&str> = self
+                .requested_schema
+                .as_ref()
+                .map(|s| s.fields().iter().map(|f| f.name().as_str()).collect())
+                .unwrap_or_default();
+            let appended: Vec<&str> = required_arrow
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .filter(|n| !requested_names.contains(n))
+                .collect();
+            // On the FFI path both JSONs were already parsed (cpp converted them
+            // to the Arrow schemas above) and the same append+convert ran once at
+            // the boundary, so a failure here is an internal inconsistency — NOT a
+            // recoverable condition. Falling back would leave reader_schema_json
+            // = None, which is the documented "non-FFI caller" sentinel
+            // (see content.rs decode_avro_record_content): the log-block decoder
+            // would then silently switch from required-schema resolution to
+            // writer-only decode, producing wrong data on an evolved table. Fail
+            // loudly instead. (Non-FFI/test callers never enter this block — the
+            // Some/Some/Some guard requires the JSONs.)
+            let required_json =
+                crate::schema::avro_schema_utils::append_mandatory_fields_avro_json(
+                    &requested_json,
+                    &data_json,
+                    &appended,
+                )
+                .map_err(|e| {
+                    crate::error::CoreError::Schema(format!(
+                        "avro-land required schema computation failed on the FFI path \
+                     (data/requested JSONs were provided): {e}"
+                    ))
+                })?;
+            let arrow = crate::schema::resolver::avro_json_to_arrow_schema(&required_json)
+                .map_err(|e| {
+                    crate::error::CoreError::Schema(format!(
+                        "required avro json -> arrow failed on the FFI path: {e}"
+                    ))
+                })?;
+            self.required_schema = Some(std::sync::Arc::new(arrow));
+            self.reader_schema_json = Some(required_json);
+        }
+        // Re-sync schema_for_updates so it tracks the possibly-replaced required_schema.
+        self.schema_for_updates = self.required_schema.clone();
+        Ok(())
+    }
+
+    /// Get the output converter for projecting from required_schema to requested_schema.
+    ///
+    /// Mirrors Java's `getOutputConverter()` (lines 143-148):
+    /// Returns `Some(ProjectionConverter)` when required_schema has more fields
+    /// than requested_schema; `None` when they are equivalent or when schemas
+    /// are not set.
+    pub fn get_output_converter(&self) -> Option<Box<dyn OutputConverter>> {
+        let required = self.required_schema.as_ref()?;
+        let requested = self.requested_schema.as_ref()?;
+
+        // If schemas are projection-equivalent (same fields in same order),
+        // no converter is needed.
+        if are_schemas_projection_equivalent(required, requested) {
+            return None;
+        }
+
+        Some(Box::new(ProjectionConverter::new(requested)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_schema::DataType;
+    use std::collections::HashMap;
+
+    /// Helper to create a simple Arrow schema from field names (all Utf8).
+    fn make_schema(field_names: &[&str]) -> SchemaRef {
+        let fields: Vec<Field> = field_names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Utf8, true))
+            .collect();
+        Arc::new(Schema::new(fields))
+    }
+
+    /// Helper to create a schema with mixed types for more realistic testing.
+    fn make_table_schema() -> SchemaRef {
+        let fields = vec![
+            Field::new("_hoodie_commit_time", DataType::Utf8, true),
+            Field::new("_hoodie_commit_seqno", DataType::Utf8, true),
+            Field::new("_hoodie_record_key", DataType::Utf8, true),
+            Field::new("_hoodie_partition_path", DataType::Utf8, true),
+            Field::new("_hoodie_file_name", DataType::Utf8, true),
+            Field::new("begin_lat", DataType::Float64, true),
+            Field::new("begin_lon", DataType::Float64, true),
+            Field::new("rider", DataType::Utf8, true),
+            Field::new("tip_history", DataType::Utf8, true),
+            Field::new("timestamp", DataType::Int64, true),
+            Field::new("_hoodie_is_deleted", DataType::Boolean, true),
+            Field::new("_hoodie_operation", DataType::Utf8, true),
+        ];
+        Arc::new(Schema::new(fields))
+    }
+
+    // =========================================================================
+    // COW tests
+    // =========================================================================
+
+    /// COW (no log files) → required_schema == requested_schema.
+    #[test]
+    fn test_cow_required_schema_equals_requested() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "tip_history", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                false, // no log files (COW)
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false, // no instant range
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(required, requested_schema);
+    }
+
+    /// COW with instant range → adds _hoodie_commit_time if not in requested schema.
+    /// Mirrors Java lines 191-194.
+    #[test]
+    fn test_cow_with_instant_range_adds_commit_time() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                false, // COW
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                true, // has instant range
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"_hoodie_commit_time"),
+            "COW with instant range should add _hoodie_commit_time"
+        );
+        assert!(field_names.contains(&"begin_lat"));
+        assert!(field_names.contains(&"rider"));
+    }
+
+    /// COW with instant range but commit_time already requested → no duplicate.
+    #[test]
+    fn test_cow_with_instant_range_no_duplicate_commit_time() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["_hoodie_commit_time", "begin_lat"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                false,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                true,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        // Should be same as requested since commit_time is already present.
+        assert_eq!(required, requested_schema);
+    }
+
+    // =========================================================================
+    // MOR tests
+    // =========================================================================
+
+    /// MOR with subset projection → record key field appended.
+    #[test]
+    fn test_mor_adds_record_key_field() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "tip_history", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true, // has log files (MOR)
+                &["_hoodie_record_key".to_string()],
+                &[], // no ordering fields (COMMIT_TIME_ORDERING)
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"_hoodie_record_key"),
+            "required_schema should include record key field"
+        );
+        assert!(
+            field_names.contains(&"begin_lat"),
+            "required_schema should include requested fields"
+        );
+        assert!(
+            field_names.contains(&"_hoodie_is_deleted"),
+            "required_schema should include _hoodie_is_deleted when present in table schema"
+        );
+        assert!(
+            field_names.contains(&"_hoodie_operation"),
+            "required_schema should include _hoodie_operation when present in table schema"
+        );
+    }
+
+    /// MOR with instant range → adds _hoodie_commit_time to mandatory fields.
+    /// Mirrors Java lines 246-248.
+    #[test]
+    fn test_mor_with_instant_range_adds_commit_time() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                true, // has instant range
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"_hoodie_commit_time"),
+            "MOR with instant range should add _hoodie_commit_time"
+        );
+        assert!(field_names.contains(&"_hoodie_record_key"));
+    }
+
+    /// COMMIT_TIME_ORDERING should NOT include ordering fields.
+    #[test]
+    fn test_mor_commit_time_ordering_excludes_ordering_fields() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &["timestamp".to_string()],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            !field_names.contains(&"timestamp"),
+            "COMMIT_TIME_ORDERING should NOT include ordering field"
+        );
+        assert!(
+            field_names.contains(&"_hoodie_record_key"),
+            "required_schema should still include record key field"
+        );
+    }
+
+    /// EVENT_TIME_ORDERING → ordering field appended.
+    #[test]
+    fn test_mor_adds_ordering_field() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "tip_history", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &["timestamp".to_string()],
+                &delete_context,
+                false,
+                "EVENT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"timestamp"),
+            "required_schema should include ordering field"
+        );
+        assert!(
+            field_names.contains(&"_hoodie_record_key"),
+            "required_schema should include record key field"
+        );
+    }
+
+    /// MOR with _hoodie_is_deleted in table schema → added to required.
+    #[test]
+    fn test_mor_adds_delete_marker_fields() {
+        let table_schema = make_table_schema(); // has _hoodie_is_deleted
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(field_names.contains(&"_hoodie_is_deleted"));
+        assert!(field_names.contains(&"_hoodie_operation"));
+    }
+
+    /// MOR with custom delete marker config → custom field added.
+    #[test]
+    fn test_mor_adds_custom_delete_marker() {
+        let table_schema =
+            make_schema(&["_hoodie_record_key", "col_a", "col_b", "is_deleted_custom"]);
+        let requested_schema = make_schema(&["col_a"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let mut props = HashMap::new();
+        props.insert(
+            "hoodie.record.merge.property.hoodie.payload.delete.field".to_string(),
+            "is_deleted_custom".to_string(),
+        );
+        props.insert(
+            "hoodie.record.merge.property.hoodie.payload.delete.marker".to_string(),
+            "true".to_string(),
+        );
+        let delete_context = DeleteContext::new(&props, &table_schema);
+
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"is_deleted_custom"),
+            "required_schema should include custom delete marker field"
+        );
+    }
+
+    /// When all mandatory fields already in requested → no extra fields.
+    #[test]
+    fn test_mor_all_mandatory_fields_already_present() {
+        let table_schema = make_table_schema();
+        let requested_schema = table_schema.clone();
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &["timestamp".to_string()],
+                &delete_context,
+                false,
+                "EVENT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(required, requested_schema);
+    }
+
+    /// A CUSTOM table whose payload class this crate has no merger for must
+    /// return a loud `Err` (not panic), and must not be quietly remapped onto an
+    /// ordering mode. The merge-mode string flows in at reader construction
+    /// before the loader's merge-mode gate, so this is the API boundary.
+    #[test]
+    fn test_custom_merge_mode_with_unknown_payload_returns_err() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let props = HashMap::from([(
+            "hoodie.compaction.payload.class".to_string(),
+            "com.example.SomeOtherPayload".to_string(),
+        )]);
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &props,
+                false,
+                "CUSTOM",
+            )
+            .expect_err("an unrecognised custom payload must be a loud error");
+
+        let delete_context = DeleteContext::new(&props, &table_schema);
+        let err = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "CUSTOM",
+            )
+            .expect_err("CUSTOM merge mode must be a loud error");
+        assert!(
+            format!("{err:?}").contains("CUSTOM merge mode is supported only for a payload class"),
+            "error should name the payload class as the reason, got: {err:?}"
+        );
+    }
+
+    /// The counterpart: a CUSTOM table naming the metadata payload is admitted,
+    /// so the refusal above is narrow rather than a blanket ban.
+    #[test]
+    fn test_custom_merge_mode_with_metadata_payload_is_admitted() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let props = HashMap::from([
+            (
+                "hoodie.compaction.payload.class".to_string(),
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+            (
+                "hoodie.record.merge.strategy.id".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+        ]);
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &props,
+                false,
+                "CUSTOM",
+            )
+            .expect("the metadata payload's merge mode must be admitted");
+        assert!(handler.required_schema.is_some());
+    }
+
+    // =========================================================================
+    // Composite record key tests
+    // =========================================================================
+
+    /// MOR with composite record keys → all key fields added.
+    #[test]
+    fn test_mor_composite_record_keys() {
+        let table_schema = make_schema(&["pk1", "pk2", "col_a", "_hoodie_is_deleted"]);
+        let requested_schema = make_schema(&["col_a"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["pk1".to_string(), "pk2".to_string()], // composite keys
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"pk1"),
+            "should include first key field"
+        );
+        assert!(
+            field_names.contains(&"pk2"),
+            "should include second key field"
+        );
+        assert!(
+            field_names.contains(&"col_a"),
+            "should include requested fields"
+        );
+    }
+
+    // =========================================================================
+    // Output converter tests
+    // =========================================================================
+
+    #[test]
+    fn test_get_output_converter_none_when_equal() {
+        let schema = make_schema(&["col_a", "col_b"]);
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(schema.clone())
+            .with_data_schema(schema.clone())
+            .with_requested_schema(schema.clone());
+        handler.required_schema = Some(schema);
+
+        assert!(handler.get_output_converter().is_none());
+    }
+
+    #[test]
+    fn test_get_output_converter_some_when_different() {
+        let requested = make_schema(&["col_a"]);
+        let required = make_schema(&["col_a", "col_b"]);
+        let mut handler = FileGroupReaderSchemaHandler::new().with_requested_schema(requested);
+        handler.required_schema = Some(required);
+
+        assert!(handler.get_output_converter().is_some());
+    }
+
+    // =========================================================================
+    // prepare_required_schema end-to-end tests
+    // =========================================================================
+
+    #[test]
+    fn test_prepare_required_schema_event_time() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema)
+            .with_data_schema(make_table_schema())
+            .with_requested_schema(requested_schema);
+
+        handler
+            .prepare_required_schema(
+                true, // has log files
+                &["_hoodie_record_key".to_string()],
+                &["timestamp".to_string()],
+                &HashMap::new(),
+                false,
+                "EVENT_TIME_ORDERING",
+            )
+            .unwrap();
+
+        let required = handler.required_schema.as_ref().unwrap();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(field_names.contains(&"begin_lat"));
+        assert!(field_names.contains(&"rider"));
+        assert!(field_names.contains(&"_hoodie_record_key"));
+        assert!(field_names.contains(&"timestamp"));
+        assert!(field_names.contains(&"_hoodie_is_deleted"));
+
+        // schema_for_updates should equal required_schema
+        assert_eq!(
+            handler.schema_for_updates(),
+            handler.required_schema.as_ref()
+        );
+        // delete_context should be stored
+        assert!(handler.delete_context().is_some());
+    }
+
+    #[test]
+    fn test_prepare_required_schema_commit_time() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema)
+            .with_data_schema(make_table_schema())
+            .with_requested_schema(requested_schema);
+
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &["timestamp".to_string()],
+                &HashMap::new(),
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap();
+
+        let required = handler.required_schema.as_ref().unwrap();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(field_names.contains(&"begin_lat"));
+        assert!(field_names.contains(&"rider"));
+        assert!(field_names.contains(&"_hoodie_record_key"));
+        assert!(
+            !field_names.contains(&"timestamp"),
+            "COMMIT_TIME_ORDERING should NOT include ordering field"
+        );
+        assert!(field_names.contains(&"_hoodie_is_deleted"));
+    }
+
+    /// prepare_required_schema with instant range stores DeleteContext and adds commit time.
+    #[test]
+    fn test_prepare_required_schema_with_instant_range() {
+        let table_schema = make_table_schema();
+        let requested_schema = make_schema(&["begin_lat", "rider"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema)
+            .with_data_schema(make_table_schema())
+            .with_requested_schema(requested_schema);
+
+        handler
+            .prepare_required_schema(
+                true, // MOR
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &HashMap::new(),
+                true, // has instant range
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap();
+
+        let required = handler.required_schema.as_ref().unwrap();
+        let field_names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            field_names.contains(&"_hoodie_commit_time"),
+            "should add _hoodie_commit_time when instant range is active"
+        );
+
+        // DeleteContext should be stored
+        let dc = handler.delete_context().unwrap();
+        assert!(dc.has_built_in_delete_field);
+    }
+
+    #[test]
+    fn test_prepare_required_schema_avro_json_path() {
+        let data_json = r#"{"type":"record","name":"rec","fields":[
+            {"name":"_hoodie_record_key","type":["null","string"],"default":null},
+            {"name":"id","type":"int"},
+            {"name":"price","type":["null","double"],"default":null}]}"#;
+        let requested_json = r#"{"type":"record","name":"rec","fields":[
+            {"name":"price","type":["null","double"],"default":null}]}"#;
+
+        let data_arrow =
+            Arc::new(crate::schema::resolver::avro_json_to_arrow_schema(data_json).unwrap());
+        let requested_arrow =
+            Arc::new(crate::schema::resolver::avro_json_to_arrow_schema(requested_json).unwrap());
+
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(data_arrow.clone())
+            .with_data_schema(data_arrow)
+            .with_requested_schema(requested_arrow)
+            .with_data_schema_json(data_json.to_string())
+            .with_requested_schema_json(requested_json.to_string());
+
+        handler
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &HashMap::new(),
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap();
+
+        // Avro-land required json exists and contains the appended key field.
+        let rj = handler
+            .reader_schema_json
+            .as_ref()
+            .expect("required json computed");
+        assert!(rj.contains("_hoodie_record_key"));
+        // Arrow required schema is DERIVED FROM the avro json (same field set/order).
+        let required = handler.required_schema.as_ref().unwrap();
+        let names: Vec<&str> = required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert_eq!(names, vec!["price", "_hoodie_record_key"]);
+    }
+
+    /// The avro-derived required schema must match the arrow-land computation
+    /// (names/order/types) for a non-trivial nested schema — locks the
+    /// "agreement by construction" invariant Task 5's log decode relies on.
+    #[test]
+    fn test_prepare_required_schema_avro_json_matches_arrow_land_for_nested_schema() {
+        let data_json = r#"{"type":"record","name":"rec","fields":[
+            {"name":"_hoodie_record_key","type":["null","string"],"default":null},
+            {"name":"id","type":"int"},
+            {"name":"fare","type":["null",{"type":"record","name":"fare_rec","fields":[
+                {"name":"amount","type":["null","double"],"default":null},
+                {"name":"currency","type":["null","string"],"default":null}]}],"default":null},
+            {"name":"tags","type":["null",{"type":"array","items":["null","string"]}],"default":null},
+            {"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-micros"}],"default":null}]}"#;
+        let requested_json = r#"{"type":"record","name":"rec","fields":[
+            {"name":"fare","type":["null",{"type":"record","name":"fare_rec","fields":[
+                {"name":"amount","type":["null","double"],"default":null},
+                {"name":"currency","type":["null","string"],"default":null}]}],"default":null},
+            {"name":"ts","type":["null",{"type":"long","logicalType":"timestamp-micros"}],"default":null}]}"#;
+
+        let data_arrow =
+            Arc::new(crate::schema::resolver::avro_json_to_arrow_schema(data_json).unwrap());
+        let requested_arrow =
+            Arc::new(crate::schema::resolver::avro_json_to_arrow_schema(requested_json).unwrap());
+
+        // Arrow-land only (no JSONs): the pre-existing computation.
+        let mut arrow_land = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(data_arrow.clone())
+            .with_data_schema(data_arrow.clone())
+            .with_requested_schema(requested_arrow.clone());
+        arrow_land
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &HashMap::new(),
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap();
+        let arrow_land_schema = arrow_land.required_schema.clone().unwrap();
+
+        // Avro-land path (JSONs present): required derived from avro json.
+        let mut avro_land = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(data_arrow.clone())
+            .with_data_schema(data_arrow)
+            .with_requested_schema(requested_arrow)
+            .with_data_schema_json(data_json.to_string())
+            .with_requested_schema_json(requested_json.to_string());
+        avro_land
+            .prepare_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &HashMap::new(),
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap();
+        assert!(avro_land.reader_schema_json.is_some());
+        let avro_land_schema = avro_land.required_schema.clone().unwrap();
+
+        // Same field names, order, and data types (nullability/metadata may differ
+        // between construction routes; types must not).
+        let names = |s: &arrow_schema::SchemaRef| -> Vec<String> {
+            s.fields().iter().map(|f| f.name().clone()).collect()
+        };
+        assert_eq!(names(&avro_land_schema), names(&arrow_land_schema));
+        for (a, b) in avro_land_schema
+            .fields()
+            .iter()
+            .zip(arrow_land_schema.fields().iter())
+        {
+            assert_eq!(
+                a.data_type(),
+                b.data_type(),
+                "type mismatch for field {}",
+                a.name()
+            );
+        }
+    }
+
+    // =========================================================================
+    // Required-schema edge cases (UT parity P3 — Task 6 / D-P3-4).
+    //
+    // Gold TestFileGroupReaderSchemaHandler covers required-schema derivation
+    // (testCow/testMor/testSchemaForMandatoryFields). These add the edges the
+    // gold matrix exercises only implicitly: requested column absent from the
+    // table/field source, mandatory-field dedup against already-projected
+    // columns, and nested-struct projection retention.
+    // =========================================================================
+
+    /// A requested column that does NOT exist in the table/field source is
+    /// passed through unchanged (no error, no drop). For COW the required schema
+    /// equals the requested schema verbatim; the schema handler does not validate
+    /// requested columns against the table schema (that resolution belongs to the
+    /// query planner upstream). This documents the fallback behavior so a future
+    /// "error on unknown requested column" change is a deliberate, test-visible
+    /// decision rather than a silent regression.
+    #[test]
+    fn test_requested_column_missing_from_table_schema_passes_through() {
+        let table_schema = make_table_schema();
+        // "does_not_exist" is absent from table_schema.
+        let requested_schema = make_schema(&["begin_lat", "does_not_exist"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+
+        // COW: required == requested, unknown column retained.
+        let cow_required = handler
+            .generate_required_schema(
+                false,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cow_required, requested_schema,
+            "COW must pass requested schema through verbatim, including unknown columns"
+        );
+
+        // MOR: mandatory fields appended, unknown requested column still retained.
+        let mor_required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+        let names: Vec<&str> = mor_required
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        assert!(
+            names.contains(&"does_not_exist"),
+            "unknown requested column must be retained on the MOR path too"
+        );
+        assert!(
+            names.contains(&"_hoodie_record_key"),
+            "mandatory record-key field must be appended"
+        );
+    }
+
+    /// Mandatory fields already present in the requested schema must NOT be
+    /// duplicated. Here the record-key field is also a requested column and the
+    /// custom-delete-marker key is requested as well; the required schema must
+    /// contain each name exactly once. Mirrors Java's appendFields semantics
+    /// (append only fields not already in the base schema).
+    #[test]
+    fn test_mandatory_field_dedup_when_already_requested() {
+        let table_schema = make_schema(&["_hoodie_record_key", "col_a", "marker"]);
+        // Record key AND the custom delete marker are already in the projection.
+        let requested_schema = make_schema(&["_hoodie_record_key", "col_a", "marker"]);
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema.clone());
+
+        let mut props = HashMap::new();
+        props.insert(
+            "hoodie.record.merge.property.hoodie.payload.delete.field".to_string(),
+            "marker".to_string(),
+        );
+        props.insert(
+            "hoodie.record.merge.property.hoodie.payload.delete.marker".to_string(),
+            "D".to_string(),
+        );
+        let delete_context = DeleteContext::new(&props, &table_schema);
+
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        // Every field name appears exactly once; no growth over the requested schema.
+        assert_eq!(
+            required.fields().len(),
+            requested_schema.fields().len(),
+            "no field should be appended when all mandatory fields are already projected"
+        );
+        let key_count = required
+            .fields()
+            .iter()
+            .filter(|f| f.name() == "_hoodie_record_key")
+            .count();
+        assert_eq!(key_count, 1, "record-key field must not be duplicated");
+        let marker_count = required
+            .fields()
+            .iter()
+            .filter(|f| f.name() == "marker")
+            .count();
+        assert_eq!(
+            marker_count, 1,
+            "custom-delete-marker field must not be duplicated"
+        );
+    }
+
+    /// A nested struct in the requested projection must be retained intact in the
+    /// required schema (type and child fields preserved), while mandatory flat
+    /// fields are appended alongside it. Locks projection retention for nested
+    /// columns on the MOR mandatory-field append path.
+    #[test]
+    fn test_nested_struct_projection_retained() {
+        let nested = DataType::Struct(
+            vec![
+                Field::new("lat", DataType::Float64, true),
+                Field::new("lon", DataType::Float64, true),
+            ]
+            .into(),
+        );
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, true),
+            Field::new("location", nested.clone(), true),
+            Field::new("col_a", DataType::Utf8, true),
+        ]));
+        // Project the nested struct (without the record key, so it's appended).
+        let requested_schema = Arc::new(Schema::new(vec![Field::new(
+            "location",
+            nested.clone(),
+            true,
+        )]));
+
+        let handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone())
+            .with_requested_schema(requested_schema);
+
+        let delete_context = DeleteContext::new(&HashMap::new(), &table_schema);
+        let required = handler
+            .generate_required_schema(
+                true,
+                &["_hoodie_record_key".to_string()],
+                &[],
+                &delete_context,
+                false,
+                "COMMIT_TIME_ORDERING",
+            )
+            .unwrap()
+            .unwrap();
+
+        let (_, location) = required
+            .column_with_name("location")
+            .expect("nested struct column must be retained");
+        assert_eq!(
+            location.data_type(),
+            &nested,
+            "nested struct type (and its child fields) must be preserved unchanged"
+        );
+        assert!(
+            required.column_with_name("_hoodie_record_key").is_some(),
+            "mandatory record-key field must be appended alongside the nested struct"
+        );
+    }
+
+    /// A projection must not remove the columns the metadata merger reads.
+    ///
+    /// Both `key` and `type` are structural for every metadata partition: the
+    /// first identifies the record, the second selects the rule `record_type`
+    /// dispatches on. Without them the merge fails on a perfectly valid metadata
+    /// table -- and that failure is a correct guard, so what must not happen is
+    /// projecting the columns away.
+    ///
+    /// No record key fields are passed, deliberately. `key` is the metadata
+    /// table's configured record key in practice, so passing it would let the
+    /// record-key path keep the column and hide whether the merger's own
+    /// declaration does the work.
+    ///
+    /// `filesystemMetadata` is in the table and named by neither the request nor
+    /// the merger, so it must stay projected away. Without that check the test
+    /// would pass if nothing were projected at all.
+    #[test]
+    fn the_required_schema_keeps_the_custom_merger_s_own_columns() {
+        let table_schema =
+            make_schema(&["_hoodie_commit_time", "key", "type", "filesystemMetadata"]);
+        let requested = make_schema(&["_hoodie_commit_time"]);
+
+        let mut handler = FileGroupReaderSchemaHandler::new();
+        handler.table_schema = Some(table_schema.clone());
+        handler.data_schema = Some(table_schema);
+        handler.requested_schema = Some(requested.clone());
+
+        let props: HashMap<String, String> = HashMap::from([
+            (
+                "hoodie.compaction.payload.class".to_string(),
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+            (
+                "hoodie.record.merge.strategy.id".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+        ]);
+
+        handler
+            .prepare_required_schema(true, &[], &[], &props, false, "CUSTOM")
+            .expect("a metadata payload table resolves its merger");
+
+        assert!(
+            handler.custom_merger.is_some(),
+            "the fixture must really resolve a custom merger, or this test is vacuous"
+        );
+        for absent in ["key", "type", "filesystemMetadata"] {
+            assert!(
+                requested.column_with_name(absent).is_none(),
+                "the requested schema must omit `{absent}`, or this test proves nothing"
+            );
+        }
+
+        let required = handler
+            .required_schema
+            .as_ref()
+            .expect("a merge-on-read read has a required schema");
+        let names: Vec<&String> = required.fields().iter().map(|f| f.name()).collect();
+        for wanted in ["key", "type"] {
+            assert!(
+                required.column_with_name(wanted).is_some(),
+                "the required schema must add back `{wanted}`, which the merger names, \
+                 got: {names:?}"
+            );
+        }
+        assert!(
+            required.column_with_name("filesystemMetadata").is_none(),
+            "a column neither the request nor the merger names must stay projected away, \
+             got: {names:?}"
+        );
+    }
+}

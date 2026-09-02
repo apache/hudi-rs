@@ -406,7 +406,11 @@ impl HudiScanExec {
 
         for slices in partitions {
             for file_slice in slices {
-                if let Some(meta) = &file_slice.base_file.file_metadata {
+                if let Some(meta) = file_slice
+                    .base_file
+                    .as_ref()
+                    .and_then(|b| b.file_metadata.as_ref())
+                {
                     if meta.num_records > 0 {
                         total_rows = total_rows.saturating_add(meta.num_records as u64);
                         have_row_estimate = true;
@@ -455,7 +459,6 @@ mod tests {
     use hudi_core::config::util::empty_options;
     use hudi_core::file_group::base_file::BaseFile;
     use hudi_core::storage::file_metadata::FileMetadata;
-    use std::collections::BTreeSet;
     use std::fs::canonicalize;
     use std::path::Path;
     use std::str::FromStr;
@@ -495,12 +498,7 @@ mod tests {
             byte_size,
             num_records,
         });
-        FileSlice {
-            base_file: bf,
-            log_files: BTreeSet::new(),
-            partition_path: String::new(),
-            base_file_column_stats: None,
-        }
+        FileSlice::new(bf, String::new())
     }
 
     #[test]
@@ -532,12 +530,7 @@ mod tests {
     fn test_aggregate_partitions_returns_absent_when_metadata_missing() {
         let mut bf = BaseFile::from_str("fileA-0_0-1-1_20250101000000000.parquet").unwrap();
         bf.file_metadata = None;
-        let slices = [vec![FileSlice {
-            base_file: bf,
-            log_files: BTreeSet::new(),
-            partition_path: String::new(),
-            base_file_column_stats: None,
-        }]];
+        let slices = [vec![FileSlice::new(bf, String::new())]];
 
         let stats = HudiScanExec::aggregate_partitions(
             slices.iter().map(Vec::as_slice),

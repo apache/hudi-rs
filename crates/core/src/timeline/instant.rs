@@ -182,6 +182,25 @@ impl Instant {
         }
     }
 
+    /// Instant times Hudi uses to mark a table's beginning, which are valid
+    /// instants but not dates.
+    ///
+    /// `HoodieTimeline` defines `INIT_INSTANT_TS`, `METADATA_BOOTSTRAP_INSTANT_TS`
+    /// and `FULL_BOOTSTRAP_INSTANT_TS` as these three strings. Hudi orders
+    /// instants by comparing the strings themselves, so it never has to read
+    /// them as dates — and its own date parser rejects them (`0000` is not a
+    /// year, `00` not a month). `HoodieSqlCommonUtils.validateInstant` therefore
+    /// admits them by name before it attempts any parse, which is what makes
+    /// `INIT_INSTANT_TS` usable as an incremental read's "from the beginning"
+    /// bound.
+    ///
+    /// This crate compares instants as `DateTime`s rather than as strings, so it
+    /// has to map them somewhere; epoch 0/1/2 ms places them before every real
+    /// instant and in the same order as the 17-character forms the metadata
+    /// table writes for the same purpose.
+    const BOOTSTRAP_INSTANT_TIMES: [&'static str; 3] =
+        ["00000000000000", "00000000000001", "00000000000002"];
+
     fn validate_timestamp(timestamp: &str) -> Result<()> {
         if !matches!(timestamp.len(), 14 | 17) {
             return Err(CoreError::Timeline(format!(
@@ -196,7 +215,8 @@ impl Instant {
     /// Supports two formats:
     /// 1. Date format: `yyyyMMddHHmmss` (14 chars) or `yyyyMMddHHmmssSSS` (17 chars)
     /// 2. Epoch milliseconds: 17-digit number representing milliseconds since Unix epoch
-    ///    (used by metadata table for timestamps like `00000000000000000`)
+    ///    (used by metadata table for timestamps like `00000000000000000`), or one
+    ///    of the [`Self::BOOTSTRAP_INSTANT_TIMES`] sentinels.
     ///
     /// The function tries date format first, then falls back to epoch milliseconds
     /// if the date parsing fails (e.g., invalid month/day like `00`).
@@ -208,7 +228,14 @@ impl Instant {
 
         // Fallback: treat as epoch milliseconds (zero-padded 17-digit number)
         // This handles metadata table timestamps like 00000000000000000, 00000000000000001, etc.
-        if timestamp.len() == 17 && timestamp.chars().all(|c| c.is_ascii_digit()) {
+        //
+        // The sentinels are admitted by name rather than by relaxing the length
+        // check to 14. Every other 14-character value that fails the date parse
+        // is a malformed date, and reading one as epoch millis would silently
+        // move it centuries rather than report it.
+        if (timestamp.len() == 17 || Self::BOOTSTRAP_INSTANT_TIMES.contains(&timestamp))
+            && timestamp.chars().all(|c| c.is_ascii_digit())
+        {
             let epoch_ms: i64 = timestamp
                 .parse()
                 .map_err(|e| CoreError::Timeline(format!("Invalid epoch timestamp: {e}")))?;
@@ -222,6 +249,15 @@ impl Instant {
     }
 
     fn parse_naive_datetime(timestamp: &str) -> Result<NaiveDateTime> {
+        // Guard the slice: a timestamp shorter than the date-time prefix would
+        // otherwise panic here. Callers reach this with values read from data
+        // (a `_hoodie_commit_time` cell), not just with instants parsed from
+        // well-formed file names, so a short value has to be an error.
+        if timestamp.len() < 14 {
+            return Err(CoreError::Timeline(format!(
+                "Cannot parse timestamp '{timestamp}': shorter than yyyyMMddHHmmss"
+            )));
+        }
         let naive_dt = NaiveDateTime::parse_from_str(&timestamp[..14], "%Y%m%d%H%M%S")
             .map_err(|e| CoreError::Timeline(format!("Failed to parse timestamp: {e}")))?;
 
@@ -587,6 +623,51 @@ mod tests {
         assert_eq!(dt.timestamp_millis(), 1734567890123);
 
         Ok(())
+    }
+
+    /// Hudi's bootstrapping sentinels are valid instant times, and a caller may
+    /// legitimately hand one to an incremental read as "from the beginning".
+    ///
+    /// They are 14 characters, so the epoch-millis fallback — which only applies
+    /// to 17 — did not reach them, and they are not dates, so the date parse
+    /// rejected them too. `hoodie.datasource.read.begin.instanttime` set to
+    /// `HoodieTimeline.INIT_INSTANT_TS`, which Spark accepts, failed the read.
+    #[test]
+    fn test_parse_datetime_bootstrap_sentinels() -> Result<()> {
+        // The values Hudi defines in HoodieTimeline, with the epoch instant each
+        // stands for. They order the same way as their 17-character metadata
+        // table counterparts, which is what callers rely on.
+        for (sentinel, expected_millis) in [
+            ("00000000000000", 0),
+            ("00000000000001", 1),
+            ("00000000000002", 2),
+        ] {
+            let dt = Instant::parse_datetime(sentinel, "UTC")?;
+            assert_eq!(
+                dt.timestamp_millis(),
+                expected_millis,
+                "sentinel '{sentinel}' must parse to epoch {expected_millis}ms"
+            );
+            assert!(
+                dt < Instant::parse_datetime("20240315142530500", "UTC")?,
+                "sentinel '{sentinel}' must order before a real instant"
+            );
+        }
+        Ok(())
+    }
+
+    /// Accepting the sentinels must not turn every unparseable 14-character
+    /// value into an epoch reading: `20241332000000` is a malformed date (month
+    /// 13, day 32), and reading it as epoch millis would silently place it in
+    /// the year 2611 instead of reporting it.
+    #[test]
+    fn test_parse_datetime_malformed_14_char_still_errors() {
+        let err = Instant::parse_datetime("20241332000000", "UTC")
+            .expect_err("a malformed date must not be reinterpreted as epoch millis");
+        assert!(
+            format!("{err}").contains("20241332000000"),
+            "the error must name the offending value, got: {err}"
+        );
     }
 
     #[test]

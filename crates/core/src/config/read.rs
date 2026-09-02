@@ -83,10 +83,32 @@ pub enum HudiReadConfig {
     /// Snapshot/time-travel timestamp. Reads return the table state at this commit.
     AsOfTimestamp,
 
-    /// Start timestamp (exclusive) used by file-group readers to filter records.
+    /// Start of an incremental window, exclusive.
+    ///
+    /// # Which timestamp this is
+    ///
+    /// On timeline layout v2 (table version 8+) this bounds a commit's
+    /// **completion** time, matching Hudi 1.x — whose
+    /// `IncrementalQueryAnalyzer` names the same bound `startCompletionTime`. A
+    /// commit becomes visible when it completes, so that is what a window has to
+    /// bound: one requested before the window but completing inside it *is* a
+    /// change in that window, and bounding requested times skipped it silently.
+    ///
+    /// Layout v1 records no completion times, so there it bounds the requested
+    /// time, as it always did.
+    ///
+    /// **Breaking change.** This used to bound requested times on every layout.
+    /// Code that passes instant times read off the timeline — `Instant::timestamp`,
+    /// or a `{requested}_{completion}` file name's first half — now excludes the
+    /// commit it names, because that commit completed strictly later. Pass the
+    /// completion half instead (`Instant::completion_timestamp`).
     StartTimestamp,
 
-    /// End timestamp (inclusive) used by file-group readers to filter records.
+    /// End of an incremental window, inclusive. Bounds the same timestamp as
+    /// [`Self::StartTimestamp`] — see there, including the breaking change.
+    ///
+    /// Defaults to the greatest completion time among completed commits, i.e.
+    /// everything committed so far.
     EndTimestamp,
 
     /// Number of input partitions to read the data in parallel.
@@ -97,6 +119,17 @@ pub enum HudiReadConfig {
     /// When set to true, only base files will be read for optimized reads.
     /// This is only applicable to Merge-On-Read (MOR) tables.
     UseReadOptimizedMode,
+    /// Which implementation of the file group reader serves a read: `2`
+    /// (default) or `1`.
+    ///
+    /// A read version 2 cannot serve is served by version 1 instead, so neither
+    /// value can make a working read fail. Set `1` explicitly to opt out of the
+    /// newer reader entirely.
+    ///
+    /// An unrecognised value is an error rather than a fall back to the default
+    /// — silently reading with the other implementation would leave a caller
+    /// convinced they had exercised the one they asked for.
+    FileGroupReaderVersion,
 
     /// Target number of rows per batch for streaming reads.
     /// This controls the batch size when using streaming APIs.
@@ -104,9 +137,71 @@ pub enum HudiReadConfig {
 
     /// Maximum number of file-slice streams to poll concurrently within one scan partition.
     FileSliceReadConcurrency,
+
+    /// Match a log record to the base row it updates by that row's position in
+    /// the base file rather than by record key. Defaults to `false`.
+    ///
+    /// Only the writer knows whether it recorded positions; a log block that did
+    /// not is merged by key regardless of this setting. The two agree except in a
+    /// file group holding duplicate record keys, where merging by key cannot say
+    /// which of them a log record updates.
+    ///
+    /// Honored only by file group reader version 2 — see
+    /// [`Self::FileGroupReaderVersion`].
+    MergeUseRecordPositions,
+}
+
+/// Where a [`HudiReadConfig`] may legitimately be set.
+///
+/// [`Table`](crate::table::Table) holds configuration for its whole lifetime,
+/// while a read is a single call, so the two kinds cannot be treated alike: a
+/// key that selects *which* read to perform would, baked at table level,
+/// silently redirect every subsequent read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadConfigScope {
+    /// Describes *how* to read. Stable for a deployment, so it may be set on the
+    /// table (including in `hoodie.properties` or `hudi-defaults.conf`) and
+    /// overridden per read.
+    TableOrRead,
+    /// Selects *which* read to perform. Meaningful only per call — see
+    /// [`ReadOptions`](crate::table::ReadOptions).
+    ReadOnly,
 }
 
 impl HudiReadConfig {
+    /// Where this config may be set. See [`ReadConfigScope`].
+    ///
+    /// Exhaustive on purpose: a new variant has to choose, rather than inheriting
+    /// whatever a prefix rule happens to do with its key.
+    pub const fn scope(&self) -> ReadConfigScope {
+        match self {
+            // These name a point or a window in the timeline, or the query shape
+            // itself. A table pinned to one of them would answer every later
+            // read as at that point, which no caller asked for.
+            Self::QueryType | Self::AsOfTimestamp | Self::StartTimestamp | Self::EndTimestamp => {
+                ReadConfigScope::ReadOnly
+            }
+            // These are deployment choices: which file group reader runs, how
+            // much parallelism to use, how big a streamed batch is. Setting them
+            // once for a table is the natural way to use them.
+            Self::InputPartitions
+            | Self::UseReadOptimizedMode
+            | Self::StreamBatchSize
+            | Self::FileSliceReadConcurrency
+            | Self::FileGroupReaderVersion
+            | Self::MergeUseRecordPositions => ReadConfigScope::TableOrRead,
+        }
+    }
+
+    /// The scope of the read config named by `key`, or `None` when `key` is not
+    /// a read config at all.
+    pub fn scope_of_key(key: &str) -> Option<ReadConfigScope> {
+        use strum::IntoEnumIterator;
+        Self::iter()
+            .find(|config| config.as_ref() == key)
+            .map(|config| config.scope())
+    }
+
     /// `&'static str` form of the config key. `const fn` so callers can use it in
     /// `const` contexts (e.g. building static lookup tables of `hoodie.*` keys
     /// without duplicating the literal strings).
@@ -118,8 +213,13 @@ impl HudiReadConfig {
             Self::EndTimestamp => "hoodie.read.end.timestamp",
             Self::InputPartitions => "hoodie.read.input.partitions",
             Self::UseReadOptimizedMode => "hoodie.read.use.read_optimized.mode",
+            Self::FileGroupReaderVersion => "hoodie.read.file.group.reader.version",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
+            // Hudi's own key, not a `hoodie.read.*` one: a table written with
+            // record positions is read with this set, and a reader that invented
+            // its own spelling would ignore what the writer was told.
+            Self::MergeUseRecordPositions => "hoodie.merge.use.record.positions",
         }
     }
 }
@@ -136,6 +236,62 @@ impl Display for HudiReadConfig {
     }
 }
 
+/// Which implementation of the file group reader serves a read.
+///
+/// Numbered rather than named after a strategy, because the older one is being
+/// retired rather than kept as an alternative: a version says newer supersedes
+/// older, where a name like `batch_merge` would imply a permanent choice.
+/// Matches how Hudi already versions `hoodie.table.version` and
+/// `hoodie.timeline.layout.version`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileGroupReaderVersion {
+    /// The reader that has always served reads: whole-batch sort and dedup.
+    /// Reachable explicitly, as an escape hatch, and reached by fall back
+    /// whenever [`Self::Two`] cannot serve a read.
+    One,
+    /// The merge-on-read reader being ported in, and the default.
+    ///
+    /// It does not serve every read yet. Anything it cannot serve is served by
+    /// [`Self::One`] instead, which is why it can be the default this early:
+    /// what changes a read is the reader gaining a capability, not this setting.
+    #[default]
+    Two,
+}
+
+impl FileGroupReaderVersion {
+    /// The integer a caller writes in config.
+    pub fn as_usize(&self) -> usize {
+        match self {
+            Self::One => 1,
+            Self::Two => 2,
+        }
+    }
+}
+
+impl TryFrom<usize> for FileGroupReaderVersion {
+    type Error = ConfigError;
+
+    fn try_from(value: usize) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::One),
+            2 => Ok(Self::Two),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
+impl FromStr for FileGroupReaderVersion {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim() {
+            "1" => Ok(Self::One),
+            "2" => Ok(Self::Two),
+            v => Err(InvalidValue(v.to_string())),
+        }
+    }
+}
+
 impl ConfigParser for HudiReadConfig {
     type Output = HudiConfigValue;
 
@@ -146,6 +302,10 @@ impl ConfigParser for HudiReadConfig {
             )),
             HudiReadConfig::InputPartitions => Some(HudiConfigValue::UInteger(0usize)),
             HudiReadConfig::UseReadOptimizedMode => Some(HudiConfigValue::Boolean(false)),
+            HudiReadConfig::FileGroupReaderVersion => Some(HudiConfigValue::UInteger(
+                FileGroupReaderVersion::default().as_usize(),
+            )),
+            HudiReadConfig::MergeUseRecordPositions => Some(HudiConfigValue::Boolean(false)),
             HudiReadConfig::StreamBatchSize => Some(HudiConfigValue::UInteger(1024usize)),
             HudiReadConfig::FileSliceReadConcurrency => Some(HudiConfigValue::UInteger(4usize)),
             _ => None,
@@ -170,7 +330,10 @@ impl ConfigParser for HudiReadConfig {
                     usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::UInteger),
-            Self::UseReadOptimizedMode => get_result
+            Self::FileGroupReaderVersion => get_result
+                .and_then(FileGroupReaderVersion::from_str)
+                .map(|v| HudiConfigValue::UInteger(v.as_usize())),
+            Self::UseReadOptimizedMode | Self::MergeUseRecordPositions => get_result
                 .and_then(|v| {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
@@ -308,6 +471,19 @@ mod tests {
         assert!(AsOfTimestamp.default_value().is_none());
         assert!(StartTimestamp.default_value().is_none());
         assert!(EndTimestamp.default_value().is_none());
+    }
+
+    #[test]
+    fn file_group_reader_version_try_from_usize_accepts_1_and_2_and_rejects_others() {
+        assert_eq!(
+            FileGroupReaderVersion::try_from(1).unwrap(),
+            FileGroupReaderVersion::One
+        );
+        assert_eq!(
+            FileGroupReaderVersion::try_from(2).unwrap(),
+            FileGroupReaderVersion::Two
+        );
+        assert!(FileGroupReaderVersion::try_from(3).is_err());
     }
 
     #[test]

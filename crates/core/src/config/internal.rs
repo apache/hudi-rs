@@ -58,6 +58,23 @@ pub enum HudiInternalConfig {
     /// Queries without time filters (e.g., `get_completed_commits()`) will never load
     /// archived instants, regardless of this setting.
     TimelineArchivedReadEnabled,
+    /// The instant times an incremental read admits, comma-separated.
+    ///
+    /// Set by [`Table::read`](crate::table::Table::read) on the incremental path
+    /// and consumed by the file-group reader's commit-time mask. It exists because
+    /// the window and the row filter key off *different* timestamps: a layout-v2
+    /// window bounds **completion** times, while `_hoodie_commit_time` on a row
+    /// holds the **requested** time. Comparing the row's requested time against
+    /// completion-time bounds is simply a different question, so the resolved
+    /// instant times are passed down and rows are matched by membership instead.
+    ///
+    /// Mirrors Hudi 1.x, where `IncrementalQueryAnalyzer` resolves the window to a
+    /// list of instant times and the reader filters on that list.
+    ///
+    /// Absent means "fall back to the start/end range comparison", which is what
+    /// layout v1 needs — it records no completion times, so its window already
+    /// bounds requested times.
+    IncrementalInstantTimes,
 }
 
 impl AsRef<str> for HudiInternalConfig {
@@ -65,6 +82,7 @@ impl AsRef<str> for HudiInternalConfig {
         match self {
             Self::SkipConfigValidation => "hoodie.internal.skip.config.validation",
             Self::TimelineArchivedReadEnabled => "hoodie.internal.timeline.archived.enabled",
+            Self::IncrementalInstantTimes => "hoodie.internal.read.incremental.instant.times",
         }
     }
 }
@@ -82,6 +100,10 @@ impl ConfigParser for HudiInternalConfig {
         match self {
             Self::SkipConfigValidation => Some(HudiConfigValue::Boolean(false)),
             Self::TimelineArchivedReadEnabled => Some(HudiConfigValue::Boolean(false)),
+            // No default: absent means "range on start/end instead", which is a
+            // different code path rather than an empty list (an empty list would
+            // correctly admit nothing).
+            Self::IncrementalInstantTimes => None,
         }
     }
 
@@ -102,6 +124,9 @@ impl ConfigParser for HudiInternalConfig {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Boolean),
+            Self::IncrementalInstantTimes => {
+                get_result.map(|v| HudiConfigValue::String(v.to_string()))
+            }
         }
     }
 }

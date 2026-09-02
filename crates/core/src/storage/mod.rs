@@ -37,12 +37,28 @@ use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
 use crate::storage::util::join_url_segments;
 
+#[cfg(test)]
+pub(crate) mod counting;
 pub mod error;
 pub mod file_metadata;
 pub mod reader;
 pub mod util;
 
-#[allow(dead_code)]
+/// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
+/// the Arrow schema it maps to. Returning `None` means no filter is pushed.
+///
+/// `Arc` rather than `Box` so options holding it stay `Clone`. The captured
+/// state must be `Send + Sync` because the parquet stream may evaluate the
+/// filter on any worker thread.
+pub type RowFilterBuilder = Arc<
+    dyn Fn(
+            &parquet::schema::types::SchemaDescriptor,
+            &arrow_schema::Schema,
+        ) -> Option<parquet::arrow::arrow_reader::RowFilter>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone, Debug)]
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
@@ -80,6 +96,27 @@ impl Storage {
             })),
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
+    }
+
+    /// Build storage over a caller-supplied object store.
+    ///
+    /// Test-only, so a test can wrap the real store and observe the requests a
+    /// reader makes. Note that a wrapper takes the trait's default `get_ranges`,
+    /// which coalesces, where `LocalFileSystem` overrides it and does not: the
+    /// counts a test sees are therefore the ones an object store would serve, not
+    /// the ones the local filesystem would.
+    #[cfg(test)]
+    pub(crate) fn new_with_object_store(
+        base_url: Url,
+        object_store: Arc<dyn ObjectStore>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Arc<Storage> {
+        Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options: Arc::new(HashMap::new()),
+            hudi_configs,
+        })
     }
 
     #[cfg(test)]
@@ -138,6 +175,24 @@ impl Storage {
         StorageReader::new(obj_store, obj_meta)
             .await
             .map_err(StorageError::ReaderError)
+    }
+
+    /// A reader that fetches bounded windows instead of the whole file.
+    ///
+    /// Only the object metadata is fetched here; no file bytes are read until
+    /// the caller reads.
+    pub async fn get_streaming_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        Ok(StorageReader::new_streaming(
+            obj_store,
+            obj_meta,
+            window_size,
+        ))
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {

@@ -59,13 +59,15 @@ jobs:
       image: xd009642/tarpaulin:0.32.7
       options: --security-opt seccomp=unconfined
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install system dependencies
+        # librocksdb-sys generates its bindings with bindgen at build time, which
+        # needs libclang. The hosted runners ship it; this container does not.
         run: |
           apt-get update
-          apt-get install -y protobuf-compiler
+          apt-get install -y protobuf-compiler clang libclang-dev
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Only cache cargo registry and git, not target directory
           # Tarpaulin needs clean builds for accurate coverage
@@ -81,12 +83,82 @@ jobs:
           path: ./cov-reports
           if-no-files-found: 'error'
 
+  # hudi-core without `spill-rocksdb` must keep building and passing. That build
+  # is the reason the feature exists — it needs no libclang and no C++ toolchain,
+  # so a consumer that cannot take a native build (or does not want one in a
+  # Python wheel) has a configuration to use. Nothing else in CI compiles it, so
+  # without this job it would break silently.
+  rust-tests-no-spill-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache dependencies
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: no-spill-backend
+      # Deliberately no clang/libclang: if a change makes the default-off build
+      # pull rocksdb back in, this job fails to compile rather than quietly
+      # reintroducing the native dependency.
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Clippy without the spill backend
+        run: cargo clippy -p hudi-core --lib --no-default-features -- -D warnings
+      - name: Unit tests without the spill backend
+        run: cargo test -p hudi-core --lib --no-default-features --no-fail-fast
+      # The umbrella crate is where a consumer actually opts out, and it reaches
+      # hudi-core twice: directly, and through hudi-datafusion. Either edge taking
+      # default features hands the tier back without the steps above noticing,
+      # since they only build hudi-core. Both shapes are built here, where there
+      # is no libclang to build rocksdb with.
+      - name: Check the umbrella crate without the spill backend
+        run: cargo check -p hudi --no-default-features
+      - name: Check the umbrella crate without the spill backend, with datafusion
+        run: cargo check -p hudi --no-default-features --features datafusion
+      # The steps above prove the opt-out COMPILES. This proves it actually drops
+      # the dependency, and unlike them it does not rest on libclang being absent,
+      # so it keeps working if this job ever gains a C++ toolchain.
+      - name: Assert the opt-out drops rocksdb from the dependency graph
+        run: |
+          # A graph assertion has two ways to look like it passed: the tier
+          # really is gone, or cargo tree never ran. `-i` exits non-zero with an
+          # empty stdout in BOTH cases, so neither the output nor the status
+          # alone tells them apart, and discarding stderr makes a broken command
+          # indistinguishable from a working opt-out. Each check below therefore
+          # pins the specific reason rather than inferring from emptiness.
+
+          # Under defaults the tier must be reachable. If this ever stops
+          # holding, the absence checks below are asserting nothing.
+          for args in "" "--features datafusion"; do
+            if ! out=$(cargo tree -p hudi $args -i rocksdb 2>&1) \
+               || ! printf '%s\n' "$out" | grep -q '^rocksdb'; then
+              echo "cargo tree did not find rocksdb under default features: '$args'"
+              echo "so the absence checks below cannot tell an opt-out from a broken command"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+          done
+
+          # With the opt-out it must be gone — and gone because the package is
+          # absent from the graph, which cargo says in those words, not because
+          # the command failed for some other reason.
+          for args in "--no-default-features" "--no-default-features --features datafusion"; do
+            if out=$(cargo tree -p hudi $args -i rocksdb 2>&1); then
+              echo "rocksdb is still reachable from hudi with: $args"
+              printf '%s\n' "$out"
+              exit 1
+            elif ! printf '%s\n' "$out" | grep -q 'did not match any packages'; then
+              echo "cargo tree failed for a reason other than rocksdb being absent: '$args'"
+              printf '%s\n' "$out"
+              exit 1
+            fi
+          done
+
   rust-tests-windows:
     runs-on: windows-2025
     # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
     if: false    
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Run unit tests on Windows with no coverage report
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
 
@@ -106,7 +178,7 @@ jobs:
             python-version: '3.10'
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install protobuf compiler (Linux)
         if: runner.os == 'Linux'
@@ -120,7 +192,7 @@ jobs:
 
       # Cache Rust dependencies and build artifacts
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Cache based on Python version and OS for better hit rate
           shared-key: "python-binding-${{ matrix.os }}-py${{ matrix.python-version }}"
@@ -128,7 +200,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
 
       - name: install uv and set the python version
-        uses: astral-sh/setup-uv@5a095e7a2014a4212f075830d4f7277575a9d098
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
           version: "0.7.19"
           python-version: ${{ matrix.python-version }}
@@ -179,9 +251,9 @@ jobs:
           app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Pre-pull base images
         run: |
           docker pull quay.io/minio/minio:latest
@@ -190,7 +262,7 @@ jobs:
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
           sudo chown -R $(id -u):$(id -g) .cargo target python/target .uv-cache
       - name: Cache integration build artifacts (cargo/target/uv)
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             target
@@ -216,14 +288,14 @@ jobs:
     needs: [ rust-tests, python-tests ]
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
         with:
           pattern: cov-report-*
           merge-multiple: true
           path: ./cov-reports
       - name: Upload coverage reports to codecov.io
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           fail_ci_if_error: true
           token: ${{ secrets.CODECOV_TOKEN }}

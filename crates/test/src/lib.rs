@@ -30,6 +30,8 @@ use tempfile::{Builder as TempDirBuilder, tempdir};
 use url::Url;
 use zip::ZipArchive;
 
+pub mod gold;
+pub mod gold_options;
 pub mod util;
 
 #[cfg(feature = "datafusion")]
@@ -163,6 +165,301 @@ pub enum QuickstartTripsTable {
     V8Trips8I3U1D,
     #[strum(serialize = "v9_trips_lance")]
     V9TripsLance,
+    /// v9 MOR table, 8 inserts + 4 updates, COMMIT_TIME_ORDERING.
+    /// Schema: id INT, name STRING, age INT, ts STRING, city STRING (partitioned by city)
+    /// Commit 1: INSERT 8 rows → base .parquet per partition
+    /// Commit 2: UPSERT 4 rows (ids 1,3,5,7) → .log files
+    #[strum(serialize = "v9_mor_8i4u_commit_time")]
+    V9Mor8I4UCommitTime,
+    /// v9 MOR non-partitioned table, 3 commits (insert + merge-delete + merge-update).
+    /// Schema: id INT, name STRING, price DOUBLE, ts LONG (non-partitioned)
+    /// Commit 1: INSERT 7 rows (ids 0-6) → base .parquet
+    /// Commit 2: MERGE INTO DELETE 3 rows (ids 0,1,2) → .log file 1 (delete block)
+    /// Commit 3: MERGE INTO UPDATE 3 rows (ids 4,5,6) → .log file 2 (avro data block)
+    #[strum(serialize = "v9_mor_nonpart_3commits")]
+    V9MorNonpart3Commits,
+    /// v9 MOR non-partitioned, base file written by COMPACTION so it carries
+    /// records from three commits at once.
+    ///
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Timeline (see the sibling `.sql`):
+    ///   `20260807223522627` deltacommit — INSERT a, b, c, d
+    ///   `20260807223526409` deltacommit — UPDATE a  → log
+    ///   `20260807223528666` deltacommit — UPDATE b  → log
+    ///   `20260807223529164` **commit**  — inline COMPACTION; the base file it
+    ///       writes holds a@…526409, b@…528666, c@…522627, d@…522627
+    ///   `20260807223530452` deltacommit — UPDATE c  → log
+    ///   `20260807223531562` deltacommit — UPDATE d  → log
+    ///
+    /// Exists so an incremental read has a base file whose records span the
+    /// window boundary: admitting the file must not admit every record in it.
+    #[strum(serialize = "v9_mor_compacted_incremental")]
+    V9MorCompactedIncremental,
+    /// v8 MOR non-partitioned, four delta commits, for incremental windows whose
+    /// bounds land on a commit's requested or completion time.
+    ///
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Table version 8, timeline layout v2 — so every completed instant is named
+    /// `{requested}_{completion}` and the two differ. That is what makes the
+    /// boundary cases expressible; a v6 table has no completion time to disagree
+    /// about.
+    ///
+    ///   `20260808010716256_20260808010719396` INSERT a, b, c, d
+    ///   `20260808010720902_20260808010722082` UPDATE a
+    ///   `20260808010723246_20260808010723734` UPDATE b   <- the pivot
+    ///   `20260808010724567_20260808010724916` UPDATE c
+    ///
+    /// `gold_incremental/` holds what Hudi returns for four windows placed
+    /// around that third commit: between commits, starting on its requested
+    /// time, starting on its completion time, and spanning requested to
+    /// completion.
+    #[strum(serialize = "v8_mor_boundary_windows")]
+    V8MorBoundaryWindows,
+    /// v9 MOR non-partitioned, log-only with compacted log block (5 log files).
+    #[strum(serialize = "table_log_compaction")]
+    MorLayoutLogCompaction,
+    /// v9 MOR non-partitioned, log-only (3 log files: insert + update + delete).
+    #[strum(serialize = "table_log_only")]
+    MorLayoutLogOnly,
+    /// v9 MOR non-partitioned, base + 2 log files (update + delete), all column types.
+    #[strum(serialize = "table_column_projection")]
+    MorLayoutColumnProjection,
+    /// v9 MOR non-partitioned, base + 3 log files (update + delete + update), all data types.
+    #[strum(serialize = "table_all_data_types")]
+    MorLayoutAllDataTypes,
+    /// v9 MOR non-partitioned, base + 1 log file containing NULL container elements.
+    /// Schema: id INT, arr_null_elem ARRAY<INT>, map_null_val MAP<STRING,INT>,
+    /// st_null_field STRUCT<a INT, b STRING>, arr_empty ARRAY<STRING>,
+    /// map_empty MAP<STRING,INT>, emptyinit_arr ARRAY<INT>, ts LONG
+    /// Commit 1: INSERT 12 rows (ids 1-12) → base .parquet
+    /// Commit 2: UPDATE id=1 SET arr_null_elem = array(1, NULL, 3), ts = 101 → .log file
+    /// (avro data block whose array carries a NULL element)
+    #[strum(serialize = "table_null_containers")]
+    MorLayoutNullContainers,
+    /// v9 MOR non-partitioned, base + 2 AVRO log files with a CORRUPT tail block.
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e), self-validating generator that asserts the log
+    /// layout before dumping gold.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1 (AVRO data block) + log.2 (AVRO data block
+    /// followed by appended garbage bytes forming a CORRUPT tail block).
+    /// Semantics: the corrupt tail block is skipped during log scan
+    /// (`total_corrupt_log_blocks >= 1`) and the valid data is read intact.
+    /// gold_data = Spark `SELECT *` snapshot, 4 rows.
+    #[strum(serialize = "table_corrupt_tail_block")]
+    MorLayoutCorruptTailBlock,
+    /// v9 MOR non-partitioned, base + 3 PARQUET-format log files.
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e); written with `hoodie.logfile.data.block.format=parquet`.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1/log.2 (PARQUET_DATA_BLOCK) + log.3
+    /// (DELETE block).
+    /// Semantics: parquet log blocks are decoded and merged, delete block
+    /// applied. gold_data = Spark `SELECT *` snapshot, 3 rows.
+    #[strum(serialize = "table_parquet_log_block")]
+    MorLayoutParquetLogBlock,
+    /// v9 MOR non-partitioned, base + 1 AVRO log file carrying a PARTIAL-update
+    /// data block (`IS_PARTIAL=true` block header).
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e); MERGE INTO updating a column subset with partial
+    /// updates enabled.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1 (AVRO data block, `IS_PARTIAL=true`).
+    /// Semantics: hudi-rs applies IS_PARTIAL / KEEP_VALUES blocks by overlaying
+    /// the updated column subset onto the prior record (the D7 refuse-loudly gap
+    /// is now closed). gold_data = Spark `SELECT *` snapshot, 4 rows (the
+    /// merge-correct truth the applied result must match).
+    #[strum(serialize = "table_partial_update")]
+    MorLayoutPartialUpdate,
+    /// v9 MOR non-partitioned, EVENT_TIME_ORDERING, where two PARTIAL-update log
+    /// blocks touch the same key and the second one LOSES the ordering.
+    ///
+    /// Provenance: `table_partial_update_event_time.sql` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT). MERGE INTO writes a partial block
+    /// when the table is MOR, the operation is an upsert, and the update touches
+    /// a strict subset of the columns.
+    /// Schema: id INT, ts LONG, a STRING, b STRING (non-partitioned).
+    /// Layout: base .parquet (2 rows at ts 100) + log.1 (partial update of
+    /// `ts`,`a`) + log.1 (partial update of `ts`,`b`).
+    /// Semantics: each key folds in the opposite direction. `id=1` takes its
+    /// second update BELOW the first (200 < 300), so the earlier record wins and
+    /// still absorbs `b` from the loser; `id=2` takes its second update above
+    /// (300 > 200), so the later record wins and absorbs `a`. Either way the
+    /// column only the LOSING record carries must survive, which is what
+    /// distinguishes a both-direction fold from one that keeps the winner whole.
+    /// `table_partial_update` cannot show this: it is COMMIT_TIME_ORDERING,
+    /// where the incoming record always wins and the fold is one-directional.
+    /// gold_data = Spark `SELECT *` snapshot, 2 rows.
+    #[strum(serialize = "table_partial_update_event_time")]
+    MorPartialUpdateEventTime,
+    /// v9 MOR non-partitioned, base + 1 HFILE-format log file
+    /// (`HFILE_DATA_BLOCK`).
+    ///
+    /// Provenance: hudi-internal `TestMORFileSliceLayoutsFixturesV2`
+    /// (commit 309a0b287e); written with `hoodie.logfile.data.block.format=hfile`.
+    /// Schema: key STRING, ts LONG, value STRING, num INT (non-partitioned).
+    /// Layout: base .parquet + log.1 (HFILE_DATA_BLOCK). The fixture carries no
+    /// gold_data: it was dumped against a reader with no HFile support, where
+    /// the expectation was a loud failure. This crate does read HFile (for the
+    /// metadata table), so what this fixture should assert here is an open
+    /// question — hence no case wired up for it yet.
+    #[strum(serialize = "table_hfile_log_block")]
+    MorLayoutHfileLogBlock,
+    /// v9 MOR non-partitioned, one file group holding the same record key more
+    /// than once — the only fixture where merging by record position and
+    /// merging by record key give different answers.
+    ///
+    /// Provenance: `table_duplicate_keys.scala` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.1.1), written with `hoodie.write.record.positions`
+    /// on so the log blocks carry `RECORD_POSITIONS` headers.
+    /// Schema: id STRING, val STRING, ts LONG (non-partitioned).
+    /// Layout: base .parquet (6 rows — k1 ×2, k2 ×3, k3 ×1, inserted in one
+    /// commit without combining) + log.1 (AVRO data block, one UPSERT of k1
+    /// expanded to one record per matched base row) + log.2 (DELETE block, one
+    /// delete of k2 expanded to three).
+    /// Semantics: Hudi's writer tags an incoming record with *every* base row
+    /// its index matches. Keyed by record key those expansions collapse to one
+    /// entry per key and only the first base row of each key is merged, leaving
+    /// a stale k1 row and two live k2 rows (5 rows). Keyed by position each base
+    /// row is merged on its own (3 rows).
+    /// Two golds, both Hudi's own output: `gold_data` is the default read,
+    /// `gold_positions` the same read with
+    /// `hoodie.merge.use.record.positions=true`.
+    #[strum(serialize = "table_duplicate_keys")]
+    MorLayoutDuplicateKeys,
+    /// v9 MOR non-partitioned, EVENT_TIME_ORDERING, where a log update and a
+    /// delete each LOSE to the live row on ordering value.
+    ///
+    /// Provenance: `table_event_time_stale.sql` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT).
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    /// Layout: base .parquet (4 rows, all at ts 100) + one log file per write:
+    /// `a` updated at ts 50, `b` updated at ts 200, `c` deleted at ts 50,
+    /// `d` deleted at ts 300.
+    /// Semantics: `a` keeps the base row and `c` survives its delete, both
+    /// because the log side's ordering value sits below the live row; `b` takes
+    /// its update and `d` is removed, because theirs sit above. Everywhere else
+    /// the corpus only ever writes at or above the live ordering value, so
+    /// nothing else in it notices if event-time ordering degrades to
+    /// last-writer-wins. Both directions of both shapes live in this one
+    /// fixture, so inverting a comparison does not pass either.
+    /// gold_data = Spark `SELECT *` snapshot, 3 rows.
+    #[strum(serialize = "table_event_time_stale")]
+    MorEventTimeStale,
+
+    // -------------------------------------------------------------------------
+    // A delta commit that wrote log blocks and never completed: what a writer
+    // killed mid-commit leaves behind. Its blocks must not reach the merge.
+    //
+    // The two versions take different routes to that answer, which is why both
+    // are here. Below table version 8 the timeline records no completion times,
+    // so the log-block scan itself has to check the instant's state. From
+    // version 8 the completion times exist and the log file is dropped when the
+    // file slice is built, so the per-block check is redundant and Java skips it
+    // (`BaseHoodieLogRecordReader`, `tableVersion.lesserThan(EIGHT)`). A fixture
+    // for only one version would leave the other route unexercised.
+    //
+    // Provenance: `table_uncommitted_log.sql` beside these zips (Spark 3.5.3 /
+    // Hudi 1.2.0-SNAPSHOT). Generated normally — a base write then two updates —
+    // after which the *middle* delta commit's completed timeline file was
+    // deleted, leaving its `.inflight` and `.requested` and its log file behind.
+    // gold_data is Spark reading the table in that state, so it is Hudi's own
+    // answer to the doctored layout.
+    //
+    // The middle one, not the last: an orphan at the end sorts above the latest
+    // committed instant, so the future-block gate discards it and the
+    // completed/inflight gate is never reached. The first attempt at this
+    // fixture orphaned the last commit and passed with the gate disarmed —
+    // regenerate it that way and the sweep goes green proving nothing.
+    //
+    // Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    // Layout: base .parquet, 4 rows at ts 100, then two log files — the orphaned
+    // update of `b` at ts 300, then the committed update of `a` at ts 200. The
+    // versions name those files differently, which is the whole point: on v6
+    // both are `.log.1`/`.log.2` carrying the *base* instant, so no file-level
+    // check can attribute either to a delta commit and only the per-block gate
+    // can exclude the orphan; on v9 each is a `.log.1` carrying its own delta
+    // commit, so the orphan's file is dropped when the slice is built.
+    // Semantics: `a` takes its update, `b` keeps the base row. gold_data = 4 rows.
+    // The orphan's ts 300 outranks every other row, so an admitted orphan would
+    // win under `preCombineField = 'ts'` — the fixture fails loudly, not silently.
+    // -------------------------------------------------------------------------
+    /// Table version 6: the orphaned blocks are excluded by the log-block scan's
+    /// completed/inflight gate.
+    #[strum(serialize = "table_uncommitted_log_v6")]
+    MorUncommittedLogV6,
+    /// Table version 9: the orphaned blocks are excluded when the file slice is
+    /// built, with no per-block gate involved.
+    #[strum(serialize = "table_uncommitted_log_v9")]
+    MorUncommittedLogV9,
+
+    // -------------------------------------------------------------------------
+    // Delete-block orderingVal wrapper-type fixtures (Task 7).
+    // Each table: v9 MOR, COMMIT_TIME_ORDERING, NON_PARTITIONED, 4 rows inserted
+    // (ids 1-4), ids 3 and 4 deleted via upsert with `_hoodie_is_deleted=true`.
+    // After applying the DELETE log block: ids 1 and 2 remain.
+    // Schema: id INT32, val STRING, ts <type-under-test> (non-partitioned).
+    // Generated by gold Hudi Spark; provenance: hudi-rs-delete-fixtures.
+    // -------------------------------------------------------------------------
+    /// DELETE block orderingVal type: IntWrapper (Avro int).
+    /// ts column is INT32; precombine values in delete block: [4, 3].
+    #[strum(serialize = "table_delete_ord_int")]
+    MorDeleteOrdInt,
+    /// DELETE block orderingVal type: LongWrapper (Avro long).
+    /// ts column is INT64; precombine values in delete block: [4000, 3000].
+    #[strum(serialize = "table_delete_ord_long")]
+    MorDeleteOrdLong,
+    /// DELETE block orderingVal type: DoubleWrapper (Avro double).
+    /// ts column is FLOAT64; precombine values in delete block: [6.0, 4.5].
+    #[strum(serialize = "table_delete_ord_double")]
+    MorDeleteOrdDouble,
+    /// DELETE block orderingVal type: StringWrapper (Avro string).
+    /// ts column is UTF8; precombine values in delete block: ["ord_4", "ord_3"].
+    #[strum(serialize = "table_delete_ord_string")]
+    MorDeleteOrdString,
+    /// DELETE block orderingVal type: DecimalWrapper (precision=30, scale=15).
+    /// ts column is DECIMAL(20,4); precombine values in delete block: [4.0, 3.0].
+    #[strum(serialize = "table_delete_ord_decimal")]
+    MorDeleteOrdDecimal,
+    /// DELETE block orderingVal type: TimestampMicrosWrapper (Avro long / epoch µs).
+    /// ts column is TIMESTAMP[us, UTC]; precombine values stored as Long (epoch
+    /// micros). adjacent: unwrapAvroValueWrapper returns Long, not
+    /// Instant — but the delete block IS written and can be decoded.
+    #[strum(serialize = "table_delete_ord_timestamp")]
+    MorDeleteOrdTimestamp,
+
+    // -------------------------------------------------------------------------
+    // Schema-on-write evolution fixtures (0610 review).
+    // Provenance: hudi-internal `TestMORFileSliceLayoutsSchemaEvo` (self-
+    // validating generator: asserts v9/MOR/COMMIT_TIME, 1 base + 2 avro logs,
+    // and the two data blocks carrying DIFFERENT writer schemas).
+    // -------------------------------------------------------------------------
+    /// v9 MOR non-partitioned, base + 2 AVRO logs written under DIFFERENT
+    /// writer schemas (added column).
+    ///
+    /// Schema v1: key STRING, ts LONG, val STRING; v2 adds extra STRING.
+    /// c1 INSERT k1-k4 (base @ v1) → c2 UPDATE k1 (log1 @ v1, no `extra`)
+    /// → ALTER TABLE ADD COLUMNS (extra STRING)
+    /// → c3 UPDATE k2 SET val,extra (log2 @ v2).
+    /// Merged truth: k1 v1_upd/NULL, k2 v2_upd/x2, k3 v3/NULL, k4 v4/NULL.
+    /// gold_data = Spark `SELECT *` snapshot, 4 rows.
+    #[strum(serialize = "table_evo_add_col")]
+    MorEvoAddCol,
+    /// v9 MOR non-partitioned, base + 2 AVRO logs written under DIFFERENT
+    /// writer schemas (type promotion int→long and float→double).
+    ///
+    /// Schema v1: key STRING, ts LONG, num INT, fnum FLOAT; v2 promotes num
+    /// to LONG and fnum to DOUBLE (schema-on-write DataFrame upsert).
+    /// c1 INSERT k1-k4 (base @ v1) → c2 UPDATE k1 num=11 (log1 @ INT/FLOAT)
+    /// → c3 upsert k2 num=5000000000 (beyond i32), fnum=2.25 (log2 @ LONG/DOUBLE).
+    /// Merged truth: k1 11/1.25, k2 5000000000/2.25, k3 3/3.75, k4 4/5.0.
+    /// gold_data = path-based snapshot (the SQL catalog keeps the
+    /// pre-promotion types), 4 rows.
+    #[strum(serialize = "table_evo_promotion")]
+    MorEvoPromotion,
 }
 
 impl QuickstartTripsTable {
@@ -215,8 +512,11 @@ impl QuickstartTripsTable {
 
     pub fn available_formats(&self) -> &'static [TableFormat] {
         match self {
-            Self::V6Trips8I1U | Self::V6Trips8I3D | Self::V8Trips8I3U1D => MOR_AVRO,
             Self::V9TripsLance => COW_AND_MOR_AVRO,
+            // Everything else is a merge-on-read fixture with Avro log blocks.
+            // The layout fixtures in particular exist to exercise log-block
+            // shapes, so they have no copy-on-write counterpart.
+            _ => MOR_AVRO,
         }
     }
 
@@ -224,6 +524,44 @@ impl QuickstartTripsTable {
         let zip_path = self.zip_path_for(format);
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
+    }
+
+    /// Where this fixture's Spark snapshot lives.
+    ///
+    /// Beside the table directory, never inside it: a full-table read lists the
+    /// table's own directory, and a stray parquet under it is picked up as a
+    /// base file (or a partition) and fails the read.
+    pub fn gold_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_data")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Where this fixture's per-read-option snapshots live, one subdirectory per
+    /// case plus the manifest naming them. Beside the table directory for the
+    /// same reason [`Self::gold_dir`] is. See [`crate::gold_options`].
+    pub fn option_cases_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_options")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Where this fixture's Spark snapshot taken with
+    /// `hoodie.merge.use.record.positions=true` lives, if it ships one.
+    ///
+    /// Only a fixture whose file group holds duplicate record keys needs a
+    /// second snapshot: everywhere else the two merge strategies agree and
+    /// [`Self::gold_dir`] is the answer for both.
+    pub fn gold_positions_dir(&self, format: TableFormat) -> Option<String> {
+        let zip_path = self.zip_path_for(format);
+        let dir = extract_test_table(zip_path.as_ref()).join("gold_positions");
+        dir.is_dir().then(|| dir.to_str().unwrap().to_string())
     }
 
     pub fn path_to_cow(&self) -> String {
@@ -370,6 +708,32 @@ impl SampleTable {
         let zip_path = self.zip_path_for(format);
         let path_buf = extract_test_table(zip_path.as_ref()).join(self.as_ref());
         path_buf.to_str().unwrap().to_string()
+    }
+
+    /// Where this fixture's Spark snapshot lives.
+    ///
+    /// Beside the table directory, never inside it: a full-table read lists the
+    /// table's own directory, and a stray parquet under it is picked up as a
+    /// base file (or a partition) and fails the read.
+    pub fn gold_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_data")
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+
+    /// Where this fixture's per-read-option snapshots live, one subdirectory per
+    /// case plus the manifest naming them. Beside the table directory for the
+    /// same reason [`Self::gold_dir`] is. See [`crate::gold_options`].
+    pub fn option_cases_dir(&self, format: TableFormat) -> String {
+        let zip_path = self.zip_path_for(format);
+        extract_test_table(zip_path.as_ref())
+            .join("gold_options")
+            .to_str()
+            .unwrap()
+            .to_string()
     }
 
     pub fn path_fresh(&self, format: TableFormat) -> String {
