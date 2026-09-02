@@ -280,6 +280,7 @@ fn run(args: &Args) -> Result<(), String> {
 
     let per_file = args.total_bytes / args.files as u64;
     let mut stats = Vec::new();
+    let mut log_stats = Vec::new();
     let mut total = 0u64;
 
     for i in 0..args.files {
@@ -298,11 +299,27 @@ fn run(args: &Args) -> Result<(), String> {
         let mut log_bytes = 0u64;
         for v in 1..=args.log_files {
             let log_name = format!(".{file_id}_{INSTANT}.log.{v}_0-2-{i}");
-            log_bytes += write_log_file(
+            let this_log = write_log_file(
                 &root.join(&log_name),
                 (i as u64) * 100_000_000 + args.log_key_offset,
                 args.log_records,
             );
+            log_bytes += this_log;
+            // `baseFile` as well as `path`: schema resolution reads the first
+            // write stat's `path`, gets nothing from a `.log.` extension, and
+            // falls through to the base file. Without it a generated table has
+            // no resolvable schema once the delta commit becomes the latest.
+            log_stats.push(format!(
+                r#"{{"fileId":"{file_id}","path":"{log_name}","baseFile":"{name}",
+                   "prevCommit":"{INSTANT}","numWrites":{records},"numDeletes":0,
+                   "numUpdateWrites":{records},"totalWriteBytes":{this_log},
+                   "fileSizeInBytes":{this_log},"partitionPath":"","tempPath":null,
+                   "totalLogRecords":{records},"totalLogFilesCompacted":0,
+                   "totalLogSizeCompacted":0,"totalLogBlocks":1,
+                   "totalCorruptLogBlock":0,"totalRollbackBlocks":0,"cdcStats":null,
+                   "minEventTime":null,"maxEventTime":null,"runtimeStats":null}}"#,
+                records = args.log_records
+            ));
         }
         total += log_bytes;
         eprintln!(
@@ -326,6 +343,25 @@ fn run(args: &Args) -> Result<(), String> {
         stats.join(",")
     );
     fs::write(root.join(format!(".hoodie/{INSTANT}.commit")), commit).map_err(|e| e.to_string())?;
+
+    // The log blocks carry LOG_INSTANT, and a read through `Table` gates a log
+    // block on its instant having completed. Writing only the base commit left
+    // the generated table readable through a standalone `FileGroupReader` --
+    // which has no timeline and so admits every block -- while `Table::read`
+    // silently dropped every log record. The delta commit is what makes the two
+    // paths agree.
+    if !log_stats.is_empty() {
+        let delta_commit = format!(
+            r#"{{"partitionToWriteStats":{{"":[{}]}},"compacted":false,
+                "extraMetadata":{{}},"operationType":"UPSERT"}}"#,
+            log_stats.join(",")
+        );
+        fs::write(
+            root.join(format!(".hoodie/{LOG_INSTANT}.deltacommit")),
+            delta_commit,
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     let mut props: HashMap<&str, String> = HashMap::new();
     props.insert("hoodie.table.name", "fg_bench_generated".to_string());

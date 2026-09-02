@@ -48,10 +48,7 @@ use host::HostSnapshot;
 use rusage::Rusage;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "fg-bench",
-    about = "Minimal HoodieFileGroupReader benchmark harness (perf M2)"
-)]
+#[command(name = "fg-bench", about = "File-group reader benchmark harness")]
 struct Args {
     /// Path to the Hudi table (local filesystem path or file:// URI).
     #[arg(long)]
@@ -71,7 +68,7 @@ struct Args {
     #[arg(long, value_delimiter = ',')]
     columns: Option<Vec<String>>,
 
-    /// Streaming chunk size (`hoodie.read.stream.batch_size`, ENG-42991). When
+    /// Streaming chunk size (`hoodie.read.stream.batch_size`). When
     /// omitted the reader uses its built-in default (DEFAULT_BATCH_SIZE = 4096).
     /// Set this to measure the effect of chunk granularity on wall time. (The
     /// peak-RSS effect shows only on the streaming `open()` path; this bench
@@ -80,28 +77,25 @@ struct Args {
     #[arg(long)]
     batch_size: Option<usize>,
 
-    /// Merge memory budget in bytes (`hoodie.memory.merge.max.size`, A1/ENG-42993).
+    /// Merge memory budget in bytes (`hoodie.memory.merge.max.size`).
     /// When omitted the reader uses its 1 GiB default (no spill on smoke
     /// datasets). Set it low (e.g. a few MiB) to force the size-tracked merge map
     /// to spill to RocksDB and measure bounded RSS without OOM.
     #[arg(long)]
     merge_max_size: Option<u64>,
 
-    /// Drive the true-streaming `open()` path (A3/ENG-42992) instead of the
-    /// eager `read()` path. In streaming mode the base parquet file is decoded
-    /// one row-group at a time (`ParquetSyncReader`) and never fully
-    /// materialised — this is the path the R3 base-file-memory fix optimizes.
-    /// The streaming iterator does `block_on` per row-group, so each slice is
-    /// driven on a dedicated OS thread (off the harness's tokio runtime),
-    /// mirroring the FFI driver's sync-consumer contract.
+    /// Consume the read as a stream of batches instead of eagerly.
+    ///
+    /// `read_file_slice_stream` yields batches and the harness drops each as it
+    /// counts it, so the whole result is never resident; the eager
+    /// `read_file_slice` retains it. On a large table that difference dominates
+    /// `max_rss_kb`, which is the comparison this flag exists for.
+    ///
+    /// One flag, not two: the public reader offers a single streaming entry
+    /// point, so a sync-consumer variant would drive the same call and measure
+    /// the same path twice.
     #[arg(long, default_value_t = false)]
     streaming: bool,
-
-    /// Drive the async streaming path (`open_blocking_stream`) from this
-    /// process's tokio runtime, rather than the sync `open()` path on a plain
-    /// OS thread. This is how a Rust async caller consumes a streaming read.
-    #[arg(long, default_value_t = false)]
-    async_stream: bool,
 
     /// Merge base + log records by base-file row POSITION instead of record key
     /// (`hoodie.merge.use.record.positions`). Selects the
@@ -133,8 +127,21 @@ struct Args {
 
     /// Directory the merge map spills into (`hoodie.memory.spillable.map.path`).
     /// Watched to report whether a run actually exercised the disk tier.
-    #[arg(long, default_value = "/tmp")]
-    spill_dir: String,
+    ///
+    /// Defaults to a fresh per-run subdirectory of the system temp directory.
+    /// Defaulting to `/tmp` itself does not work: the watcher would report the
+    /// whole directory's contents as this run's spill — several GB on an
+    /// ordinary host, before the read has done anything — and would re-walk all
+    /// of `/tmp` every 100 ms to do it.
+    #[arg(long)]
+    spill_dir: Option<String>,
+}
+
+/// A fresh spill directory for this run, under the system temp directory.
+///
+/// Named by pid so two concurrent runs cannot watch each other's spill.
+fn default_spill_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("fg-bench-spill-{}", std::process::id()))
 }
 
 /// Per-slice read configuration, bundled to keep the read helpers under the
@@ -144,10 +151,8 @@ struct ReadConfig {
     requested_schema: Option<SchemaRef>,
     batch_size: Option<usize>,
     merge_max_size: Option<u64>,
-    /// True → drive the streaming `open()` path (A3); false → eager `read()`.
+    /// True → consume `read_file_slice_stream`; false → eager `read_file_slice`.
     streaming: bool,
-    /// True → drive `open_blocking_stream()` from the tokio runtime.
-    async_stream: bool,
     /// True → position-based merge (`use_record_position`); false → key-based.
     use_record_position: bool,
     /// How many slices to read concurrently — a ceiling when a budget is set.
@@ -155,9 +160,9 @@ struct ReadConfig {
     /// Scan-wide memory budget, in bytes.
     scan_memory_budget: Option<u64>,
     /// Where the merge map spills (`hoodie.memory.spillable.map.path`). Passed
-    /// to the reader, not only watched: the reader's own default is `/tmp`, and
-    /// on a host where anything else lives under `/tmp` a watcher pointed there
-    /// measures that instead of spill.
+    /// to the reader, not only watched: the reader's own default is `/tmp`, so
+    /// without this the reader would spill somewhere the watcher is not
+    /// looking and every run would report no spill.
     spill_dir: String,
 }
 
@@ -174,8 +179,17 @@ struct ReadConfig {
 /// spilling, which is why this pairs with a low `--merge-max-size` rather than
 /// standing alone.
 ///
-/// Off unless `FG_BENCH_ALLOC_CAP_BYTES` is set, so ordinary runs are unaffected
-/// and pay only a relaxed atomic add per allocation.
+/// The ceiling is read from `FG_BENCH_ALLOC_CAP_BYTES`, so an ordinary run pays
+/// only the counter and is never refused.
+///
+/// The counter runs unconditionally, from the first allocation the process
+/// makes. Gating it on the cap being set does not work: the cap can only be
+/// installed once `main` runs, which is after the tokio runtime and the
+/// environment have already allocated. Those allocations would never be added,
+/// but their frees would still be subtracted, underflowing the counter to near
+/// `u64::MAX` — every later `live > cap` test then fails and a capped run aborts
+/// immediately whatever its real usage. Counting every allocation and every free
+/// keeps `ALLOC_LIVE` balanced, which is what makes the comparison meaningful.
 struct CappedAllocator;
 
 static ALLOC_CAP: AtomicU64 = AtomicU64::new(0);
@@ -183,24 +197,20 @@ static ALLOC_LIVE: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for CappedAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let size = layout.size() as u64;
+        let live = ALLOC_LIVE.fetch_add(size, Ordering::Relaxed) + size;
         let cap = ALLOC_CAP.load(Ordering::Relaxed);
-        if cap > 0 {
-            let live = ALLOC_LIVE.fetch_add(layout.size() as u64, Ordering::Relaxed)
-                + layout.size() as u64;
-            if live > cap {
-                ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
-                // Null here, rather than a panic: a panic would unwind through
-                // an allocation path that has just been told there is no memory.
-                return std::ptr::null_mut();
-            }
+        if cap > 0 && live > cap {
+            ALLOC_LIVE.fetch_sub(size, Ordering::Relaxed);
+            // Null here, rather than a panic: a panic would unwind through
+            // an allocation path that has just been told there is no memory.
+            return std::ptr::null_mut();
         }
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ALLOC_CAP.load(Ordering::Relaxed) > 0 {
-            ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
-        }
+        ALLOC_LIVE.fetch_sub(layout.size() as u64, Ordering::Relaxed);
         unsafe { System.dealloc(ptr, layout) }
     }
 }
@@ -271,7 +281,20 @@ async fn run(args: &Args) -> Result<()> {
 
     let mut iterations = Vec::with_capacity(args.iterations);
     let mut over_budget_any = false;
-    let spill_dir = std::path::PathBuf::from(&args.spill_dir);
+    // Created up front so the watcher has something to stat from the first
+    // sample, and so its baseline is this run's own starting size.
+    let spill_dir = args
+        .spill_dir
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(default_spill_dir);
+    if let Err(e) = std::fs::create_dir_all(&spill_dir) {
+        eprintln!(
+            "[fg-bench] could not create spill dir {}: {e}",
+            spill_dir.display()
+        );
+    }
+    let spill_dir_string = spill_dir.to_string_lossy().into_owned();
     let mut any_contended = false;
 
     for iter_idx in 0..args.iterations {
@@ -300,11 +323,10 @@ async fn run(args: &Args) -> Result<()> {
             batch_size: args.batch_size,
             merge_max_size: args.merge_max_size,
             streaming: args.streaming,
-            async_stream: args.async_stream,
             use_record_position: args.use_record_position,
             slice_concurrency: args.slice_concurrency,
             scan_memory_budget: args.scan_memory_budget,
-            spill_dir: args.spill_dir.clone(),
+            spill_dir: spill_dir_string.clone(),
         };
         let spill_watch = SpillWatcher::start(spill_dir.clone());
         let rows =
@@ -417,13 +439,19 @@ async fn run(args: &Args) -> Result<()> {
 struct SpillWatcher {
     stop: Arc<AtomicBool>,
     peak: Arc<AtomicU64>,
+    /// What the directory already held when sampling began, subtracted from the
+    /// peak so the reported number is this read's spill and not the directory's
+    /// prior contents. Zero for the default per-run directory; non-zero matters
+    /// when `--spill-dir` names somewhere shared.
+    baseline: u64,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SpillWatcher {
     fn start(dir: std::path::PathBuf) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let peak = Arc::new(AtomicU64::new(0));
+        let baseline = spill_dir_bytes(&dir);
+        let peak = Arc::new(AtomicU64::new(baseline));
         let (s, pk) = (stop.clone(), peak.clone());
         let handle = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
@@ -435,17 +463,22 @@ impl SpillWatcher {
         Self {
             stop,
             peak,
+            baseline,
             handle: Some(handle),
         }
     }
 
-    /// Stops sampling and returns the largest total seen, in bytes.
+    /// Stops sampling and returns the largest *growth* over the starting size,
+    /// in bytes. Saturating, because the directory can end smaller than it
+    /// began once RocksDB removes what it wrote.
     fn finish(mut self) -> u64 {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        self.peak.load(Ordering::Relaxed)
+        self.peak
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.baseline)
     }
 }
 
@@ -556,7 +589,7 @@ async fn read_all_slices(
         .map(|slice| {
             let reader = &reader;
             let read_options = &read_options;
-            let streaming = cfg.streaming || cfg.async_stream;
+            let streaming = cfg.streaming;
             async move {
                 if streaming {
                     // The streaming path yields batches and drops each as it
@@ -655,7 +688,7 @@ struct IterationReport {
     max_rss_kb: u64,
     rows: usize,
     contended: bool,
-    /// A6e detector #3: true when `max_rss` greatly exceeds the merge-map
+    /// True when `max_rss` greatly exceeds the merge-map
     /// accounted retained bytes + headroom — i.e. the size accounting is not
     /// tracking the resident set. False on a correctly-bounded read.
     accounting_drift: bool,

@@ -17,47 +17,112 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# fg-bench — file-group reader benchmark harness (perf M2)
+# fg-bench — file-group reader benchmark harness
 
-Minimal harness that drives `HoodieFileGroupReader` directly and records
-per-iteration wall/CPU/RSS plus the full `HoodieReadStats` (with the per-stage
-timings added for the perf effort). This is the **M2 minimal** harness: no
-docker, no flamegraphs, no resource-tier matrix — just enough to get
-before/after numbers while the Tier-A alignment fixes land.
+Drives the public `FileGroupReader` over a Hudi table's file slices and records
+per-iteration wall clock, CPU, peak RSS and row count. It exists to answer two
+questions about a merge-on-read read: how long does it take, and does it stay
+inside a memory bound.
 
-See the design in `02-bench-harness-design.md` (D1–D3, D9 minimal) and the
-milestone scope in `03-milestones.md` (M2).
+Everything it configures is a Hudi config key, so a run measures the shipped
+reader rather than a harness-specific assembly of its internals.
 
 ## Build & run
 
 ```shell
 cargo build -p fg-bench --release
 
-# Full read, 3 iterations (first is warmup), JSON to stdout
+# Full read, 3 iterations (the first is a warmup), JSON to stdout
 ./target/release/fg-bench --table /abs/path/to/hudi/table
 
 # Project columns + persist JSON
 ./target/release/fg-bench --table /abs/path/to/table \
     --columns id,ts,value --iterations 5 --output-json run.json
 
-# Override the streaming chunk size (hoodie.read.stream.batch_size, ENG-42991).
-# Omit to use the reader default (4096 rows). Smaller chunks reduce per-chunk
-# wall overhead; the peak-RSS effect is observable only on the streaming
-# (open()) path -- this bench drives read(), which retains the full output, so
-# max_rss here is dominated by output retention, not chunk size.
+# Override the streaming chunk size (hoodie.read.stream.batch_size). Omit to use
+# the reader default (4096 rows).
 ./target/release/fg-bench --table /abs/path/to/table --batch-size 1024
 ```
 
-### Key-based vs position-based merge
+`--table` must be an absolute path or a `file://` URI — the table loader needs a
+base URI. The harness opens the table, discovers its latest file slices via
+`Table::get_file_slices`, and reads each to completion, summing rows.
 
-`--use-record-position` selects the position-based merge buffer (match base rows
-to log records by base-file row position instead of record key). The table's log
-blocks must carry `RECORD_POSITIONS` headers (written by Spark with
+## Generating a table
+
+`fg-gen` writes a synthetic merge-on-read table, because the reads worth
+measuring need more data than can be committed to the repository:
+
+```shell
+cargo run -p fg-bench --release --bin fg-gen -- \
+    --out /tmp/fg-table --rows 2000000 --log-files 4
+```
+
+The generated table is table version 6, timeline layout 1, and carries a real
+timeline: a `commit` for the base files and a `deltacommit` for the log files.
+Both are required — a read through `Table` gates log blocks on their instant
+having completed, so log records written at an instant that never commits are
+dropped.
+
+## What it measures (per iteration)
+
+- `wall_ms` — wall clock of the whole read.
+- `user_ms` / `sys_ms` — `getrusage(RUSAGE_SELF)` CPU deltas against the
+  pre-iteration snapshot.
+- `max_rss_kb` — `ru_maxrss`, a monotonic peak-RSS high-water mark.
+- `rows` — total output rows across slices.
+- `spilled` / `spill_peak_bytes` — whether the merge map's disk tier engaged,
+  observed by watching the spill directory grow while the read runs.
+- `accounting_drift` — true when peak RSS greatly exceeds the merge map's
+  accounted retained bytes, i.e. the size accounting is not tracking the
+  resident set.
+- `host` — `load1` from `/proc/loadavg` and `MemAvailable` from `/proc/meminfo`,
+  sampled just before the iteration.
+
+The first iteration is marked `warmup: true` and excluded from `summary`
+(median/min/max wall over the measured iterations).
+
+Per-stage timings are **not** reported. They live in `HoodieReadStats`, which is
+not on the public reader surface, and widening that surface for a benchmark is
+not a trade worth making.
+
+## Bounding memory
+
+Three knobs turn the harness from a measurement into a gate:
+
+| flag | effect |
+|---|---|
+| `--scan-memory-budget` | Total bytes the scan may use. Slices-in-flight is derived from it by `hudi_core::file_group::admission::slices_in_flight` — the same function the DataFusion plan uses — with `--slice-concurrency` as a ceiling it may not exceed. |
+| `--merge-max-size` | `hoodie.memory.merge.max.size`. Set it low to push the merge map into its RocksDB disk tier and confirm the read degrades rather than growing. |
+| `--max-rss-bytes` | Fails the run when peak RSS exceeds this. |
+
+`FG_BENCH_ALLOC_CAP_BYTES` is stronger than `--max-rss-bytes`: it installs a
+hard ceiling in the global allocator, so an allocation past the cap returns null
+and the process aborts. `--max-rss-bytes` asserts after the fact, on a machine
+that had the memory to spare; the allocator cap answers whether the read
+survives on a machine that does not.
+
+### Reading the spill report
+
+`spill_peak_bytes` is *growth* over what the spill directory held when the
+iteration started, so a shared directory with existing contents does not read as
+spill. By default each run spills into a fresh per-run subdirectory, which also
+keeps the 100 ms sampler off large unrelated trees.
+
+Sampling happens during the read, not at its boundaries: RocksDB creates its
+directory, writes, compacts, and removes it before the read call returns, so a
+before/after comparison sees an empty directory both times. Even sampling during
+the read, treat `spilled: true` as proof and `false` as unproven — compaction
+can erase the evidence between two samples.
+
+## Key-based vs position-based merge
+
+`--use-record-position` selects the position-based merge buffer, which matches
+base rows to log records by base-file row position instead of record key. The
+table's log blocks must carry `RECORD_POSITIONS` headers (written by Spark with
 `hoodie.merge.use.record.positions` enabled); otherwise the reader falls back to
-key-based merge per block. The chosen strategy is recorded in the report as
+key-based merge per block. The strategy is recorded in the report as
 `merge_strategy` (`"key"` / `"position"`).
-
-Compare the two strategies on the same MOR table:
 
 ```shell
 ./target/release/fg-bench --table /abs/path/to/mor/table \
@@ -65,71 +130,23 @@ Compare the two strategies on the same MOR table:
 ./target/release/fg-bench --table /abs/path/to/mor/table --use-record-position \
     --iterations 6 --output-json position.json
 
-# Median wall / RSS + per-stage timing deltas (position vs key baseline)
 python3 benchmark/filegroup/compare.py key.json position.json
 ```
 
-`--table` must be an absolute path or `file://` URI (the table loader needs a
-base URI). The harness opens the table, discovers the latest file slice(s) via
-`Table::get_file_slices`, builds one `HoodieFileGroupReader` per slice (full
-table schema as data schema, requested = full schema or `--columns`), reads each
-to completion, and sums rows + folds per-slice `HoodieReadStats`.
+## Eager vs streaming
 
-## What it measures (per iteration)
+`--streaming` consumes the read as a stream of batches, dropping each as it
+goes, so the whole result is never resident. Without it the harness calls the
+eager read, which retains the full output. On a large table that difference
+dominates `max_rss_kb`.
 
-- `wall_ms` — wall-clock of the whole read.
-- `user_ms` / `sys_ms` — `getrusage(RUSAGE_SELF)` CPU deltas vs the pre-iteration snapshot.
-- `max_rss_kb` — `ru_maxrss` (peak RSS high-water mark, monotonic).
-- `rows` — total output rows across slices.
-- `read_stats` — the full `HoodieReadStats`, including the stage timings.
-- `host` — `/proc/loadavg` (load1) + `MemAvailable` (`/proc/meminfo`) sampled
-  just before the iteration.
+## Host-contention guard
 
-The first iteration is marked `warmup: true` and is excluded from `summary`
-(median/min/max wall over the measured iterations).
-
-## Host-contention guard (minimal)
-
-Before each iteration the harness samples host load + free memory. If
-`load1 / nproc > 0.5` it prints a loud warning, tags that iteration
-`contended: true`, and sets the top-level `contended: true`. This is the
-**minimal** version: it records + flags but does NOT yet wait for a quiet
-window or rerun contended iterations (that is the M4 full version). Always run
+Before each iteration the harness samples host load and free memory. If
+`load1 / nproc > 0.5` it prints a warning, tags that iteration
+`contended: true`, and sets the top-level `contended: true`. It records and
+flags; it does not wait for a quiet window or rerun contended iterations. Run
 A/B pairs back-to-back in the same quiet window.
-
-## Stage timings
-
-Added to `HoodieReadStats` and wired with cheap `Instant`-based accumulation
-(always-on, per block/batch — never per row):
-
-| field | site | meaning |
-|---|---|---|
-| `base_read_ms` | `reader/mod.rs` | base parquet read + projection |
-| `log_block_read_ms` | `log_record_reader.rs` Pass 1 | log-block metadata + byte read off storage |
-| `log_block_decode_ms` | `buffer/key_based.rs` | `inflate_from_bytes` (inflate/decode), a **subset** of `merge_insert_ms` |
-| `merge_insert_ms` | `log_record_reader.rs` Pass 3 | block dispatch into the merge map (decode + per-key upsert) |
-| `final_merge_ms` | `reader/mod.rs` | `merge_and_collect_with_stats` (base+log final merge) |
-| `output_build_ms` | `reader/mod.rs` | output projection assembly |
-| `merge_map_peak_entries` | `buffer/key_based.rs` | peak merge-map entry count |
-
-### Known coarseness / deviations
-
-- **decode is nested inside merge_insert.** In hudi-rs the log block is inflated
-  lazily inside the buffer's `process_data_block`, which runs inside the Pass-3
-  merge-insert window. So `log_block_decode_ms` is a *subset* of
-  `merge_insert_ms`, not a disjoint stage. The design's clean decode-vs-merge
-  split would require refactoring the lazy-inflate path; we
-  kept the coarser split and document it here.
-- **lazy-inflate can shift decode cost into `log_block_read_ms`.** For some log
-  layouts the block bytes are materialized during the Pass-1 metadata read, so
-  `log_block_decode_ms` reads near-zero while `log_block_read_ms` absorbs it.
-  Treat `log_block_read_ms + log_block_decode_ms + merge_insert_ms` as the
-  log-path total; the individual split is indicative, not exact.
-- **per-slice aggregation.** Timings/counters are summed across slices;
-  `merge_map_peak_entries` is the max across slices. Wall/CPU/RSS are for the
-  whole iteration (all slices).
-- Stage timings are millisecond-granular; sub-ms stages on tiny fixtures read
-  as `0`.
 
 ## Comparing runs
 
@@ -137,5 +154,5 @@ Added to `HoodieReadStats` and wired with cheap `Instant`-based accumulation
 python3 benchmark/filegroup/compare.py baseline.json candidate.json [more.json ...]
 ```
 
-Prints median wall, peak RSS, and the stage breakdown for each file with a
-percent delta vs the first (baseline) file. Stdlib only.
+Prints median wall, peak RSS and the other per-iteration metrics for each file,
+with a percent delta against the first (baseline) file. Stdlib only.
