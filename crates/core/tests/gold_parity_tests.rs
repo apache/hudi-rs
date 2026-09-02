@@ -566,6 +566,16 @@ const KNOWN: &[Known] = &[
         reader_version: "1",
         reason: "version 1 panics on a partial-update block",
     },
+    // The same version 1 limitation as the fixture above, reached by the same
+    // route: the partial block's narrower schema is concatenated onto the base
+    // batch positionally, so the key column meets the ordering column. Version 2
+    // folds both blocks correctly, which is what this fixture exists to pin.
+    Known {
+        fixture: "table_partial_update_event_time",
+        scope: CaseScope::Any,
+        reader_version: "1",
+        reason: "version 1 concatenates a partial-update block onto a wider base batch",
+    },
     Known {
         fixture: "table_all_data_types",
         scope: CaseScope::Any,

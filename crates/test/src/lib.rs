@@ -274,6 +274,27 @@ pub enum QuickstartTripsTable {
     /// merge-correct truth the applied result must match).
     #[strum(serialize = "table_partial_update")]
     MorLayoutPartialUpdate,
+    /// v9 MOR non-partitioned, EVENT_TIME_ORDERING, where two PARTIAL-update log
+    /// blocks touch the same key and the second one LOSES the ordering.
+    ///
+    /// Provenance: `table_partial_update_event_time.sql` beside this zip
+    /// (Spark 3.5.3 / Hudi 1.2.0-SNAPSHOT). MERGE INTO writes a partial block
+    /// when the table is MOR, the operation is an upsert, and the update touches
+    /// a strict subset of the columns.
+    /// Schema: id INT, ts LONG, a STRING, b STRING (non-partitioned).
+    /// Layout: base .parquet (2 rows at ts 100) + log.1 (partial update of
+    /// `ts`,`a`) + log.1 (partial update of `ts`,`b`).
+    /// Semantics: each key folds in the opposite direction. `id=1` takes its
+    /// second update BELOW the first (200 < 300), so the earlier record wins and
+    /// still absorbs `b` from the loser; `id=2` takes its second update above
+    /// (300 > 200), so the later record wins and absorbs `a`. Either way the
+    /// column only the LOSING record carries must survive, which is what
+    /// distinguishes a both-direction fold from one that keeps the winner whole.
+    /// `table_partial_update` cannot show this: it is COMMIT_TIME_ORDERING,
+    /// where the incoming record always wins and the fold is one-directional.
+    /// gold_data = Spark `SELECT *` snapshot, 2 rows.
+    #[strum(serialize = "table_partial_update_event_time")]
+    MorPartialUpdateEventTime,
     /// v9 MOR non-partitioned, base + 1 HFILE-format log file
     /// (`HFILE_DATA_BLOCK`).
     ///

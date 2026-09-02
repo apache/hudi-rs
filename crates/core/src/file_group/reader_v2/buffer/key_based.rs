@@ -1458,37 +1458,50 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         // is the `else`:
         //
         // Partial-update (IS_PARTIAL / KEEP_VALUES): the incoming record carries only
-        // a subset of columns; overlay its present columns onto the prior buffered
-        // record for this key, producing the UNION of their columns. The result
-        // stays narrower than the reader schema until a base row or later update
-        // supplies the rest, so base-vs-log can still fill the gaps. With no prior
-        // data record it stays narrow and is padded at the base/drain step.
+        // a subset of columns; fold it together with the prior buffered record for
+        // this key, producing the UNION of their columns. The result stays narrower
+        // than the reader schema until a base row or later update supplies the rest,
+        // so base-vs-log can still fill the gaps. With no prior data record it stays
+        // narrow and is padded at the base/drain step.
         let inc_is_partial = match (record.get_record(), self.base.reader_schema.as_ref()) {
             (Some(ib), Some(target)) => schema_is_partial(&ib.schema(), target),
             _ => false,
         };
         if inc_is_partial {
-            let record = match self.base.records.get(key)? {
-                Some(prior) => match (record.get_record(), prior.get_record()) {
-                    (Some(ib), Some(prior_batch)) => {
-                        let union = union_schema(&ib.schema(), &prior_batch.schema());
-                        let merged = overlay_partial_over_prior(&ib, &prior_batch, &union)?;
-                        BufferedRecord::new_data(record.record_key, merged, record.ordering_value)
-                    }
-                    // Prior is a delete tombstone (no columns) → keep incoming as-is.
-                    _ => record,
-                },
-                None => record,
-            };
-            // Single-probe merge (perf): probe `key` once via `merge_in_place` and
-            // overwrite in place, instead of get(probe+clone) → delta_merge → insert
-            // (probe+clone+probe). The merger only reads `existing` by reference. A2
-            // semantics preserved: the merged BatchRef payload is stored in-memory
-            // (IPC serialization deferred to spill only).
+            // Mirrors Java `DefaultSparkRecordMerger.partialMerge`, which folds in BOTH
+            // directions: the ordering WINNER supplies every column it carries and the
+            // loser only the columns the winner omits. The union takes the winner's
+            // ordering value, so a later update is compared against the winner's
+            // position on the timeline rather than the loser's.
+            //
+            // Single-probe merge (perf): the fold runs inside `merge_in_place`, which
+            // probes `key` once and overwrites the slot in place rather than
+            // get(probe+clone) → merge → insert(probe+clone+probe). A2 semantics
+            // preserved: the merged payload is stored in-memory (IPC serialization
+            // deferred to spill only).
             let merger = &self.base.buffered_record_merger;
-            self.base
-                .records
-                .merge_in_place(key, |existing| merger.delta_merge(&record, existing))?;
+            let commit_time_ordering = self.base.record_merge_mode == "COMMIT_TIME_ORDERING";
+            self.base.records.merge_in_place(key, |existing| {
+                // Folding needs columns on both sides. With no prior, or a prior that
+                // is a delete tombstone, the ordering comparison alone decides.
+                let Some((prior, prior_batch, ib)) = existing
+                    .and_then(|prior| Some((prior, prior.get_record()?, record.get_record()?)))
+                else {
+                    return merger.delta_merge(&record, existing);
+                };
+                let union = union_schema(&ib.schema(), &prior_batch.schema());
+                let new_wins = commit_time_ordering || should_keep_newer_record(prior, &record);
+                let (winner, loser, ordering_value) = if new_wins {
+                    (&ib, &prior_batch, record.ordering_value.clone())
+                } else {
+                    (&prior_batch, &ib, prior.ordering_value.clone())
+                };
+                Ok(Some(BufferedRecord::new_data(
+                    record.record_key.clone(),
+                    overlay_partial_over_prior(winner, loser, &union)?,
+                    ordering_value,
+                )))
+            })?;
         } else if self.ignore_defaults || self.unavailable_value.is_some() {
             // Full-schema partial-update (IGNORE_DEFAULTS or FILL_UNAVAILABLE),
             // log-vs-log blend. Mirrors Java `EventTimePartialRecordMerger.deltaMerge`,
@@ -6200,7 +6213,10 @@ mod tests {
     }
 
     fn build_pu_event_buffer() -> KeyBasedFileGroupRecordBuffer {
-        let merge_mode = "EVENT_TIME_ORDERING";
+        build_pu_buffer("EVENT_TIME_ORDERING")
+    }
+
+    fn build_pu_buffer(merge_mode: &str) -> KeyBasedFileGroupRecordBuffer {
         let mut ctx = ReaderContext::empty();
         ctx.table_config.insert(
             HudiTableConfig::OrderingFields.as_ref().to_string(),
@@ -6240,6 +6256,27 @@ mod tests {
                 Arc::new(StringArray::from(vec![key])) as _,
                 Arc::new(Int64Array::from(vec![ts])) as _,
                 Arc::new(Int32Array::from(vec![a])) as _,
+            ],
+        )
+        .unwrap();
+        BufferedRecord::new_data(key.to_string(), batch, Some(OrderingValue::Long(ts)))
+    }
+
+    /// A partial record carrying `_hoodie_record_key` + `ts` + `note` (omits `a`),
+    /// with ordering value = `ts`. Disjoint from `pu_event_partial`'s columns, so a
+    /// fold of the two is observable in both directions.
+    fn pu_event_partial_note(key: &str, ts: i64, note: &str) -> BufferedRecord {
+        let s = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("note", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            s,
+            vec![
+                Arc::new(StringArray::from(vec![key])) as _,
+                Arc::new(Int64Array::from(vec![ts])) as _,
+                Arc::new(StringArray::from(vec![Some(note)])) as _,
             ],
         )
         .unwrap();
@@ -6323,6 +6360,110 @@ mod tests {
             pu_event_drain(buffer),
             (5, 10, Some("keep".to_string())),
             "stale partial loses; base row kept intact"
+        );
+    }
+
+    /// EVENT_TIME, log-vs-log: the HIGHER-ordering partial arrives FIRST, so the
+    /// second (stale) partial loses the ordering comparison. Java folds in both
+    /// directions, so the loser's unique column still lands: `a` from ts=9,
+    /// `note` from ts=2.
+    #[test]
+    fn test_partial_update_event_time_out_of_order_folds_loser_columns() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial_note("k1", 2, "late"), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("late".to_string())),
+            "winner keeps a=99 at ts=9; the losing partial still contributes note"
+        );
+    }
+
+    /// The folded union carries the WINNER's ordering value: a later update at ts=5
+    /// must lose to a union whose winner sat at ts=9. Carrying the loser's ts=2
+    /// instead would let this update take over.
+    #[test]
+    fn test_partial_update_event_time_fold_keeps_winner_ordering() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial_note("k1", 2, "late"), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 5, 55), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("late".to_string())),
+            "ts=5 loses to the union's winner ordering of 9"
+        );
+    }
+
+    /// EVENT_TIME, incoming wins: on a column BOTH partials carry, the winner's
+    /// value survives. The mirror of the stale-loses tests above, which use
+    /// disjoint columns and so cannot see the overlay direction at all.
+    #[test]
+    fn test_partial_update_event_time_newer_wins_overlapping_column() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("keep".to_string())),
+            "both partials carry `a`; the ts=9 winner's value must survive, not the ts=2 loser's"
+        );
+    }
+
+    /// EVENT_TIME, incoming wins: the folded union carries the WINNER's ordering
+    /// value, so a later write between the two loses. Mirrors
+    /// `test_partial_update_event_time_fold_keeps_winner_ordering`, which pins
+    /// the same property on the other arm.
+    #[test]
+    fn test_partial_update_event_time_newer_wins_fold_keeps_winner_ordering() {
+        let mut buffer = build_pu_event_buffer();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 5, 55), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (9, 99, Some("keep".to_string())),
+            "ts=5 loses to a union whose winner sat at ts=9, not to the ts=2 loser it folded"
+        );
+    }
+
+    /// COMMIT_TIME_ORDERING is last-writer-wins, so a later partial update wins
+    /// even when its ordering value went DOWN. Without the short-circuit the
+    /// ordering comparison would hand it to the earlier record, which is
+    /// event-time behavior on a commit-time table.
+    #[test]
+    fn test_partial_update_commit_time_later_write_wins_a_lower_ordering_value() {
+        let mut buffer = build_pu_buffer("COMMIT_TIME_ORDERING");
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 9, 99), "k1")
+            .unwrap();
+        buffer
+            .process_next_data_record(pu_event_partial("k1", 2, 11), "k1")
+            .unwrap();
+        assert_eq!(
+            pu_event_drain(buffer),
+            (2, 11, Some("keep".to_string())),
+            "last writer wins on a commit-time table, whichever way the ordering value moved"
         );
     }
 
