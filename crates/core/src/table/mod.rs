@@ -574,6 +574,13 @@ impl Table {
             Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
             None => None,
         };
+        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
+            (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
+                table,
+                valid_instants,
+            }),
+            _ => None,
+        };
 
         let mut file_slices = self
             .file_system_view
@@ -582,8 +589,7 @@ impl Table {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                metadata_table,
-                valid_instants.as_ref(),
+                metadata_listing,
                 estimator,
             )
             .await?;
@@ -884,20 +890,32 @@ impl Table {
     /// call whose absence compiles perfectly, and the arithmetic behind it is
     /// tested elsewhere in isolation, which says nothing about whether anything
     /// calls it.
-    /// [`Self::bounded_read_concurrency`] for a borrowed selection.
+    fn bounded_read_concurrency(&self, file_slices: &[FileSlice]) -> usize {
+        self.bounded_read_concurrency_from_log_bytes(
+            file_slices.iter().map(FileSlice::log_size_bytes),
+        )
+    }
+
+    /// [`Self::bounded_read_concurrency`] over a borrowed selection.
     ///
     /// The metadata read routes keys to a subset of a partition's slices, so it
     /// holds `&FileSlice` rather than owning them. The budget must see that
     /// subset, not the whole partition: routing a single key to one shard should
     /// admit on that shard's cost.
     pub(crate) fn bounded_read_concurrency_for(&self, file_slices: &[&FileSlice]) -> usize {
-        let owned: Vec<FileSlice> = file_slices.iter().map(|s| (*s).clone()).collect();
-        self.bounded_read_concurrency(&owned)
+        self.bounded_read_concurrency_from_log_bytes(file_slices.iter().map(|s| s.log_size_bytes()))
     }
 
-    fn bounded_read_concurrency(&self, file_slices: &[FileSlice]) -> usize {
-        let slice_log_bytes: Vec<Option<u64>> =
-            file_slices.iter().map(FileSlice::log_size_bytes).collect();
+    /// The one place the ceiling and the budget meet.
+    ///
+    /// Both public forms funnel through this, over log sizes alone: the
+    /// admission decision needs nothing else from a slice, so neither form has
+    /// to own or copy one.
+    fn bounded_read_concurrency_from_log_bytes(
+        &self,
+        slice_log_bytes: impl Iterator<Item = Option<u64>>,
+    ) -> usize {
+        let slice_log_bytes: Vec<Option<u64>> = slice_log_bytes.collect();
         let ceiling: usize = self
             .hudi_configs
             .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
@@ -910,7 +928,7 @@ impl Table {
         )
     }
 
-    /// Read `file_slices` with at most [`Self::file_slice_read_concurrency`] in
+    /// Read `file_slices` with at most [`Self::bounded_read_concurrency`] in
     /// flight, or fewer when a scan memory budget admits fewer, in slice order.
     ///
     /// Order is preserved (`buffered`, not `buffer_unordered`) because a caller

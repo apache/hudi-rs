@@ -94,7 +94,6 @@ impl MetadataTableV2Reader {
     /// `keys` empty reads every record; otherwise only those keys, pushed into the
     /// base file reader so the read seeks rather than scans — which is what the
     /// reader this replaces does through `HFileReader::lookup_records`.
-    /// Read the `files` partition's records from one file slice.
     ///
     /// Decodes the merged batch into the records the caller expects. Callers that
     /// want the batch itself, rather than decoded structs, use

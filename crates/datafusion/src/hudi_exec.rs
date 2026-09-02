@@ -75,6 +75,21 @@ impl HudiScanExec {
     /// supposed to get slower, not to stop. One slice is admitted whether or not
     /// the pool grants it, because refusing to read is not a degraded read and
     /// the reservation is an estimate, not a measurement.
+    /// How many slices to attempt, before the memory pool lowers it further.
+    ///
+    /// A slice whose log size the listing did not record cannot be estimated.
+    /// Reading that gap as zero bytes would reserve only the per-slice floor for
+    /// exactly the slices least is known about, understating pressure on the
+    /// pool — and it would contradict `slices_in_flight`, which admits one slice
+    /// in the same situation. The rule is the same in both places so that an
+    /// unmeasured slice means one thing throughout the scan.
+    fn planned_slices(configured: usize, file_slices: &[FileSlice]) -> usize {
+        if file_slices.iter().any(|s| s.log_size_bytes().is_none()) {
+            return 1;
+        }
+        configured.min(file_slices.len()).max(1)
+    }
+
     fn reserve_for_slices(
         reservation: &mut MemoryReservation,
         per_slice_bytes: usize,
@@ -317,11 +332,6 @@ impl ExecutionPlan for HudiScanExec {
 
         let reader = self.file_group_reader.clone();
         let options = self.read_options.clone();
-        let planned = self
-            .file_slice_read_concurrency
-            .min(file_slices.len())
-            .max(1);
-
         // The plan-time budget cannot see what else is running. Registering with
         // the pool lets this scan account for what it is about to hold and, when
         // the pool is already under pressure, read fewer slices at once instead
@@ -329,6 +339,7 @@ impl ExecutionPlan for HudiScanExec {
         // the bytes.
         let mut reservation = MemoryConsumer::new(format!("HudiScanExec[{partition}]"))
             .register(context.memory_pool());
+        let planned = Self::planned_slices(self.file_slice_read_concurrency, &file_slices);
         let per_slice = file_slices
             .iter()
             .map(|s| {
@@ -542,6 +553,53 @@ mod memory_pool_tests {
     fn a_zero_estimate_reserves_nothing_and_keeps_the_plan() {
         let mut r = reservation(1);
         assert_eq!(HudiScanExec::reserve_for_slices(&mut r, 0, 6), 6);
+    }
+
+    /// A slice whose log files were listed without sizes must not be treated as
+    /// costing nothing.
+    ///
+    /// `slices_in_flight` admits one slice when any log size is unknown. The
+    /// reservation used to read the same gap as zero bytes and reserve only the
+    /// 33 MiB floor, so the two halves of the same budget disagreed about what an
+    /// unmeasured slice costs. This pins them together.
+    #[test]
+    fn an_unmeasured_log_file_plans_one_slice() {
+        use hudi_core::file_group::base_file::BaseFile;
+        use hudi_core::file_group::log_file::LogFile;
+        use hudi_core::storage::file_metadata::FileMetadata;
+        use std::str::FromStr;
+
+        let slice_with = |sized: bool| {
+            let base = BaseFile::from_str(
+                "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
+            )
+            .unwrap();
+            let mut slice = FileSlice::new(base, "".to_string());
+            let mut log = LogFile::from_str(
+                ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115",
+            )
+            .unwrap();
+            if sized {
+                log.file_metadata = Some(FileMetadata::new("log.1", 1024));
+            }
+            slice.log_files.insert(log);
+            slice
+        };
+
+        let measured = vec![slice_with(true), slice_with(true)];
+        assert_eq!(
+            HudiScanExec::planned_slices(4, &measured),
+            2,
+            "with every log size known the ceiling stands, bounded by slice count"
+        );
+
+        let mut mixed = measured.clone();
+        mixed.push(slice_with(false));
+        assert_eq!(
+            HudiScanExec::planned_slices(4, &mixed),
+            1,
+            "one unmeasured slice is enough to fall back to admitting one"
+        );
     }
 }
 

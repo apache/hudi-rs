@@ -322,14 +322,10 @@ impl Table {
         concat_metadata_batches(batches)
     }
 
-    /// Resolve the `files` partition's single file slice and build a reader for it.
+    /// The reader and every file slice of the `files` partition.
     ///
     /// `None` when the metadata table has no commits, which both callers treat as
     /// an empty result rather than an error.
-    ///
-    /// # Note
-    /// Must be called on a METADATA table instance.
-    /// The reader and slices for the `files` partition.
     ///
     /// A thin wrapper over [`Self::partition_reader`]: `files` is the only
     /// partition with a decoded record type and a caller today. The others are
@@ -420,14 +416,25 @@ impl Table {
             v2_reader::MetadataTableV2Reader::new(configs, storage),
             file_slices,
         )))
-        // NOTE: the valid-instant set is attached by `partition_reader_with_valid_instants`,
-        // which has the data table in hand; this constructor does not.
+        // NOTE: the reader comes back without a valid-instant set. Each read
+        // attaches its own with `MetadataTableV2Reader::with_valid_instants`,
+        // because the set needs the data table's timeline and this constructor
+        // has only the metadata table's.
     }
 }
 
 /// Hudi's sentinel prefix for a metadata delta commit written outside the data
 /// timeline (`HoodieTableMetadata.SOLO_COMMIT_TIMESTAMP`).
 const SOLO_COMMIT_TIMESTAMP: &str = "00000000000000";
+
+/// How many rollback instants to read at once when assembling the valid-instant
+/// set.
+///
+/// Each read is one small GET of an instant file, so this bounds request
+/// concurrency rather than memory -- unlike the file-slice fan-out, nothing here
+/// retains a batch. Fixed rather than configurable because it is not a
+/// user-facing trade-off: the alternative is the sequential walk this replaces.
+const ROLLBACK_READ_CONCURRENCY: usize = 8;
 
 impl Table {
     /// The instants whose metadata log blocks may be read.
@@ -457,17 +464,30 @@ impl Table {
         //
         //    Only rollbacks newer than the earliest valid instant can have
         //    rolled back anything we hold a log block for; Java bounds the scan
-        //    the same way, falling back to the sentinel when the set is empty.
+        //    the same way (`getValidInstantTimestamps`, HoodieTableMetadataUtil
+        //    :2101), falling back to the sentinel when the set is empty.
         let earliest = valid
             .iter()
             .min()
             .cloned()
             .unwrap_or_else(|| SOLO_COMMIT_TIMESTAMP.to_string());
-        for instant in self.rollback_and_restore_instants().await? {
-            if instant.timestamp > earliest {
-                valid.extend(self.commits_rolled_back_by(&instant).await?);
-            }
-        }
+        let in_scope: Vec<Instant> = self
+            .rollback_and_restore_instants()
+            .await?
+            .into_iter()
+            .filter(|instant| instant.timestamp > earliest)
+            .collect();
+        // Each of these is an awaited GET, and the bound above is the only thing
+        // limiting how many there are -- a long-lived table with many rollbacks
+        // pays all of them on every metadata read. Reading them concurrently
+        // keeps that cost off the critical path without narrowing the set.
+        let rolled_back = crate::util::concurrency::bounded_in_order(
+            &in_scope,
+            ROLLBACK_READ_CONCURRENCY,
+            |instant| self.commits_rolled_back_by(instant),
+        )
+        .await?;
+        valid.extend(rolled_back.into_iter().flatten());
 
         // 4. The metadata table's own rollback and restore instants.
         for instant in mdt.rollback_and_restore_instants().await? {
