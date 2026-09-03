@@ -79,7 +79,7 @@ Which knobs each API consumes:
 Notes:
 
 - `read_stream` errors with `Unsupported` for `query_type = Incremental` — incremental streaming is not yet implemented.
-- The `hudi_options` bag is a per-read override layer — set arbitrary `hoodie.read.*` configs (e.g. `hoodie.read.use.read_optimized.mode = true`) for this single read. Read configs (`hoodie.read.*`) are not stored in the `Table` instance; they flow exclusively through `ReadOptions`.
+- The `hudi_options` bag is a per-read override layer — set arbitrary `hoodie.read.*` configs (e.g. `hoodie.read.use.read_optimized.mode = true`) for this single read. Each read config declares a scope. A `ReadOnly` one — `hoodie.read.query.type` and the as-of/start/end timestamps — selects *which* read to perform, so it flows exclusively through `ReadOptions` and is dropped when set on the table. A `TableOrRead` one describes *how* to read, so it may be set on the table and overridden here. The full list is in the [README](../README.md#read-configs).
 - Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods. The method resolves timestamps automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same `ReadOptions` used for `get_file_slices`.
 - For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi::util::collection::split_into_chunks` or your engine's preferred partitioning policy.
 
@@ -102,6 +102,7 @@ The `field` may be any column. Filters drive three things:
 
 - **Partition pruning** when the field is a partition column. Always applied.
 - **File-level stats pruning** when the field is a data column with min/max stats in the metadata table. Snapshot/time-travel only — incremental file planning does not stats-prune.
+- **Row-group pruning** inside a base file, from the parquet footer's own statistics. Conservative: a row group that cannot match is never fetched, and one that might match is kept.
 - **Row-level mask** applied to every returned batch. This is the authoritative filter; pruning is best-effort.
 
 Values are strings; they are cast to the target column's Arrow type at filter time. Unparseable values (e.g. `"abc"` against `Int64`) error.
@@ -176,7 +177,7 @@ let table = HudiTableBuilder::from_base_uri("/tmp/trips_table")
     .await?;
 ```
 
-Available pairs: `with_hudi_option` / `with_hudi_options`, `with_storage_option` / `with_storage_options`, `with_option` / `with_options` (the generic forms route by key prefix). Read configs (`hoodie.read.*`) passed at table construction are silently dropped — they belong in `ReadOptions` per-call.
+Available pairs: `with_hudi_option` / `with_hudi_options`, `with_storage_option` / `with_storage_options`, `with_option` / `with_options` (the generic forms route by key prefix). A read config passed at table construction is kept when its scope is `TableOrRead` (`hoodie.read.file.group.reader.version`, `hoodie.read.use.read_optimized.mode`, `hoodie.read.stream.batch_size`, `hoodie.read.file.slice.read.concurrency`, `hoodie.read.scan.max.memory.size`, `hoodie.read.input.partitions`, `hoodie.merge.use.record.positions`) and dropped when it is `ReadOnly` (`hoodie.read.query.type`, `hoodie.read.as.of.timestamp`, `hoodie.read.start.timestamp`, `hoodie.read.end.timestamp`) — those belong in `ReadOptions` per-call.
 
 ### Filter, Timeline, FileSlice
 
@@ -214,7 +215,7 @@ table = (
 )
 ```
 
-`with_hudi_option` and `with_option` accept a string key or a `HudiReadConfig` / `HudiTableConfig` enum member. The bulk variants (`with_hudi_options`, `with_options`) currently accept dicts of string keys. Read configs (`hoodie.read.*`) are silently dropped at table construction — pass them via `HudiReadOptions` per-call instead.
+`with_hudi_option` and `with_option` accept a string key or a `HudiReadConfig` / `HudiTableConfig` enum member. The bulk variants (`with_hudi_options`, `with_options`) currently accept dicts of string keys. Read configs scoped `TableOrRead` are kept at table construction and overridden per read; the `ReadOnly` ones (`hoodie.read.query.type` and the as-of/start/end timestamps) are dropped there — pass them via `HudiReadOptions` per-call instead. See [§2](#2-readoptions).
 
 ### `HudiTable`
 
@@ -304,7 +305,7 @@ The range is half-open: (`start_timestamp`, `end_timestamp`]. A record updated m
 
 ### MOR streaming fallback
 
-Streaming yields true streaming batches when the slice is base-file-only or `hoodie.read.use.read_optimized.mode = true`. For MOR slices with log files, the implementation collects-and-merges and yields the result as a single batch on the stream.
+Streaming yields true streaming batches when the slice is base-file-only or `hoodie.read.use.read_optimized.mode = true`. A MOR slice with log files is merged, and what the stream yields depends on which file group reader serves it: version 2, the default, merges a bounded chunk at a time and yields each chunk, while version 1 has no incremental form for its whole-batch sort and dedup, so it collects-and-merges and yields the result as a single batch.
 
 ### `batch_size` and `projection`
 
@@ -342,6 +343,6 @@ Reader APIs documented here are the supported public surface as of this release.
 
 For I/O cost estimation (on-disk base + log file sizes), use `FileSlice::total_size_bytes()` instead.
 
-`Table` / `HudiTable` only stores table configs (`HudiTableConfig`). Read configs (`HudiReadConfig`, keyed under `hoodie.read.*`) are filtered out during construction and flow exclusively through `ReadOptions` / `HudiReadOptions` per-call. `hudi_options()` on the table reflects the stored table configs, not any read configs the caller may have passed at construction.
+`Table` / `HudiTable` stores table configs (`HudiTableConfig`) and those read configs whose scope is `TableOrRead`; a per-read value overrides them. `ReadOnly` read configs — `hoodie.read.query.type` and the as-of/start/end timestamps — are filtered out during construction and flow exclusively through `ReadOptions` / `HudiReadOptions` per-call, so `hudi_options()` on the table never reflects them.
 
 Out of scope for this version: writer APIs, internal architecture (timeline parsing, log-record merging, metadata table layout), the full configuration key glossary (`HudiReadConfig` / `HudiTableConfig` members), and the DataFusion and C++ bindings — separate spec follow-ups.
