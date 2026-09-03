@@ -148,24 +148,35 @@ async fn verify_plan(
         plan.contains("SortExec: TopK(fetch=10)"),
         "Plan should contain TopK sort"
     );
+    // The projection, struct field access included, is pushed into the Parquet
+    // source rather than planned as its own `ProjectionExec`, so it is asserted
+    // wherever it lands. The index in `structField@N` is the field's position in
+    // the file schema and differs per table, hence the two-part match.
+    assert!(
+        plan.contains("get_field(structField@")
+            && plan.contains(&format!(", field2) as {table_name}.structField[field2]")),
+        "Plan should project the struct field"
+    );
+    // Simple predicates (id % 2 = 0, name != Alice) and the struct field access
+    // alike are pushed into the Parquet source.
+    assert!(
+        plan.contains(", field2) > 30"),
+        "Plan should contain struct field filter"
+    );
     assert!(
         plan.contains(&format!(
-            "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
-            get_field(structField@3, field2) as {table_name}.structField[field2]]"
+            "file_groups={{{planned_input_partitioned} {}:",
+            file_group_noun(*planned_input_partitioned)
         )),
-        "Plan should contain expected projection"
+        "Plan should scan {planned_input_partitioned} file group(s)"
     );
-    // With pushdown_filters enabled, simple predicates (id % 2 = 0, name != Alice)
-    // are pushed into the Parquet source. Only non-pushable predicates like
-    // struct field access remain in FilterExec.
-    assert!(
-        plan.contains("get_field(structField@3, field2) > 30"),
-        "Plan should contain struct field filter (either in FilterExec or DataSourceExec)"
-    );
-    assert!(
-        plan.contains(&format!("input_partitions={planned_input_partitioned}")),
-        "Plan should contain expected input_partitions={planned_input_partitioned}"
-    );
+}
+
+/// How the plan spells the file-group count: `hoodie.read.input.partitions`
+/// decides how many groups the scan is split into, and DataFusion renders one
+/// group in the singular.
+fn file_group_noun(count: i32) -> &'static str {
+    if count == 1 { "group" } else { "groups" }
 }
 
 async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -385,16 +396,16 @@ mod v8_tests {
             "Should have TopK sort"
         );
         assert!(
-            plan_lines[2].contains("ProjectionExec"),
-            "Should have ProjectionExec"
+            plan_lines[2].starts_with("DataSourceExec"),
+            "Should scan through DataSourceExec"
         );
         assert!(
-            plan.contains("FilterExec"),
-            "Should have FilterExec for non-partition filters"
+            plan.contains(", field2) > 30"),
+            "Non-partition filters should reach the source"
         );
         assert!(
-            plan.contains("input_partitions=2"),
-            "Should have input_partitions=2"
+            plan.contains("file_groups={2 groups:"),
+            "Should scan 2 file groups"
         );
 
         // Verify data
@@ -430,8 +441,8 @@ mod v8_tests {
         let plan = get_str_column(explaining_rb, "plan").join("");
 
         assert!(
-            plan.contains("input_partitions=2"),
-            "Complex keygen table should have input_partitions=2"
+            plan.contains("file_groups={2 groups:"),
+            "Complex keygen table should scan 2 file groups"
         );
         assert!(
             plan.contains("DataSourceExec"),

@@ -252,7 +252,7 @@ fn batch(from: u64, rows: usize) -> RecordBatch {
 fn write_one(path: &Path, target_bytes: u64, row_group_rows: usize, start_key: u64) -> u64 {
     let props = WriterProperties::builder()
         .set_compression(Compression::UNCOMPRESSED)
-        .set_max_row_group_size(row_group_rows)
+        .set_max_row_group_row_count(Some(row_group_rows))
         .build();
     let file = fs::File::create(path).expect("create parquet");
     let mut writer = ArrowWriter::try_new(file, schema(), Some(props)).expect("writer");

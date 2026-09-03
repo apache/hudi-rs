@@ -69,7 +69,7 @@ fn write_parquet_file_multiple_row_groups(batches: &[RecordBatch], path: &std::p
     let props = WriterProperties::builder()
         .set_compression(Compression::SNAPPY)
         .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
-        .set_max_row_group_size(3) // Force smaller row groups
+        .set_max_row_group_row_count(Some(3)) // Force smaller row groups
         .build();
     let mut writer = ArrowWriter::try_new(file, batches[0].schema(), Some(props)).unwrap();
     for batch in batches {

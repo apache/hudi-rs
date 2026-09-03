@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, parse_url_opts};
+use object_store::{ObjectStore, ObjectStoreExt, parse_url_opts};
 use url::Url;
 
 use crate::config::HudiConfigs;
