@@ -27,6 +27,7 @@ use std::task::{Context, Poll};
 
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
+use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -67,6 +68,44 @@ pub struct HudiScanExec {
 }
 
 impl HudiScanExec {
+    /// Reserve for as many slices as the pool will grant, down to one.
+    ///
+    /// Returns how many may be read at once. Reaching the pool's limit lowers
+    /// the fan-out; it never fails the scan — a read under memory pressure is
+    /// supposed to get slower, not to stop. One slice is admitted whether or not
+    /// the pool grants it, because refusing to read is not a degraded read and
+    /// the reservation is an estimate, not a measurement.
+    /// How many slices to attempt, before the memory pool lowers it further.
+    ///
+    /// A slice whose log size the listing did not record cannot be estimated.
+    /// Reading that gap as zero bytes would reserve only the per-slice floor for
+    /// exactly the slices least is known about, understating pressure on the
+    /// pool — and it would contradict `slices_in_flight`, which admits one slice
+    /// in the same situation. The rule is the same in both places so that an
+    /// unmeasured slice means one thing throughout the scan.
+    fn planned_slices(configured: usize, file_slices: &[FileSlice]) -> usize {
+        if file_slices.iter().any(|s| s.log_size_bytes().is_none()) {
+            return 1;
+        }
+        configured.min(file_slices.len()).max(1)
+    }
+
+    fn reserve_for_slices(
+        reservation: &mut MemoryReservation,
+        per_slice_bytes: usize,
+        planned: usize,
+    ) -> usize {
+        if per_slice_bytes == 0 {
+            return planned;
+        }
+        for n in (1..=planned).rev() {
+            if reservation.try_grow(per_slice_bytes * n).is_ok() {
+                return n;
+            }
+        }
+        1
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         file_slice_partitions: Vec<Vec<FileSlice>>,
@@ -267,7 +306,7 @@ impl ExecutionPlan for HudiScanExec {
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<datafusion::execution::TaskContext>,
+        context: Arc<datafusion::execution::TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let file_slices = self
             .file_slice_partitions
@@ -293,10 +332,24 @@ impl ExecutionPlan for HudiScanExec {
 
         let reader = self.file_group_reader.clone();
         let options = self.read_options.clone();
-        let concurrency = self
-            .file_slice_read_concurrency
-            .min(file_slices.len())
-            .max(1);
+        // The plan-time budget cannot see what else is running. Registering with
+        // the pool lets this scan account for what it is about to hold and, when
+        // the pool is already under pressure, read fewer slices at once instead
+        // of allocating anyway. Dropping the reservation with the stream returns
+        // the bytes.
+        let mut reservation = MemoryConsumer::new(format!("HudiScanExec[{partition}]"))
+            .register(context.memory_pool());
+        let planned = Self::planned_slices(self.file_slice_read_concurrency, &file_slices);
+        let per_slice = file_slices
+            .iter()
+            .map(|s| {
+                hudi_core::file_group::admission::estimated_slice_bytes(
+                    s.log_size_bytes().unwrap_or(0),
+                )
+            })
+            .max()
+            .unwrap_or(0) as usize;
+        let concurrency = Self::reserve_for_slices(&mut reservation, per_slice, planned);
 
         let stream = stream::iter(0..file_slices.len())
             .map(move |idx| {
@@ -328,6 +381,12 @@ impl ExecutionPlan for HudiScanExec {
             stream
         };
         let stream = BaselineMetricStream::new(stream, baseline_metrics);
+        // Held for the life of the stream: the bytes are returned when the scan
+        // finishes or is dropped, not when this function returns.
+        let stream = stream.map(move |item| {
+            let _keep = &reservation;
+            item
+        });
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             projected_schema,
@@ -447,6 +506,100 @@ impl HudiScanExec {
             total_byte_size,
             column_statistics,
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_pool_tests {
+    use super::*;
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+    const SLICE: usize = 100 * 1024 * 1024;
+
+    fn reservation(pool_bytes: usize) -> MemoryReservation {
+        let pool = Arc::new(GreedyMemoryPool::new(pool_bytes)) as Arc<dyn MemoryPool>;
+        MemoryConsumer::new("test").register(&pool)
+    }
+
+    /// A pool with room for everything planned changes nothing.
+    #[test]
+    fn a_pool_with_room_grants_the_planned_fan_out() {
+        let mut r = reservation(SLICE * 8);
+        assert_eq!(HudiScanExec::reserve_for_slices(&mut r, SLICE, 4), 4);
+    }
+
+    /// A pool with room for fewer slices lowers the fan-out rather than failing.
+    /// This is the behaviour the requirement names: slower, not failed.
+    #[test]
+    fn a_tight_pool_lowers_the_fan_out_instead_of_failing() {
+        let mut r = reservation(SLICE * 2 + SLICE / 2);
+        let granted = HudiScanExec::reserve_for_slices(&mut r, SLICE, 8);
+        assert_eq!(granted, 2, "room for two slices must grant two, not eight");
+        assert!(granted > 0, "a lowered fan-out is still a fan-out");
+    }
+
+    /// A pool with no room still admits one slice. Refusing to read is not a
+    /// degraded read, and the reservation is an estimate rather than a
+    /// measurement — declining to start on it would fail scans that would fit.
+    #[test]
+    fn an_exhausted_pool_still_admits_one_slice() {
+        let mut r = reservation(1);
+        assert_eq!(HudiScanExec::reserve_for_slices(&mut r, SLICE, 8), 1);
+    }
+
+    /// Nothing to estimate means nothing to reserve: a slice with no log files
+    /// costs no merge map, and the plan-time budget already bounded the rest.
+    #[test]
+    fn a_zero_estimate_reserves_nothing_and_keeps_the_plan() {
+        let mut r = reservation(1);
+        assert_eq!(HudiScanExec::reserve_for_slices(&mut r, 0, 6), 6);
+    }
+
+    /// A slice whose log files were listed without sizes must not be treated as
+    /// costing nothing.
+    ///
+    /// `slices_in_flight` admits one slice when any log size is unknown. The
+    /// reservation used to read the same gap as zero bytes and reserve only the
+    /// 33 MiB floor, so the two halves of the same budget disagreed about what an
+    /// unmeasured slice costs. This pins them together.
+    #[test]
+    fn an_unmeasured_log_file_plans_one_slice() {
+        use hudi_core::file_group::base_file::BaseFile;
+        use hudi_core::file_group::log_file::LogFile;
+        use hudi_core::storage::file_metadata::FileMetadata;
+        use std::str::FromStr;
+
+        let slice_with = |sized: bool| {
+            let base = BaseFile::from_str(
+                "54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_0-7-24_20250109233025121.parquet",
+            )
+            .unwrap();
+            let mut slice = FileSlice::new(base, "".to_string());
+            let mut log = LogFile::from_str(
+                ".54e9a5e9-ee5d-4ed2-acee-720b5810d380-0_20250109233025121.log.1_0-51-115",
+            )
+            .unwrap();
+            if sized {
+                log.file_metadata = Some(FileMetadata::new("log.1", 1024));
+            }
+            slice.log_files.insert(log);
+            slice
+        };
+
+        let measured = vec![slice_with(true), slice_with(true)];
+        assert_eq!(
+            HudiScanExec::planned_slices(4, &measured),
+            2,
+            "with every log size known the ceiling stands, bounded by slice count"
+        );
+
+        let mut mixed = measured.clone();
+        mixed.push(slice_with(false));
+        assert_eq!(
+            HudiScanExec::planned_slices(4, &mixed),
+            1,
+            "one unmeasured slice is enough to fall back to admitting one"
+        );
     }
 }
 

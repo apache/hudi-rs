@@ -567,6 +567,21 @@ impl Table {
         // and fallback storage listing.
         let estimator = self.get_or_init_estimator(timestamp).await;
 
+        // Built here rather than inside the view: it needs the data table's
+        // timeline as well as the metadata table's, and only this scope holds
+        // both.
+        let valid_instants = match metadata_table {
+            Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
+            None => None,
+        };
+        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
+            (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
+                table,
+                valid_instants,
+            }),
+            _ => None,
+        };
+
         let mut file_slices = self
             .file_system_view
             .get_file_slices(
@@ -574,7 +589,7 @@ impl Table {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                metadata_table,
+                metadata_listing,
                 estimator,
             )
             .await?;
@@ -842,25 +857,79 @@ impl Table {
         FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
     }
 
+    /// The scan's memory budget, when the table set one.
+    ///
+    /// Absent means `hoodie.read.file.slice.read.concurrency` stands on its own,
+    /// which is the behaviour every existing table keeps.
+    fn scan_max_memory_size(&self) -> Option<u64> {
+        self.hudi_configs
+            .try_get(HudiReadConfig::ScanMaxMemorySize)
+            .ok()
+            .flatten()
+            .map(|v| -> usize { v.into() })
+            .map(|v| v as u64)
+    }
+
     /// How many file slices to read at once.
     ///
     /// `try_join_all` over every slice was unbounded, so a table with a thousand
     /// file groups issued a thousand concurrent reads and held a thousand merged
-    /// batches at the same time — and under file group reader version 2 each of those
-    /// also carries its own merge map and, on spill, its own RocksDB instance.
-    /// `hoodie.read.file.slice.read.concurrency` already bounds the DataFusion
-    /// scan; honoring it here puts the direct and Python read paths on the same
-    /// knob instead of leaving them unbounded.
-    fn file_slice_read_concurrency(&self) -> usize {
-        let configured: usize = self
+    /// batches at once — and under file group reader version 2 each of those also
+    /// carries its own merge map and, on spill, its own RocksDB instance.
+    ///
+    /// The same derivation the DataFusion plan uses, so the two paths cannot
+    /// bound a scan differently. This is the **only** way to obtain a
+    /// concurrency for a read: the raw `hoodie.read.file.slice.read.concurrency`
+    /// lookup lives inside it rather than in a method of its own, so a read
+    /// cannot reach the ceiling while bypassing the budget. A test can miss that
+    /// bypass — one did — but a compile error cannot. One `Table` read is one partition's worth of
+    /// work, so the budget is not divided further here — dividing twice would
+    /// bound this path below what the caller asked for.
+    ///
+    /// Separated from the read so it can be asserted directly: it is a single
+    /// call whose absence compiles perfectly, and the arithmetic behind it is
+    /// tested elsewhere in isolation, which says nothing about whether anything
+    /// calls it.
+    fn bounded_read_concurrency(&self, file_slices: &[FileSlice]) -> usize {
+        self.bounded_read_concurrency_from_log_bytes(
+            file_slices.iter().map(FileSlice::log_size_bytes),
+        )
+    }
+
+    /// [`Self::bounded_read_concurrency`] over a borrowed selection.
+    ///
+    /// The metadata read routes keys to a subset of a partition's slices, so it
+    /// holds `&FileSlice` rather than owning them. The budget must see that
+    /// subset, not the whole partition: routing a single key to one shard should
+    /// admit on that shard's cost.
+    pub(crate) fn bounded_read_concurrency_for(&self, file_slices: &[&FileSlice]) -> usize {
+        self.bounded_read_concurrency_from_log_bytes(file_slices.iter().map(|s| s.log_size_bytes()))
+    }
+
+    /// The one place the ceiling and the budget meet.
+    ///
+    /// Both public forms funnel through this, over log sizes alone: the
+    /// admission decision needs nothing else from a slice, so neither form has
+    /// to own or copy one.
+    fn bounded_read_concurrency_from_log_bytes(
+        &self,
+        slice_log_bytes: impl Iterator<Item = Option<u64>>,
+    ) -> usize {
+        let slice_log_bytes: Vec<Option<u64>> = slice_log_bytes.collect();
+        let ceiling: usize = self
             .hudi_configs
             .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
             .into();
-        configured.max(1)
+        crate::file_group::admission::slices_in_flight(
+            self.scan_max_memory_size(),
+            1,
+            &slice_log_bytes,
+            ceiling.max(1),
+        )
     }
 
-    /// Read `file_slices` with at most [`Self::file_slice_read_concurrency`] in
-    /// flight, in slice order.
+    /// Read `file_slices` with at most [`Self::bounded_read_concurrency`] in
+    /// flight, or fewer when a scan memory budget admits fewer, in slice order.
     ///
     /// Order is preserved (`buffered`, not `buffer_unordered`) because a caller
     /// that concatenates these batches should not see its row order shift with
@@ -872,22 +941,12 @@ impl Table {
         file_slices: &[FileSlice],
         fg_options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let concurrency = self.file_slice_read_concurrency();
-        let mut batches = Vec::with_capacity(file_slices.len());
-        // One `try_join_all` per chunk rather than a sliding window. A chunk waits
-        // for its slowest member, so this is slightly less busy than a true
-        // window — but the goal here is the ceiling, not maximal overlap, and the
-        // sliding-window form (`buffered` over these futures) cannot be proven
-        // `Send`: the futures borrow `&FileSlice`/`&ReadOptions`, and the
-        // higher-ranked lifetimes inside `FuturesOrdered` then defeat the
-        // auto-trait inference for any caller that spawns the read.
-        for chunk in file_slices.chunks(concurrency) {
-            let reads = chunk
-                .iter()
-                .map(|file_slice| fg_reader.read_file_slice(file_slice, fg_options));
-            batches.extend(futures::future::try_join_all(reads).await?);
-        }
-        Ok(batches)
+        crate::util::concurrency::bounded_in_order(
+            file_slices,
+            self.bounded_read_concurrency(file_slices),
+            |file_slice| fg_reader.read_file_slice(file_slice, fg_options),
+        )
+        .await
     }
 
     /// Warn when an incremental window reaches below the active timeline.
@@ -1151,6 +1210,20 @@ impl Table {
         });
 
         // Chain all file slice streams together, propagating errors to the caller.
+        // Sequential, and deliberately so: `.then` awaits each slice's future
+        // before starting the next, so exactly one slice is in flight however many
+        // the table has.
+        //
+        // `hoodie.read.file.slice.read.concurrency` therefore does **not** apply
+        // here, unlike [`Self::read`], which fans out through
+        // `read_file_slices_bounded`. That is not an oversight: a streaming read
+        // exists so the whole result is never resident, and fanning out N ways
+        // would hold N slices' batches in flight at once — spending the memory the
+        // caller chose this API to avoid. A caller who wants the slices read
+        // concurrently wants `read`.
+        //
+        // The consequence worth stating: peak memory here does not grow with slice
+        // count, so a scan memory budget has nothing to bound on this path.
         let combined_stream = stream::iter(streams_iter)
             .then(|fut| fut)
             .flat_map(|result| match result {
@@ -1185,8 +1258,9 @@ impl Table {
         let hudi_configs = self.hudi_configs.as_ref();
         let partition_pruner = PartitionPruner::new(&[], &partition_schema, hudi_configs).ok()?;
         let mdt = self.get_or_init_metadata_table().await.ok()?;
+        let valid = self.valid_instant_timestamps(mdt).await.ok()?;
         let records = mdt
-            .fetch_files_partition_records(&partition_pruner)
+            .fetch_files_partition_records(&partition_pruner, &valid)
             .await
             .ok()?;
 
@@ -1346,6 +1420,109 @@ mod tests {
             file_paths.push(file_url.to_string());
         }
         Ok(file_paths)
+    }
+
+    /// A scan memory budget lowers the core fan-out's concurrency; without one
+    /// the configured ceiling stands.
+    ///
+    /// Pins the wiring rather than the arithmetic — `slices_in_flight` has its
+    /// own tests, and passing those tells you nothing about whether this path
+    /// calls it. The equivalent wiring on the DataFusion side was claimed,
+    /// compiled, and shipped absent; this is the same class of gap on the core
+    /// path.
+    #[tokio::test]
+    async fn a_scan_memory_budget_lowers_the_core_fan_out() {
+        use crate::file_group::base_file::BaseFile;
+        use crate::file_group::file_slice::FileSlice;
+        use crate::storage::file_metadata::FileMetadata;
+        use std::str::FromStr;
+
+        // Log files with recorded sizes: an unmeasured slice is unestimatable and
+        // floors at 1, which would make the bounded arm pass for the wrong reason.
+        let slices: Vec<FileSlice> = (0..4)
+            .map(|i| {
+                let name = format!("a{i}0000-0000-0000-0000-00000000000{i}-0_0-1-0_001.parquet");
+                let mut fs = FileSlice::new(BaseFile::from_str(&name).unwrap(), String::new());
+                let log = format!(".a{i}0000-0000-0000-0000-00000000000{i}-0_002.log.1_0-1-0");
+                let mut lf = crate::file_group::log_file::LogFile::from_str(&log).unwrap();
+                lf.file_metadata = Some(FileMetadata::new(&log, 8 * 1024 * 1024));
+                fs.log_files.insert(lf);
+                fs
+            })
+            .collect();
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let unbounded = Table::new(base_url.path()).await.unwrap();
+        assert_eq!(
+            unbounded.bounded_read_concurrency(&slices),
+            4,
+            "with no budget the configured ceiling stands"
+        );
+
+        // Each slice estimates at 33 MiB + 4 x 8 MiB = 65 MiB, so 128 MiB admits one.
+        let bounded = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.read.scan.max.memory.size", "134217728")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            bounded.bounded_read_concurrency(&slices),
+            1,
+            "a 128 MiB budget must admit one 65 MiB slice, not the ceiling of 4"
+        );
+    }
+
+    /// `read_stream` returns exactly what `read` returns, and the slice
+    /// concurrency ceiling changes neither.
+    ///
+    /// The invariant this pins is the documented contract at
+    /// `read_snapshot_stream_inner`: the streaming path reads slices sequentially,
+    /// so `hoodie.read.file.slice.read.concurrency` does not apply to it. Setting
+    /// the ceiling to 1 and to 8 must produce the same rows as the eager read —
+    /// if a future change made the stream fan out, the row totals would still
+    /// match, but the config would start mattering, and this test is where that
+    /// divergence gets noticed.
+    ///
+    /// It does not prove sequentiality. Nothing observable from outside
+    /// distinguishes one slice in flight from four; the contract is asserted by
+    /// the doc comment and by `.then`, and this test pins the consequence a caller
+    /// can actually check.
+    #[tokio::test]
+    async fn read_stream_matches_read_and_ignores_the_slice_ceiling() -> Result<()> {
+        use futures::StreamExt;
+
+        // A partitioned fixture, because the point is several file slices: on a
+        // single-slice table this test cannot tell "read every slice" from "read
+        // the first", and a `.take(1)` mutation passes it.
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let eager = Table::new(base_url.path())
+            .await?
+            .read(&ReadOptions::new())
+            .await?;
+        let expected: usize = eager.iter().map(|b| b.num_rows()).sum();
+        assert!(
+            expected > 0,
+            "the fixture must return rows, or nothing is pinned"
+        );
+
+        for ceiling in ["1", "8"] {
+            let table = Table::new_with_options(
+                base_url.path(),
+                [(HudiReadConfig::FileSliceReadConcurrency.as_ref(), ceiling)],
+            )
+            .await?;
+            let mut stream = table.read_stream(&ReadOptions::new()).await?;
+            let mut rows = 0usize;
+            while let Some(batch) = stream.next().await {
+                rows += batch?.num_rows();
+            }
+            assert_eq!(
+                rows, expected,
+                "read_stream at concurrency={ceiling} must return the eager row count"
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -2396,7 +2573,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(serial.file_slice_read_concurrency(), 1);
+        assert_eq!(serial.bounded_read_concurrency(&[]), 1);
         let serial_rows = serial
             .read(&ReadOptions::new())
             .await
@@ -2427,7 +2604,7 @@ mod tests {
             "the error must name the offending key, got: {err}"
         );
         // And the ceiling the fan-out would have used is never zero regardless.
-        assert!(zero.file_slice_read_concurrency() >= 1);
+        assert!(zero.bounded_read_concurrency(&[]) >= 1);
     }
 
     /// Regression test: the file group reader version set at TABLE level must
@@ -3078,8 +3255,12 @@ mod tests {
         let partition_schema = table.get_partition_schema().await.unwrap();
         let partition_pruner =
             PartitionPruner::new(&[], &partition_schema, table.hudi_configs.as_ref()).unwrap();
+        let valid = table
+            .valid_instant_timestamps(metadata_table)
+            .await
+            .unwrap();
         let records = metadata_table
-            .fetch_files_partition_records(&partition_pruner)
+            .fetch_files_partition_records(&partition_pruner, &valid)
             .await
             .unwrap();
         assert!(!records.is_empty());

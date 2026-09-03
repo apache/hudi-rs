@@ -176,6 +176,19 @@ impl Timeline {
         }
     }
 
+    /// Instant times with a requested or inflight file and no completed one,
+    /// across every action rather than only the three in
+    /// [`DEFAULT_LOADING_ACTIONS`].
+    ///
+    /// Separate from [`Self::pending_instants`], which this deliberately does
+    /// not widen: that field also feeds [`Self::completion_gate_inputs`], where
+    /// a wider inflight set would start rejecting log blocks the gate admits
+    /// today. The metadata table's valid-instant set is the one caller that
+    /// needs Java's whole-timeline view.
+    pub(crate) async fn all_pending_instant_times(&self) -> Result<HashSet<String>> {
+        self.active_loader.list_pending_instant_times().await
+    }
+
     /// Load instants from the timeline based on the selector criteria.
     ///
     /// # Archived Timeline Loading
@@ -310,6 +323,13 @@ impl Timeline {
         instant: &Instant,
     ) -> Result<Map<String, Value>> {
         self.active_loader.load_instant_metadata(instant).await
+    }
+
+    /// The raw bytes of one instant file, for readers that decode a record
+    /// other than commit metadata — a rollback, a restore, or a rollback plan.
+    ///
+    pub(crate) async fn load_instant_bytes(&self, instant: &Instant) -> Result<Vec<u8>> {
+        self.active_loader.load_instant_bytes(instant).await
     }
 
     /// Get the instant metadata in JSON format.

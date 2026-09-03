@@ -138,6 +138,19 @@ pub enum HudiReadConfig {
     /// Maximum number of file-slice streams to poll concurrently within one scan partition.
     FileSliceReadConcurrency,
 
+    /// Total memory, in bytes, a whole scan may use for concurrent file-slice
+    /// reads. Unset by default, which leaves
+    /// [`Self::FileSliceReadConcurrency`] in charge on its own.
+    ///
+    /// This exists because that knob cannot express the peak. Real peak memory
+    /// is the product of the per-merge budget, the slices open inside one engine
+    /// partition, and the partitions running at once — three settings whose
+    /// product nothing multiplies. Set this instead and the concurrency is
+    /// derived from it, shared across partitions rather than granted to each.
+    ///
+    /// Reaching the limit lowers throughput; it never fails the read.
+    ScanMaxMemorySize,
+
     /// Match a log record to the base row it updates by that row's position in
     /// the base file rather than by record key. Defaults to `false`.
     ///
@@ -188,6 +201,7 @@ impl HudiReadConfig {
             | Self::UseReadOptimizedMode
             | Self::StreamBatchSize
             | Self::FileSliceReadConcurrency
+            | Self::ScanMaxMemorySize
             | Self::FileGroupReaderVersion
             | Self::MergeUseRecordPositions => ReadConfigScope::TableOrRead,
         }
@@ -216,6 +230,7 @@ impl HudiReadConfig {
             Self::FileGroupReaderVersion => "hoodie.read.file.group.reader.version",
             Self::StreamBatchSize => "hoodie.read.stream.batch_size",
             Self::FileSliceReadConcurrency => "hoodie.read.file.slice.read.concurrency",
+            Self::ScanMaxMemorySize => "hoodie.read.scan.max.memory.size",
             // Hudi's own key, not a `hoodie.read.*` one: a table written with
             // record positions is read with this set, and a reader that invented
             // its own spelling would ignore what the writer was told.
@@ -347,6 +362,20 @@ impl ConfigParser for HudiReadConfig {
                         return Err(InvalidValue(format!("{key}=0 (must be > 0)")));
                     }
                     Ok(parsed)
+                })
+                .map(HudiConfigValue::UInteger),
+            // Rejected at zero rather than silently meaning "unbounded": a
+            // caller who sets a memory budget of 0 is asking for a bound, and
+            // reading that as "no bound" is the opposite of what they asked.
+            Self::ScanMaxMemorySize => get_result
+                .and_then(|v| {
+                    let key = self.key();
+                    let parsed =
+                        u64::from_str(v).map_err(|e| ParseInt(key.clone(), v.to_string(), e))?;
+                    if parsed == 0 {
+                        return Err(InvalidValue(format!("{key}=0 (must be > 0)")));
+                    }
+                    Ok(parsed as usize)
                 })
                 .map(HudiConfigValue::UInteger),
             Self::FileSliceReadConcurrency => get_result

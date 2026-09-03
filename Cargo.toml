@@ -21,6 +21,7 @@ members = [
     "cpp",
     "python",
     "benchmark/tpch",
+    "benchmark/filegroup",
 ]
 resolver = "2"
 

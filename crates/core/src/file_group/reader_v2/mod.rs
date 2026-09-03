@@ -55,6 +55,8 @@ pub(crate) mod iterator_mode;
 pub(crate) mod log_record_reader;
 #[cfg(test)]
 mod memory_limit_tests;
+#[cfg(test)]
+mod merge_cpu_bench;
 pub(crate) mod merge_iterator;
 pub(crate) mod merged_log_record_reader;
 // The one module here that names something outside this reader: it holds Hudi's

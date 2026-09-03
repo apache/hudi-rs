@@ -20,6 +20,7 @@
 //!
 //! A set of data/base files + set of log files, that make up a unit for all operations.
 
+pub mod admission;
 pub mod base_file;
 pub mod builder;
 pub mod file_slice;

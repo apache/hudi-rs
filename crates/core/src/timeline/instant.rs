@@ -31,6 +31,19 @@ pub enum Action {
     Commit,
     DeltaCommit,
     ReplaceCommit,
+    /// A rollback of one earlier instant.
+    ///
+    /// Deliberately absent from [`DEFAULT_LOADING_ACTIONS`]: a rollback is not a
+    /// commit, and adding it there would put it in `completed_commits` and
+    /// change every existing read. It is loaded only by a caller that names it,
+    /// which today is the metadata table's valid-instant set -- Hudi counts the
+    /// commits a rollback rolled back as valid, because their log blocks were
+    /// written and then re-applied.
+    ///
+    /// [`DEFAULT_LOADING_ACTIONS`]: crate::timeline::DEFAULT_LOADING_ACTIONS
+    Rollback,
+    /// A restore, which is made up of several rollbacks.
+    Restore,
 }
 
 impl FromStr for Action {
@@ -41,6 +54,8 @@ impl FromStr for Action {
             "commit" => Ok(Action::Commit),
             "deltacommit" => Ok(Action::DeltaCommit),
             "replacecommit" => Ok(Action::ReplaceCommit),
+            "rollback" => Ok(Action::Rollback),
+            "restore" => Ok(Action::Restore),
             _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
@@ -52,6 +67,8 @@ impl AsRef<str> for Action {
             Action::Commit => "commit",
             Action::DeltaCommit => "deltacommit",
             Action::ReplaceCommit => "replacecommit",
+            Action::Rollback => "rollback",
+            Action::Restore => "restore",
         }
     }
 }
@@ -696,5 +713,48 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// Every action round-trips through its on-disk suffix.
+    ///
+    /// The suffix is the file extension Hudi writes, so a mismatch here means an
+    /// instant file is silently discarded by the loader rather than failing --
+    /// which is exactly how rollback and restore went unseen before they were
+    /// added.
+    #[test]
+    fn every_action_round_trips_through_its_suffix() {
+        for action in [
+            Action::Commit,
+            Action::DeltaCommit,
+            Action::ReplaceCommit,
+            Action::Rollback,
+            Action::Restore,
+        ] {
+            let suffix = action.as_ref();
+            assert_eq!(
+                Action::from_str(suffix).unwrap(),
+                action,
+                "`{suffix}` must parse back to the action that produced it"
+            );
+        }
+    }
+
+    /// Rollback and restore are deliberately **not** in the default loading set.
+    ///
+    /// They are not commits. Adding them there would put them in
+    /// `completed_commits`, which drives file-slice discovery and the commit
+    /// visibility gate -- so every existing read would change. They are loaded
+    /// only by a caller that names them.
+    #[test]
+    fn rollback_and_restore_are_not_loaded_by_default() {
+        let defaults = crate::timeline::DEFAULT_LOADING_ACTIONS;
+        assert!(
+            !defaults.contains(&Action::Rollback) && !defaults.contains(&Action::Restore),
+            "adding these to the default set would change every existing read, \
+             got: {defaults:?}"
+        );
+        // The premise: the set is not empty, so the assertion above is not
+        // vacuously true.
+        assert!(defaults.contains(&Action::Commit));
     }
 }

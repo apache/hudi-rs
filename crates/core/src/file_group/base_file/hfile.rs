@@ -143,6 +143,123 @@ impl HFileBaseFileReader {
         .await
         .map_err(|e| StorageError::Creation(format!("Failed to read HFile {relative_path}: {e:?}")))
     }
+
+    /// The read itself, once the file is open. Split out of [`Self::read_stream`]
+    /// so a caller can hold the reader across the read and read its
+    /// `FetchCounts` — the only way to observe that a key predicate narrowed
+    /// what was fetched, since selection over-includes and `decode_window`
+    /// filters afterwards, leaving the rows identical either way.
+    fn stream_from(
+        &self,
+        reader: HFileReader,
+        relative_path: &str,
+        options: &BaseFileReadOptions,
+    ) -> Result<BaseFileStream> {
+        // `Some(vec![])` asks for the row count only. The trailer carries it,
+        // so no data block is read and no schema is needed.
+        //
+        // Not when a key predicate is set: the trailer counts the whole file,
+        // so answering from it would report every record as though it matched.
+        // A caller asking how many of five keys a file holds must get five or
+        // fewer, so that combination reads blocks like any other.
+        if options.key_predicate.is_none()
+            && options.projection.as_ref().is_some_and(|p| p.is_empty())
+        {
+            let schema: SchemaRef = Arc::new(Schema::empty());
+            let row_count = usize::try_from(reader.num_entries()).unwrap_or(usize::MAX);
+            let batch = RecordBatch::try_new_with_options(
+                schema.clone(),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(row_count)),
+            )
+            .map_err(StorageError::ArrowError)?;
+            return Ok(BaseFileStream::new(
+                schema,
+                futures::stream::once(async move { Ok(batch) }).boxed(),
+            ));
+        }
+
+        let (full_schema, decoder, registered) = Self::decoded_schema(&reader, relative_path)?;
+        let schema = Self::project(&full_schema, options.projection.as_deref())?;
+        let projection: Option<Vec<String>> =
+            options.projection.as_ref().map(|names| names.to_vec());
+
+        let budget = reader
+            .window_budget()
+            .unwrap_or(DEFAULT_WINDOW_BUDGET_FALLBACK);
+        // Seek when the caller named keys, scan when it did not. Selection
+        // over-includes, so `decode_window` filters below; this only changes
+        // which blocks are fetched.
+        let entries = match options.key_predicate.as_ref() {
+            Some(predicate) => reader.blocks_for_predicate(predicate),
+            None => reader.data_block_entries(),
+        };
+        // Windows still bound peak memory over whatever was selected.
+        let windows = HFileReader::plan_windows(&entries, budget);
+        let key_predicate = options.key_predicate.clone();
+
+        let stream = futures::stream::unfold(
+            (
+                reader,
+                windows.into_iter(),
+                full_schema,
+                projection,
+                key_predicate,
+                // The decoder the schema was resolved with, for the first window.
+                // Later windows build their own: a decoder is flushed at the end of
+                // a window and `arrow_avro` does not fully reset a union's state on
+                // flush (arrow-rs#10876), so carrying one across a window boundary
+                // would decode the next window against stale offsets.
+                Some(decoder),
+                registered,
+                false,
+            ),
+            |(
+                reader,
+                mut windows,
+                full_schema,
+                projection,
+                key_predicate,
+                decoder,
+                registered,
+                failed,
+            )| async move {
+                // Sticky: once a window fails the read is not whole, so no
+                // later window is handed out as though it were.
+                if failed {
+                    return None;
+                }
+                let window = windows.next()?;
+                let item = decode_window(
+                    &reader,
+                    &window,
+                    &full_schema,
+                    projection.as_deref(),
+                    key_predicate.as_ref(),
+                    decoder,
+                    &registered,
+                )
+                .await;
+                let failed = item.is_err();
+                Some((
+                    item,
+                    (
+                        reader,
+                        windows,
+                        full_schema,
+                        projection,
+                        key_predicate,
+                        None,
+                        registered,
+                        failed,
+                    ),
+                ))
+            },
+        )
+        .boxed();
+
+        Ok(BaseFileStream::new(schema, stream))
+    }
 }
 
 impl BaseFileReader for HFileBaseFileReader {
@@ -153,111 +270,7 @@ impl BaseFileReader for HFileBaseFileReader {
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
             let reader = self.open(relative_path, &options).await?;
-
-            // `Some(vec![])` asks for the row count only. The trailer carries it,
-            // so no data block is read and no schema is needed.
-            //
-            // Not when a key predicate is set: the trailer counts the whole file,
-            // so answering from it would report every record as though it matched.
-            // A caller asking how many of five keys a file holds must get five or
-            // fewer, so that combination reads blocks like any other.
-            if options.key_predicate.is_none()
-                && options.projection.as_ref().is_some_and(|p| p.is_empty())
-            {
-                let schema: SchemaRef = Arc::new(Schema::empty());
-                let row_count = usize::try_from(reader.num_entries()).unwrap_or(usize::MAX);
-                let batch = RecordBatch::try_new_with_options(
-                    schema.clone(),
-                    vec![],
-                    &RecordBatchOptions::new().with_row_count(Some(row_count)),
-                )
-                .map_err(StorageError::ArrowError)?;
-                return Ok(BaseFileStream::new(
-                    schema,
-                    futures::stream::once(async move { Ok(batch) }).boxed(),
-                ));
-            }
-
-            let (full_schema, decoder, registered) = Self::decoded_schema(&reader, relative_path)?;
-            let schema = Self::project(&full_schema, options.projection.as_deref())?;
-            let projection: Option<Vec<String>> =
-                options.projection.as_ref().map(|names| names.to_vec());
-
-            let budget = reader
-                .window_budget()
-                .unwrap_or(DEFAULT_WINDOW_BUDGET_FALLBACK);
-            // Seek when the caller named keys, scan when it did not. Selection
-            // over-includes, so `decode_window` filters below; this only changes
-            // which blocks are fetched.
-            let entries = match options.key_predicate.as_ref() {
-                Some(predicate) => reader.blocks_for_predicate(predicate),
-                None => reader.data_block_entries(),
-            };
-            // Windows still bound peak memory over whatever was selected.
-            let windows = HFileReader::plan_windows(&entries, budget);
-            let key_predicate = options.key_predicate.clone();
-
-            let stream = futures::stream::unfold(
-                (
-                    reader,
-                    windows.into_iter(),
-                    full_schema,
-                    projection,
-                    key_predicate,
-                    // The decoder the schema was resolved with, for the first window.
-                    // Later windows build their own: a decoder is flushed at the end of
-                    // a window and `arrow_avro` does not fully reset a union's state on
-                    // flush (arrow-rs#10876), so carrying one across a window boundary
-                    // would decode the next window against stale offsets.
-                    Some(decoder),
-                    registered,
-                    false,
-                ),
-                |(
-                    reader,
-                    mut windows,
-                    full_schema,
-                    projection,
-                    key_predicate,
-                    decoder,
-                    registered,
-                    failed,
-                )| async move {
-                    // Sticky: once a window fails the read is not whole, so no
-                    // later window is handed out as though it were.
-                    if failed {
-                        return None;
-                    }
-                    let window = windows.next()?;
-                    let item = decode_window(
-                        &reader,
-                        &window,
-                        &full_schema,
-                        projection.as_deref(),
-                        key_predicate.as_ref(),
-                        decoder,
-                        &registered,
-                    )
-                    .await;
-                    let failed = item.is_err();
-                    Some((
-                        item,
-                        (
-                            reader,
-                            windows,
-                            full_schema,
-                            projection,
-                            key_predicate,
-                            None,
-                            registered,
-                            failed,
-                        ),
-                    ))
-                },
-            )
-            .boxed();
-
-            Ok(BaseFileStream::new(schema, stream))
+            self.stream_from(reader, relative_path, &options)
         })
     }
 
@@ -1807,6 +1820,225 @@ mod tests {
             record_keys(&read_mdt_slice(slice, true).await?),
             expected,
             "the v2 read of a files slice must return the metadata-table reader's keys"
+        );
+        Ok(())
+    }
+
+    /// A key predicate reaching the reader fetches fewer bytes for the same rows.
+    ///
+    /// The half no committed fixture could show. Every Avro-carrying HFile in the
+    /// repo has one data block, and with one block a seek and a scan fetch
+    /// identically — so the mutation `Some(_) => reader.data_block_entries()`
+    /// passes against all of them. This drives a generated `record_index` HFile
+    /// with 9 data blocks.
+    ///
+    /// Bytes, not rows, and deliberately: selection over-includes and
+    /// `decode_window` filters afterwards, so a predicate read returns the same
+    /// rows whether it fetched one block or nine. A row assertion here would
+    /// reproduce the very hole this test exists to close.
+    ///
+    /// Both arms run the production path — `open` then `stream_from` — with the
+    /// whole-read cache set to 0, documented as "always read in ranges", because
+    /// `FetchCounts` exists only on a ranged source.
+    ///
+    #[tokio::test]
+    async fn a_key_predicate_fetches_fewer_bytes_for_the_same_rows() -> crate::Result<()> {
+        use crate::file_group::base_file::reader::{BaseFileReadOptions, KeyPredicate};
+        use futures::TryStreamExt;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../test/data/metadata_multi_block_hfile");
+        let name = "record-index-0009-0_10-71-248_20260830075534042.hfile".to_string();
+        let size = std::fs::metadata(dir.join(&name)).unwrap().len();
+
+        let base_url = url::Url::from_directory_path(std::fs::canonicalize(&dir).unwrap()).unwrap();
+        let configs = Arc::new(HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                base_url.to_string(),
+            ),
+            (
+                crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
+                "0".to_string(),
+            ),
+        ]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs)?;
+        let base = HFileBaseFileReader::new(storage);
+
+        // Measure one production read: open, hand the reader to the read, and
+        // read the counts back through the fetcher clone that outlives it.
+        async fn measure(
+            base: &HFileBaseFileReader,
+            name: &str,
+            options: BaseFileReadOptions,
+        ) -> crate::Result<(u64, usize, usize)> {
+            let reader = base.open(name, &options).await?;
+            let blocks = reader.data_block_entries().len();
+            let counts = reader
+                .reads_handle()
+                .expect("the whole-read cache is 0, so this reader is ranged");
+            let stream = base.stream_from(reader, name, &options)?;
+            let rows: usize = stream
+                .try_fold(0usize, |n, b| async move { Ok(n + b.num_rows()) })
+                .await?;
+            Ok((counts.reads().bytes(), rows, blocks))
+        }
+
+        // A key the file certainly holds, taken from the file rather than
+        // guessed: a miss would also fetch few bytes, for the wrong reason.
+        let (scan_bytes, scan_rows, blocks) =
+            measure(&base, &name, BaseFileReadOptions::default()).await?;
+        let sample = base
+            .read_data(&name, BaseFileReadOptions::default())
+            .await?;
+        use arrow_array::Array;
+        let keys = sample
+            .column_by_name("key")
+            .and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .cloned()
+            })
+            .expect("record_index rows carry a key column");
+        let wanted = keys.value(keys.len() / 2).to_string();
+
+        let (seek_bytes, seek_rows, _) = measure(
+            &base,
+            &name,
+            BaseFileReadOptions {
+                key_predicate: Some(KeyPredicate::Keys(vec![wanted.clone()])),
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        assert!(
+            blocks > 1,
+            "the fixture must be multi-block or this test cannot fail: {blocks} in {size} bytes"
+        );
+        assert_eq!(seek_rows, 1, "the predicate must select exactly {wanted}");
+        assert!(
+            scan_rows > seek_rows,
+            "the scan must return more than the one matching row: {scan_rows}"
+        );
+        assert!(
+            seek_bytes < scan_bytes,
+            "a one-key predicate must fetch fewer bytes than a scan of {blocks} blocks: \
+             {seek_bytes} vs {scan_bytes}"
+        );
+        println!(
+            "MEASURED blocks={blocks} bytes={seek_bytes}/{scan_bytes} rows={seek_rows}/{scan_rows}"
+        );
+        Ok(())
+    }
+
+    /// The `bloom_filters` slice, base HFile plus the log written after it.
+    const MDT_BLOOM_DIR: &str = "../test/data/metadata_bloom_filters_slice";
+    const MDT_BLOOM_BASE: &str = "bloom-filters-0000-0_0-51-131_20260830093346422.hfile";
+    const MDT_BLOOM_LOG: &str = ".bloom-filters-0000-0_20260830093352285.log.1_0-109-277";
+
+    /// A `bloom_filters` slice reads through the metadata table's CUSTOM merge
+    /// path, base and log both contributing.
+    ///
+    /// The corpus reaches `files`, `partition_stats` and `secondary_index`; this
+    /// is the fourth metadata partition type and nothing covered it. It is the one
+    /// whose payload is a raw byte buffer rather than a struct of scalars, so a
+    /// decoder that works for the others can still fail here — which is what makes
+    /// the type worth a fixture rather than a unit test on constructed records.
+    ///
+    /// The row count is what gives the log side weight: the base holds 2 records
+    /// and the log 2 more, under keys the base does not have, so a read that
+    /// dropped the log would return 2 and every other assertion here would still
+    /// hold.
+    ///
+    /// It does **not** pin partition routing. Rebuilding the record context for
+    /// `files` instead of `bloom_filters` changes nothing observable here — the
+    /// `type` field is decoded from the record, not chosen by the context — so
+    /// that is measured, not asserted.
+    #[tokio::test]
+    async fn v2_reads_a_bloom_filters_slice() -> crate::Result<()> {
+        use arrow_array::Array;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(MDT_BLOOM_DIR);
+        let uri = url::Url::from_directory_path(std::fs::canonicalize(&dir).unwrap()).unwrap();
+        let configs = Arc::new(HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                uri.to_string(),
+            ),
+            (
+                HudiTableConfig::BaseFileFormat.as_ref().to_string(),
+                "hfile".to_string(),
+            ),
+            (
+                HudiReadConfig::EndTimestamp.as_ref().to_string(),
+                MAX_INSTANT_TIME.to_string(),
+            ),
+            (
+                HudiTableConfig::RecordKeyFields.as_ref().to_string(),
+                "key".to_string(),
+            ),
+            (
+                HudiTableConfig::PopulatesMetaFields.as_ref().to_string(),
+                "false".to_string(),
+            ),
+            ("hoodie.record.merge.mode".to_string(), "CUSTOM".to_string()),
+            (
+                "hoodie.record.merge.strategy.id".to_string(),
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ),
+            (
+                "hoodie.compaction.payload.class".to_string(),
+                "org.apache.hudi.metadata.HoodieMetadataPayload".to_string(),
+            ),
+        ]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone())?;
+        let mut context = resolve_reader_context(&configs, true, Some("hfile"))?;
+        // The partition drives which metadata payload the merger decodes into.
+        context.rebuild_record_context("bloom_filters".to_string());
+        let mut reader = HoodieFileGroupReader::new(
+            Arc::new(context),
+            storage,
+            InputSplit::new(
+                Some(MDT_BLOOM_BASE.to_string()),
+                Some(MAX_INSTANT_TIME.to_string()),
+                vec![MDT_BLOOM_LOG.to_string()],
+                String::new(),
+            ),
+            ReaderParameters::default(),
+            None,
+            None,
+        )?;
+        let batch = reader.read().await?;
+
+        assert_eq!(
+            batch.num_rows(),
+            4,
+            "2 records from the base and 2 from the log; a dropped log side reads 2"
+        );
+        let types = batch
+            .column_by_name("type")
+            .expect("a metadata record carries its partition type")
+            .as_primitive::<arrow_array::types::Int32Type>();
+        // 4 is BLOOM_FILTERS in Hudi's metadata record schema.
+        assert!(
+            (0..batch.num_rows()).all(|i| types.value(i) == 4),
+            "every record must be a bloom-filter record"
+        );
+
+        let bloom = batch
+            .column_by_name("BloomFilterMetadata")
+            .expect("the bloom-filter column")
+            .as_struct();
+        let filters = bloom
+            .column_by_name("bloomFilter")
+            .expect("the filter payload")
+            .as_binary::<i32>();
+        let non_empty = (0..batch.num_rows())
+            .filter(|i| !filters.is_null(*i) && !filters.value(*i).is_empty())
+            .count();
+        assert_eq!(
+            non_empty,
+            batch.num_rows(),
+            "every bloom-filter record must carry a non-empty filter buffer"
         );
         Ok(())
     }
