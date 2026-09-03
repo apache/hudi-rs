@@ -46,7 +46,7 @@ use crate::file_group::reader_v2::read_stats::HoodieReadStats;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
-use crate::storage::{RowFilterBuilder, Storage};
+use crate::storage::{RowFilterBuilder, RowGroupSelector, Storage};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use futures::StreamExt;
@@ -164,6 +164,7 @@ const MERGE_CHUNK_ROWS: usize = 1024;
 /// not the read that dropped it.
 fn base_read_options(
     row_filter: Option<RowFilterBuilder>,
+    row_group_selector: Option<RowGroupSelector>,
     key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
     use_record_position: bool,
 ) -> BaseFileReadOptions {
@@ -171,6 +172,9 @@ fn base_read_options(
     options = options.with_batch_size(MERGE_CHUNK_ROWS);
     if let Some(row_filter) = row_filter {
         options = options.with_row_filter(row_filter);
+    }
+    if let Some(row_group_selector) = row_group_selector {
+        options = options.with_row_group_selector(row_group_selector);
     }
     if let Some(key_predicate) = key_predicate {
         options = options.with_key_predicate(key_predicate);
@@ -659,6 +663,64 @@ impl HoodieFileGroupReader {
         ))
     }
 
+    /// Is it safe to push the predicate into the BASE read of this split?
+    ///
+    /// Safe exactly when no log merge can change the predicate's outcome. Two
+    /// ways that holds:
+    ///   - the split carries no log files, so nothing merges and the base rows
+    ///     are final; or
+    ///   - the predicate references only record-key columns, which are immutable
+    ///     across upserts, so the outcome survives the merge (`mor_pk_safe`).
+    ///
+    /// Mirrors Java's `SparkFileFormatInternalRowReaderContext
+    /// .getSchemaAndFiltersForRead`, which branches on `getHasLogFiles()` and
+    /// never on the table type: `allFilters` when there are no log files,
+    /// `morFilters` when there are. The table type does not appear here either —
+    /// a CoW slice has no log files, so it takes the first branch on its own.
+    ///
+    /// # Why the split and not `ReaderContext`
+    ///
+    /// [`ReaderContext::has_log_files`] is a different fact with a different
+    /// source: it is set by whoever built the context, whereas
+    /// [`InputSplit::log_file_paths`] is the split's own file list. Nothing
+    /// derives one from the other, so gating on the context flag would rest a
+    /// safety decision on a caller-supplied boolean. If it were ever false for a
+    /// slice that does have logs, a non-PK predicate would reach the base read
+    /// and drop rows the merge would have updated — silently, because a filter
+    /// above the reader can only remove rows, never restore them.
+    ///
+    /// Using the split also keeps this in lock-step with
+    /// [`Self::use_record_position`], which reads the same
+    /// `input_split.has_log_files()`. The gate and the merge therefore cannot
+    /// disagree about a split.
+    ///
+    /// # Why there is no bootstrap term, unlike Java
+    ///
+    /// Java has a third branch — `!getHasLogFiles && hasRowIndexField` selects
+    /// `bootstrapSafeFilters` — because a bootstrap read pairs skeleton and data
+    /// files by row position, and filters that physically drop records misalign
+    /// that pairing. `has_bootstrap_base_file` reaches `ReaderContext` here and
+    /// is consulted nowhere, so a bootstrap slice with
+    /// `needs_bootstrap_merge == false` does arrive at this gate. It is still
+    /// safe, for two independent reasons:
+    ///
+    /// 1. The positional mechanism here is the virtual `RowNumber` column, which
+    ///    carries each row's TRUE physical position and stays correct under
+    ///    row-group selection and `RowFilter` pushdown. Dropping rows cannot
+    ///    shift it, which is exactly the failure Java's tier avoids by not
+    ///    pushing.
+    /// 2. The row-index column is requested only from
+    ///    [`Self::use_record_position`], which returns false when the split has
+    ///    no log files — so on the branch this gate widens, there is no
+    ///    positional pairing to misalign at all.
+    ///
+    /// Anyone adding a bootstrap term should re-check both: lifting the
+    /// `needs_bootstrap_merge` rejection in `new()` without revisiting this gate
+    /// is how the Java hazard would arrive here.
+    fn base_read_pushdown_is_safe(&self) -> bool {
+        !self.input_split.has_log_files() || self.reader_context.mor_pk_safe
+    }
+
     /// Whether this read should merge base + log records by base-file row
     /// position (rather than by record key). Mirrors Java
     /// `HoodieFileGroupReader`'s `setShouldMergeUseRecordPosition`:
@@ -734,22 +796,48 @@ impl HoodieFileGroupReader {
             );
         }
 
-        // gate parquet RowFilter pushdown.
-        //   CoW: always safe (no merge).
-        //   MOR: safe ONLY when every column referenced by the filter is a
-        //        primary key (PKs are immutable across upserts, so the predicate
-        //        outcome doesn't change post-merge — `reader_context.mor_pk_safe`,
-        //        mirroring Java's `filterIsSafeForPrimaryKey`).
+        // gate parquet RowFilter pushdown on whether this read MERGES.
+        //   No log files on this split: always safe (nothing merges). A CoW
+        //        slice reaches the gate this way.
+        //   Log files present: safe ONLY when every column referenced by the
+        //        filter is a primary key (PKs are immutable across upserts, so
+        //        the predicate outcome doesn't change post-merge —
+        //        `reader_context.mor_pk_safe`, mirroring Java's
+        //        `filterIsSafeForPrimaryKey`).
         //   Otherwise: drop the filter; the post-merge filter (Velox/Spark above
         //        the FG reader) evaluates the predicate after base+log merge.
-        let row_filter = if self.reader_context.can_push_row_filter() {
+        // ONE gate, bound once and shared by both mechanisms. Bound to a local
+        // rather than called twice so the sharing is structural: an edit that
+        // changes the condition for one can no longer leave the other behind,
+        // and pruning is the one that must not be left behind — it drops rows
+        // before the merge can see them.
+        let pushdown_is_safe = self.base_read_pushdown_is_safe();
+        let row_filter = if pushdown_is_safe {
             self.reader_context.row_filter_builder.clone()
         } else {
             if self.reader_context.row_filter_builder.is_some() {
                 log::debug!(
-                    "MOR + non-PK predicate — skipping parquet \
+                    "merging read with a non-PK predicate — skipping parquet \
                      RowFilter pushdown for base file '{path}' \
                      (post-merge filter still runs)"
+                );
+            }
+            None
+        };
+        let row_group_selector = if pushdown_is_safe {
+            self.reader_context.row_group_selector.clone()
+        } else {
+            // Record the suppression. The gate and the selector are each correct
+            // alone; what does not compose is the observability.
+            // `row_group_selector_calls` exists to separate "ran and found
+            // nothing" from "never installed", and a selector the gate refuses
+            // is a third state that also reads zero calls. Counting it here
+            // keeps that counter answerable.
+            if self.reader_context.row_group_selector.is_some() {
+                self.storage.read_volume().record_selector_suppressed();
+                log::debug!(
+                    "merging read with a non-PK predicate — skipping row-group \
+                     pruning for base file '{path}' (post-merge filter still runs)"
                 );
             }
             None
@@ -780,7 +868,12 @@ impl HoodieFileGroupReader {
                 .base_file_reader()?
                 .read_data(
                     &path,
-                    base_read_options(row_filter.clone(), key_predicate.clone(), use_position),
+                    base_read_options(
+                        row_filter.clone(),
+                        row_group_selector.clone(),
+                        key_predicate.clone(),
+                        use_position,
+                    ),
                 )
                 .await
                 .map_err(|e| {
@@ -808,9 +901,8 @@ impl HoodieFileGroupReader {
         // interleaves is already in `required_schema`.
         let file_schema = self
             .base_file_reader()?
-            .read_stream(&path, BaseFileReadOptions::new())
+            .read_schema(&path)
             .await
-            .map(|s| s.schema().clone())
             .map_err(|e| {
                 CoreError::ReadFileSliceError(format!(
                     "Failed to read base file footer schema '{path}': {e:?}"
@@ -861,16 +953,22 @@ impl HoodieFileGroupReader {
         }
 
         // Open the base file as a stream. The whole file never lives in memory;
-        // one batch does. The (CoW-gated) RowFilter is threaded through the
-        // intersection read so row groups can be pruned via column-index stats
-        // (the builder resolves predicate columns by name and returns None when
-        // any referenced column is absent — safe even for evolved/added cols).
+        // one batch does. The gated RowFilter and row-group selector are both
+        // threaded through the intersection read. Only the SELECTOR skips IO: a
+        // RowFilter decides per row once the predicate columns are decoded. The
+        // filter builder resolves predicate columns by name and returns None when
+        // any referenced column is absent — safe even for evolved/added cols.
         let base_stream = self
             .base_file_reader()?
             .read_stream(
                 &path,
-                base_read_options(row_filter.clone(), key_predicate.clone(), use_position)
-                    .with_projection(intersection.fields().iter().map(|f| f.name())),
+                base_read_options(
+                    row_filter.clone(),
+                    row_group_selector.clone(),
+                    key_predicate.clone(),
+                    use_position,
+                )
+                .with_projection(intersection.fields().iter().map(|f| f.name())),
             )
             .await
             .map_err(|e| {
@@ -1084,6 +1182,9 @@ pub struct HoodieFileGroupReaderBuilder {
     /// at build time so the same builder is visible to base parquet reads
     /// (this file) and parquet log block decodes (`log_file::content`).
     row_filter_builder: Option<RowFilterBuilder>,
+    /// Set by `with_row_group_selector`; copied onto a cloned reader_context in
+    /// `build()`, exactly like `row_filter_builder`.
+    row_group_selector: Option<RowGroupSelector>,
     /// Set by `with_mor_pk_safe`; copied onto the cloned reader_context.
     mor_pk_safe: Option<bool>,
 }
@@ -1128,7 +1229,7 @@ impl HoodieFileGroupReaderBuilder {
     /// install a parquet `RowFilter` builder.
     ///
     /// Whether the builder is actually used at scan time is gated by
-    /// `reader_context.can_push_row_filter()`:
+    /// `base_read_pushdown_is_safe()`:
     /// - CoW table → always pushed
     /// - MOR table → pushed only if `mor_pk_safe` is true (see
     ///   [`Self::with_mor_pk_safe`])
@@ -1137,6 +1238,18 @@ impl HoodieFileGroupReaderBuilder {
     /// same `reader_context` channel.
     pub fn with_row_filter_builder(mut self, b: RowFilterBuilder) -> Self {
         self.row_filter_builder = Some(b);
+        self
+    }
+
+    /// Install a row-group selector, pruning base reads from footer statistics.
+    ///
+    /// Routed onto `reader_context` exactly like
+    /// [`Self::with_row_filter_builder`], and gated at scan time by the same
+    /// `base_read_pushdown_is_safe()`. Setting one without the other is
+    /// supported: they are independent mechanisms over the same predicate, and
+    /// only this one avoids IO.
+    pub fn with_row_group_selector(mut self, selector: RowGroupSelector) -> Self {
+        self.row_group_selector = Some(selector);
         self
     }
 
@@ -1167,10 +1280,16 @@ impl HoodieFileGroupReaderBuilder {
         // builder API, copy them onto the reader_context. Clone-and-replace
         // mirrors the same pattern HoodieFileGroupReader::new() uses to
         // update the schema_handler on its reader_context.
-        let reader_context = if self.row_filter_builder.is_some() || self.mor_pk_safe.is_some() {
+        let reader_context = if self.row_filter_builder.is_some()
+            || self.row_group_selector.is_some()
+            || self.mor_pk_safe.is_some()
+        {
             let mut updated = (*reader_context).clone();
             if let Some(b) = self.row_filter_builder {
                 updated.row_filter_builder = Some(b);
+            }
+            if let Some(selector) = self.row_group_selector {
+                updated.row_group_selector = Some(selector);
             }
             if let Some(s) = self.mor_pk_safe {
                 updated.mor_pk_safe = s;
@@ -1583,6 +1702,19 @@ mod tests {
         InputSplit::new(None, None, vec![], "p1".to_string())
     }
 
+    /// A split that merges: one base file and one log file. The gate reduces to
+    /// `mor_pk_safe` only on a split like this — with no log files it is open
+    /// whatever `mor_pk_safe` says, so a PK-safety assertion made on a bare
+    /// split would pass without testing anything.
+    fn merging_input_split() -> InputSplit {
+        InputSplit::new(
+            Some("base.parquet".to_string()),
+            None,
+            vec![".log.1".to_string()],
+            "p1".to_string(),
+        )
+    }
+
     fn make_row_filter_builder() -> RowFilterBuilder {
         // Closure that always returns None — we only care that the builder
         // was installed, not what it produces.
@@ -1611,14 +1743,14 @@ mod tests {
         let reader = HoodieFileGroupReader::builder()
             .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
             .with_storage(storage)
-            .with_input_split(dummy_input_split())
+            .with_input_split(merging_input_split())
             .with_row_filter_builder(make_row_filter_builder())
             .with_mor_pk_safe(true)
             .build()
             .unwrap();
         assert!(reader.reader_context.mor_pk_safe);
         assert!(
-            reader.reader_context.can_push_row_filter(),
+            reader.base_read_pushdown_is_safe(),
             "MOR + mor_pk_safe=true must push"
         );
     }
@@ -1629,16 +1761,233 @@ mod tests {
         let reader = HoodieFileGroupReader::builder()
             .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
             .with_storage(storage)
-            .with_input_split(dummy_input_split())
+            .with_input_split(merging_input_split())
             .with_row_filter_builder(make_row_filter_builder())
             // mor_pk_safe defaults to false
             .build()
             .unwrap();
         assert!(!reader.reader_context.mor_pk_safe);
         assert!(
-            !reader.reader_context.can_push_row_filter(),
+            !reader.base_read_pushdown_is_safe(),
             "MOR without PK-safety must NOT push (mirrors Java's morFilters gate)"
         );
+    }
+
+    /// A MOR slice with no log files does not merge, so the predicate is safe to
+    /// push whatever `mor_pk_safe` says. Parameterized over both values so the
+    /// "does it merge" rule is shown to be independent of PK safety.
+    #[test]
+    fn base_only_mor_slice_allows_pushdown_regardless_of_pk_safety() {
+        for mor_pk_safe in [false, true] {
+            let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+            let reader = HoodieFileGroupReader::builder()
+                .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+                .with_storage(storage)
+                .with_input_split(InputSplit::new(
+                    Some("base.parquet".to_string()),
+                    None,
+                    // No log files => no merge => nothing can flip the predicate.
+                    vec![],
+                    "p1".to_string(),
+                ))
+                .with_row_filter_builder(make_row_filter_builder())
+                .with_mor_pk_safe(mor_pk_safe)
+                .build()
+                .unwrap();
+            assert!(
+                reader.base_read_pushdown_is_safe(),
+                "base-only slice must push regardless of mor_pk_safe ({mor_pk_safe})"
+            );
+        }
+    }
+
+    /// The split rule must not weaken the real MOR case: with log files present
+    /// the merge can supersede or delete a base row, so a non-PK-safe predicate
+    /// still may not be pushed.
+    #[test]
+    fn mor_slice_with_log_files_still_blocks_pushdown_when_not_pk_safe() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(InputSplit::new(
+                Some("base.parquet".to_string()),
+                None,
+                vec![".log.1".to_string()],
+                "p1".to_string(),
+            ))
+            .with_row_filter_builder(make_row_filter_builder())
+            // mor_pk_safe defaults to false
+            .build()
+            .unwrap();
+        assert!(reader.input_split.has_log_files());
+        assert!(
+            !reader.base_read_pushdown_is_safe(),
+            "MOR with log files and no PK safety must NOT push"
+        );
+    }
+
+    #[test]
+    fn builder_routes_row_group_selector_into_reader_context() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_group_selector(std::sync::Arc::new(|_| None))
+            .build()
+            .unwrap();
+        assert!(
+            reader.reader_context.row_group_selector.is_some(),
+            "with_row_group_selector should land on reader_context"
+        );
+        assert!(
+            reader.reader_context.row_filter_builder.is_none(),
+            "the two mechanisms are independent: one may be set without the other"
+        );
+    }
+
+    /// Three rows, one per row group. A selector keeping only the first must
+    /// leave the read with that row group's row and no other -- and the volume
+    /// counters must show that the other two were never scanned, which is the
+    /// difference between pruning and filtering.
+    #[tokio::test]
+    async fn a_selector_prunes_row_groups_when_the_read_does_not_merge() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+        install_selector(&mut reader, |_| Some(vec![0]), false);
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 1, "only the kept row group was read");
+        assert_eq!(volume.row_group_selector_calls.load(Relaxed), 1);
+        assert_eq!(volume.row_group_selector_suppressed.load(Relaxed), 0);
+        assert_eq!(volume.file_row_groups.load(Relaxed), 3);
+        assert_eq!(
+            volume.row_groups_read.load(Relaxed),
+            1,
+            "the other two row groups were never fetched"
+        );
+    }
+
+    /// The same selector on a slice that merges, with a predicate that is not
+    /// primary-key-safe. Pruning would drop base rows before the merge could
+    /// update them into a match, so the gate refuses it -- and counts the
+    /// refusal, because a suppressed selector otherwise reads as "no caller ever
+    /// installed one": both are zero calls.
+    #[tokio::test]
+    async fn a_selector_the_gate_refuses_is_counted_not_silently_dropped() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+        reader.input_split = InputSplit::new(
+            Some(base_name.clone()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        install_selector(&mut reader, |_| Some(vec![0]), false);
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 3, "every base row still reaches the merge");
+        assert_eq!(
+            volume.row_group_selector_calls.load(Relaxed),
+            0,
+            "the selector never ran"
+        );
+        assert_eq!(
+            volume.row_group_selector_suppressed.load(Relaxed),
+            1,
+            "and the reason it never ran is on the record"
+        );
+        assert_eq!(volume.row_groups_read.load(Relaxed), 3);
+    }
+
+    /// The same merging slice with a primary-key-safe predicate: the gate opens,
+    /// so the selector runs. Pairs with the case above -- same file, same
+    /// selector, opposite outcome from `mor_pk_safe` alone.
+    #[tokio::test]
+    async fn a_pk_safe_predicate_lets_the_selector_run_on_a_merging_slice() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+        reader.input_split = InputSplit::new(
+            Some(base_name.clone()),
+            Some("20240101120000000".to_string()),
+            vec![".f1-0_20240101130000000.log.1_0-1-1".to_string()],
+            String::new(),
+        );
+        install_selector(&mut reader, |_| Some(vec![0]), true);
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 1);
+        assert_eq!(volume.row_group_selector_calls.load(Relaxed), 1);
+        assert_eq!(volume.row_group_selector_suppressed.load(Relaxed), 0);
+    }
+
+    /// A selector with no opinion reads the whole file -- but the call is still
+    /// counted, which is what separates "ran and found nothing" from "never
+    /// installed".
+    #[tokio::test]
+    async fn a_selector_that_declines_reads_every_row_group_and_still_counts() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let (tmp, base_name, schema) = three_row_groups();
+        let mut reader = test_file_group_reader_for_base_file(tmp.path(), &base_name, schema).await;
+        let volume = reader.storage.read_volume();
+        install_selector(&mut reader, |_| None, false);
+
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 3);
+        assert_eq!(volume.row_group_selector_calls.load(Relaxed), 1);
+        assert_eq!(
+            volume.row_groups_read.load(Relaxed),
+            volume.file_row_groups.load(Relaxed),
+            "declining prunes nothing"
+        );
+    }
+
+    /// A three-row base file written one row per row group, so a selector has
+    /// something to choose between.
+    fn three_row_groups() -> (tempfile::TempDir, String, SchemaRef) {
+        use arrow_array::Int32Array;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![7, 8, 9]))],
+        )
+        .unwrap();
+        let base_name = "f1-0_0-1-1_20240101120000000.parquet".to_string();
+        write_parquet_file_in_row_groups(tmp.path(), &base_name, &batch, 1);
+        (tmp, base_name, schema)
+    }
+
+    /// Put a selector and a PK-safety verdict on a reader that was already built.
+    fn install_selector(
+        reader: &mut HoodieFileGroupReader,
+        select: fn(&parquet::file::metadata::ParquetMetaData) -> Option<Vec<usize>>,
+        mor_pk_safe: bool,
+    ) {
+        let mut context = (*reader.reader_context).clone();
+        context.row_group_selector = Some(std::sync::Arc::new(select));
+        context.mor_pk_safe = mor_pk_safe;
+        reader.reader_context = Arc::new(context);
     }
 
     // Bootstrap base files are rejected loudly at reader construction.
@@ -1862,6 +2211,8 @@ mod tests {
         );
     }
 
+    /// A CoW slice never carries log files, so it reaches the gate through the
+    /// "nothing merges" branch rather than through a table-type test.
     #[test]
     fn builder_cow_always_pushes_regardless_of_mor_pk_safe() {
         let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
@@ -1874,7 +2225,7 @@ mod tests {
             .build()
             .unwrap();
         assert!(
-            reader.reader_context.can_push_row_filter(),
+            reader.base_read_pushdown_is_safe(),
             "CoW path always pushes regardless of mor_pk_safe"
         );
     }
@@ -1903,7 +2254,7 @@ mod tests {
         for use_position in [false, true] {
             for filter in [None, Some(make_row_filter_builder())] {
                 assert_eq!(
-                    base_read_options(filter, None, use_position).batch_size,
+                    base_read_options(filter, None, None, use_position).batch_size,
                     Some(MERGE_CHUNK_ROWS),
                     "the base read must ask for the merge's chunk bound rather than \
                      inherit one (use_position={use_position})"

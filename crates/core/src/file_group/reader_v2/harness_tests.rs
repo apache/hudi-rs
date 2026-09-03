@@ -1307,9 +1307,10 @@ fg_case_test!(
 // Java contract (SparkFileFormatInternalRowReaderContext.filterIsSafeForPrimaryKey):
 //   - PK-safe filters (record-key columns) may be pushed under MOR merge.
 //   - Data-column filters may be pushed only on the CoW path (no log files).
-//   - The gate `can_push_row_filter() = is_cow() || mor_pk_safe` blocks unsafe
-//     pushes; when blocked, ALL rows return and the post-merge filter (above
-//     the FG reader, e.g. Velox/Spark) evaluates the predicate.
+//   - The gate `base_read_pushdown_is_safe() = no log files on the split ||
+//     mor_pk_safe` blocks unsafe pushes; when blocked, ALL rows return and the
+//     post-merge filter (above the FG reader, e.g. Velox/Spark) evaluates the
+//     predicate.
 //
 // Record-key format for V9Mor8I4UCommitTime: plain id value ("1", "2", ...)
 // (verified by reading the sf base parquet's _hoodie_record_key column).
@@ -1379,17 +1380,18 @@ fg_case_test!(
     }
 );
 
-// (3) Data-column filter on the CoW path (base-only, no logs -> is_cow gate):
-// `age` Gt "27", mor_pk_safe=false. The gate is open via is_cow(), so the
-// filter is pushed: Alice(30) survives, Bob(25) is filtered out.
+// (3) Data-column filter on a base-only slice of a MOR table: `age` Gt "27",
+// mor_pk_safe=false. No log files, so nothing merges and the gate is open on
+// the split alone: the filter is pushed, Alice(30) survives, Bob(25) is
+// filtered out. Poisons if the split-level gate stops opening.
 fg_case_test!(
-    harness_filter_data_col_cow,
+    harness_filter_data_col_base_only,
     FgReaderCase {
-        name: "filter_data_col_cow",
+        name: "filter_data_col_base_only",
         fixture: QuickstartTripsTable::V9Mor8I4UCommitTime,
         partition: "city=sf",
         base_file: I8I4U_SF_BASE,
-        log_files: &[], // base-only => COW path => can_push_row_filter via is_cow()
+        log_files: &[], // base-only => nothing merges => the split gate opens
         expect_output_columns: Some(&["id", "name", "age"]),
         row_filter: Some(RowFilterSpec {
             column: "age",
@@ -1405,18 +1407,18 @@ fg_case_test!(
     }
 );
 
-// (4) Logical/typed-column filter on the CoW path: MorLayoutAllDataTypes
+// (4) Logical/typed-column filter on a base-only slice: MorLayoutAllDataTypes
 // base-only read, `long_field` (Int64) Gt "250". Base values long_field =
 // 100,200,300,400,500 for keys k1..k5 (read from the base parquet, pre-merge).
 // => k3,k4,k5 (300,400,500) survive.
 fg_case_test!(
-    harness_filter_logical_type_cow,
+    harness_filter_logical_type_base_only,
     FgReaderCase {
-        name: "filter_logical_type_cow",
+        name: "filter_logical_type_base_only",
         fixture: QuickstartTripsTable::MorLayoutAllDataTypes,
         partition: "",
         base_file: "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
-        log_files: &[], // base-only => COW path
+        log_files: &[], // base-only => nothing merges => the split gate opens
         expect_output_columns: Some(&["key", "long_field", "severity"]),
         row_filter: Some(RowFilterSpec {
             column: "long_field",
@@ -1439,8 +1441,7 @@ fg_case_test!(
 // (5) NEGATIVE gate case: data-column filter under MOR merge with
 // mor_pk_safe=false. `age` Gt "27" — pushing this under merge could DROP a
 // base row (Bob, age 25) whose log update might later have made it match, so
-// the gate (can_push_row_filter = is_cow() || mor_pk_safe = false) BLOCKS the
-// push. The post-merge filter (above the FG reader) is responsible instead, so
+// the gate (no log files = false, mor_pk_safe = false) BLOCKS the push. The post-merge filter (above the FG reader) is responsible instead, so
 // the FG reader returns ALL merged rows: Alice-V2(31) AND Bob(25).
 // (Unsafe because the predicate evaluated on BASE values can disagree with post-merge values for
 // the same key: a log update may change the column so a pruned base row would have matched after
@@ -1452,7 +1453,7 @@ fg_case_test!(
         fixture: QuickstartTripsTable::V9Mor8I4UCommitTime,
         partition: "city=sf",
         base_file: I8I4U_SF_BASE,
-        log_files: &[I8I4U_SF_LOG], // MOR merge => is_cow() false
+        log_files: &[I8I4U_SF_LOG], // MOR merge => the split gate stays shut
         expect_output_columns: Some(&["id", "name", "age"]),
         row_filter: Some(RowFilterSpec {
             column: "age",
@@ -1821,9 +1822,9 @@ fg_case_test!(
 // 0-6; IN ("1","4") keeps exactly those two original rows. Unfiltered would
 // be 7 rows.
 fg_case_test!(
-    harness_filter_pk_in_cow,
+    harness_filter_pk_in_base_only,
     FgReaderCase {
-        name: "filter_pk_in_cow",
+        name: "filter_pk_in_base_only",
         fixture: QuickstartTripsTable::V9MorNonpart3Commits,
         partition: "",
         base_file: NONPART_BASE_FILE,
@@ -1850,9 +1851,9 @@ fg_case_test!(
 
 // Boolean Eq: true rows are k2, k4.
 fg_case_test!(
-    harness_filter_boolean_cow,
+    harness_filter_boolean_base_only,
     FgReaderCase {
-        name: "filter_boolean_cow",
+        name: "filter_boolean_base_only",
         fixture: QuickstartTripsTable::MorLayoutAllDataTypes,
         partition: "",
         base_file: "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
@@ -1874,9 +1875,9 @@ fg_case_test!(
 
 // Date32 Gt: days > 19754 (2024-02-01) are k3, k4, k5.
 fg_case_test!(
-    harness_filter_date_cow,
+    harness_filter_date_base_only,
     FgReaderCase {
-        name: "filter_date_cow",
+        name: "filter_date_base_only",
         fixture: QuickstartTripsTable::MorLayoutAllDataTypes,
         partition: "",
         base_file: "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
@@ -1898,9 +1899,9 @@ fg_case_test!(
 
 // Timestamp(us, UTC) Lt: strictly before k3's 2024-03-01T00:00:03Z are k1, k2.
 fg_case_test!(
-    harness_filter_timestamp_cow,
+    harness_filter_timestamp_base_only,
     FgReaderCase {
-        name: "filter_timestamp_cow",
+        name: "filter_timestamp_base_only",
         fixture: QuickstartTripsTable::MorLayoutAllDataTypes,
         partition: "",
         base_file: "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
@@ -1922,9 +1923,9 @@ fg_case_test!(
 
 // Decimal128(20,2) Gt: values > 300.30 are k4 (400.40), k5 (500.50).
 fg_case_test!(
-    harness_filter_decimal_cow,
+    harness_filter_decimal_base_only,
     FgReaderCase {
-        name: "filter_decimal_cow",
+        name: "filter_decimal_base_only",
         fixture: QuickstartTripsTable::MorLayoutAllDataTypes,
         partition: "",
         base_file: "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
@@ -1947,9 +1948,9 @@ fg_case_test!(
 // Float32 Gt: 3.4f32 equals k3's stored value exactly (same literal), so the
 // strictly-greater rows are k4 (4.5), k5 (5.6).
 fg_case_test!(
-    harness_filter_float32_cow,
+    harness_filter_float32_base_only,
     FgReaderCase {
-        name: "filter_float32_cow",
+        name: "filter_float32_base_only",
         fixture: QuickstartTripsTable::MorLayoutAllDataTypes,
         partition: "",
         base_file: "c887c1e8-5fb9-475e-8171-769c5cf10c61-0_0-240-395_20260409030537482.parquet",
