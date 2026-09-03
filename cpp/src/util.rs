@@ -31,3 +31,42 @@ pub fn create_raw_pointer_for_record_batches(
     let raw_ptr = Box::into_raw(Box::new(ffi_array_stream));
     raw_ptr as *mut ffi::ArrowArrayStream
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::ffi_stream::ArrowArrayStreamReader;
+    use arrow_array::{Int32Array, StringArray};
+    use std::sync::Arc;
+
+    /// The C++ caller only ever sees batches as a C Data Interface stream, so an
+    /// arrow upgrade that changed how that stream is exported would break the
+    /// binding without failing anything else: running the C++ side needs Arrow
+    /// C++, which the Rust test suite does not have. Importing the exported
+    /// pointer back keeps the surface covered here instead.
+    #[test]
+    fn exported_stream_round_trips_through_the_c_data_interface() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        )
+        .unwrap();
+
+        let raw = create_raw_pointer_for_record_batches(vec![batch.clone()], schema);
+        // SAFETY: the pointer is the one box `create_raw_pointer_for_record_batches`
+        // leaks, taken back here rather than by the C++ caller that normally frees it.
+        let stream = unsafe { Box::from_raw(raw as *mut FFI_ArrowArrayStream) };
+
+        let mut reader = ArrowArrayStreamReader::try_new(*stream).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), batch);
+        assert!(reader.next().is_none());
+    }
+}
