@@ -200,7 +200,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'pull_request' }}
 
       - name: install uv and set the python version
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: "0.7.19"
           python-version: ${{ matrix.python-version }}
