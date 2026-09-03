@@ -20,6 +20,7 @@ use crate::avro_to_arrow::to_arrow_schema;
 use crate::config::table::BaseFileFormatValue;
 use crate::config::table::HudiTableConfig;
 use crate::error::{CoreError, Result};
+#[cfg(feature = "lance")]
 use crate::file_group::base_file::lance::LanceBaseFileReader;
 use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::metadata::commit::HoodieCommitMetadata;
@@ -182,11 +183,14 @@ async fn read_schema_by_extension(path: &str, storage: &Arc<Storage>) -> Result<
                 .get_schema(path)
                 .await?,
         )),
+        #[cfg(feature = "lance")]
         Some(BaseFileFormatValue::Lance) => Ok(Some(
             LanceBaseFileReader::new(storage.clone())
                 .get_schema(path)
                 .await?,
         )),
+        #[cfg(not(feature = "lance"))]
+        Some(BaseFileFormatValue::Lance) => Ok(None),
         _ => Ok(None),
     }
 }

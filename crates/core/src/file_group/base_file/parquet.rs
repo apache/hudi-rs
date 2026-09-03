@@ -22,8 +22,15 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+// `ParquetObjectReader` is deprecated as of parquet 59 in favour of hand-rolling
+// an `AsyncFileReader` over `object_store`. Replacing it is its own change — it
+// has to carry the counting wrapper and the metadata normalization below — so
+// the deprecated reader is kept, allowed at each use site rather than for the
+// whole file.
+#[allow(deprecated)]
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
@@ -88,6 +95,7 @@ impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
 
 /// The builder every read here is driven from: a parquet object reader with the
 /// read-volume counters wrapped around it.
+#[allow(deprecated)]
 type CountedBuilder = ParquetRecordBatchStreamBuilder<CountingReader<ParquetObjectReader>>;
 
 /// Parquet implementation of [`BaseFileReader`].
@@ -133,6 +141,7 @@ impl ParquetBaseFileReader {
         file_size: u64,
         row_index_column: Option<&str>,
     ) -> Result<CountedBuilder> {
+        #[allow(deprecated)]
         let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
             .with_file_size(file_size);
 

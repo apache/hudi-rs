@@ -19,7 +19,6 @@
 //! Custom DataFusion execution plan for reading Hudi tables through
 //! [`FileGroupReader`], supporting all base file formats and MOR log merging.
 
-use std::any::Any;
 use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -37,7 +36,9 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{ColumnStatistics, DataFusionError, Result, Statistics};
+use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{self, BoxStream, TryStreamExt};
 use futures::{Stream, StreamExt};
 
@@ -63,7 +64,7 @@ pub struct HudiScanExec {
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     limit: Option<usize>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
     metrics: ExecutionPlanMetricsSet,
 }
 
@@ -152,7 +153,7 @@ impl HudiScanExec {
             projected_schema,
             projection,
             limit,
-            properties,
+            properties: Arc::new(properties),
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -262,16 +263,19 @@ impl ExecutionPlan for HudiScanExec {
         "HudiScanExec"
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(
@@ -394,11 +398,7 @@ impl ExecutionPlan for HudiScanExec {
         )))
     }
 
-    fn statistics(&self) -> Result<Statistics> {
-        Ok(self.aggregate_file_slice_statistics())
-    }
-
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let column_statistics =
             vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
 
@@ -410,11 +410,14 @@ impl ExecutionPlan for HudiScanExec {
             ),
             Some(idx) => match self.file_slice_partitions.get(idx) {
                 Some(slices) => Box::new(std::iter::once(slices.as_slice())),
-                None => return Ok(Statistics::new_unknown(&self.projected_schema)),
+                None => return Ok(Arc::new(Statistics::new_unknown(&self.projected_schema))),
             },
         };
 
-        Ok(Self::aggregate_partitions(partitions, column_statistics))
+        Ok(Arc::new(Self::aggregate_partitions(
+            partitions,
+            column_statistics,
+        )))
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -440,17 +443,6 @@ impl ExecutionPlan for HudiScanExec {
 }
 
 impl HudiScanExec {
-    fn aggregate_file_slice_statistics(&self) -> Statistics {
-        let column_statistics =
-            vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
-        Self::aggregate_partitions(
-            self.file_slice_partitions
-                .iter()
-                .map(|slices| slices.as_slice()),
-            column_statistics,
-        )
-    }
-
     fn aggregate_partitions<'a, I>(
         partitions: I,
         column_statistics: Vec<ColumnStatistics>,

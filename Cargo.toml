@@ -38,31 +38,31 @@ repository = "https://github.com/apache/hudi-rs"
 
 [workspace.dependencies]
 # arrow
-arrow = { version = "57" }
-arrow-arith = { version = "57" }
-arrow-array = { version = "57" }
-arrow-buffer = { version = "57" }
-arrow-cast = { version = "57" }
-arrow-ipc = { version = "57" }
-arrow-json = { version = "57" }
-arrow-ord = { version = "57" }
-arrow-row = { version = "57" }
-arrow-schema = { version = "57", features = ["serde"] }
-arrow-select = { version = "57" }
-object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
-parquet = { version = "57", features = ["async", "object_store"] }
+arrow = { version = "59.2.0" }
+arrow-arith = { version = "59.2.0" }
+arrow-array = { version = "59.2.0" }
+arrow-buffer = { version = "59.2.0" }
+arrow-cast = { version = "59.2.0" }
+arrow-ipc = { version = "59.2.0" }
+arrow-json = { version = "59.2.0" }
+arrow-ord = { version = "59.2.0" }
+arrow-row = { version = "59.2.0" }
+arrow-schema = { version = "59.2.0", features = ["serde"] }
+arrow-select = { version = "59.2.0" }
+object_store = { version = "0.13.2", features = ["aws", "azure", "gcp"] }
+parquet = { version = "59.2.0", features = ["async", "object_store"] }
 
 # avro
-arrow-avro = { version = "57" }
+arrow-avro = { version = "59.2.0" }
 apache-avro = { version = "0.21", features = ["derive"] }
 apache-avro-derive = { version = "0.21" }
 
 # datafusion
-datafusion = { version = "52" }
-datafusion-expr = { version = "52" }
-datafusion-common = { version = "52" }
-datafusion-physical-expr = { version = "52" }
-datafusion-ffi = { version = "52" }
+datafusion = { version = "55" }
+datafusion-expr = { version = "55" }
+datafusion-common = { version = "55" }
+datafusion-physical-expr = { version = "55" }
+datafusion-ffi = { version = "55" }
 
 # serde
 percent-encoding = { version = "2" }

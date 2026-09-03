@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, parse_url_opts};
+use object_store::{ObjectStore, ObjectStoreExt, parse_url_opts};
 use url::Url;
 
 use crate::config::HudiConfigs;
@@ -81,6 +81,9 @@ pub type RowGroupSelector =
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
     pub(crate) object_store: Arc<dyn ObjectStore>,
+    /// Read only by the Lance base-file reader, which hands them to Lance's own
+    /// object-store resolver, so nothing reads them without that feature.
+    #[cfg_attr(not(feature = "lance"), allow(dead_code))]
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
     /// Read-volume counters for the base-file reads made through this
