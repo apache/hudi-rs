@@ -17,7 +17,7 @@
  * under the License.
  */
 
-//! `fg-bench` — minimal file-group reader benchmark harness (perf effort M2).
+//! `fg-bench` — minimal file-group reader benchmark harness.
 //!
 //! Opens a Hudi table, discovers its latest file slice(s), drives a
 //! `HoodieFileGroupReader` per slice to completion, and records per-iteration
@@ -248,8 +248,6 @@ async fn run(args: &Args) -> Result<()> {
     let hoodie_options = resolve_hoodie_options(&args.table).await?;
 
     // 2. Discover the latest file slice(s) (snapshot, no partition filters).
-    // OSS `get_file_slices` takes `&ReadOptions` (the internal fork takes filter
-    // tuples). Default options = snapshot, no partition filters.
     let no_filters = hudi_core::config::ReadOptions::default();
     let file_slices = table.get_file_slices(&no_filters).await?;
     if file_slices.is_empty() {

@@ -30,5 +30,4 @@ sized by the entries it holds.
 which also suppresses `partition_stats`, since Hudi does not build partition
 stats without column stats. Two statistics merge rules that this fixture was
 originally meant to reach are therefore not reachable from any Spark workload;
-`tasks/eng-47745-multi-block-metadata-fixture/log.md` records the five variants
-tried and why each failed.
+several fixture variants were tried without managing to reach them.

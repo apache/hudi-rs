@@ -36,8 +36,8 @@ INSERT INTO mdt_rich5 SELECT 1700000000000 + id,
                            WHEN 2 THEN 'sao_paulo' ELSE 'amsterdam' END
 FROM range(300000, 600000);
 
--- Updates that repeat keys from commit 1: what ENG-47731 needs for a merge to
--- actually happen, and what the old fixture never has.
+-- Updates that repeat keys from commit 1: what the merge tests need for a merge
+-- to actually happen, and what the old fixture never has.
 UPDATE mdt_rich5 SET fare = fare + 1000.0, ts = ts + 1 WHERE uuid LIKE 'uuid-000001%';
 UPDATE mdt_rich5 SET rider = 'rider-updated', ts = ts + 2 WHERE uuid LIKE 'uuid-000002%';
 DELETE FROM mdt_rich5 WHERE uuid LIKE 'uuid-000003%';

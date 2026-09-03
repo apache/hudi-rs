@@ -20,9 +20,8 @@
 //! Minimal host-contention pre-flight (minimal version).
 //!
 //! Reads `/proc/loadavg` and `/proc/meminfo` to snapshot host pressure before
-//! each measured iteration. No waiting/rerun loop yet (that is the M4 full
-//! version) — this only records the snapshot and flags a run `contended` when
-//! `load1 / nproc > LOAD_THRESHOLD`.
+//! each measured iteration. No waiting/rerun loop yet — this only records the
+//! snapshot and flags a run `contended` when `load1 / nproc > LOAD_THRESHOLD`.
 
 /// Fraction of cores above which a run is flagged `contended`.
 pub const LOAD_THRESHOLD: f64 = 0.5;

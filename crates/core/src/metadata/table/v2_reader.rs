@@ -477,8 +477,8 @@ mod tests {
     ///
     /// This is the deliverable rather than a check on it: the task is parity, so an
     /// equality test that passes *is* the result. Values and not just keys, because
-    /// a key-set comparison passes while the merge is wrong — which is how the fold
-    /// bug in ENG-47455 stayed hidden behind ENG-47456's key-set assertion.
+    /// a key-set comparison passes while the merge is wrong — an earlier fold bug
+    /// stayed hidden behind exactly that kind of key-set assertion.
     #[tokio::test]
     async fn it_matches_the_existing_reader_value_for_value() -> crate::Result<()> {
         let configs = metadata_configs();
