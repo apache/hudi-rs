@@ -1165,7 +1165,6 @@ mod tests {
         let state = ctx.state();
         let plan = hudi.scan(&state, None, filters, None).await.unwrap();
         let exec = plan
-            .as_any()
             .downcast_ref::<HudiScanExec>()
             .expect("scan should route to HudiScanExec");
 
@@ -1438,7 +1437,6 @@ mod tests {
             .await
             .unwrap();
         let exec = plan
-            .as_any()
             .downcast_ref::<HudiScanExec>()
             .expect("MOR snapshot scan should use HudiScanExec");
 

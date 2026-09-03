@@ -30,6 +30,8 @@ use futures::stream::BoxStream;
 use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
 use crate::storage::error::Result;
+#[cfg(not(feature = "lance"))]
+use crate::storage::error::StorageError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::{RowFilterBuilder, RowGroupSelector, Storage};
 

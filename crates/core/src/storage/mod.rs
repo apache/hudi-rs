@@ -81,6 +81,9 @@ pub type RowGroupSelector =
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
     pub(crate) object_store: Arc<dyn ObjectStore>,
+    /// Read only by the Lance base-file reader, which hands them to Lance's own
+    /// object-store resolver, so nothing reads them without that feature.
+    #[cfg_attr(not(feature = "lance"), allow(dead_code))]
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
     /// Read-volume counters for the base-file reads made through this
