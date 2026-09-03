@@ -83,7 +83,7 @@ impl LanceBaseFileReader {
                     ),
                 );
                 // `ObjectStoreParams::object_store` is marked deprecated in lance-io
-                // 4.0.x in favor of implementing `ObjectStoreProvider`. We still set
+                // 11.x in favor of implementing `ObjectStoreProvider`. We still set
                 // it here so Lance reuses the ObjectStore we already built (with
                 // hudi-rs's storage options applied) and skips re-resolving
                 // credentials. `storage_options_accessor` itself is current API.
@@ -362,7 +362,7 @@ impl BaseFileReader for LanceBaseFileReader {
                 num_records: num_rows,
             };
 
-            // lance-file 4.0.x v2 format does not expose per-column min/max via
+            // lance-file 11.x v2 format does not expose per-column min/max via
             // `FileReader` (only num_pages and size_bytes via `FileStatistics`).
             // Populate an entry per file column with empty bounds so column-level
             // pruning falls back to "include".
