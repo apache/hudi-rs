@@ -32,10 +32,12 @@ use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_encoding::decoder::{DecoderPlugins, FilterExpression};
 use lance_file::LanceEncodingsIo;
 use lance_file::reader::{CachedFileMetadata, FileReader, FileReaderOptions, ReaderProjection};
+use lance_file::versions::reader_projection_from_column_names;
 use lance_io::ReadBatchParams;
 use lance_io::object_store::{ObjectStore as LanceObjectStore, ObjectStoreRegistry};
 use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
+use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use tokio::sync::OnceCell;
 
@@ -81,7 +83,7 @@ impl LanceBaseFileReader {
                     ),
                 );
                 // `ObjectStoreParams::object_store` is marked deprecated in lance-io
-                // 4.0.x in favor of implementing `ObjectStoreProvider`. We still set
+                // 11.x in favor of implementing `ObjectStoreProvider`. We still set
                 // it here so Lance reuses the ObjectStore we already built (with
                 // hudi-rs's storage options applied) and skips re-resolving
                 // credentials. `storage_options_accessor` itself is current API.
@@ -154,7 +156,7 @@ impl LanceBaseFileReader {
             return Ok(None);
         }
         let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-        ReaderProjection::from_column_names(
+        reader_projection_from_column_names(
             metadata.version(),
             metadata.file_schema.as_ref(),
             &col_refs,
@@ -304,13 +306,14 @@ impl BaseFileReader for LanceBaseFileReader {
                     ReadBatchParams::RangeFull,
                     batch_size,
                     batch_readahead,
-                    // lance-file 4.0.x decoders do not act on FilterExpression:
+                    // lance-file 11.x decoders do not act on FilterExpression:
                     // per lance-encoding, "the core decoders do not currently
                     // take advantage of filtering in any way." Callers needing
                     // row-level predicates must apply them on the returned
                     // record batches.
                     FilterExpression::no_filter(),
                 )
+                .await
                 .map_err(|e| {
                     StorageError::Creation(format!(
                         "Failed to create Lance read stream for {relative_path}: {e}"
@@ -359,7 +362,7 @@ impl BaseFileReader for LanceBaseFileReader {
                 num_records: num_rows,
             };
 
-            // lance-file 4.0.x v2 format does not expose per-column min/max via
+            // lance-file 11.x v2 format does not expose per-column min/max via
             // `FileReader` (only num_pages and size_bytes via `FileStatistics`).
             // Populate an entry per file column with empty bounds so column-level
             // pruning falls back to "include".

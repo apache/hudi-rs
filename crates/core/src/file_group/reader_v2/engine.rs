@@ -1428,7 +1428,7 @@ mod tests {
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::WriterProperties;
         let props = WriterProperties::builder()
-            .set_max_row_group_size(rows_per_group)
+            .set_max_row_group_row_count(Some(rows_per_group))
             .build();
         let file = std::fs::File::create(dir.join(name)).unwrap();
         let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props)).unwrap();

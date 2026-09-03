@@ -362,7 +362,7 @@ extension to query Hudi tables.
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@52
+cargo add tokio@1 datafusion@54
 cargo add hudi --features datafusion
 ```
 

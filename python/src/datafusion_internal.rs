@@ -40,23 +40,29 @@ fn extract_codec(session: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
     } else {
         session
     };
-    let capsule = capsule_obj.downcast::<PyCapsule>()?;
-    if let Some(name) = capsule.name()? {
-        let name = name
-            .to_str()
-            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-        if name != "datafusion_logical_extension_codec" {
-            return Err(PyValueError::new_err(format!(
-                "Expected PyCapsule name 'datafusion_logical_extension_codec', got '{name}'"
-            )));
-        }
-    }
-    let codec = unsafe { capsule.reference::<FFI_LogicalExtensionCodec>() };
+    let capsule = capsule_obj.cast::<PyCapsule>()?;
+    // `pointer_checked` is the name check and the pointer read in one step: it
+    // refuses any capsule not carrying exactly this name. An unnamed capsule no
+    // longer passes, where the previous name-then-read pair let one through.
+    let codec = capsule
+        .pointer_checked(Some(c"datafusion_logical_extension_codec"))
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "Expected a PyCapsule named 'datafusion_logical_extension_codec': {e}"
+            ))
+        })?;
+    // SAFETY: DataFusion puts that name only on a capsule holding an
+    // `FFI_LogicalExtensionCodec`, so the check above settles what the capsule
+    // holds. It does not settle which `datafusion-ffi` built it, because the
+    // name carries no version: a `datafusion` wheel built against another major
+    // would present the same name over a different layout. Holding the two in
+    // step is what the pinned `datafusion` extra in pyproject.toml is for.
+    let codec = unsafe { codec.cast::<FFI_LogicalExtensionCodec>().as_ref() };
     Ok(codec.clone())
 }
 
 #[cfg(not(tarpaulin_include))]
-#[pyclass(name = "HudiDataFusionDataSource")]
+#[pyclass(name = "HudiDataFusionDataSource", from_py_object)]
 #[derive(Clone)]
 pub struct HudiDataFusionDataSource {
     table: InternalDataFusionHudiDataSource,

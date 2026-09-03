@@ -148,24 +148,44 @@ async fn verify_plan(
         plan.contains("SortExec: TopK(fetch=10)"),
         "Plan should contain TopK sort"
     );
+    // The projection, struct field access included, is pushed into the Parquet
+    // source rather than planned as its own `ProjectionExec`. Keeping the whole
+    // column list in the anchor is what makes this catch a scan that stopped
+    // projecting; only the `structField@N` index varies per table, so the alias
+    // is matched separately.
     assert!(
-        plan.contains(&format!(
-            "ProjectionExec: expr=[id@0 as id, name@1 as name, isActive@2 as isActive, \
-            get_field(structField@3, field2) as {table_name}.structField[field2]]"
-        )),
-        "Plan should contain expected projection"
+        plan.contains("projection=[id, name, isActive, get_field(structField@")
+            && plan.contains(&format!(", field2) as {table_name}.structField[field2]")),
+        "Plan should project the struct field"
     );
-    // With pushdown_filters enabled, simple predicates (id % 2 = 0, name != Alice)
-    // are pushed into the Parquet source. Only non-pushable predicates like
-    // struct field access remain in FilterExec.
+    // Simple predicates (id % 2 = 0, name != Alice) and the struct field access
+    // alike are pushed into the Parquet source.
     assert!(
-        plan.contains("get_field(structField@3, field2) > 30"),
-        "Plan should contain struct field filter (either in FilterExec or DataSourceExec)"
+        scan_predicate(&plan).contains(", field2) > 30"),
+        "Scan predicate should contain the struct field filter"
     );
+    // `hoodie.read.input.partitions` decides how many groups the scan is split
+    // into. One group renders in the singular, which this prefix covers too.
     assert!(
-        plan.contains(&format!("input_partitions={planned_input_partitioned}")),
-        "Plan should contain expected input_partitions={planned_input_partitioned}"
+        plan.contains(&format!("file_groups={{{planned_input_partitioned} group")),
+        "Plan should scan {planned_input_partitioned} file group(s)"
     );
+}
+
+/// The predicate the scan evaluates per row, which it renders as `, predicate=`.
+///
+/// The scan also renders a `, pruning_predicate=` derived from that one, and a
+/// bare substring search cannot tell the two apart. Only the former says what
+/// actually reached the source.
+fn scan_predicate(plan: &str) -> &str {
+    let predicate = plan
+        .split(", predicate=")
+        .nth(1)
+        .expect("plan should carry a scan predicate");
+    predicate
+        .split(", pruning_predicate=")
+        .next()
+        .unwrap_or(predicate)
 }
 
 async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -385,16 +405,16 @@ mod v8_tests {
             "Should have TopK sort"
         );
         assert!(
-            plan_lines[2].contains("ProjectionExec"),
-            "Should have ProjectionExec"
+            plan_lines[2].starts_with("DataSourceExec"),
+            "Should scan through DataSourceExec"
         );
         assert!(
-            plan.contains("FilterExec"),
-            "Should have FilterExec for non-partition filters"
+            scan_predicate(&plan).contains(", field2) > 30"),
+            "Non-partition filters should reach the source"
         );
         assert!(
-            plan.contains("input_partitions=2"),
-            "Should have input_partitions=2"
+            plan.contains("file_groups={2 groups:"),
+            "Should scan 2 file groups"
         );
 
         // Verify data
@@ -430,8 +450,8 @@ mod v8_tests {
         let plan = get_str_column(explaining_rb, "plan").join("");
 
         assert!(
-            plan.contains("input_partitions=2"),
-            "Complex keygen table should have input_partitions=2"
+            plan.contains("file_groups={2 groups:"),
+            "Complex keygen table should scan 2 file groups"
         );
         assert!(
             plan.contains("DataSourceExec"),

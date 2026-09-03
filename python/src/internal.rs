@@ -84,7 +84,7 @@ impl From<PythonError> for PyErr {
 /// Python wrapper around [`hudi::table::QueryType`].
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[pyclass(eq)]
+#[pyclass(eq, from_py_object)]
 pub struct HudiQueryType {
     inner: QueryType,
 }
@@ -121,7 +121,7 @@ impl HudiQueryType {
 
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug, Default)]
-#[pyclass]
+#[pyclass(from_py_object)]
 pub struct HudiReadOptions {
     inner: ReadOptions,
 }
@@ -347,7 +347,7 @@ impl HudiRecordBatchStream {
 
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
-#[pyclass]
+#[pyclass(from_py_object)]
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
 }
@@ -488,7 +488,7 @@ impl HudiFileGroupReader {
 
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
-#[pyclass]
+#[pyclass(from_py_object)]
 pub struct HudiFileSlice {
     #[pyo3(get)]
     file_id: String,
@@ -632,7 +632,7 @@ impl From<&FileSlice> for HudiFileSlice {
 
 #[cfg(not(tarpaulin_include))]
 #[derive(Clone, Debug)]
-#[pyclass]
+#[pyclass(from_py_object)]
 pub struct HudiInstant {
     inner: Instant,
 }

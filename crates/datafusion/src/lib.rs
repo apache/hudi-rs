@@ -20,7 +20,6 @@
 pub(crate) mod hudi_exec;
 pub(crate) mod util;
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
@@ -787,10 +786,6 @@ impl HudiDataSource {
 
 #[async_trait]
 impl TableProvider for HudiDataSource {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
@@ -1158,7 +1153,6 @@ mod tests {
         let state = ctx.state();
         let plan = hudi.scan(&state, None, filters, None).await.unwrap();
         let exec = plan
-            .as_any()
             .downcast_ref::<HudiScanExec>()
             .expect("scan should route to HudiScanExec");
 
@@ -1431,7 +1425,6 @@ mod tests {
             .await
             .unwrap();
         let exec = plan
-            .as_any()
             .downcast_ref::<HudiScanExec>()
             .expect("MOR snapshot scan should use HudiScanExec");
 

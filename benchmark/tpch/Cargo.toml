@@ -34,11 +34,22 @@ comfy-table = "7"
 datafusion = { workspace = true }
 hudi = { path = "../../crates/hudi", features = ["datafusion"] }
 object_store = { workspace = true }
-parquet = { workspace = true }
+
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-tpchgen = "2"
-tpchgen-arrow = "2"
+# The TPC-H generator has no arrow-58 line: tpchgen-arrow ships 2.x on arrow 57
+# and 3.x on arrow 59, and the workspace sits on 58. Generation is a
+# self-contained step — `datagen::run_generate` takes a scale factor and an
+# output path and hands nothing arrow-shaped back — so it builds against its own
+# arrow and parquet rather than holding the workspace back. `object_store` is
+# not duplicated: parquet 59 wants the same 0.13 the workspace does.
+tpchgen = "3"
+tpchgen-arrow = "3"
+arrow-gen = { package = "arrow", version = "59" }
+parquet-gen = { package = "parquet", version = "59", features = [
+    "async",
+    "object_store",
+] }
 serde_yaml = "0.9"
 url = { workspace = true }

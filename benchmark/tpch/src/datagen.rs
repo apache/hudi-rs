@@ -17,15 +17,15 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
-use arrow::record_batch::RecordBatch;
+use arrow_gen::datatypes::SchemaRef;
+use arrow_gen::record_batch::RecordBatch;
 use object_store::buffered::BufWriter;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStore, parse_url_opts};
-use parquet::arrow::ArrowWriter;
-use parquet::arrow::async_writer::AsyncArrowWriter;
-use parquet::basic::Compression;
-use parquet::file::properties::WriterProperties;
+use parquet_gen::arrow::ArrowWriter;
+use parquet_gen::arrow::async_writer::AsyncArrowWriter;
+use parquet_gen::basic::Compression;
+use parquet_gen::file::properties::WriterProperties;
 use tpchgen::generators::{
     CustomerGenerator, LineItemGenerator, NationGenerator, OrderGenerator, PartGenerator,
     PartSuppGenerator, RegionGenerator, SupplierGenerator,

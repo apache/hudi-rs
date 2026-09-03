@@ -53,7 +53,7 @@ lint = [
     "mypy==2.3.1",
 ]
 datafusion = [
-    "datafusion==52.3.0",
+    "datafusion==54.0.0",
 ]
 
 [tool.maturin]
