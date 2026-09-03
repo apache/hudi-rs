@@ -56,6 +56,13 @@ Hudi integration in the data ecosystems for a diverse range of users and project
 [crates]: https://crates.io/crates/hudi
 [crates-badge]: https://img.shields.io/crates/d/hudi?style=flat-square&color=163669
 
+The `hudi` crate carries two features: `datafusion` (off by default, see
+[Apache DataFusion](#apache-datafusion)) and `spill-rocksdb` (on by default), the merge map's
+on-disk tier, which a merge-on-read merge spills to when a file group's log records exceed
+`hoodie.memory.merge.max.size`. RocksDB is built from source with `bindgen`, so it needs `libclang`
+and a C++ toolchain; `default-features = false` drops it, and a merge that would have spilled then
+fails instead.
+
 ## Usage Examples
 
 > [!NOTE]
@@ -331,7 +338,7 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 - `batch_size` (`with_batch_size`) — rows per batch (streaming only; eager reads return one batch per file slice).
 - `as_of_timestamp` (`with_as_of_timestamp`) — snapshot/time-travel timestamp (defaults to latest commit).
 - `start_timestamp` / `end_timestamp` (`with_start_timestamp` / `with_end_timestamp`) — incremental range (defaults to earliest…latest).
-- `hudi_options` — per-read Hudi configs (e.g. `hoodie.read.use.read_optimized.mode`). Read configs are not stored in the table; they flow exclusively through `ReadOptions`.
+- `hudi_options` — Hudi configs for this read (e.g. `hoodie.read.use.read_optimized.mode`). A config that selects *which* read to perform — `hoodie.read.query.type` and the as-of/start/end timestamps — is per-read only and is dropped when set on the table. The rest describe *how* to read: set them on the table and override them here. See [Read configs](#read-configs).
 
 | Stage           | API                                                              | Description                                                                                              |
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
@@ -339,6 +346,34 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 |                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning. Snapshot (default) uses the metadata table; incremental aggregates from changed file slices. Returns `None` when stats cannot be computed. |
 | Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. Both args are optional. Timestamps are resolved automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same options used for `get_file_slices`. |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
+
+### Read configs
+
+Read configs reach a read either through `ReadOptions` / `HudiReadOptions` or, for those scoped
+`table or read`, through the table (`TableBuilder`, `hoodie.properties`, `hudi-defaults.conf`), where
+a per-read value wins. A `per read` config set on the table is dropped: baked in there, it would
+silently redirect every later read.
+
+| Config                                                          | Default       | Scope         | Notes                                                                                                                    |
+|-----------------------------------------------------------------|---------------|---------------|--------------------------------------------------------------------------------------------------------------------------|
+| `hoodie.read.query.type`                                        | `snapshot`    | per read      | `snapshot` or `incremental`.                                                                                             |
+| `hoodie.read.as.of.timestamp`                                   | latest commit | per read      | Snapshot time-travel point.                                                                                              |
+| `hoodie.read.start.timestamp` / `hoodie.read.end.timestamp`     | earliest / latest | per read  | Incremental window, half-open `(start, end]`.                                                                            |
+| `hoodie.read.file.group.reader.version`                         | `2`           | table or read | Which file group reader merges a slice. Version 2 is the default; a read it cannot serve falls back to version 1.        |
+| `hoodie.read.use.read_optimized.mode`                           | `false`       | table or read | Read base files only, skipping the log files, on MOR tables.                                                             |
+| `hoodie.read.stream.batch_size`                                 | `1024`        | table or read | Rows per batch for streaming reads.                                                                                      |
+| `hoodie.read.file.slice.read.concurrency`                       | `4`           | table or read | File slices read concurrently.                                                                                           |
+| `hoodie.read.scan.max.memory.size`                              | unset         | table or read | Total bytes a whole scan may use for concurrent slice reads; when set, the concurrency is derived from it. Reaching the limit lowers throughput, it never fails the read. |
+| `hoodie.read.input.partitions`                                  | `0`           | table or read | How many partitions the DataFusion table provider buckets the file slices into. `0` defers to DataFusion's `target_partitions`. |
+| `hoodie.merge.use.record.positions`                             | `false`       | table or read | Match a log record to the base row it updates by position rather than by record key. Honored by reader version 2 only; a log block written without positions is merged by key regardless. |
+
+A table whose `hoodie.record.merge.mode` is `CUSTOM` needs a merger for its payload class. When
+neither reader has one, the read fails rather than returning wrong rows; set
+`hoodie.read.file.group.reader.version=1` to read it the way it was read before, unless its base
+files are HFile, which version 1 cannot read.
+
+Base files are read from Parquet, Lance (`hoodie.table.base.file.format=lance`), and HFile (metadata
+tables only).
 
 ### File Group API
 
@@ -348,13 +383,13 @@ Create a Hudi file group reader instance using its constructor or the Hudi table
 |-----------------|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | Query execution | `read_file_slice()`                     | Read records from a given file slice; based on the configs, read records from only base file, or from base file and log files, and merge records based on the configured strategy. |
 |                 | `read_file_slice_from_paths()`          | Read records from an explicit base file path and a list of log file paths. Pass an empty log path list to read just the base file.                                                 |
-|                 | `read_file_slice_stream()`              | Streaming version of `read_file_slice()`. Yields true streaming batches when the slice is base-file-only or read-optimized; for MOR slices with log files, falls back to a single merged batch. |
+|                 | `read_file_slice_stream()`              | Streaming version of `read_file_slice()`. A base-file-only or read-optimized slice streams straight from the base file. A MOR slice with log files streams merged chunks under file group reader version 2 (the default), and collapses to a single merged batch under version 1, whose merge has no incremental form. |
 |                 | `read_file_slice_from_paths_stream()`   | Streaming version of `read_file_slice_from_paths()`.                                                                                                                               |
 
 
 ### Apache DataFusion
 
-Enabling the `hudi` crate with `datafusion` feature will provide a [DataFusion](https://datafusion.apache.org/) 
+Enabling the `hudi` crate with `datafusion` feature will provide a [DataFusion](https://datafusion.apache.org/)
 extension to query Hudi tables.
 
 <details>
@@ -408,7 +443,7 @@ table = HudiDataFusionDataSource(
     "/tmp/trips_table", [("hoodie.read.input.partitions", "5")]
 )
 ctx = SessionContext()
-ctx.register_table_provider("trips", table)
+ctx.register_table("trips", table)
 ctx.sql("SELECT max(fare), city from trips group by city order by 1 desc").show()
 ```
 
