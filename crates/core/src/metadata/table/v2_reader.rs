@@ -75,11 +75,31 @@ impl MetadataTableV2Reader {
     /// `keys` empty reads every record; otherwise only those keys, pushed into the
     /// base file reader so the read seeks rather than scans — which is what the
     /// reader this replaces does through `HFileReader::lookup_records`.
+    /// Read the `files` partition's records from one file slice.
+    ///
+    /// Decodes the merged batch into the records the caller expects. Callers that
+    /// want the batch itself, rather than decoded structs, use
+    /// [`Self::read_files_partition_batch`]; this is that plus the decode.
     pub(crate) async fn read_files_partition(
         &self,
         file_slice: &FileSlice,
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
+        let batch = self.read_files_partition_batch(file_slice, keys).await?;
+        Self::records_from_batch(&batch, keys)
+    }
+
+    /// The merged `files` partition batch, before it is decoded into records.
+    ///
+    /// Separate because the batch is what an Arrow consumer wants and decoding it
+    /// only to re-encode would be work in both directions. Nothing about the read
+    /// differs between the two; this is the read, and the other is this plus a
+    /// decode.
+    pub(crate) async fn read_files_partition_batch(
+        &self,
+        file_slice: &FileSlice,
+        keys: &[&str],
+    ) -> Result<RecordBatch> {
         let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths = if file_slice.has_log_file() {
             file_slice
@@ -129,14 +149,13 @@ impl MetadataTableV2Reader {
         )?;
 
         let batch = reader.read().await?;
-        let records = Self::records_from_batch(&batch, keys);
         log::debug!(
             "metadata read of '{}' with {} named key(s): merge map peaked at {} entries",
             FilesPartitionRecord::PARTITION_NAME,
             keys.len(),
             reader.read_stats().merge_map_peak_entries
         );
-        records
+        Ok(batch)
     }
 
     /// Convert the merged Arrow batch into the decoded records the caller expects.
