@@ -234,10 +234,12 @@ impl ParquetBaseFileReader {
             select(builder.metadata())
         }) {
             // A selector that names a row group the file does not have is a bug
-            // in the selector, and parquet-rs ignores such an index rather than
-            // failing, so it would go unnoticed. `debug_assert!` catches it in
-            // tests without adding a release-mode check for a case that cannot
-            // lose rows.
+            // in the selector. parquet-rs does not validate the indices; the
+            // read panics when the stream reaches the bad index, release builds
+            // included. The `debug_assert!` surfaces the bug at this choke
+            // point with a clear message in tests; no release check is added
+            // because the failure is already loud, a panic rather than lost
+            // rows.
             debug_assert!(
                 keep.iter().all(|&i| i < total_row_groups),
                 "selector returned an out-of-range row-group index"

@@ -83,12 +83,16 @@ pub struct Storage {
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
-    /// Read-volume counters for the reads made through this `Storage`.
+    /// Read-volume counters for the base-file reads made through this
+    /// `Storage`.
     ///
-    /// Here rather than on a read parameter so no read signature changes, and
-    /// because a file-group read constructs its own `Storage` — which makes the
-    /// scope of these counters exactly "this read". The `object_store` inside
-    /// could not carry them: it is shared, so its counts would be everyone's.
+    /// Here rather than on a read parameter so no read signature changes. The
+    /// scope is this `Storage`'s lifetime, which is as narrow as the caller
+    /// makes it: a per-read `Storage` yields per-read counters, while a
+    /// `FileGroupReader` builds one `Storage` in its constructor and reuses
+    /// it, so every slice read through that reader accumulates into the same
+    /// counters. The `object_store` inside could not carry them: it is shared
+    /// even wider, so its counts would be everyone's.
     pub(crate) read_volume: Arc<ReadVolume>,
 }
 
@@ -103,6 +107,9 @@ pub struct Storage {
 /// which makes them exact and independent of the OS page cache: a warm re-read
 /// reports the same bytes as a cold one. Wall-clock does not have that property,
 /// which is what makes these the transferable numbers when comparing read paths.
+/// The boundary also bounds the scope: footer fetches happen before the
+/// counting wrapper is installed and log-file IO never crosses it, so these
+/// two count base-file column-chunk reads only.
 ///
 /// All fields are `AtomicU64` under an `Arc` because the parquet stream is
 /// polled on whichever worker thread drives it, while a consumer may read the
