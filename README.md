@@ -443,7 +443,7 @@ table = HudiDataFusionDataSource(
     "/tmp/trips_table", [("hoodie.read.input.partitions", "5")]
 )
 ctx = SessionContext()
-ctx.register_table_provider("trips", table)
+ctx.register_table("trips", table)
 ctx.sql("SELECT max(fare), city from trips group by city order by 1 desc").show()
 ```
 
