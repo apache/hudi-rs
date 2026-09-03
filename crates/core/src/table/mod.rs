@@ -519,6 +519,158 @@ impl Table {
         }
     }
 
+    /// Stream the [`FileSlice`]s targeted by a read.
+    ///
+    /// Snapshot queries list files with bounded partition concurrency and emit
+    /// slices as each partition completes instead of retaining the table-wide
+    /// file-group and slice collections. Metadata-table-backed snapshots still
+    /// fetch the metadata records eagerly because that reader does not yet
+    /// expose a row stream. Incremental planning retains its existing eager
+    /// touched-file-group lookup, then exposes the resulting slices as a stream.
+    ///
+    /// The stream has no stable global ordering; consumers that require one
+    /// should sort by partition path and file ID after collection. Listing work
+    /// is driven by polling the stream; dropping it cancels the in-flight
+    /// partition futures without spawning detached tasks.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::TryStreamExt;
+    /// use hudi::table::ReadOptions;
+    ///
+    /// let mut slices = table.get_file_slices_stream(&ReadOptions::new()).await?;
+    /// while let Some(slice) = slices.try_next().await? {
+    ///     schedule(slice);
+    /// }
+    /// ```
+    pub async fn get_file_slices_stream(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::StreamExt;
+        use futures::stream;
+
+        let prepared = self.prepare_reader_options(options)?;
+        let base_file_only = self.is_base_file_only(&prepared)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => {
+                let Some(timestamp) = prepared.end_timestamp() else {
+                    return Ok(stream::empty().boxed());
+                };
+                self.get_file_slices_stream_inner(timestamp, &prepared.filters, base_file_only)
+                    .await
+            }
+            QueryType::Incremental => {
+                let (Some(start), Some(end)) =
+                    (prepared.start_timestamp(), prepared.end_timestamp())
+                else {
+                    return Ok(stream::empty().boxed());
+                };
+                self.get_file_slices_between_stream_inner(
+                    start,
+                    end,
+                    &prepared.filters,
+                    base_file_only,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn get_file_slices_between_stream_inner(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: &str,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::future;
+        use futures::{StreamExt, TryStreamExt};
+
+        let estimator = self.get_or_init_estimator(end_timestamp).await;
+        let file_groups = self
+            .timeline
+            .get_file_groups_between(Some(start_timestamp), Some(end_timestamp), estimator)
+            .await?;
+        let mut touched: HashMap<String, HashSet<String>> = HashMap::new();
+        for file_group in file_groups {
+            touched
+                .entry(file_group.partition_path)
+                .or_default()
+                .insert(file_group.file_id);
+        }
+
+        let stream = self
+            .get_file_slices_stream_inner(end_timestamp, filters, base_file_only)
+            .await?;
+        Ok(stream
+            .try_filter(move |slice| {
+                future::ready(
+                    touched
+                        .get(&slice.partition_path)
+                        .is_some_and(|file_ids| file_ids.contains(slice.file_id())),
+                )
+            })
+            .boxed())
+    }
+
+    async fn get_file_slices_stream_inner(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::{StreamExt, TryStreamExt};
+
+        let timeline_view = Arc::new(self.timeline.create_view_as_of(timestamp).await?);
+        let partition_schema = self.get_partition_schema().await?;
+        let table_schema = self.get_schema_with_meta_fields().await?;
+        validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
+
+        let partition_pruner =
+            PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+        let file_pruner = if base_file_only {
+            FilePruner::new(filters, &table_schema, &partition_schema)?
+        } else {
+            FilePruner::empty()
+        };
+
+        let metadata_table = if self.is_metadata_table_enabled() {
+            match self.get_or_init_metadata_table().await {
+                Ok(mdt) => Some(mdt),
+                Err(e) => {
+                    log::warn!(
+                        "Failed to create metadata table, falling back to storage listing: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let estimator = self.get_or_init_estimator(timestamp).await.cloned();
+        let stream = self
+            .file_system_view
+            .get_file_slices_stream(
+                &partition_pruner,
+                &file_pruner,
+                &table_schema,
+                timeline_view,
+                metadata_table,
+                estimator,
+            )
+            .await?;
+
+        Ok(stream
+            .map_ok(move |mut slice| {
+                if base_file_only {
+                    slice.log_files.clear();
+                }
+                slice
+            })
+            .boxed())
+    }
+
     async fn get_file_slices_inner(
         &self,
         timestamp: &str,
@@ -1992,7 +2144,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_hudi_table_read_apis_return_empty() {
-        use futures::StreamExt;
+        use futures::{StreamExt, TryStreamExt};
 
         let base_url = SampleTable::V6Empty.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
@@ -2012,6 +2164,15 @@ mod tests {
 
         let mut snapshot_stream = hudi_table.read_stream(&ReadOptions::new()).await.unwrap();
         assert!(snapshot_stream.next().await.is_none());
+
+        let file_slices = hudi_table
+            .get_file_slices_stream(&ReadOptions::new())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(file_slices.is_empty());
     }
 
     #[tokio::test]
@@ -2175,6 +2336,130 @@ mod tests {
             .unwrap();
         assert!(!snapshot_slices.is_empty());
         assert!(!incremental_slices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_snapshot() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let options = ReadOptions::new().with_filters([("byteField", ">=", "20")])?;
+
+        let mut eager = hudi_table.get_file_slices(&options).await?;
+        let mut streamed = hudi_table
+            .get_file_slices_stream(&options)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let compare = |left: &FileSlice, right: &FileSlice| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+                .then_with(|| {
+                    left.creation_instant_time()
+                        .cmp(right.creation_instant_time())
+                })
+        };
+        eager.sort_by(compare);
+        streamed.sort_by(compare);
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_metadata_snapshot() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let base_url = SampleTable::V9TxnsSimpleMeta.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        assert!(hudi_table.is_metadata_table_enabled());
+
+        let mut eager = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        let mut streamed = hudi_table
+            .get_file_slices_stream(&ReadOptions::new())
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        eager.sort_by(|left, right| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+        });
+        streamed.sort_by(|left, right| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+        });
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_incremental() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(EARLIEST_START_TIMESTAMP);
+
+        let eager = hudi_table.get_file_slices(&options).await?;
+        let streamed = hudi_table
+            .get_file_slices_stream(&options)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_emits_before_later_partition_error() -> Result<()> {
+        use crate::config::plan::HudiPlanConfig;
+        use futures::TryStreamExt;
+        use std::path::Path;
+
+        let table_path = SampleTable::V6SimplekeygenNonhivestyle.path_to_cow_fresh();
+        let bad_partition = Path::new(&table_path).join("z-bad");
+        std::fs::create_dir_all(&bad_partition).unwrap();
+        std::fs::write(bad_partition.join("not-a-hudi-name.parquet"), []).unwrap();
+
+        let hudi_table = Table::new_with_options(
+            &table_path,
+            // With one in-flight partition, `try_buffer_unordered` cannot pull
+            // z-bad from the discovery stream until the first partition's
+            // future has yielded. The first assertion therefore distinguishes
+            // streaming discovery from a path that discovers every partition
+            // before it emits anything.
+            [(HudiPlanConfig::ListingParallelism, "1")],
+        )
+        .await?;
+        assert!(
+            hudi_table
+                .get_file_slices(&ReadOptions::new())
+                .await
+                .is_err(),
+            "the eager API cannot return any slice when a later partition fails"
+        );
+
+        let mut stream = hudi_table
+            .get_file_slices_stream(&ReadOptions::new())
+            .await?;
+        let first = stream
+            .try_next()
+            .await?
+            .expect("a valid partition must be emitted before z-bad is listed");
+        assert_ne!(first.partition_path, "z-bad");
+
+        let error = stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect_err("the malformed later partition must still propagate its error");
+        assert!(error.to_string().contains("not-a-hudi-name.parquet"));
+        Ok(())
     }
 
     #[tokio::test]

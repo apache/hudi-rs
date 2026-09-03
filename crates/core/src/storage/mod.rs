@@ -25,6 +25,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, parse_url_opts};
 use url::Url;
@@ -371,6 +373,46 @@ impl Storage {
         }
         Ok(file_metadata)
     }
+
+    /// Recursively stream files below the table base path.
+    ///
+    /// Each item is a table-relative object path.
+    /// Unlike [`Self::list_files`], this uses the object store's paginated
+    /// `list` stream and does not wait for a complete directory result.
+    pub(crate) fn list_relative_paths_stream(&self) -> Result<BoxStream<'static, Result<String>>> {
+        let prefix_url = join_url_segments(&self.base_url, &[""])?;
+        let prefix_path = ObjPath::from_url_path(prefix_url.path())?;
+        let prefix = prefix_path.as_ref().trim_end_matches('/').to_string();
+
+        Ok(self
+            .object_store
+            .list(Some(&prefix_path))
+            .map(move |result| {
+                let object = result?;
+                let location = object.location.as_ref();
+                let suffix = location.strip_prefix(&prefix).ok_or_else(|| {
+                    InvalidPath(format!(
+                        "Object path '{location}' is not below table prefix '{prefix}'"
+                    ))
+                })?;
+                let relative_path = if prefix.is_empty() {
+                    suffix
+                } else {
+                    suffix.strip_prefix('/').ok_or_else(|| {
+                        InvalidPath(format!(
+                            "Object path '{location}' is not below table prefix '{prefix}'"
+                        ))
+                    })?
+                };
+                if relative_path.is_empty() {
+                    return Err(InvalidPath(format!(
+                        "Object path '{location}' has no path below table prefix '{prefix}'"
+                    )));
+                }
+                Ok(relative_path.to_string())
+            })
+            .boxed())
+    }
 }
 
 /// Get relative paths of leaf directories under a given directory.
@@ -533,6 +575,53 @@ mod tests {
 
         assert!(!files.iter().any(|f| f.name.ends_with(".crc")));
         assert_eq!(files, vec![FileMetadata::new("a.parquet", 0)]);
+    }
+
+    #[tokio::test]
+    async fn storage_streams_table_relative_paths_recursively() {
+        use futures::TryStreamExt;
+
+        let base_url = Url::from_directory_path(
+            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
+        )
+        .unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let paths: HashSet<String> = storage
+            .list_relative_paths_stream()
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+
+        assert!(paths.contains("a.parquet"));
+        assert!(paths.contains("part1/b.parquet"));
+        assert!(paths.contains("part2/part22/c.parquet"));
+        assert!(paths.contains("part3/part32/part33/d.parquet"));
+        assert!(paths.iter().all(|path| !path.starts_with('/')));
+    }
+
+    #[tokio::test]
+    async fn storage_recursive_stream_respects_non_empty_prefix_boundary() {
+        use futures::TryStreamExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let table_dir = temp_dir.path().join("table");
+        let sibling_dir = temp_dir.path().join("table-sibling");
+        std::fs::create_dir_all(table_dir.join("partition")).unwrap();
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        std::fs::write(table_dir.join("partition/inside.parquet"), []).unwrap();
+        std::fs::write(sibling_dir.join("outside.parquet"), []).unwrap();
+
+        let base_url = Url::from_directory_path(&table_dir).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+        let paths = storage
+            .list_relative_paths_stream()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        assert_eq!(paths, vec!["partition/inside.parquet"]);
     }
 
     #[tokio::test]
