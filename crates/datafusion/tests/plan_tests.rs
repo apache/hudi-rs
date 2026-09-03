@@ -149,34 +149,43 @@ async fn verify_plan(
         "Plan should contain TopK sort"
     );
     // The projection, struct field access included, is pushed into the Parquet
-    // source rather than planned as its own `ProjectionExec`, so it is asserted
-    // wherever it lands. The index in `structField@N` is the field's position in
-    // the file schema and differs per table, hence the two-part match.
+    // source rather than planned as its own `ProjectionExec`. Keeping the whole
+    // column list in the anchor is what makes this catch a scan that stopped
+    // projecting; only the `structField@N` index varies per table, so the alias
+    // is matched separately.
     assert!(
-        plan.contains("get_field(structField@")
+        plan.contains("projection=[id, name, isActive, get_field(structField@")
             && plan.contains(&format!(", field2) as {table_name}.structField[field2]")),
         "Plan should project the struct field"
     );
     // Simple predicates (id % 2 = 0, name != Alice) and the struct field access
     // alike are pushed into the Parquet source.
     assert!(
-        plan.contains(", field2) > 30"),
-        "Plan should contain struct field filter"
+        scan_predicate(&plan).contains(", field2) > 30"),
+        "Scan predicate should contain the struct field filter"
     );
+    // `hoodie.read.input.partitions` decides how many groups the scan is split
+    // into. One group renders in the singular, which this prefix covers too.
     assert!(
-        plan.contains(&format!(
-            "file_groups={{{planned_input_partitioned} {}:",
-            file_group_noun(*planned_input_partitioned)
-        )),
+        plan.contains(&format!("file_groups={{{planned_input_partitioned} group")),
         "Plan should scan {planned_input_partitioned} file group(s)"
     );
 }
 
-/// How the plan spells the file-group count: `hoodie.read.input.partitions`
-/// decides how many groups the scan is split into, and DataFusion renders one
-/// group in the singular.
-fn file_group_noun(count: i32) -> &'static str {
-    if count == 1 { "group" } else { "groups" }
+/// The predicate the scan evaluates per row, which it renders as `, predicate=`.
+///
+/// The scan also renders a `, pruning_predicate=` derived from that one, and a
+/// bare substring search cannot tell the two apart. Only the former says what
+/// actually reached the source.
+fn scan_predicate(plan: &str) -> &str {
+    let predicate = plan
+        .split(", predicate=")
+        .nth(1)
+        .expect("plan should carry a scan predicate");
+    predicate
+        .split(", pruning_predicate=")
+        .next()
+        .unwrap_or(predicate)
 }
 
 async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -400,7 +409,7 @@ mod v8_tests {
             "Should scan through DataSourceExec"
         );
         assert!(
-            plan.contains(", field2) > 30"),
+            scan_predicate(&plan).contains(", field2) > 30"),
             "Non-partition filters should reach the source"
         );
         assert!(

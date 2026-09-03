@@ -42,9 +42,8 @@ fn extract_codec(session: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
     };
     let capsule = capsule_obj.cast::<PyCapsule>()?;
     // `pointer_checked` is the name check and the pointer read in one step: it
-    // refuses any capsule not carrying exactly this name, which is what makes
-    // the cast below sound. An unnamed capsule no longer passes, where the
-    // previous name-then-read pair let one through.
+    // refuses any capsule not carrying exactly this name. An unnamed capsule no
+    // longer passes, where the previous name-then-read pair let one through.
     let codec = capsule
         .pointer_checked(Some(c"datafusion_logical_extension_codec"))
         .map_err(|e| {
@@ -53,7 +52,11 @@ fn extract_codec(session: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
             ))
         })?;
     // SAFETY: DataFusion puts that name only on a capsule holding an
-    // `FFI_LogicalExtensionCodec`, and the check above just confirmed it.
+    // `FFI_LogicalExtensionCodec`, so the check above settles what the capsule
+    // holds. It does not settle which `datafusion-ffi` built it, because the
+    // name carries no version: a `datafusion` wheel built against another major
+    // would present the same name over a different layout. Holding the two in
+    // step is what the pinned `datafusion` extra in pyproject.toml is for.
     let codec = unsafe { codec.cast::<FFI_LogicalExtensionCodec>().as_ref() };
     Ok(codec.clone())
 }
