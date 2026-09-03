@@ -21,6 +21,14 @@
 **/data
 **/results
 
+# Test fixtures live under a data/ directory and must be committed; without this
+# they are silently swallowed by the rule above and CI fails on tables nobody
+# can see are missing.
+# The directory itself has to be re-included, not just its contents — git never
+# descends into an excluded directory, so a pattern for the files alone is dead.
+!crates/test/data/
+!crates/core/tests/data/
+
 /.idea
 .vscode
 

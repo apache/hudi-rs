@@ -1,0 +1,59 @@
+{
+  "namespace": "org.apache.hudi.avro.model",
+  "type": "record",
+  "name": "HoodieRollbackPlan",
+  "fields": [
+     {
+           "name": "instantToRollback",
+           "doc": "Hoodie instant that needs to be rolled back",
+           "type": ["null", "HoodieInstantInfo"],
+           "default": null
+    },
+    {
+      "name": "RollbackRequests",
+      "type":["null", {
+                "type":"array",
+                "items":{
+                 "type": "record",
+                         "name": "HoodieRollbackRequest",
+                         "fields": [
+                            {"name": "partitionPath", "type": "string"},
+                            {"name": "fileId",
+                              "type":["null", "string"],
+                              "default": null
+                             },
+                            {"name": "latestBaseInstant",
+                              "type":["null", "string"],
+                              "default": null
+                            },
+                            {"name": "filesToBeDeleted",
+                             "default": [],
+                             "type": {
+                                       "type": "array",
+                                       "default": [],
+                                       "items": "string"
+                                    }
+                            },
+                            {"name": "logBlocksToBeDeleted",
+                             "type": ["null", {
+                               "type": "map",
+                               "doc": "Log blocks that need to be deleted as part of the rollback",
+                               "values": {
+                                   "type": "long",
+                                   "doc": "Size of this file/block in bytes"
+                               }
+                             }],
+                             "default":null
+                            }
+                         ]
+                }
+                }],
+       "default" : null
+    },
+    {
+       "name":"version",
+       "type":["int", "null"],
+       "default": 1
+    }
+  ]
+}

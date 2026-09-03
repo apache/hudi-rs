@@ -19,9 +19,12 @@
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_format::LogFormatVersion;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
+use crate::storage::reader::LogBlockFetcher;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -275,6 +278,18 @@ impl LogBlockContent {
     }
 }
 
+/// Where a block's content sits, for reading it later.
+///
+/// A scan that only needs headers records this instead of decoding, so a block
+/// the gates then discard costs nothing beyond its header.
+#[derive(Debug, Clone)]
+pub struct LogBlockContentLocation {
+    /// Byte offset where the content starts.
+    pub content_position: u64,
+    /// Length of the content in bytes.
+    pub content_length: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogBlock {
     pub format_version: LogFormatVersion,
@@ -282,10 +297,113 @@ pub struct LogBlock {
     pub header: HashMap<BlockMetadataKey, String>,
     pub content: LogBlockContent,
     pub footer: HashMap<BlockMetadataKey, String>,
+    /// Set when the block was read headers-only; `content` is then `Empty`
+    /// until [`LogBlock::load_content`] runs.
+    ///
+    /// One field rather than two so the pairing is structural: the location and
+    /// the fetcher are only ever meaningful together, and a caller that set one
+    /// without the other used to compile and fail at read time.
+    ///
+    pub deferred_content: Option<DeferredContent>,
+    /// Content bytes the headers-only walk already had in hand, undecoded.
+    ///
+    /// Set alongside `deferred_content` when the walk's reader was holding the
+    /// range anyway, which a log file smaller than one fetch window always is.
+    /// The location stays because the decode still checks the byte count against
+    /// it; what these bytes remove is the second request, not the check.
+    /// Undecoded on purpose: decoding here would cost a block the gates go on to
+    /// discard, which is the property the headers-only walk exists to keep.
+    pub resident_content: Option<bytes::Bytes>,
     pub skipped: bool,
 }
 
+/// Where a headers-only block's content sits, and how to read it.
+#[derive(Debug, Clone)]
+pub struct DeferredContent {
+    pub location: LogBlockContentLocation,
+    /// Reads this block's own content range, holding no file bytes.
+    pub fetcher: LogBlockFetcher,
+}
+
 impl LogBlock {
+    /// Decode the content a headers-only scan did not decode.
+    ///
+    /// Three cases, in order: a block that already holds decoded content is left
+    /// alone; a block holding undecoded bytes the scan had in hand is decoded from
+    /// those; otherwise its own range is read, so a scan can walk a file without
+    /// holding it and each admitted block costs its own content and no more.
+    pub async fn load_content(&mut self, decoder: &Decoder) -> Result<()> {
+        if !self.content.is_empty() {
+            return Ok(());
+        }
+        // Already in hand: the walk was holding these bytes, so there is nothing
+        // to fetch and only the decode is left.
+        if let Some(bytes) = self.resident_content.take() {
+            return self.decode_fetched(decoder, bytes);
+        }
+        let Some(DeferredContent { location, fetcher }) = self.deferred_content.as_ref() else {
+            return Err(CoreError::LogBlockError(
+                "Cannot load the content of a block that was not read headers-only".to_string(),
+            ));
+        };
+
+        let bytes = fetcher
+            .read_content(location.content_position, location.content_length)
+            .await
+            .map_err(CoreError::ReadLogFileError)?;
+        self.decode_fetched(decoder, bytes)
+    }
+
+    /// Decode content that was already fetched for this block.
+    ///
+    /// Pairs with the batched prefetch in Pass 3, which reads many blocks'
+    /// ranges in one call and then hands each block its own bytes. Identical to
+    /// [`Self::load_content`] from the length check onwards, so a prefetched
+    /// block and a self-fetched one decode by the same path.
+    pub fn decode_fetched(&mut self, decoder: &Decoder, bytes: Bytes) -> Result<()> {
+        if !self.content.is_empty() {
+            return Ok(());
+        }
+        let Some(DeferredContent { location, .. }) = self.deferred_content.as_ref() else {
+            return Err(CoreError::LogBlockError(
+                "Cannot load the content of a block that was not read headers-only".to_string(),
+            ));
+        };
+        // A ranged read whose end runs past the file is CLAMPED rather than
+        // refused, so an overlong content length comes back as a short buffer.
+        // That length is read straight out of the file and nothing upstream
+        // validates it — `is_block_corrupted` checks the block's outer span, not
+        // this inner field — so decoding the short buffer would fail somewhere
+        // inside the block format rather than naming the real problem.
+        if bytes.len() as u64 != location.content_length {
+            return Err(CoreError::LogBlockError(format!(
+                "ranged read at offset {} returned {} bytes, expected {}: this block's content \
+                 runs past the end of the file (truncated or corrupt block)",
+                location.content_position,
+                bytes.len(),
+                location.content_length,
+            )));
+        }
+        let mut reader = std::io::Cursor::new(bytes);
+        self.content = decoder.decode_content(
+            &mut reader,
+            &self.format_version,
+            location.content_length,
+            &self.block_type,
+            &self.header,
+        )?;
+        // Content is decoded, so the means to fetch it again is dead weight.
+        // Mirrors Java's `deflate()` releasing the block's `byte[]`. A block that
+        // decodes to no content keeps its location: a command block decodes to
+        // `Empty`, which is indistinguishable here from never having been loaded,
+        // so releasing it there would turn a second call into an error rather
+        // than the no-op it is.
+        if !self.content.is_empty() {
+            self.deferred_content = None;
+        }
+        Ok(())
+    }
+
     /// Create a new log block with the given content.
     pub fn new(
         format_version: LogFormatVersion,
@@ -300,6 +418,8 @@ impl LogBlock {
             header,
             content,
             footer,
+            deferred_content: None,
+            resident_content: None,
             skipped: false,
         }
     }
@@ -318,6 +438,8 @@ impl LogBlock {
             header,
             content: LogBlockContent::Empty,
             footer: HashMap::new(),
+            deferred_content: None,
+            resident_content: None,
             skipped: true,
         }
     }
@@ -379,6 +501,26 @@ impl LogBlock {
                 )
             })?;
         v.parse::<CommandBlock>()
+    }
+
+    /// The `RECORD_POSITIONS` header value: the positions this block's records
+    /// occupy in the base file, as a base64-encoded Roaring64 bitmap, if the
+    /// writer recorded them.
+    #[must_use]
+    pub fn record_positions_header(&self) -> Option<&str> {
+        self.header
+            .get(&BlockMetadataKey::RecordPositions)
+            .map(String::as_str)
+    }
+
+    /// The `BASE_FILE_INSTANT_TIME_OF_RECORD_POSITIONS` header value: the base
+    /// file instant time this block's record positions were computed against.
+    /// Positions are only usable when it matches the base file being merged.
+    #[must_use]
+    pub fn base_file_instant_time_of_positions(&self) -> Option<&str> {
+        self.header
+            .get(&BlockMetadataKey::BaseFileInstantTimeOfRecordPositions)
+            .map(String::as_str)
     }
 
     #[must_use]

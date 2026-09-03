@@ -593,8 +593,18 @@ impl From<&FileSlice> for HudiFileSlice {
         let file_id = f.file_id().to_string();
         let partition_path = f.partition_path.to_string();
         let creation_instant_time = f.creation_instant_time().to_string();
-        let base_file_name = f.base_file.file_name();
-        let file_metadata = f.base_file.file_metadata.clone().unwrap_or_default();
+        // A slice with no base file reports an empty name and zero sizes rather
+        // than changing the shape of what Python already receives.
+        let base_file_name = f
+            .base_file
+            .as_ref()
+            .map(|b| b.file_name())
+            .unwrap_or_default();
+        let file_metadata = f
+            .base_file
+            .as_ref()
+            .and_then(|b| b.file_metadata.clone())
+            .unwrap_or_default();
         let base_file_size = file_metadata.size;
         let base_file_byte_size = file_metadata.byte_size;
         let log_file_names = f.log_files.iter().map(|l| l.file_name()).collect();
@@ -785,15 +795,18 @@ impl HudiTable {
         &self,
         read_options: Option<HudiReadOptions>,
         extra_storage_overrides: Option<HashMap<String, String>>,
+        py: Python,
     ) -> PyResult<HudiFileGroupReader> {
         let read_options = read_options.map(|o| o.to_inner());
-        let fg_reader = self
-            .inner
-            .create_file_group_reader_with_options(
+        // Resolving the table's data schema reads the timeline, so this blocks;
+        // release the GIL for it like the other I/O-bound methods here.
+        let fg_reader = py.detach(|| {
+            rt().block_on(self.inner.create_file_group_reader_with_options(
                 read_options.as_ref(),
                 extra_storage_overrides.unwrap_or_default(),
-            )
-            .map_err(PythonError::from)?;
+            ))
+            .map_err(PythonError::from)
+        })?;
         Ok(HudiFileGroupReader { inner: fg_reader })
     }
 

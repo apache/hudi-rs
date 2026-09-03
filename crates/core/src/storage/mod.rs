@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -37,18 +38,156 @@ use crate::storage::file_metadata::FileMetadata;
 use crate::storage::reader::StorageReader;
 use crate::storage::util::join_url_segments;
 
+#[cfg(test)]
+pub(crate) mod counting;
 pub mod error;
 pub mod file_metadata;
 pub mod reader;
 pub mod util;
 
-#[allow(dead_code)]
+/// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
+/// the Arrow schema it maps to. Returning `None` means no filter is pushed.
+///
+/// `Arc` rather than `Box` so options holding it stay `Clone`. The captured
+/// state must be `Send + Sync` because the parquet stream may evaluate the
+/// filter on any worker thread.
+pub type RowFilterBuilder = Arc<
+    dyn Fn(
+            &parquet::schema::types::SchemaDescriptor,
+            &arrow_schema::Schema,
+        ) -> Option<parquet::arrow::arrow_reader::RowFilter>
+        + Send
+        + Sync,
+>;
+
+/// Chooses which row groups a read fetches, from the file's parsed footer.
+/// Returning `None` means "no opinion, read them all".
+///
+/// This is the only mechanism on the read path that can avoid reading bytes: a
+/// [`RowFilterBuilder`] decides per row after the predicate columns are decoded,
+/// so it saves decode, never IO, while a row group excluded here is never
+/// fetched.
+///
+/// The selector must be CONSERVATIVE. Keeping a row group that cannot match
+/// costs only time; dropping one that can match silently loses rows, and nothing
+/// downstream can restore them.
+///
+/// `Arc` for the same reason as [`RowFilterBuilder`]: options holding it stay
+/// `Clone`, and it may run on any worker thread.
+pub type RowGroupSelector =
+    Arc<dyn Fn(&parquet::file::metadata::ParquetMetaData) -> Option<Vec<usize>> + Send + Sync>;
+
 #[derive(Clone, Debug)]
 pub struct Storage {
     pub(crate) base_url: Arc<Url>,
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
+    /// Read-volume counters for the base-file reads made through this
+    /// `Storage`.
+    ///
+    /// Here rather than on a read parameter so no read signature changes. The
+    /// scope is this `Storage`'s lifetime, which is as narrow as the caller
+    /// makes it: a per-read `Storage` yields per-read counters, while a
+    /// `FileGroupReader` builds one `Storage` in its constructor and reuses
+    /// it, so every slice read through that reader accumulates into the same
+    /// counters. The `object_store` inside could not carry them: it is shared
+    /// even wider, so its counts would be everyone's.
+    pub(crate) read_volume: Arc<ReadVolume>,
+}
+
+/// Read-volume counters for one [`Storage`]'s lifetime.
+///
+/// Whether a predicate was pushed is not the same question as what a push
+/// bought: a parquet `RowFilter` can be installed on every file and still read
+/// every byte, because it decides per row after the predicate columns are
+/// decoded. Only pruning avoids IO. These counters separate the two.
+///
+/// `bytes_read` and `io_calls` are counted at the `AsyncFileReader` boundary,
+/// which makes them exact and independent of the OS page cache: a warm re-read
+/// reports the same bytes as a cold one. Wall-clock does not have that property,
+/// which is what makes these the transferable numbers when comparing read paths.
+/// The boundary also bounds the scope: footer fetches happen before the
+/// counting wrapper is installed and log-file IO never crosses it, so these
+/// two count base-file column-chunk reads only.
+///
+/// All fields are `AtomicU64` under an `Arc` because the parquet stream is
+/// polled on whichever worker thread drives it, while a consumer may read the
+/// counters from another. `Relaxed` throughout: these are advisory counters, and
+/// the happens-before that makes them visible is the consumer draining the
+/// stream.
+#[derive(Debug, Default)]
+pub struct ReadVolume {
+    /// Bytes actually fetched from the object store, summed over every range read.
+    pub bytes_read: AtomicU64,
+    /// Number of `get_bytes` / `get_byte_ranges` calls — round trips, not ranges.
+    /// A two-pass read (predicate columns, then the selected rows) shows up here
+    /// as roughly double the calls of a single-pass read over the same file.
+    pub io_calls: AtomicU64,
+    /// Row groups the reader was configured to scan. Equal to `file_row_groups`
+    /// until something prunes; the gap between the two is what pruning bought.
+    pub row_groups_read: AtomicU64,
+    /// Row groups the file contains. Denominator for the line above.
+    pub file_row_groups: AtomicU64,
+    /// Times the row-group selector closure actually RAN.
+    ///
+    /// Separate from its outcome on purpose. A selector returns `None` when it
+    /// cannot prune anything, so `row_groups_read == file_row_groups` reads the
+    /// same whether the selector ran and found nothing or was never installed.
+    /// Only this counter separates them.
+    pub row_group_selector_calls: AtomicU64,
+    /// Times a selector WAS installed by the caller but the merge-safety gate
+    /// refused to pass it down.
+    ///
+    /// Without this the gate silently defeats the counter above: a suppressed
+    /// selector is a third state that also reads zero calls. Read the two
+    /// together:
+    ///   calls > 0                   the selector ran
+    ///   calls == 0, suppressed > 0  the gate refused it (the read merges, and
+    ///                               the predicate is not primary-key-safe)
+    ///   calls == 0, suppressed == 0 no caller ever installed one
+    pub row_group_selector_suppressed: AtomicU64,
+    /// Rows the file contains, from parquet metadata.
+    pub file_rows: AtomicU64,
+    /// Rows the stream actually yielded, after any row filter. `file_rows -
+    /// rows_out` is what filtering removed; `bytes_read` says what it cost to
+    /// remove it.
+    pub rows_out: AtomicU64,
+}
+
+impl ReadVolume {
+    /// One completed fetch: its bytes, and the round trip that carried them.
+    pub(crate) fn add_bytes(&self, n: u64) {
+        self.bytes_read.fetch_add(n, Ordering::Relaxed);
+        self.io_calls.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// What the file holds, read off the footer the reader has already fetched.
+    pub(crate) fn record_file_shape(&self, row_groups: u64, rows: u64) {
+        self.file_row_groups
+            .fetch_add(row_groups, Ordering::Relaxed);
+        self.file_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_row_groups_read(&self, n: u64) {
+        self.row_groups_read.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// The selector ran. Counted whether or not it managed to prune.
+    pub(crate) fn record_selector_call(&self) {
+        self.row_group_selector_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A caller installed a selector and the safety gate declined to pass it on.
+    pub(crate) fn record_selector_suppressed(&self) {
+        self.row_group_selector_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn add_rows_out(&self, n: u64) {
+        self.rows_out.fetch_add(n, Ordering::Relaxed);
+    }
 }
 
 impl Storage {
@@ -77,9 +216,38 @@ impl Storage {
                 object_store: Arc::new(object_store),
                 options,
                 hudi_configs,
+                read_volume: Arc::new(ReadVolume::default()),
             })),
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
+    }
+
+    /// Clone of this `Storage`'s read-volume counters, for a consumer that
+    /// outlives the read and reports them once the stream has drained.
+    pub fn read_volume(&self) -> Arc<ReadVolume> {
+        self.read_volume.clone()
+    }
+
+    /// Build storage over a caller-supplied object store.
+    ///
+    /// Test-only, so a test can wrap the real store and observe the requests a
+    /// reader makes. Note that a wrapper takes the trait's default `get_ranges`,
+    /// which coalesces, where `LocalFileSystem` overrides it and does not: the
+    /// counts a test sees are therefore the ones an object store would serve, not
+    /// the ones the local filesystem would.
+    #[cfg(test)]
+    pub(crate) fn new_with_object_store(
+        base_url: Url,
+        object_store: Arc<dyn ObjectStore>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Arc<Storage> {
+        Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options: Arc::new(HashMap::new()),
+            hudi_configs,
+            read_volume: Arc::new(ReadVolume::default()),
+        })
     }
 
     #[cfg(test)]
@@ -138,6 +306,24 @@ impl Storage {
         StorageReader::new(obj_store, obj_meta)
             .await
             .map_err(StorageError::ReaderError)
+    }
+
+    /// A reader that fetches bounded windows instead of the whole file.
+    ///
+    /// Only the object metadata is fetched here; no file bytes are read until
+    /// the caller reads.
+    pub async fn get_streaming_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let obj_meta = obj_store.head(&obj_path).await?;
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        Ok(StorageReader::new_streaming(
+            obj_store,
+            obj_meta,
+            window_size,
+        ))
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {

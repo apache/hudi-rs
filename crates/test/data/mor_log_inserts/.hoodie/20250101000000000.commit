@@ -1,0 +1,7 @@
+{"partitionToWriteStats":{"":[{"fileId":"f00000000-0000-0000-0000-000000000000-0","path":"f00000000-0000-0000-0000-000000000000-0_0-1-0_20250101000000000.parquet","prevCommit":"null","numWrites":0,
+               "numDeletes":0,"numUpdateWrites":0,"totalWriteBytes":276041,
+               "fileSizeInBytes":276041,"partitionPath":"","tempPath":null,
+               "totalLogRecords":0,"totalLogFilesCompacted":0,"totalLogSizeCompacted":0,
+               "totalLogBlocks":0,"totalCorruptLogBlock":0,"totalRollbackBlocks":0,
+               "cdcStats":null,"minEventTime":null,"maxEventTime":null,"runtimeStats":null}]},"compacted":false,
+            "extraMetadata":{},"operationType":"INSERT"}

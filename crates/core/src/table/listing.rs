@@ -96,12 +96,10 @@ impl FileLister {
                 // we expect a file that has the base file extension to be a valid base file.
                 let mut base_file = BaseFile::try_from(file_metadata)?;
 
-                // Look up completion timestamp and filter uncommitted files if applicable
+                // Look up completion timestamp, and skip the file outright if the
+                // commit that wrote it never completed.
                 base_file.set_completion_time(completion_time_view);
-                if completion_time_view.should_filter_uncommitted()
-                    && base_file.completion_timestamp.is_none()
-                {
-                    // file belongs to an uncommitted commit, skip it
+                if !completion_time_view.is_committed(&base_file.commit_timestamp) {
                     continue;
                 }
                 if let Some(metadata) = base_file.file_metadata.as_mut() {
@@ -124,12 +122,10 @@ impl FileLister {
             } else {
                 match LogFile::try_from(file_metadata) {
                     Ok(mut log_file) => {
-                        // Look up completion timestamp and filter uncommitted files if applicable
+                        // Look up completion timestamp, and skip the file outright
+                        // if the commit that wrote it never completed.
                         log_file.set_completion_time(completion_time_view);
-                        if completion_time_view.should_filter_uncommitted()
-                            && log_file.completion_timestamp.is_none()
-                        {
-                            // file belongs to an uncommitted commit, skip it
+                        if !completion_time_view.is_committed(&log_file.timestamp) {
                             continue;
                         }
 
@@ -152,7 +148,6 @@ impl FileLister {
         }
 
         let mut file_groups: Vec<FileGroup> = Vec::new();
-        // TODO support creating file groups without base files
         for (file_id, base_files) in file_id_to_base_files.into_iter() {
             let mut file_group = FileGroup::new(file_id.to_owned(), partition_path.to_string());
 
@@ -161,6 +156,17 @@ impl FileLister {
             let log_files = file_id_to_log_files.remove(&file_id).unwrap_or_default();
             file_group.add_log_files(log_files)?;
 
+            file_groups.push(file_group);
+        }
+
+        // Whatever log files are left belong to file groups with no base file:
+        // inserts that went straight to a log file, which is what Flink
+        // ingestion, a bucket index's first write to a bucket, and any
+        // merge-on-read file group before its first compaction all produce.
+        // Dropping them loses every record in the group.
+        for (file_id, log_files) in file_id_to_log_files.into_iter() {
+            let mut file_group = FileGroup::new(file_id, partition_path.to_string());
+            file_group.add_log_files(log_files)?;
             file_groups.push(file_group);
         }
         Ok(file_groups)
@@ -252,13 +258,18 @@ mod test {
     use tempfile::tempdir;
     use url::Url;
 
+    /// A view that admits every file, so these tests stay about extension
+    /// handling rather than commit visibility: the far-future archival boundary
+    /// puts every instant below it, i.e. archived and therefore committed.
+    /// Commit visibility is covered in `timeline::view`.
     fn layout_v1_view() -> TimelineView {
-        TimelineView::new(
+        TimelineView::new_with_archival_boundary(
             "99999999999999999".to_string(),
             None,
             &[],
             HashSet::new(),
             &Arc::new(HudiConfigs::new([("hoodie.timeline.layout.version", "1")])),
+            Some("99999999999999999".to_string()),
         )
     }
 
@@ -332,7 +343,7 @@ mod test {
         let extensions: HashSet<_> = file_groups
             .iter()
             .flat_map(|fg| fg.file_slices.values())
-            .map(|slice| slice.base_file.extension.as_str())
+            .map(|slice| slice.base_file.as_ref().unwrap().extension.as_str())
             .collect();
 
         assert_eq!(extensions, HashSet::from(["lance", "parquet"]));

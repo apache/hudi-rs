@@ -28,6 +28,7 @@ use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
 use log::debug;
 use serde_json::{Map, Value};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -147,6 +148,64 @@ impl TimelineLoader {
         }
     }
 
+    /// Every instant time that has a `requested` or `inflight` file and no
+    /// completed one, for **any** action.
+    ///
+    /// Deliberately not built on [`TimelineSelector`], which resolves the action
+    /// through [`Action`](crate::timeline::instant::Action) and so can only see
+    /// the three commit actions the enum names. Java's `getValidInstantTimestamps`
+    /// takes its `datasetPendingInstants` from `filterInflightsAndRequested()`
+    /// over the whole active timeline, which includes compaction, clean,
+    /// clustering, indexing and savepoint. A metadata delta commit whose data
+    /// instant is a `.compaction.inflight` is one Java excludes and a
+    /// commit-action-only view admits.
+    ///
+    /// Only the timestamp is needed, never the action, so the file name is
+    /// parsed structurally instead: the state is the suffix, and the instant
+    /// time is what precedes the first `.` — minus the completion time that
+    /// timeline layout 2 appends after a `_`.
+    pub async fn list_pending_instant_times(&self) -> Result<HashSet<String>> {
+        let dir = match self.layout {
+            TimelineLayout::V1Active => HUDI_METADATA_DIR.to_string(),
+            TimelineLayout::V2Active => self.get_timeline_dir(),
+            _ => {
+                return Err(CoreError::Unsupported(
+                    "Pending instants can only be listed from an active timeline.".to_string(),
+                ));
+            }
+        };
+
+        let mut pending: HashSet<String> = HashSet::new();
+        let mut completed: HashSet<String> = HashSet::new();
+        for file_info in self.storage.list_files(Some(&dir)).await? {
+            let name = file_info.name.as_str();
+            if name.starts_with("history/") || name.ends_with(".crc") {
+                continue;
+            }
+            let Some((timestamp_part, suffix)) = name.split_once('.') else {
+                continue;
+            };
+            // The instant time only; layout 2 completed files append the
+            // completion time after a `_`.
+            let timestamp = timestamp_part
+                .split_once('_')
+                .map_or(timestamp_part, |(requested, _)| requested);
+            if timestamp.is_empty() {
+                continue;
+            }
+            // `{ts}.inflight` with no action is a legacy commit inflight.
+            match suffix.rsplit_once('.').map_or(suffix, |(_, state)| state) {
+                "requested" | "inflight" => pending.insert(timestamp.to_string()),
+                _ => completed.insert(timestamp.to_string()),
+            };
+        }
+
+        // An instant is listed once per state file it has, so one that completed
+        // also has a requested and an inflight file. Pending means it reached no
+        // completed state at all.
+        Ok(&pending - &completed)
+    }
+
     pub async fn load_instants(
         &self,
         selector: &TimelineSelector,
@@ -218,6 +277,19 @@ impl TimelineLoader {
     /// Note: This method assumes the archived loader was created only when
     /// `TimelineArchivedReadEnabled` is true. The config check is done in the builder.
     ///
+    /// # Not yet implemented
+    ///
+    /// Neither layout reads archived instants today. V2 returns empty outright.
+    /// V1 lists the archive folder and parses file *names* as instants, but Hudi
+    /// stores archived instants as records inside Avro archive logs
+    /// (`.commits_.archive.*`) rather than as one file per instant, so that
+    /// listing yields nothing either.
+    ///
+    /// Callers must therefore not treat an empty result as "no archived instants
+    /// in range" — see `Table::warn_if_window_predates_active_timeline`, which
+    /// reports the shortfall rather than letting a range query return quietly
+    /// short.
+    ///
     /// # Arguments
     ///
     /// * `selector` - The criteria for selecting instants (actions, states, time range)
@@ -267,6 +339,17 @@ impl TimelineLoader {
     /// Layout Version 2 (v8+): Avro format
     ///
     /// Returns the metadata as a JSON Map for uniform processing.
+    /// The raw bytes of one instant file.
+    ///
+    /// `load_instant_metadata` decodes commit metadata; a rollback, restore or
+    /// plan is a different Avro record, so its reader needs the bytes rather
+    /// than a decoded commit.
+    pub(crate) async fn load_instant_bytes(&self, instant: &Instant) -> Result<Vec<u8>> {
+        let timeline_dir = self.get_timeline_dir();
+        let path = instant.relative_path_with_base(&timeline_dir)?;
+        Ok(self.storage.get_file_data(path.as_str()).await?.to_vec())
+    }
+
     pub(crate) async fn load_instant_metadata(
         &self,
         instant: &Instant,
@@ -323,6 +406,73 @@ mod tests {
     use crate::config::HudiConfigs;
     use crate::config::table::HudiTableConfig;
     use std::collections::HashMap;
+
+    /// An archived instant is enumerated when the archived loader is used.
+    ///
+    /// Nothing covered this: the existing tests assert only that the loader is
+    /// *constructed* when `hoodie.internal.timeline.archived.enabled` is set,
+    /// never that it finds anything. Without this, the opt-in could resolve a
+    /// directory and return nothing and every test would still pass.
+    ///
+    /// Layout v1 keeps archived instants as ordinarily-named files under
+    /// `hoodie.archivelog.folder`, so the timeline can be laid out directly
+    /// rather than generated: what is under test is the enumeration, not the
+    /// file format.
+    #[tokio::test]
+    async fn test_archived_instants_are_enumerated_from_the_archive_folder() {
+        use crate::timeline::selector::TimelineSelector;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join(".hoodie/archived")).unwrap();
+        // One archived instant, and one active instant the archived loader must
+        // NOT pick up — it reads the archive folder, not the table's timeline.
+        std::fs::write(base.join(".hoodie/archived/20240101000000000.commit"), "{}").unwrap();
+        std::fs::write(base.join(".hoodie/20240301000000000.commit"), "{}").unwrap();
+
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            format!("file://{}", base.display()),
+        )]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+
+        // A window covering both instants, so exclusion cannot be an artifact of
+        // the range.
+        let selector = TimelineSelector::completed_commits_in_range(
+            configs.clone(),
+            Some("20240101000000000"),
+            Some("20240401000000000"),
+        )
+        .unwrap();
+        assert!(
+            selector.has_time_filter(),
+            "the archived timeline is only consulted for a time-filtered read"
+        );
+
+        let archived = TimelineLoader::new_layout_one_archived(configs.clone(), storage.clone());
+        let found = archived
+            .load_archived_instants(&selector, false)
+            .await
+            .unwrap();
+        let timestamps: Vec<&str> = found.iter().map(|i| i.timestamp.as_str()).collect();
+        assert_eq!(
+            timestamps,
+            vec!["20240101000000000"],
+            "the archived loader must return the archived instant and only that"
+        );
+
+        // An ACTIVE loader has no archived part and must return nothing, which is
+        // what makes the opt-in the thing that changes the answer.
+        let active = TimelineLoader::new_layout_one_active(configs, storage);
+        assert!(
+            active
+                .load_archived_instants(&selector, false)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an active loader must not read the archive folder"
+        );
+    }
 
     fn create_test_configs() -> Arc<HudiConfigs> {
         let mut options = HashMap::new();
@@ -456,5 +606,106 @@ mod tests {
 
         // Verify storage is accessible and is the same instance
         assert_eq!(Arc::as_ptr(loader.storage()), storage_ptr);
+    }
+
+    /// Every action counts toward pending, and only instants with no completed
+    /// file at all.
+    ///
+    /// Layout v1, where each instant is a plain `{ts}.{action}[.{state}]` file
+    /// under `.hoodie`. The actions here are deliberately ones
+    /// [`Action`](crate::timeline::instant::Action) cannot represent — a
+    /// selector-based listing drops them before anything can count them, which
+    /// is the whole reason this method parses file names itself.
+    #[tokio::test]
+    async fn pending_instants_span_every_action_and_exclude_the_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join(".hoodie")).unwrap();
+
+        for name in [
+            // Pending, under actions the Action enum does not name.
+            "20240101000000001.compaction.inflight",
+            "20240101000000002.clean.requested",
+            "20240101000000003.indexing.inflight",
+            // Pending, under actions it does.
+            "20240101000000004.deltacommit.requested",
+            // A legacy bare inflight, which means a commit.
+            "20240101000000005.inflight",
+            // Completed, and so not pending -- even though it also has the
+            // requested and inflight files every completed instant leaves.
+            "20240101000000006.commit",
+            "20240101000000006.commit.inflight",
+            "20240101000000006.commit.requested",
+            // A completed clean, likewise not pending.
+            "20240101000000007.clean",
+            "20240101000000007.clean.requested",
+        ] {
+            std::fs::write(base.join(".hoodie").join(name), "{}").unwrap();
+        }
+
+        let configs = Arc::new(HudiConfigs::new([(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            format!("file://{}", base.display()),
+        )]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let loader = TimelineLoader::new_layout_one_active(configs, storage);
+
+        let pending = loader.list_pending_instant_times().await.unwrap();
+        assert_eq!(
+            pending,
+            [
+                "20240101000000001",
+                "20240101000000002",
+                "20240101000000003",
+                "20240101000000004",
+                "20240101000000005",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<String>>()
+        );
+    }
+
+    /// Layout 2 appends the completion time to a completed instant's name, so
+    /// the instant time is what precedes the `_`. Reading the whole
+    /// `{ts}_{completionTs}` as the instant time would leave the completed
+    /// instant's own requested file counted as pending forever.
+    #[tokio::test]
+    async fn a_layout_two_completed_instant_cancels_its_pending_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join(".hoodie/timeline")).unwrap();
+
+        for name in [
+            "20240101000000001_20240101000000009.deltacommit",
+            "20240101000000001.deltacommit.inflight",
+            "20240101000000001.deltacommit.requested",
+            "20240101000000002.compaction.inflight",
+        ] {
+            std::fs::write(base.join(".hoodie/timeline").join(name), "{}").unwrap();
+        }
+
+        let configs = Arc::new(HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                format!("file://{}", base.display()),
+            ),
+            (
+                HudiTableConfig::TimelineLayoutVersion.as_ref().to_string(),
+                "2".to_string(),
+            ),
+        ]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let loader = TimelineLoader::new_layout_two_active(configs, storage);
+
+        let pending = loader.list_pending_instant_times().await.unwrap();
+        assert_eq!(
+            pending,
+            ["20240101000000002"]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<HashSet<String>>(),
+            "the completed delta commit must cancel its own requested/inflight files"
+        );
     }
 }

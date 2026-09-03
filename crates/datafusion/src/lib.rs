@@ -380,6 +380,10 @@ impl HudiDataSource {
                     e,
                 )
             })?;
+            // No base file: nothing with a parquet footer to prune on.
+            let Some(relative_path) = relative_path else {
+                return Ok(true);
+            };
             if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
                 return Ok(false);
             }
@@ -645,9 +649,18 @@ impl HudiDataSource {
                         e,
                     )
                 })?;
+                // A slice with no base file contributes no parquet file here;
+                // its records come from log files, which this path does not read.
+                let Some(relative_path) = relative_path else {
+                    continue;
+                };
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| external_error("Failed to join URL segments", e))?;
-                let size = f.base_file.file_metadata.as_ref().map_or(0, |m| m.size);
+                let size = f
+                    .base_file
+                    .as_ref()
+                    .and_then(|b| b.file_metadata.as_ref())
+                    .map_or(0, |m| m.size);
                 let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }
@@ -702,6 +715,18 @@ impl HudiDataSource {
         flat_slices: Vec<FileSlice>,
         read_options: ReadOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Derive the fan-out from the scan's memory budget when one is set. The
+        // concurrency knob alone cannot express the peak: it multiplies by the
+        // partitions running at once, and nothing multiplies them. Sharing one
+        // budget across partitions is what keeps the product inside it.
+        let slice_log_bytes: Vec<Option<u64>> =
+            flat_slices.iter().map(FileSlice::log_size_bytes).collect();
+        let file_slice_read_concurrency = hudi_core::file_group::admission::slices_in_flight(
+            self.scan_max_memory_size(),
+            input_partitions,
+            &slice_log_bytes,
+            self.file_slice_read_concurrency,
+        );
         let file_slices =
             hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
 
@@ -712,6 +737,7 @@ impl HudiDataSource {
         let file_group_reader = Arc::new(
             self.table
                 .create_file_group_reader_with_options(Some(&read_options), empty_options())
+                .await
                 .map_err(|e| external_error("Failed to create FileGroupReader", e))?,
         );
 
@@ -730,11 +756,25 @@ impl HudiDataSource {
             file_group_reader,
             hudi_read_options,
             input_partitions,
-            self.file_slice_read_concurrency,
+            file_slice_read_concurrency,
             self.schema.clone(),
             projection.cloned(),
             limit,
         )))
+    }
+
+    /// The scan's memory budget, when the table or read set one.
+    ///
+    /// Absent means the concurrency knob stands on its own, which is the
+    /// behaviour every existing table keeps.
+    fn scan_max_memory_size(&self) -> Option<u64> {
+        self.table
+            .hudi_configs
+            .try_get(hudi_core::config::read::HudiReadConfig::ScanMaxMemorySize)
+            .ok()
+            .flatten()
+            .map(|v| -> usize { v.into() })
+            .map(|v| v as u64)
     }
 
     fn get_input_partitions_for_scan(&self, state: &dyn Session) -> usize {
@@ -1399,6 +1439,51 @@ mod tests {
         let filter = &exec.read_options().filters[0];
         assert_eq!(filter.field, "id");
         assert_eq!(filter.values, vec!["1".to_string()]);
+    }
+
+    /// A scan memory budget lowers the plan's slice concurrency; without one the
+    /// configured ceiling stands.
+    ///
+    /// This asserts the wiring, not the arithmetic — `slices_in_flight` has its
+    /// own tests. The wiring is what needs a test of its own: it is one call in
+    /// `scan_hudi`, it compiles fine when absent, and the derivation it feeds
+    /// looks correct in isolation either way. It went missing once already.
+    ///
+    /// `HudiScanExec`'s verbose display carries the value, so this reads the
+    /// plan the planner actually built rather than a field.
+    #[tokio::test]
+    async fn a_scan_memory_budget_lowers_the_planned_slice_concurrency() {
+        use datafusion::physical_plan::displayable;
+
+        async fn planned_concurrency(options: Vec<(&str, &str)>) -> String {
+            let hudi = HudiDataSource::new_with_options(
+                V6SimplekeygenNonhivestyle.url_to_mor_parquet().as_str(),
+                options,
+            )
+            .await
+            .unwrap();
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+            let plan = hudi.scan(&state, None, &[], None).await.unwrap();
+            displayable(plan.as_ref())
+                .set_show_schema(false)
+                .indent(true)
+                .to_string()
+        }
+
+        let unbounded = planned_concurrency(vec![]).await;
+        assert!(
+            unbounded.contains("file_slice_read_concurrency=4"),
+            "the default ceiling should stand with no budget: {unbounded}"
+        );
+
+        // 1 MiB cannot fit even one slice's estimate, so admission floors at 1.
+        let bounded =
+            planned_concurrency(vec![("hoodie.read.scan.max.memory.size", "1048576")]).await;
+        assert!(
+            bounded.contains("file_slice_read_concurrency=1"),
+            "a 1 MiB budget must lower the fan-out to 1: {bounded}"
+        );
     }
 
     #[tokio::test]

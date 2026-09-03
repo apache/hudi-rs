@@ -149,7 +149,7 @@ impl LogFileScanner {
         for path in relative_paths {
             let mut reader =
                 LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path).await?;
-            let blocks = reader.read_all_blocks(instant_range)?;
+            let blocks = reader.read_all_blocks(instant_range).await?;
 
             // Collect rollback targets from command blocks
             for block in &blocks {

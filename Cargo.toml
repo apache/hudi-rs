@@ -21,6 +21,7 @@ members = [
     "cpp",
     "python",
     "benchmark/tpch",
+    "benchmark/filegroup",
 ]
 resolver = "2"
 
@@ -52,6 +53,7 @@ object_store = { version = "0.12", features = ["aws", "azure", "gcp"] }
 parquet = { version = "57", features = ["async", "object_store"] }
 
 # avro
+arrow-avro = { version = "57" }
 apache-avro = { version = "0.21", features = ["derive"] }
 apache-avro-derive = { version = "0.21" }
 
@@ -91,6 +93,18 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 
 # protobuf
 prost = { version = "0.14" }
+
+# record positions: log blocks store them as a base64-encoded roaring bitmap
+base64 = { version = "0.22" }
+# Spill backend for the merge-on-read merge map, behind hudi-core's default-on
+# `spill-rocksdb` feature: it bundles RocksDB 8.10 and needs libclang to build
+# (bindgen), which every consumer would otherwise pay for — including the Python
+# wheel and the cxx bridge — for a disk tier that only engages on spill.
+# Licenses: rocksdb Apache-2.0; librocksdb-sys MIT/Apache-2.0/BSD-3-Clause.
+rocksdb = { version = "0.22" }
+# Fast hasher for the merge map (folded multiply, no hardware-AES dependency).
+foldhash = { version = "0.2" }
+roaring = { version = "0.11" }
 
 # compression
 flate2 = { version = "1" }

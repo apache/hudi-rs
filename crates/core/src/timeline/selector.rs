@@ -23,6 +23,7 @@ use crate::error::CoreError;
 use crate::timeline::Timeline;
 use crate::timeline::instant::{Action, Instant, State};
 use chrono::{DateTime, Utc};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 #[allow(dead_code)]
@@ -33,6 +34,20 @@ pub struct InstantRange {
     end_timestamp: Option<String>,
     start_inclusive: bool,
     end_inclusive: bool,
+    /// Explicit membership, mirroring Java's `RangeType::EXACT_MATCH`.
+    ///
+    /// A window cannot express the set the metadata table filters its log blocks
+    /// by: that set has **holes** -- a pending data instant is excluded while
+    /// instants on either side of it are included -- and members from outside the
+    /// data timeline entirely, such as metadata-only indexing delta commits.
+    /// Approximating it with bounds would admit blocks written for a pending
+    /// instant, and for every partition except `files` those records are used
+    /// as-is: wrong column statistics prune away files that hold matching rows,
+    /// which is a silently wrong query result rather than a failure.
+    ///
+    /// When set, bounds are ignored entirely -- membership is the whole test, as
+    /// it is in Java.
+    explicit_instants: Option<HashSet<String>>,
 }
 
 impl InstantRange {
@@ -49,7 +64,31 @@ impl InstantRange {
             end_timestamp,
             start_inclusive,
             end_inclusive,
+            explicit_instants: None,
         }
+    }
+
+    /// A range that admits exactly the instants in `instants`, and nothing else.
+    ///
+    /// See [`Self::explicit_instants`] for why a window cannot stand in for this.
+    pub fn exact_match<I, S>(instants: I, timezone: &str) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            timezone: timezone.to_string(),
+            start_timestamp: None,
+            end_timestamp: None,
+            start_inclusive: false,
+            end_inclusive: false,
+            explicit_instants: Some(instants.into_iter().map(Into::into).collect()),
+        }
+    }
+
+    /// Whether this range admits by explicit membership rather than by bounds.
+    pub fn is_exact_match(&self) -> bool {
+        self.explicit_instants.is_some()
     }
 
     /// Create a new [InstantRange] with a closed end timestamp range.
@@ -74,6 +113,38 @@ impl InstantRange {
         )
     }
 
+    /// Lexicographic variant of [`Self::is_in_range`], with the same
+    /// inclusivity, for instants that cannot be parsed as datetimes.
+    ///
+    /// Mirrors the JVM reader's `InstantComparison`, which compares instant
+    /// strings directly and never parses. Hudi instants are fixed-format
+    /// numeric strings, so lexicographic order matches chronological order, and
+    /// short instants still bound correctly rather than being kept
+    /// unconditionally.
+    pub fn is_in_range_lexicographic(&self, timestamp: &str) -> bool {
+        if let Some(allowed) = &self.explicit_instants {
+            return allowed.contains(timestamp);
+        }
+        if let Some(start) = self.start_timestamp.as_deref() {
+            if self.start_inclusive {
+                if timestamp < start {
+                    return false;
+                }
+            } else if timestamp <= start {
+                return false;
+            }
+        }
+        if let Some(end) = self.end_timestamp.as_deref() {
+            if self.end_inclusive {
+                if timestamp > end {
+                    return false;
+                }
+            } else if timestamp >= end {
+                return false;
+            }
+        }
+        true
+    }
     /// Create a new [InstantRange] with an open start and closed end timestamp range.
     pub fn within_open_closed(start_timestamp: &str, end_timestamp: &str, timezone: &str) -> Self {
         Self::new(
@@ -104,6 +175,12 @@ impl InstantRange {
     }
 
     pub fn is_in_range(&self, timestamp: &str, timezone: &str) -> Result<bool> {
+        // Membership short-circuits before any parsing: an exact-match set may
+        // hold instants the bounds would reject, and parsing would be wasted
+        // work besides.
+        if let Some(allowed) = &self.explicit_instants {
+            return Ok(allowed.contains(timestamp));
+        }
         let t = Instant::parse_datetime(timestamp, timezone)?;
         if let Some(start) = self.start_timestamp()? {
             if self.start_inclusive {
@@ -139,9 +216,21 @@ pub struct TimelineSelector {
     timezone: String,
     start_datetime: Option<DateTime<Utc>>,
     end_datetime: Option<DateTime<Utc>>,
+    /// The raw range bounds, kept alongside the parsed ones because a layout-v2
+    /// range is applied to *completion* timestamps, which are compared as
+    /// strings — see [`Self::select`].
+    start_timestamp: Option<String>,
+    end_timestamp: Option<String>,
+    /// Whether the range bounds **completion** times rather than requested times.
+    ///
+    /// Only an incremental window does. A snapshot or time-travel bound is a
+    /// requested-time bound by construction — it comes from an instant's own
+    /// timestamp — so ranging it on completion time would exclude the newest
+    /// commit from itself, and with it the replace-commit that prunes overwritten
+    /// file groups.
+    range_on_completion_time: bool,
     states: Vec<State>,
     actions: Vec<Action>,
-    include_archived: bool,
     /// Timeline layout version determines instant format validation:
     /// - Layout 1 (pre-v8): expects `{timestamp}.{action}` for completed instants
     /// - Layout 2 (v8+): expects `{requestedTimestamp}_{completedTimestamp}.{action}` for completed instants
@@ -182,6 +271,43 @@ impl TimelineSelector {
         start: Option<&str>,
         end: Option<&str>,
     ) -> Result<Self> {
+        Self::actions_in_range(actions, &[State::Completed], hudi_configs, start, end)
+    }
+
+    /// As [`Self::completed_actions_in_range`], but the bounds apply to
+    /// **completion** times — the semantics an incremental window needs. See
+    /// [`Self::select_by_completion_time`].
+    ///
+    /// Falls back to requested-time ranging on timeline layout v1, which records
+    /// no completion times.
+    pub fn completed_actions_in_completion_time_range(
+        actions: &[Action],
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
+        let mut selector =
+            Self::actions_in_range(actions, &[State::Completed], hudi_configs, start, end)?;
+        selector.range_on_completion_time = true;
+        Ok(selector)
+    }
+
+    /// Select `actions` in any of `states`.
+    ///
+    /// The all-states form exists so one listing of the timeline directory can
+    /// answer two questions: which commits completed, and where the active
+    /// timeline *starts*. The second needs pending instants too — archival never
+    /// moves past the oldest pending instant, so the earliest instant of any
+    /// state is the archival boundary, and taking it over completed instants
+    /// alone would place the boundary above a pending instant and let that
+    /// instant's files read as archived (i.e. as committed).
+    pub fn actions_in_range(
+        actions: &[Action],
+        states: &[State],
+        hudi_configs: Arc<HudiConfigs>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> Result<Self> {
         let timezone = Self::get_timezone_from_configs(&hudi_configs);
         let timeline_layout_version =
             Self::get_timeline_layout_version_from_configs(&hudi_configs)?;
@@ -191,9 +317,11 @@ impl TimelineSelector {
             timezone,
             start_datetime,
             end_datetime,
-            states: vec![State::Completed],
+            start_timestamp: start.map(str::to_string),
+            end_timestamp: end.map(str::to_string),
+            range_on_completion_time: false,
+            states: states.to_vec(),
             actions: actions.to_vec(),
-            include_archived: false,
             timeline_layout_version,
         })
     }
@@ -318,8 +446,73 @@ impl TimelineSelector {
 
     /// Select loaded instants based on the selector's properties.
     ///
-    /// Instants timestamps should be in the range from start (exclusive) to end (inclusive).
+    /// The range is `(start, end]`. Which timestamp it applies to depends on the
+    /// timeline layout — see [`Self::select_by_completion_time`].
     pub fn select(&self, timeline: &Timeline) -> Result<Vec<Instant>> {
+        if self.range_on_completion_time
+            && self.timeline_layout_version >= 2
+            && (self.start_timestamp.is_some() || self.end_timestamp.is_some())
+        {
+            return Ok(self.select_by_completion_time(timeline));
+        }
+        self.select_by_requested_time(timeline)
+    }
+
+    /// Range a layout-v2 timeline on **completion** time.
+    ///
+    /// A commit becomes visible when it completes, not when it was requested, so
+    /// that is what an incremental window has to bound. Hudi 1.x does the same:
+    /// `CompletionTimeQueryViewV2.getInstantTimes` filters an
+    /// `instantTime -> completionTime` map by the window.
+    ///
+    /// Ranging on the requested time instead — which this did — silently skips
+    /// any commit requested before the window that completed inside it. That is
+    /// the normal shape of a concurrent or simply slow write, and a consumer that
+    /// advances its checkpoint by completion time never comes back for the commit
+    /// it missed.
+    ///
+    /// Linear rather than binary: `completed_commits` is sorted by requested
+    /// time, and completion order does not follow it — that reordering is the
+    /// whole point. Java scans its map for the same reason. The active timeline
+    /// is bounded by `hoodie.keep.min/max.commits`, so this is a short scan.
+    ///
+    /// Commits archived below the active timeline cannot be considered at all;
+    /// `Table::warn_if_window_predates_active_timeline` reports that shortfall.
+    fn select_by_completion_time(&self, timeline: &Timeline) -> Vec<Instant> {
+        timeline
+            .completed_commits
+            .iter()
+            .filter(|instant| {
+                // A completed layout-v2 instant always carries a completion time
+                // (it is the second half of its file name). Falling back to the
+                // requested time keeps a malformed one in range-by-requested-time
+                // rather than dropping it silently.
+                let effective = instant
+                    .completion_timestamp
+                    .as_deref()
+                    .unwrap_or(instant.timestamp.as_str());
+                if let Some(start) = self.start_timestamp.as_deref()
+                    && effective <= start
+                {
+                    return false;
+                }
+                if let Some(end) = self.end_timestamp.as_deref()
+                    && effective > end
+                {
+                    return false;
+                }
+                self.should_include_action(&instant.action)
+                    && self.should_include_state(&instant.state)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Range on the requested time, by binary search over the sorted vector.
+    ///
+    /// Correct for layout v1, which records no completion timestamps at all —
+    /// Hudi's own `CompletionTimeQueryViewV1` is in the same position.
+    fn select_by_requested_time(&self, timeline: &Timeline) -> Result<Vec<Instant>> {
         let time_pruned_instants = if let Some(start) = self.start_datetime {
             // Find first instant > start using binary search
             let start_pos = timeline
@@ -531,9 +724,11 @@ mod tests {
             timezone: "UTC".to_string(),
             start_datetime,
             end_datetime,
+            start_timestamp: None,
+            end_timestamp: None,
+            range_on_completion_time: false,
             states: states.to_vec(),
             actions: actions.to_vec(),
-            include_archived: false,
             timeline_layout_version: 1, // Default to layout v1 for tests
         }
     }
@@ -617,6 +812,83 @@ mod tests {
         timeline
     }
 
+    /// Regression test: a layout-v2 incremental window bounds COMPLETION times.
+    ///
+    /// It used to bound requested times, which silently skipped any commit
+    /// requested before the window that completed inside it — the normal shape of
+    /// a slow or contended write. Both halves matter: the commit that only
+    /// completion-time bounds admit must be returned, and the commit that only
+    /// requested-time bounds would admit must not be.
+    #[tokio::test]
+    async fn test_completion_time_range_admits_by_completion_not_request() {
+        fn instant(requested: &str, completed: &str) -> Instant {
+            Instant {
+                timestamp: requested.to_string(),
+                completion_timestamp: Some(completed.to_string()),
+                action: Action::Commit,
+                state: State::Completed,
+                epoch_millis: Instant::parse_datetime(requested, "UTC")
+                    .unwrap()
+                    .timestamp_millis(),
+            }
+        }
+
+        // `early` was requested before the window and completed inside it;
+        // `late` was requested inside the window and completed after it.
+        let early = instant("20240101120000000", "20240101123000000");
+        let late = instant("20240101124000000", "20240101130000000");
+
+        let configs = Arc::new(HudiConfigs::new([
+            (HudiTableConfig::BasePath.as_ref(), "file:///tmp/t"),
+            (HudiTableConfig::TimelineLayoutVersion.as_ref(), "2"),
+        ]));
+        let storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let mut timeline = TimelineBuilder::new(configs.clone(), storage)
+            .build()
+            .await
+            .unwrap();
+        timeline.completed_commits = vec![early.clone(), late.clone()];
+
+        let window = TimelineSelector::completed_actions_in_completion_time_range(
+            &[Action::Commit],
+            configs.clone(),
+            Some("20240101122000000"),
+            Some("20240101125000000"),
+        )
+        .unwrap();
+        let selected: Vec<String> = window
+            .select(&timeline)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.timestamp)
+            .collect();
+        assert_eq!(
+            selected,
+            vec![early.timestamp.clone()],
+            "the window admits the commit that COMPLETED inside it, and only that one"
+        );
+
+        // The same bounds read as requested times would have picked the other one.
+        let by_request = TimelineSelector::completed_actions_in_range(
+            &[Action::Commit],
+            configs,
+            Some("20240101122000000"),
+            Some("20240101125000000"),
+        )
+        .unwrap();
+        let by_request: Vec<String> = by_request
+            .select(&timeline)
+            .unwrap()
+            .into_iter()
+            .map(|i| i.timestamp)
+            .collect();
+        assert_eq!(
+            by_request,
+            vec![late.timestamp],
+            "requested-time bounds pick the other commit — which is the bug"
+        );
+    }
+
     #[tokio::test]
     async fn test_select_no_instants() {
         let timeline = create_test_timeline().await;
@@ -627,8 +899,10 @@ mod tests {
             states: vec![State::Completed, State::Requested],
             start_datetime: None,
             end_datetime: None,
+            start_timestamp: None,
+            end_timestamp: None,
+            range_on_completion_time: false,
             timezone: "UTC".to_string(),
-            include_archived: false,
             timeline_layout_version: 1,
         };
         assert!(selector.select(&timeline).unwrap().is_empty());
@@ -639,12 +913,14 @@ mod tests {
         end: Option<&str>,
     ) -> TimelineSelector {
         TimelineSelector {
+            start_timestamp: None,
+            end_timestamp: None,
+            range_on_completion_time: false,
             states: vec![State::Completed],
             actions: vec![Action::Commit, Action::ReplaceCommit],
             start_datetime: start.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             end_datetime: end.map(|s| Instant::parse_datetime(s, "UTC").unwrap()),
             timezone: "UTC".to_string(),
-            include_archived: false,
             timeline_layout_version: 1,
         }
     }
@@ -656,9 +932,11 @@ mod tests {
             timezone: "UTC".to_string(),
             start_datetime: None,
             end_datetime: None,
+            start_timestamp: None,
+            end_timestamp: None,
+            range_on_completion_time: false,
             states: vec![State::Completed],
             actions: vec![Action::DeltaCommit],
-            include_archived: false,
             timeline_layout_version: 1,
         };
 
@@ -684,9 +962,11 @@ mod tests {
             timezone: "UTC".to_string(),
             start_datetime: None,
             end_datetime: None,
+            start_timestamp: None,
+            end_timestamp: None,
+            range_on_completion_time: false,
             states: vec![State::Completed],
             actions: vec![Action::DeltaCommit],
-            include_archived: false,
             timeline_layout_version: 2,
         };
 
@@ -712,9 +992,11 @@ mod tests {
             timezone: "UTC".to_string(),
             start_datetime: None,
             end_datetime: None,
+            start_timestamp: None,
+            end_timestamp: None,
+            range_on_completion_time: false,
             states: vec![State::Inflight],
             actions: vec![Action::DeltaCommit],
-            include_archived: false,
             timeline_layout_version: 2,
         };
 
@@ -777,5 +1059,72 @@ mod tests {
             &["20240103153020999"]
         );
         Ok(())
+    }
+
+    /// The property a window cannot have: a set with a hole in it.
+    ///
+    /// The metadata table's valid-instant set excludes a *pending* data instant
+    /// while including instants on either side. Any bounded range that admits
+    /// both neighbours necessarily admits the pending one too, so this is the
+    /// test that separates the two representations rather than merely exercising
+    /// the new constructor.
+    #[test]
+    fn an_exact_match_set_can_exclude_an_instant_between_two_it_admits() {
+        let range = InstantRange::exact_match(["20250101000000000", "20250103000000000"], "UTC");
+
+        assert!(range.is_in_range("20250101000000000", "UTC").unwrap());
+        assert!(range.is_in_range("20250103000000000", "UTC").unwrap());
+        assert!(
+            !range.is_in_range("20250102000000000", "UTC").unwrap(),
+            "the instant between two admitted ones must be excluded -- this is \
+             exactly what a bounded range cannot express"
+        );
+
+        // And the equivalent window really would admit it, which is what makes
+        // the assertion above meaningful rather than trivially true.
+        let window =
+            InstantRange::within_open_closed("20241231000000000", "20250103000000000", "UTC");
+        assert!(
+            window.is_in_range("20250102000000000", "UTC").unwrap(),
+            "a window covering both endpoints admits the hole, by construction"
+        );
+    }
+
+    /// Membership ignores bounds entirely, as Java's EXACT_MATCH does.
+    #[test]
+    fn an_exact_match_set_admits_an_instant_no_window_would() {
+        // An instant from outside the data timeline -- a metadata-only indexing
+        // delta commit -- is admitted purely because it is in the set.
+        let range = InstantRange::exact_match(["00000000000000000"], "UTC");
+        assert!(range.is_in_range("00000000000000000", "UTC").unwrap());
+        assert!(range.is_exact_match());
+    }
+
+    /// The lexicographic predicate must agree with the parsing one, since the
+    /// log-block gate falls back to it for instants that will not parse.
+    #[test]
+    fn both_predicates_agree_on_an_exact_match_set() {
+        let range = InstantRange::exact_match(["20250101000000000"], "UTC");
+        for (instant, expected) in [("20250101000000000", true), ("20250102000000000", false)] {
+            assert_eq!(
+                range.is_in_range(instant, "UTC").unwrap(),
+                expected,
+                "parsing predicate disagreed on {instant}"
+            );
+            assert_eq!(
+                range.is_in_range_lexicographic(instant),
+                expected,
+                "lexicographic predicate disagreed on {instant}"
+            );
+        }
+    }
+
+    /// An empty set admits nothing. A range that silently admitted everything
+    /// when handed no instants would turn a filter into a no-op.
+    #[test]
+    fn an_empty_exact_match_set_admits_nothing() {
+        let range = InstantRange::exact_match(Vec::<String>::new(), "UTC");
+        assert!(!range.is_in_range("20250101000000000", "UTC").unwrap());
+        assert!(!range.is_in_range_lexicographic("20250101000000000"));
     }
 }

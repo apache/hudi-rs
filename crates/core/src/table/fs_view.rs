@@ -49,6 +49,22 @@ pub struct FileSystemView {
     partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
 }
 
+/// A metadata table together with the instants whose log blocks it may read.
+///
+/// One parameter rather than two, because the two are only ever meaningful
+/// together. Passed separately, a metadata table with no valid-instant set fell
+/// back to an empty one -- which admits *no* metadata log blocks, the strongest
+/// filtering there is, reached through an argument that reads as "no filtering".
+/// That state now cannot be written down.
+///
+/// The set is built by the data table, which holds both timelines, and handed in
+/// because this view holds only the metadata one.
+#[derive(Clone, Copy)]
+pub(crate) struct MetadataListing<'a> {
+    pub table: &'a Table,
+    pub valid_instants: &'a std::collections::HashSet<String>,
+}
+
 impl FileSystemView {
     pub(crate) fn configured_base_file_format(&self) -> Result<Option<BaseFileFormatValue>> {
         Ok(BaseFileFormatValue::from_configs(&self.hudi_configs)?)
@@ -176,7 +192,13 @@ impl FileSystemView {
         for mut fg in file_groups {
             if let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) {
                 let relative_path = match fsl.base_file_relative_path() {
-                    Ok(path) => path,
+                    // No base file means no parquet footer to prune on; the
+                    // slice's records are all in its log files.
+                    Ok(None) => {
+                        retained.push(fg);
+                        continue;
+                    }
+                    Ok(Some(path)) => path,
                     Err(e) => {
                         log::warn!(
                             "Cannot get base file path for pruning: {e}. Including file group."
@@ -206,7 +228,9 @@ impl FileSystemView {
                 };
 
                 if file_pruner.should_include(&col_stats) {
-                    fsl.base_file.file_metadata = Some(file_metadata);
+                    if let Some(base_file) = fsl.base_file.as_mut() {
+                        base_file.file_metadata = Some(file_metadata);
+                    }
                     fsl.base_file_column_stats = Some(col_stats);
                     retained.push(fg);
                 } else {
@@ -269,20 +293,25 @@ impl FileSystemView {
     /// * `file_pruner` - Filters files based on column statistics
     /// * `table_schema` - Table schema for statistics extraction
     /// * `timeline_view` - The timeline view containing query context
-    /// * `metadata_table` - Optional metadata table instance for file listing
+    /// * `metadata_table` - Metadata table to list from, with the instants whose
+    ///   log blocks it may read, or [`None`] to list from storage
     pub(crate) async fn get_file_slices(
         &self,
         partition_pruner: &PartitionPruner,
         file_pruner: &FilePruner,
         table_schema: &Schema,
         timeline_view: &TimelineView,
-        metadata_table: Option<&Table>,
+        metadata_table: Option<MetadataListing<'_>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
-        let files_partition_records = if let Some(mdt) = metadata_table {
-            Some(mdt.fetch_files_partition_records(partition_pruner).await?)
-        } else {
-            None
+        let files_partition_records = match metadata_table {
+            Some(listing) => Some(
+                listing
+                    .table
+                    .fetch_files_partition_records(partition_pruner, listing.valid_instants)
+                    .await?,
+            ),
+            None => None,
         };
 
         self.load_file_groups(
@@ -477,7 +506,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a079bdb3-731c-4894-b855-abfcd6921007-0"]);
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
@@ -517,7 +552,13 @@ mod tests {
 
         assert!(!file_slices.is_empty());
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
             assert!(metadata.byte_size > 0);
             assert!(metadata.num_records > 0);
@@ -549,7 +590,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["ebcb261d-62d3-4895-90ec-5b3c9622dff4-0"]);
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
@@ -775,7 +822,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(file_ids, vec!["a22e8257-e249-45e9-ba46-115bc85adcba-0"]);
         for fsl in file_slices.iter() {
-            let metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+            let metadata = fsl
+                .base_file
+                .as_ref()
+                .unwrap()
+                .file_metadata
+                .as_ref()
+                .unwrap();
             assert!(metadata.size > 0);
         }
     }
@@ -925,6 +978,17 @@ mod tests {
         let file_pruner = FilePruner::empty();
         let table_schema = hudi_table.get_schema().await.unwrap();
         let metadata_table = hudi_table.get_or_init_metadata_table().await.unwrap();
+        // The real set, not an empty one. Passing no set used to be possible and
+        // meant "admit no metadata log blocks", so this test could pass while
+        // reading a metadata table it had filtered down to nothing.
+        let valid_instants = hudi_table
+            .valid_instant_timestamps(metadata_table)
+            .await
+            .unwrap();
+        assert!(
+            !valid_instants.is_empty(),
+            "the fixture must yield a non-empty valid-instant set, or this reads nothing"
+        );
 
         let file_slices = hudi_table
             .file_system_view
@@ -933,7 +997,10 @@ mod tests {
                 &file_pruner,
                 &table_schema,
                 &timeline_view,
-                Some(metadata_table),
+                Some(MetadataListing {
+                    table: metadata_table,
+                    valid_instants: &valid_instants,
+                }),
                 None,
             )
             .await
@@ -994,7 +1061,13 @@ mod tests {
 
         assert_eq!(retained.len(), 1);
         let fsl = retained[0].get_file_slice_as_of(&as_of).unwrap();
-        let file_metadata = fsl.base_file.file_metadata.as_ref().unwrap();
+        let file_metadata = fsl
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
         assert!(file_metadata.size > 0);
         assert!(file_metadata.num_records > 0);
         assert!(fsl.base_file_column_stats.is_some());

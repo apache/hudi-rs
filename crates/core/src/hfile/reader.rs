@@ -29,11 +29,12 @@ use crate::hfile::error::{HFileError, Result};
 use crate::hfile::key::{Key, KeyValue, Utf8Key, compare_keys};
 use crate::hfile::proto::InfoProto;
 use crate::hfile::record::HFileRecord;
-use crate::hfile::trailer::HFileTrailer;
+use crate::hfile::trailer::{HFileTrailer, TRAILER_SIZE};
 use crate::storage::Storage;
+use crate::storage::reader::LogBlockFetcher;
 use apache_avro::Schema as AvroSchema;
 use prost::Message;
-use std::cell::OnceCell;
+use std::sync::OnceLock;
 
 /// Magic bytes indicating protobuf format in file info block
 const PBUF_MAGIC: &[u8; 4] = b"PBUF";
@@ -70,10 +71,98 @@ const FILE_INFO_MIN_RECORD_KEY: &str = "minRecordKey";
 /// File info key for max record key
 const FILE_INFO_MAX_RECORD_KEY: &str = "maxRecordKey";
 
+/// The exclusive upper bound of everything beginning with `prefix`.
+///
+/// `b"ab"` bounds at `b"ac"`. `None` when the prefix is all `0xFF`, since then
+/// nothing sorts above it and the caller must take the tail instead of a range.
+fn prefix_upper_bound(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut upper = prefix.to_vec();
+    while let Some(last) = upper.pop() {
+        if last != u8::MAX {
+            upper.push(last + 1);
+            return Some(upper);
+        }
+    }
+    None
+}
+
+/// Where the decoder reads bytes from.
+///
+/// `Whole` is the file already in memory, which is what an HFile arriving as a
+/// log block's content is. `Ranged` holds only the section from
+/// `load_on_open_data_offset` to the end of the file, which carries the index,
+/// the file info and the trailer; data blocks are fetched when they are read,
+/// so peak memory tracks what is being read rather than the file.
+enum Source {
+    Whole(Vec<u8>),
+    Ranged {
+        fetcher: LogBlockFetcher,
+        /// `[tail_start, file_len)`, resident for the life of the reader.
+        tail: bytes::Bytes,
+        tail_start: usize,
+        file_len: u64,
+        /// Bytes per fetch, so index levels are bounded like data blocks are.
+        window_budget: u64,
+    },
+}
+
+impl Source {
+    /// Bytes from `offset` to the end of the resident region.
+    ///
+    /// The load-on-open blocks are self-describing: a caller reads the length
+    /// out of the block header rather than being told one, so this hands back
+    /// an open-ended slice rather than an exact range.
+    fn metadata_at(&self, offset: usize) -> Result<&[u8]> {
+        match self {
+            Source::Whole(bytes) => bytes.get(offset..).ok_or_else(|| {
+                HFileError::InvalidFormat(format!(
+                    "offset {offset} is past the end of a {}-byte HFile",
+                    bytes.len()
+                ))
+            }),
+            Source::Ranged {
+                tail, tail_start, ..
+            } => {
+                let relative = offset.checked_sub(*tail_start).ok_or_else(|| {
+                    HFileError::InvalidFormat(format!(
+                        "offset {offset} is below the resident section starting at {tail_start}"
+                    ))
+                })?;
+                tail.get(relative..).ok_or_else(|| {
+                    HFileError::InvalidFormat(format!(
+                        "offset {offset} is past the resident section of {} bytes",
+                        tail.len()
+                    ))
+                })
+            }
+        }
+    }
+
+    /// An exact range, when it is already resident. A ranged source must fetch
+    /// its data blocks instead, which is asynchronous, so it refuses here
+    /// rather than reading the wrong bytes.
+    fn resident_range(&self, offset: usize, size: usize) -> Result<&[u8]> {
+        match self {
+            Source::Whole(bytes) => bytes.get(offset..offset + size).ok_or_else(|| {
+                HFileError::InvalidFormat(format!(
+                    "range {offset}..{} is past the end of a {}-byte HFile",
+                    offset + size,
+                    bytes.len()
+                ))
+            }),
+            Source::Ranged { .. } => Err(HFileError::InvalidFormat(
+                "a ranged HFile reader fetches data blocks asynchronously; \
+                 this path needs the file to be resident"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
 /// HFile reader that supports sequential reads and seeks.
 pub struct HFileReader {
-    /// Raw file bytes
-    bytes: Vec<u8>,
+    /// Where bytes come from.
+    source: Source,
     /// Parsed trailer
     trailer: HFileTrailer,
     /// Compression codec from trailer
@@ -87,7 +176,7 @@ pub struct HFileReader {
     /// Last key in the file
     last_key: Option<Key>,
     /// Cached Avro schema (parsed lazily from file info)
-    cached_schema: OnceCell<AvroSchema>,
+    cached_schema: OnceLock<AvroSchema>,
     /// Current cursor position
     cursor: Cursor,
     /// Currently loaded data block
@@ -113,24 +202,27 @@ impl HFileReader {
     /// Create a new HFile reader from raw bytes.
     pub fn new(bytes: Vec<u8>) -> Result<Self> {
         let trailer = HFileTrailer::read(&bytes)?;
-        let codec = trailer.compression_codec;
+        let mut reader = Self::with_source(Source::Whole(bytes), trailer);
+        reader.initialize_metadata()?;
+        Ok(reader)
+    }
 
-        let mut reader = Self {
-            bytes,
+    /// A reader with its metadata not yet parsed.
+    fn with_source(source: Source, trailer: HFileTrailer) -> Self {
+        let codec = trailer.compression_codec;
+        Self {
+            source,
             trailer,
             codec,
             data_block_index: BTreeMap::new(),
             meta_block_index: BTreeMap::new(),
             file_info: BTreeMap::new(),
             last_key: None,
-            cached_schema: OnceCell::new(),
+            cached_schema: OnceLock::new(),
             cursor: Cursor::default(),
             current_block: None,
             current_block_entry: None,
-        };
-
-        reader.initialize_metadata()?;
-        Ok(reader)
+        }
     }
 
     /// Open an HFile from storage.
@@ -156,36 +248,405 @@ impl HFileReader {
         Self::new(bytes.to_vec())
     }
 
+    /// Open the file whole when it is at most `whole_read_max_size` bytes, and in
+    /// ranges when it is larger.
+    ///
+    /// Mirrors `HFileReaderFactory.createInputStream`, which reads the file whole
+    /// below `hoodie.metadata.file.cache.max.size.mb` and opens a seekable stream
+    /// above it. Both directions matter, measured locally on generated HFiles: a
+    /// ranged point lookup is 2.7x slower than a whole read at 8 KB, because a
+    /// `head` plus a trailer range plus a load-on-open range are three round trips
+    /// where one would do, and 25x faster at 512 MB, because it pays for the blocks
+    /// it needs rather than for every byte.
+    ///
+    /// `known_file_size` skips the size lookup when the caller already has it. When
+    /// it does not, the size comes from the streaming reader that the ranged path
+    /// would open anyway, so the decision costs no request of its own.
+    pub async fn open_sized(
+        storage: &Storage,
+        relative_path: &str,
+        whole_read_max_size: u64,
+        known_file_size: Option<u64>,
+    ) -> Result<Self> {
+        if let Some(size) = known_file_size {
+            return if size <= whole_read_max_size {
+                Self::open(storage, relative_path).await
+            } else {
+                Self::open_ranged(storage, relative_path).await
+            };
+        }
+        // Zero means never whole, so the size cannot change the outcome.
+        if whole_read_max_size == 0 {
+            return Self::open_ranged(storage, relative_path).await;
+        }
+        let reader = storage
+            .get_streaming_storage_reader(relative_path)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!("Failed to open HFile {relative_path}: {e:?}"))
+            })?;
+        if reader.file_len() <= whole_read_max_size {
+            return Self::open(storage, relative_path).await;
+        }
+        Self::open_ranged_with(storage, relative_path, reader).await
+    }
+
+    /// Open an HFile without holding it.
+    ///
+    /// Two ranged reads before any data is touched: the trailer, which is the
+    /// final [`TRAILER_SIZE`] bytes, then the load-on-open section it points at,
+    /// which carries the index and the file info. Data blocks are read later,
+    /// through [`Self::read_records_batched`].
+    pub async fn open_ranged(storage: &Storage, relative_path: &str) -> Result<Self> {
+        let reader = storage
+            .get_streaming_storage_reader(relative_path)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!("Failed to open HFile {relative_path}: {e:?}"))
+            })?;
+        Self::open_ranged_with(storage, relative_path, reader).await
+    }
+
+    /// Open in ranges from a storage reader already in hand.
+    ///
+    /// Split out so a caller that needed the file's length to decide between
+    /// whole and ranged does not pay a second `head` for it.
+    async fn open_ranged_with(
+        storage: &Storage,
+        relative_path: &str,
+        reader: crate::storage::reader::StorageReader,
+    ) -> Result<Self> {
+        let file_len = reader.file_len();
+        let fetcher = reader.block_fetcher();
+
+        let trailer_size = TRAILER_SIZE as u64;
+        if file_len < trailer_size {
+            return Err(HFileError::InvalidFormat(format!(
+                "File too small for HFile trailer: {file_len} bytes, need at least {TRAILER_SIZE}"
+            )));
+        }
+
+        // The trailer occupies exactly the last TRAILER_SIZE bytes, so it parses
+        // from that slice alone.
+        let trailer_bytes = fetcher
+            .read_content(file_len - trailer_size, trailer_size)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!(
+                    "Failed to read the trailer of HFile {relative_path}: {e:?}"
+                ))
+            })?;
+        let trailer = HFileTrailer::read(&trailer_bytes)?;
+
+        let tail_start = trailer.load_on_open_data_offset;
+        // A trailer is file data, so its offsets are not trustworthy. Left
+        // unchecked, the length below underflows and asks for a nonsense range.
+        if tail_start > file_len {
+            return Err(HFileError::InvalidFormat(format!(
+                "HFile {relative_path} has a load-on-open offset of {tail_start}, \
+                 past the end of its {file_len} bytes"
+            )));
+        }
+        let tail = fetcher
+            .read_content(tail_start, file_len - tail_start)
+            .await
+            .map_err(|e| {
+                HFileError::InvalidFormat(format!(
+                    "Failed to read the load-on-open section of HFile {relative_path}: {e:?}"
+                ))
+            })?;
+
+        let window_budget = crate::storage::reader::stream_window_size(&storage.hudi_configs)
+            .map_err(|e| HFileError::InvalidFormat(format!("{e}")))?;
+        let mut reader = Self::with_source(
+            Source::Ranged {
+                fetcher,
+                tail,
+                tail_start: tail_start as usize,
+                file_len,
+                window_budget,
+            },
+            trailer,
+        );
+        reader.initialize_metadata_ranged().await?;
+        Ok(reader)
+    }
+
+    /// Group consecutive blocks into runs that each stay under `budget`.
+    ///
+    /// A run is read in one request, so this bounds both peak memory and the
+    /// number of round trips. A block larger than the budget goes out alone
+    /// rather than being split: a block has to be whole to decode.
+    pub fn plan_windows(entries: &[BlockIndexEntry], budget: u64) -> Vec<Vec<BlockIndexEntry>> {
+        let mut windows: Vec<Vec<BlockIndexEntry>> = Vec::new();
+        let mut current: Vec<BlockIndexEntry> = Vec::new();
+        let mut current_bytes: u64 = 0;
+
+        for entry in entries {
+            let len = entry.size as u64;
+            if !current.is_empty() && current_bytes.saturating_add(len) > budget {
+                windows.push(std::mem::take(&mut current));
+                current_bytes = 0;
+            }
+            current_bytes = current_bytes.saturating_add(len);
+            current.push(entry.clone());
+        }
+        if !current.is_empty() {
+            windows.push(current);
+        }
+        windows
+    }
+
+    /// The window budget a ranged reader was opened with.
+    pub fn window_budget(&self) -> Option<u64> {
+        match &self.source {
+            Source::Ranged { window_budget, .. } => Some(*window_budget),
+            Source::Whole(_) => None,
+        }
+    }
+
+    /// Length of the whole file, known without reading it.
+    pub fn file_len(&self) -> u64 {
+        match &self.source {
+            Source::Ranged { file_len, .. } => *file_len,
+            Source::Whole(bytes) => bytes.len() as u64,
+        }
+    }
+
+    /// The records of one data block, from a resident source.
+    ///
+    /// The synchronous counterpart to [`Self::read_records_batched`], which needs a
+    /// ranged source because it fetches. An HFile arriving as a log block's content
+    /// is already in memory, so a caller that has narrowed the blocks with
+    /// [`Self::blocks_for_predicate`] wants to parse just those rather than walk the
+    /// file — the saving is parsing and decompression, not I/O.
+    pub fn records_in_block(&self, entry: &BlockIndexEntry) -> Result<Vec<HFileRecord>> {
+        let block = self.read_block_at(entry.offset as usize, entry.size as usize)?;
+        if block.block_type() != HFileBlockType::Data {
+            return Err(HFileError::UnexpectedBlockType {
+                expected: HFileBlockType::Data.to_string(),
+                actual: block.block_type().to_string(),
+            });
+        }
+        let data_block = DataBlock::from_block(block);
+        // The shared helper, not a second copy of it: two places building an
+        // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
+        // would drift on what a record key is.
+        Ok(data_block
+            .iter()
+            .map(|kv| Self::key_value_to_record(&kv))
+            .collect())
+    }
+
+    /// The data blocks a key predicate can be satisfied from.
+    ///
+    /// Over-includes, like the two functions it dispatches to, so the caller must
+    /// still filter the records it gets back.
+    pub fn blocks_for_predicate(
+        &self,
+        predicate: &crate::file_group::base_file::reader::KeyPredicate,
+    ) -> Vec<BlockIndexEntry> {
+        use crate::file_group::base_file::reader::KeyPredicate;
+        match predicate {
+            KeyPredicate::Keys(keys) => {
+                let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+                self.blocks_for_keys(&refs)
+            }
+            KeyPredicate::Prefixes(prefixes) => {
+                // Union the prefixes, deduplicated by offset and back in file
+                // order so the result still coalesces.
+                let mut selected: BTreeMap<u64, BlockIndexEntry> = BTreeMap::new();
+                for prefix in prefixes {
+                    for entry in self.blocks_for_prefix(prefix) {
+                        selected.insert(entry.offset, entry);
+                    }
+                }
+                selected.into_values().collect()
+            }
+        }
+    }
+
+    /// The data blocks that can contain any of `keys`.
+    ///
+    /// Pure index arithmetic, no I/O: for each key, the entry with the greatest
+    /// index key not exceeding it, which is what `find_block_for_key` does for a
+    /// single key. Deduplicated and returned in file order, so the result can go
+    /// straight to [`Self::read_records_batched`] and coalesce.
+    ///
+    /// A block's index key is a *lower bound* on its first real key, since the
+    /// writer may shorten it. So this over-includes rather than under-includes: a
+    /// selected block may turn out to hold nothing the caller asked for, which
+    /// costs one block read. `SeekResult::BeforeBlockFirstKey` is the sync path
+    /// naming the same case.
+    ///
+    /// One case needs the block *before* the selected one as well. Row keys are
+    /// not required to be unique, and when a key's copies straddle a block
+    /// boundary HBase's midpoint falls back to the right-hand cell, so the
+    /// separator equals the key itself. Selecting only the entry at or below the
+    /// key would then take the later block and drop the copies in the earlier
+    /// one. So when the probe lands exactly on a separator, the preceding block
+    /// is taken too — one extra block read on an exact hit, against silently
+    /// losing rows.
+    pub fn blocks_for_keys(&self, keys: &[&str]) -> Vec<BlockIndexEntry> {
+        let mut selected: BTreeMap<u64, BlockIndexEntry> = BTreeMap::new();
+        for key in keys {
+            // A key too long for the length prefix cannot be compared against
+            // the index, so it selects every block rather than none: a wrong
+            // answer is worse than a slow one.
+            let Some(probe) = Key::from_content(key.as_bytes()) else {
+                return self.data_block_entries();
+            };
+            // No entry at or below the key means every block starts above it, so
+            // no block can hold it. Selecting nothing is correct, not a miss.
+            let mut at_or_below = self.data_block_index.range(..=probe.clone()).rev();
+            if let Some((index_key, entry)) = at_or_below.next() {
+                selected.insert(entry.offset, entry.clone());
+                // An exact hit on a separator means the key may also end the
+                // previous block; see the note above on non-unique row keys.
+                if index_key == &probe
+                    && let Some((_, previous)) = at_or_below.next()
+                {
+                    selected.insert(previous.offset, previous.clone());
+                }
+            }
+        }
+        selected.into_values().collect()
+    }
+
+    /// The data blocks that can contain keys beginning with `prefix`.
+    ///
+    /// The block holding the prefix's lower bound, plus every block whose index
+    /// key sorts below the prefix's exclusive upper bound. Over-includes for the
+    /// same reason [`Self::blocks_for_keys`] does.
+    pub fn blocks_for_prefix(&self, prefix: &str) -> Vec<BlockIndexEntry> {
+        let Some(lower) = Key::from_content(prefix.as_bytes()) else {
+            return self.data_block_entries();
+        };
+        let mut selected: BTreeMap<u64, BlockIndexEntry> = BTreeMap::new();
+
+        // The block the prefix's first possible key falls in. Its index key sorts
+        // at or below the prefix, so `range(prefix..)` below would skip it.
+        if let Some((_, entry)) = self.data_block_index.range(..=lower.clone()).next_back() {
+            selected.insert(entry.offset, entry.clone());
+        }
+
+        match prefix_upper_bound(prefix.as_bytes()) {
+            // Every block that starts inside the prefix's span.
+            Some(upper) => {
+                // `upper` is never longer than the prefix, and an over-long
+                // prefix already returned above, so this cannot fail.
+                let upper = Key::from_content(&upper).unwrap_or_else(|| {
+                    unreachable!("an upper bound is never longer than its prefix")
+                });
+                for (_, entry) in self.data_block_index.range(lower..upper) {
+                    selected.insert(entry.offset, entry.clone());
+                }
+            }
+            // The prefix is all 0xFF, so nothing sorts above it: take the tail.
+            None => {
+                for (_, entry) in self.data_block_index.range(lower..) {
+                    selected.insert(entry.offset, entry.clone());
+                }
+            }
+        }
+        selected.into_values().collect()
+    }
+
+    /// What this reader has actually read from storage, or `None` for a resident
+    /// source, which reads nothing after construction.
+    ///
+    /// Reports what storage returned, not the ranges asked for. A seek is judged
+    /// on `bytes` rather than on the rows it returns; see `FetchCounts` for why
+    /// `calls` is not a round-trip count.
+    pub fn reads(&self) -> Option<&crate::storage::reader::FetchCounts> {
+        match &self.source {
+            Source::Ranged { fetcher, .. } => Some(fetcher.reads()),
+            Source::Whole(_) => None,
+        }
+    }
+
+    /// A clone of the fetcher, sharing this reader's counts. Lets a caller keep
+    /// measuring across a read it hands the reader off to, which `reads` — a
+    /// borrow — cannot.
+    pub fn reads_handle(&self) -> Option<crate::storage::reader::LogBlockFetcher> {
+        match &self.source {
+            Source::Ranged { fetcher, .. } => Some(fetcher.clone()),
+            Source::Whole(_) => None,
+        }
+    }
+
+    /// The data blocks in key order, each with the range it occupies, so a
+    /// caller can decide how many to read at once.
+    pub fn data_block_entries(&self) -> Vec<BlockIndexEntry> {
+        self.data_block_index.values().cloned().collect()
+    }
+
+    /// Decode the records of several data blocks, fetching their ranges in one
+    /// request. Peak memory is what `entries` covers, so the caller bounds it by
+    /// choosing how many blocks to pass.
+    pub async fn read_records_batched(
+        &self,
+        entries: &[BlockIndexEntry],
+    ) -> Result<Vec<HFileRecord>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let blocks = self.fetch_blocks(entries).await?;
+        let mut records = Vec::new();
+        for block in blocks {
+            if block.block_type() != HFileBlockType::Data {
+                return Err(HFileError::UnexpectedBlockType {
+                    expected: HFileBlockType::Data.to_string(),
+                    actual: block.block_type().to_string(),
+                });
+            }
+            let data_block = DataBlock::from_block(block);
+            for kv in data_block.iter() {
+                records.push(Self::key_value_to_record(&kv));
+            }
+        }
+        Ok(records)
+    }
+
     /// Initialize metadata by reading index blocks and file info.
     fn initialize_metadata(&mut self) -> Result<()> {
-        // Read the "load-on-open" section starting from load_on_open_data_offset
-        let start = self.trailer.load_on_open_data_offset as usize;
-
-        // Read root data index block
-        let (data_index, offset) = self.read_root_index_block(start)?;
-        self.data_block_index = data_index;
-
-        // Handle multi-level index if needed
+        let offset = self.read_root_index()?;
         if self.trailer.num_data_index_levels > 1 {
             self.load_multi_level_index()?;
         }
+        self.read_meta_and_file_info(offset)
+    }
 
-        // Read meta index block
+    /// As [`Self::initialize_metadata`], but the leaf index blocks of a
+    /// multi-level index are fetched rather than sliced. They live in the data
+    /// region, not the load-on-open section, so a ranged reader has to go back
+    /// to storage for them; every other step reads resident bytes.
+    async fn initialize_metadata_ranged(&mut self) -> Result<()> {
+        let offset = self.read_root_index()?;
+        if self.trailer.num_data_index_levels > 1 {
+            self.load_multi_level_index_batched().await?;
+        }
+        self.read_meta_and_file_info(offset)
+    }
+
+    /// Root data index. Returns the offset just past it.
+    fn read_root_index(&mut self) -> Result<usize> {
+        let start = self.trailer.load_on_open_data_offset as usize;
+        let (data_index, offset) = self.read_root_index_block(start)?;
+        self.data_block_index = data_index;
+        Ok(offset)
+    }
+
+    /// Meta index, file info, last key and the MVCC check: the rest of the
+    /// load-on-open section, all resident.
+    fn read_meta_and_file_info(&mut self, offset: usize) -> Result<()> {
         let (meta_index, offset) = self.read_meta_index_block(offset)?;
         self.meta_block_index = meta_index;
-
-        // Read file info block
         self.read_file_info_block(offset)?;
-
-        // Parse last key from file info
         if let Some(last_key_bytes) = self.file_info.get(FILE_INFO_LAST_KEY) {
             self.last_key = Some(Key::from_bytes(last_key_bytes.clone()));
         }
-
-        // Check MVCC timestamp support
-        self.check_mvcc_support()?;
-
-        Ok(())
+        self.check_mvcc_support()
     }
 
     /// Check if the file uses MVCC timestamps (not supported).
@@ -226,7 +687,7 @@ impl HFileReader {
         &self,
         start: usize,
     ) -> Result<(BTreeMap<Key, BlockIndexEntry>, usize)> {
-        let block = HFileBlock::parse(&self.bytes[start..], self.codec)?;
+        let block = HFileBlock::parse(self.source.metadata_at(start)?, self.codec)?;
         if block.block_type() != HFileBlockType::RootIndex {
             return Err(HFileError::UnexpectedBlockType {
                 expected: HFileBlockType::RootIndex.to_string(),
@@ -280,23 +741,84 @@ impl HFileReader {
             levels_remaining -= 1;
         }
 
-        // Build final index map from leaf entries
+        self.data_block_index = Self::index_from_leaf_entries(&current_entries);
+        Ok(())
+    }
+
+    /// Key-ordered index over leaf entries, each carrying the next entry's
+    /// first key so a seek knows where a block's range ends.
+    fn index_from_leaf_entries(entries: &[BlockIndexEntry]) -> BTreeMap<Key, BlockIndexEntry> {
         let mut index_map = BTreeMap::new();
-        for i in 0..current_entries.len() {
-            let entry = &current_entries[i];
-            let next_key = if i + 1 < current_entries.len() {
-                Some(current_entries[i + 1].first_key.clone())
-            } else {
-                None
-            };
+        for (i, entry) in entries.iter().enumerate() {
+            let next_key = entries.get(i + 1).map(|next| next.first_key.clone());
             index_map.insert(
                 entry.first_key.clone(),
                 BlockIndexEntry::new(entry.first_key.clone(), next_key, entry.offset, entry.size),
             );
         }
+        index_map
+    }
 
-        self.data_block_index = index_map;
+    /// The multi-level walk for a ranged source: one batched request per level
+    /// instead of one per leaf block, since `read_contents` coalesces ranges
+    /// that sit close together.
+    async fn load_multi_level_index_batched(&mut self) -> Result<()> {
+        let mut levels_remaining = self.trailer.num_data_index_levels - 1;
+        let mut current_entries: Vec<BlockIndexEntry> =
+            self.data_block_index.values().cloned().collect();
+
+        let budget = match &self.source {
+            Source::Ranged { window_budget, .. } => *window_budget,
+            Source::Whole(_) => {
+                return Err(HFileError::InvalidFormat(
+                    "the batched index walk needs a ranged HFile reader".to_string(),
+                ));
+            }
+        };
+
+        while levels_remaining > 0 {
+            let mut next_level_entries = Vec::new();
+            // A level can hold many leaf blocks, so it is read in runs under the
+            // same budget the data blocks use rather than all at once.
+            for window in Self::plan_windows(&current_entries, budget) {
+                let blocks = self.fetch_blocks(&window).await?;
+                for block in &blocks {
+                    next_level_entries.extend(self.parse_leaf_index_entries(&block.data)?);
+                }
+            }
+            current_entries = next_level_entries;
+            levels_remaining -= 1;
+        }
+
+        self.data_block_index = Self::index_from_leaf_entries(&current_entries);
         Ok(())
+    }
+
+    /// Fetch and parse several blocks in one request. Ranged sources only.
+    async fn fetch_blocks(&self, entries: &[BlockIndexEntry]) -> Result<Vec<HFileBlock>> {
+        // Resident: the bytes are already here, so a "fetch" is a slice.
+        let Source::Ranged { fetcher, .. } = &self.source else {
+            return entries
+                .iter()
+                .map(|e| {
+                    let bytes = self
+                        .source
+                        .resident_range(e.offset as usize, e.size as usize)?;
+                    HFileBlock::parse(bytes, self.codec)
+                })
+                .collect();
+        };
+        let ranges: Vec<std::ops::Range<u64>> = entries
+            .iter()
+            .map(|e| e.offset..e.offset + e.size as u64)
+            .collect();
+        let fetched = fetcher.read_contents(&ranges).await.map_err(|e| {
+            HFileError::InvalidFormat(format!("Failed to read HFile block ranges: {e:?}"))
+        })?;
+        fetched
+            .iter()
+            .map(|bytes| HFileBlock::parse(bytes, self.codec))
+            .collect()
     }
 
     /// Parse root index entries from block data.
@@ -421,7 +943,7 @@ impl HFileReader {
         &self,
         start: usize,
     ) -> Result<(BTreeMap<String, BlockIndexEntry>, usize)> {
-        let block = HFileBlock::parse(&self.bytes[start..], self.codec)?;
+        let block = HFileBlock::parse(self.source.metadata_at(start)?, self.codec)?;
         if block.block_type() != HFileBlockType::RootIndex {
             return Err(HFileError::UnexpectedBlockType {
                 expected: HFileBlockType::RootIndex.to_string(),
@@ -448,7 +970,7 @@ impl HFileReader {
 
     /// Read file info block.
     fn read_file_info_block(&mut self, start: usize) -> Result<()> {
-        let block = HFileBlock::parse(&self.bytes[start..], self.codec)?;
+        let block = HFileBlock::parse(self.source.metadata_at(start)?, self.codec)?;
         if block.block_type() != HFileBlockType::FileInfo {
             return Err(HFileError::UnexpectedBlockType {
                 expected: HFileBlockType::FileInfo.to_string(),
@@ -479,7 +1001,7 @@ impl HFileReader {
 
     /// Read a block at the given offset and size.
     fn read_block_at(&self, offset: usize, size: usize) -> Result<HFileBlock> {
-        HFileBlock::parse(&self.bytes[offset..offset + size], self.codec)
+        HFileBlock::parse(self.source.resident_range(offset, size)?, self.codec)
     }
 
     /// Get the number of key-value entries in the file.
@@ -514,6 +1036,19 @@ impl HFileReader {
     ///
     /// The schema is cached after the first successful parse.
     /// Returns `None` if no schema is present in the file info.
+    /// The Avro schema exactly as the writer stored it.
+    ///
+    /// Not the parsed schema's canonical form: canonicalising rewrites named-type
+    /// references and a decoder built from the result cannot resolve them.
+    pub fn avro_schema_json(&self) -> Result<Option<&str>> {
+        let Some(bytes) = self.file_info.get(FILE_INFO_SCHEMA) else {
+            return Ok(None);
+        };
+        std::str::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| HFileError::InvalidFormat(format!("Invalid UTF-8 in schema: {e}")))
+    }
+
     pub fn get_avro_schema(&self) -> Result<Option<&AvroSchema>> {
         // Check if schema exists in file info
         let schema_bytes = match self.file_info.get(FILE_INFO_SCHEMA) {
@@ -1111,6 +1646,98 @@ mod tests {
     fn read_test_hfile(filename: &str) -> Vec<u8> {
         let path = test_data_dir().join(filename);
         std::fs::read(&path).unwrap_or_else(|_| panic!("Failed to read test file: {path:?}"))
+    }
+
+    /// Storage rooted at the fixture directory, so a ranged read addresses the
+    /// fixtures by name.
+    /// Every HFile fixture in the repo, spanning one, two and three index levels.
+    pub(super) const ALL_FIXTURES: &[&str] = &[
+        "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile",
+        "hudi_1_0_hbase_2_4_9_16KB_GZ_20000.hfile",
+        "hudi_1_0_hbase_2_4_9_512KB_GZ_20000.hfile",
+        "hudi_1_0_hbase_2_4_9_64KB_NONE_5000.hfile",
+        "hudi_1_0_hbase_2_4_9_16KB_GZ_200_20_non_unique.hfile",
+        "hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile",
+        "hudi_1_0_hbase_2_4_13_1KB_GZ_20000_large_keys.hfile",
+        "hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile",
+        "hudi_1_0_hbase_2_4_9_no_entry.hfile",
+    ];
+
+    pub(super) fn fixture_storage() -> std::sync::Arc<Storage> {
+        let url =
+            url::Url::from_directory_path(std::fs::canonicalize(test_data_dir()).unwrap()).unwrap();
+        Storage::new_with_base_url(url).unwrap()
+    }
+
+    /// A trailer is file data, so its offsets are attacker- or corruption-
+    /// controlled. Taking a valid fixture's final trailer alone gives a file
+    /// whose `load_on_open_data_offset` points far past its own end, which is
+    /// what the length arithmetic in `open_ranged` must not be handed
+    /// unchecked: unguarded it underflows a `u64` and asks for a nonsense range.
+    #[tokio::test]
+    async fn a_load_on_open_offset_past_the_end_is_refused() -> Result<()> {
+        let whole = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let trailer_only = &whole[whole.len() - TRAILER_SIZE..];
+
+        let dir = std::env::temp_dir().join("hudi_rs_hfile_trailer_only_case");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = "trailer_only.hfile";
+        std::fs::write(dir.join(name), trailer_only).unwrap();
+
+        let url = url::Url::from_directory_path(std::fs::canonicalize(&dir).unwrap()).unwrap();
+        let storage = Storage::new_with_base_url(url).unwrap();
+
+        let message = match HFileReader::open_ranged(&storage, name).await {
+            Ok(_) => panic!("a load-on-open offset past the end must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("past the end of its"),
+            "expected the offset to be named as past the end, got: {message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Every fixture, read both ways, must yield identical records.
+    ///
+    /// This is the guard on the two multi-level index walks: the resident one
+    /// slices each leaf block, the ranged one fetches a level per request, and
+    /// nothing else forces them to agree. `..._deep_index` is the fixture with
+    /// more than one index level, so it is the one that exercises the split.
+    #[tokio::test]
+    async fn ranged_and_resident_reads_agree_on_every_fixture() -> Result<()> {
+        let fixtures = ALL_FIXTURES;
+        let storage = fixture_storage();
+
+        for name in fixtures {
+            let mut resident = HFileReader::new(read_test_hfile(name))?;
+            let expected = resident.collect_records()?;
+
+            let ranged = HFileReader::open_ranged(&storage, name).await?;
+            let entries = ranged.data_block_entries();
+            let actual = ranged.read_records_batched(&entries).await?;
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "{name}: ranged read returned {} records, resident read {}",
+                actual.len(),
+                expected.len()
+            );
+            assert_eq!(
+                actual, expected,
+                "{name}: records differ between the two reads"
+            );
+            assert_eq!(
+                ranged.num_entries(),
+                resident.num_entries(),
+                "{name}: trailer entry count differs"
+            );
+        }
+        Ok(())
     }
 
     #[test]
@@ -2533,6 +3160,442 @@ mod tests {
         assert!(
             results[5].1.is_none(),
             "Nonexistent key should not be found"
+        );
+    }
+}
+
+#[cfg(test)]
+mod key_pushdown_tests {
+    use super::*;
+
+    /// Fixtures with enough data blocks for selection to mean anything, and the
+    /// worst-case reduction each must still achieve. The metadata table's own
+    /// HFiles are deliberately absent: every one of them holds a single data
+    /// block, so selecting one of one is the whole file and no seek can be shown.
+    /// Budgets are set just above what the read currently costs, so widening
+    /// selection by even a block or two fails rather than fitting inside slack.
+    /// A budget of "less than the full scan" would pass on a selection of all but
+    /// one block.
+    const MULTI_BLOCK_FIXTURES: &[(&str, u64)] = &[
+        // (fixture, the most bytes a three-key seek may read)
+        ("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile", 52_000),
+        (
+            "hudi_1_0_hbase_2_4_13_1KB_GZ_10000_large_keys_deep_index.hfile",
+            600,
+        ),
+        // The writer shortens block index keys here, which is the case selection
+        // has to over-include rather than miss on.
+        (
+            "hudi_1_0_hbase_2_4_13_16KB_GZ_20000_fake_first_key.hfile",
+            3_200,
+        ),
+    ];
+
+    /// Read every record of a fixture, and what that cost.
+    async fn full_scan(path: &str) -> Result<(Vec<HFileRecord>, u64)> {
+        let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+        let entries = reader.data_block_entries();
+        let counts = reader.reads().expect("a ranged reader counts its reads");
+        let before = counts.bytes();
+        let records = reader.read_records_batched(&entries).await?;
+        Ok((records, counts.bytes() - before))
+    }
+
+    /// A key-set seek returns every key it asked for, and reads far less than a
+    /// full scan.
+    ///
+    /// Both halves matter and neither implies the other. Returning the right
+    /// records proves selection did not *miss* a block; reading fewer bytes
+    /// proves it actually narrowed rather than quietly selecting everything.
+    /// A test asserting only the records would pass on `data_block_entries()`.
+    #[tokio::test]
+    async fn a_key_seek_finds_its_keys_and_reads_less() -> Result<()> {
+        for (path, byte_budget) in MULTI_BLOCK_FIXTURES {
+            let (all, scan_bytes) = full_scan(path).await?;
+            assert!(
+                all.len() > 1000,
+                "{path}: the fixture must be large enough for selection to matter"
+            );
+
+            // First, middle and last, so the selected blocks are scattered rather
+            // than adjacent and cannot be coalesced into the whole file.
+            let keys: Vec<String> = [0, all.len() / 2, all.len() - 1]
+                .iter()
+                .map(|i| String::from_utf8_lossy(&all[*i].key).to_string())
+                .collect();
+            let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
+
+            let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+            let picked = reader.blocks_for_keys(&key_refs);
+            // Three keys touch at most six blocks, counting the boundary rule.
+            // "fewer than all" would pass on a selection of all but one.
+            assert!(
+                picked.len() <= 6,
+                "{path}: three keys must select at most six blocks, picked {} of {}",
+                picked.len(),
+                reader.data_block_entries().len()
+            );
+
+            let counts = reader.reads().unwrap();
+            let before = counts.bytes();
+            let got = reader.read_records_batched(&picked).await?;
+            let seek_bytes = counts.bytes() - before;
+
+            let found: std::collections::HashSet<&[u8]> =
+                got.iter().map(|r| r.key.as_slice()).collect();
+            for key in &key_refs {
+                assert!(
+                    found.contains(key.as_bytes()),
+                    "{path}: key {key:?} was in the file but not in the selected blocks"
+                );
+            }
+            assert!(
+                seek_bytes <= *byte_budget && seek_bytes < scan_bytes,
+                "{path}: seek read {seek_bytes} bytes, budget {byte_budget}, \
+                 full scan {scan_bytes}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A prefix seek returns every record carrying the prefix, and no record that
+    /// does not, after the caller filters what the over-included blocks bring.
+    #[tokio::test]
+    async fn a_prefix_seek_covers_every_matching_record() -> Result<()> {
+        for (path, _) in MULTI_BLOCK_FIXTURES {
+            let (all, scan_bytes) = full_scan(path).await?;
+
+            // A prefix taken from a real key by dropping its last two characters,
+            // so it matches a neighbourhood rather than the whole file. A short
+            // fixed prefix is not selective on every fixture: these keys share a
+            // long common head, and six characters of it match everything, which
+            // is why the narrowing assertion below is conditional.
+            let sample = String::from_utf8_lossy(&all[all.len() / 3].key).to_string();
+            let prefix = &sample[..sample.len().saturating_sub(2)];
+            let expected: Vec<&[u8]> = all
+                .iter()
+                .map(|r| r.key.as_slice())
+                .filter(|k| k.starts_with(prefix.as_bytes()))
+                .collect();
+            assert!(
+                !expected.is_empty(),
+                "{path}: prefix {prefix:?} must match something"
+            );
+
+            let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+            let picked = reader.blocks_for_prefix(prefix);
+            let counts = reader.reads().unwrap();
+            let before = counts.bytes();
+            let got = reader.read_records_batched(&picked).await?;
+            let seek_bytes = counts.bytes() - before;
+
+            let matched: Vec<&[u8]> = got
+                .iter()
+                .map(|r| r.key.as_slice())
+                .filter(|k| k.starts_with(prefix.as_bytes()))
+                .collect();
+            assert_eq!(
+                matched, expected,
+                "{path}: a prefix seek must cover every matching record, in order"
+            );
+            // Narrowing is only required of a prefix that is actually selective.
+            // One matching every record in the file has nothing to narrow, and
+            // reading the file is then the right answer rather than a failure.
+            if expected.len() < all.len() {
+                assert!(
+                    seek_bytes < scan_bytes,
+                    "{path}: prefix {prefix:?} matches {} of {} records, so the seek \
+                     must narrow, but it read {seek_bytes} bytes against a full scan's \
+                     {scan_bytes}",
+                    expected.len(),
+                    all.len()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Selection is exhaustive over the whole key space: for *every* key in the
+    /// file, the blocks selected for it must include one that holds it.
+    ///
+    /// This is what rules out the failure the design most fears — index bounds
+    /// that under-include, dropping a key that exists. A sampled key cannot rule
+    /// out an off-by-one bound; every key can.
+    ///
+    /// Run over **every** fixture, because the multi-level index walk is a second
+    /// population path for `data_block_index` and the one most likely to break
+    /// the lower-bound invariant. The fixtures span one, two and three levels.
+    ///
+    /// Each block is read once, up front, rather than once per key: at ~79,000
+    /// keys over ~5,900 blocks the per-key read made this the slowest test in the
+    /// crate by an order of magnitude, and it was checking the same thing.
+    #[tokio::test]
+    async fn no_key_in_any_fixture_is_missed_by_selection() -> Result<()> {
+        for path in tests::ALL_FIXTURES {
+            let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+            let entries = reader.data_block_entries();
+            if entries.is_empty() {
+                continue; // the empty fixture has no keys to seek to
+            }
+
+            // offset -> the keys that block holds, from one pass over the blocks.
+            let mut by_block: BTreeMap<u64, std::collections::HashSet<Vec<u8>>> = BTreeMap::new();
+            for entry in &entries {
+                let records = reader
+                    .read_records_batched(std::slice::from_ref(entry))
+                    .await?;
+                by_block.insert(entry.offset, records.into_iter().map(|r| r.key).collect());
+            }
+            let all_keys: Vec<Vec<u8>> = by_block.values().flatten().cloned().collect();
+            assert!(
+                !all_keys.is_empty(),
+                "{path}: the fixture must hold keys for this to check anything"
+            );
+
+            // Every key at once must reach every block, or a block is unreachable
+            // through selection and its records can never be read.
+            let owned: Vec<String> = all_keys
+                .iter()
+                .map(|k| String::from_utf8_lossy(k).to_string())
+                .collect();
+            let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+            assert_eq!(
+                reader.blocks_for_keys(&refs).len(),
+                entries.len(),
+                "{path}: selecting every key must select every block"
+            );
+
+            // And one key at a time, which is where an off-by-one bound shows up.
+            for (key, text) in all_keys.iter().zip(&owned) {
+                let picked = reader.blocks_for_keys(&[text.as_str()]);
+                assert!(
+                    !picked.is_empty() && picked.len() <= 2,
+                    "{path}: key {text:?} selected {} blocks; expected one, or two \
+                     when the probe lands exactly on a separator",
+                    picked.len()
+                );
+                assert!(
+                    picked.iter().any(|e| by_block[&e.offset].contains(key)),
+                    "{path}: key {text:?} exists but no selected block holds it"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A key that is exactly a block's index key selects that block **and** the
+    /// one before it.
+    ///
+    /// Not an optimisation lost: row keys need not be unique, and when a key's
+    /// copies straddle a block boundary the writer's separator equals the key, so
+    /// taking only the entry at or below it would drop the copies in the earlier
+    /// block. Asserted here because no fixture in the repo actually straddles, so
+    /// nothing else would notice if this rule were removed.
+    #[tokio::test]
+    async fn a_key_on_a_block_boundary_takes_the_previous_block_too() -> Result<()> {
+        let path = "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile";
+        let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+        let entries = reader.data_block_entries();
+        assert!(entries.len() > 2, "the fixture needs several blocks");
+
+        // The second block's index key: an exact separator with a block before it.
+        let separator = entries[1].first_key.clone();
+        let key = std::str::from_utf8(separator.content()).expect("a utf8 row key");
+        let picked = reader.blocks_for_keys(&[key]);
+        assert_eq!(
+            picked.len(),
+            2,
+            "an exact separator hit must take the previous block as well"
+        );
+        assert_eq!(picked[0].offset, entries[0].offset);
+        assert_eq!(picked[1].offset, entries[1].offset);
+
+        // The first block has nothing before it, so it stays a single selection.
+        let first = entries[0].first_key.clone();
+        let first_key = std::str::from_utf8(first.content()).expect("a utf8 row key");
+        assert_eq!(reader.blocks_for_keys(&[first_key]).len(), 1);
+        Ok(())
+    }
+
+    /// A key below everything in the file selects nothing, rather than selecting
+    /// the first block and reading it for no reason.
+    #[tokio::test]
+    async fn a_key_below_the_file_selects_nothing() -> Result<()> {
+        let path = "hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile";
+        let reader = HFileReader::open_ranged(&tests::fixture_storage(), path).await?;
+        assert!(
+            reader.blocks_for_keys(&[""]).is_empty(),
+            "the empty key sorts below every block's index key, so nothing can hold it"
+        );
+        Ok(())
+    }
+
+    /// The exclusive upper bound of a prefix, including the all-0xFF case that
+    /// has no bound and must fall back to the file's tail.
+    #[test]
+    fn prefix_upper_bound_increments_the_last_byte_it_can() {
+        assert_eq!(prefix_upper_bound(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_upper_bound(&[b'a', 0xFF]), Some(b"b".to_vec()));
+        assert_eq!(prefix_upper_bound(&[0xFF, 0xFF]), None);
+        assert_eq!(prefix_upper_bound(b""), None);
+    }
+}
+
+#[cfg(test)]
+mod threshold_sweep {
+    use super::*;
+    use crate::config::HudiConfigs;
+    use crate::config::table::HudiTableConfig;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    fn storage_for(dir: &str, threshold_mb: &str) -> Arc<Storage> {
+        let url = url::Url::from_directory_path(std::fs::canonicalize(dir).unwrap()).unwrap();
+        let configs = HudiConfigs::new([
+            (
+                HudiTableConfig::BasePath.as_ref().to_string(),
+                url.as_str().to_string(),
+            ),
+            (
+                crate::storage::reader::CONFIG_HFILE_WHOLE_READ_MAX_SIZE_MB.to_string(),
+                threshold_mb.to_string(),
+            ),
+        ]);
+        Storage::new(Arc::new(HashMap::new()), Arc::new(configs)).unwrap()
+    }
+
+    async fn point_lookup(storage: &Storage, name: &str, threshold_mb: u64, key: &str) -> usize {
+        let reader = HFileReader::open_sized(storage, name, threshold_mb, None)
+            .await
+            .unwrap();
+        let blocks = reader.blocks_for_keys(&[key]);
+        reader.read_records_batched(&blocks).await.unwrap().len()
+    }
+
+    async fn full_scan(storage: &Storage, name: &str, threshold_mb: u64) -> usize {
+        let reader = HFileReader::open_sized(storage, name, threshold_mb, None)
+            .await
+            .unwrap();
+        let entries = reader.data_block_entries();
+        let budget = reader.window_budget().unwrap_or(4 * 1024 * 1024);
+        let mut total = 0;
+        for window in HFileReader::plan_windows(&entries, budget) {
+            total += reader.read_records_batched(&window).await.unwrap().len();
+        }
+        total
+    }
+
+    /// Does the threshold pick the faster strategy at every file size?
+    ///
+    /// Set `HFILE_SWEEP_DIR` to a directory of generated `.hfile` files. Ignored
+    /// otherwise: the files are hundreds of megabytes and are not committed.
+    #[tokio::test]
+    #[ignore]
+    async fn the_threshold_picks_the_faster_strategy_across_sizes() {
+        let Ok(dir) = std::env::var("HFILE_SWEEP_DIR") else {
+            eprintln!("HFILE_SWEEP_DIR unset");
+            return;
+        };
+        // The shipped policy: a scan gets Hudi's threshold, a seek gets the much
+        // smaller keyed bound. `HFileBaseFileReader::open` applies the same min.
+        const SCAN_WHOLE_BELOW: u64 = 50 * 1024 * 1024;
+        const SEEK_WHOLE_BELOW: u64 = crate::storage::reader::HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE;
+        const ALWAYS_RANGED: u64 = 0;
+
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().to_str()?.to_string();
+                name.ends_with(".hfile").then_some(name)
+            })
+            .collect();
+        names.sort_by_key(|n| {
+            std::fs::metadata(std::path::Path::new(&dir).join(n))
+                .unwrap()
+                .len()
+        });
+
+        let default_storage = storage_for(&dir, "50");
+        let ranged_storage = storage_for(&dir, "0");
+
+        println!(
+            "{:<16} {:>12} {:>13} | {:>10} {:>10} {:>7} | {:>10} {:>10} {:>7}",
+            "file", "bytes", "seek/scan", "seek d", "seek r", "ratio", "scan d", "scan r", "ratio"
+        );
+        for name in &names {
+            let bytes = std::fs::metadata(std::path::Path::new(&dir).join(name))
+                .unwrap()
+                .len();
+            let rounds = if bytes > 32 * 1024 * 1024 { 5 } else { 15 };
+
+            // A key from the middle of the file, so a seek is a real seek.
+            let probe = HFileReader::open_ranged(&ranged_storage, name)
+                .await
+                .unwrap();
+            let entries = probe.data_block_entries();
+            let mid = &entries[entries.len() / 2];
+            let key = String::from_utf8(
+                probe
+                    .read_records_batched(std::slice::from_ref(mid))
+                    .await
+                    .unwrap()[0]
+                    .key
+                    .clone(),
+            )
+            .unwrap();
+            drop(probe);
+
+            // Correctness first: a fast wrong answer is not a win.
+            let seek_d = point_lookup(&default_storage, name, SEEK_WHOLE_BELOW, &key).await;
+            let seek_r = point_lookup(&ranged_storage, name, ALWAYS_RANGED, &key).await;
+            assert_eq!(seek_d, seek_r, "{name}: the two arms disagree on a seek");
+            let scan_d = full_scan(&default_storage, name, SCAN_WHOLE_BELOW).await;
+            let scan_r = full_scan(&ranged_storage, name, ALWAYS_RANGED).await;
+            assert_eq!(scan_d, scan_r, "{name}: the two arms disagree on a scan");
+
+            let mut sd = Vec::new();
+            let mut sr = Vec::new();
+            let mut cd = Vec::new();
+            let mut cr = Vec::new();
+            for _ in 0..rounds {
+                let t = Instant::now();
+                point_lookup(&default_storage, name, SEEK_WHOLE_BELOW, &key).await;
+                sd.push(t.elapsed().as_micros());
+                let t = Instant::now();
+                point_lookup(&ranged_storage, name, ALWAYS_RANGED, &key).await;
+                sr.push(t.elapsed().as_micros());
+                let t = Instant::now();
+                full_scan(&default_storage, name, SCAN_WHOLE_BELOW).await;
+                cd.push(t.elapsed().as_micros());
+                let t = Instant::now();
+                full_scan(&ranged_storage, name, ALWAYS_RANGED).await;
+                cr.push(t.elapsed().as_micros());
+            }
+            for v in [&mut sd, &mut sr, &mut cd, &mut cr] {
+                v.sort();
+            }
+            let m = |v: &Vec<u128>| v[rounds / 2] as f64 / 1000.0;
+            let side = match (bytes <= SEEK_WHOLE_BELOW, bytes <= SCAN_WHOLE_BELOW) {
+                (true, _) => "whole/whole",
+                (false, true) => "ranged/whole",
+                (false, false) => "ranged/ranged",
+            };
+            println!(
+                "{:<16} {:>12} {:>13} | {:>10.2} {:>10.2} {:>7.2} | {:>10.2} {:>10.2} {:>7.2}",
+                name,
+                bytes,
+                side,
+                m(&sd),
+                m(&sr),
+                m(&sd) / m(&sr),
+                m(&cd),
+                m(&cr),
+                m(&cd) / m(&cr)
+            );
+        }
+        println!(
+            "d = default (whole below 50MB), r = always ranged; ratio < 1 means the default wins"
         );
     }
 }
