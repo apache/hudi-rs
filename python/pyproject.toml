@@ -58,6 +58,10 @@ datafusion = [
 
 [tool.maturin]
 module-name = "hudi._internal"
+# hudi/__init__.py exports HudiDataFusionDataSource unconditionally, so every
+# build (wheel or from-sdist) must compile the datafusion feature or the
+# resulting package fails on `import hudi`.
+features = ["datafusion"]
 
 [tool.ruff]
 target-version = 'py310'
