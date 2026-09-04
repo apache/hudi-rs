@@ -53,7 +53,9 @@ lint = [
     "mypy==2.3.1",
 ]
 datafusion = [
-    "datafusion==54.0.0",
+    # The FFI contract is per DataFusion major: keep the Python package on the
+    # same major as the Rust workspace's datafusion dependency.
+    "datafusion>=54.0.0,<55",
 ]
 
 [tool.maturin]
