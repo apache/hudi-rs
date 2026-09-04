@@ -31,7 +31,9 @@ dist_dirname=hudi-rs-$hudi_version
 
 echo "❗️  Publishing $dist_dirname"
 
-work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')"
+tmp_root="${TMPDIR:-/tmp}"
+work_dir="${tmp_root%/}/$(date +'%Y-%m-%d-%H-%M-%S')"
+mkdir -p "$work_dir"
 
 svn_dev_url="https://dist.apache.org/repos/dist/dev/hudi/$dist_dirname"
 svn_dev_dir="$work_dir/$dist_dirname"

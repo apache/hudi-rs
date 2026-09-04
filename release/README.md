@@ -31,7 +31,7 @@ This issue tracks the release process as instructed in the [release guide](https
 
 ### Issues
 
-- [ ] All other issues in the [release milestone](https://github.com/apache/hudi-rs/milestone/1) should be closed.
+- [ ] All other issues in the [release milestone](https://github.com/apache/hudi-rs/milestone/xxx) should be closed.
 
 > [!IMPORTANT]
 > Highlight blocker issues if any
@@ -89,8 +89,9 @@ named `release/1.0.x`.
 For a patch release, don't cut a new branch, use its base release branch. For example, if it's `0.3.1`, cherry-pick
 fixes to `release/0.3.x`.
 
-Create and merge a PR to bump the major or minor version on the `main` branch. For example, if the current version
-is `0.3.0`, bump it to `0.5.0` or `1.0.0`.
+Create and merge a PR to bump the major or minor version on the `main` branch, using
+`./release/bump_version_in_main.sh`. For example, if the current version is `0.5.0-dev`, bump it to
+`0.6.0-dev` (minor) or `1.0.0-dev` (major); `main` always carries the `-dev` suffix.
 
 On the release branch, bump the version to indicate pre-release by pushing a commit.
 
@@ -273,7 +274,8 @@ CODE_SIGNING_KEY=<your code-signing key id>
 
 ./release/upload_src_release_to_dev.sh $RELEASE_VER $CODE_SIGNING_KEY
 
-./release/publish_src_release.sh $RELEASE_VER $CODE_SIGNING_KEY
+# re-uses the already-signed artifacts from the dev repo, so no signing key is needed
+./release/publish_src_release.sh $RELEASE_VER
 ```
 
 // TODO support verify local copy
@@ -317,7 +319,7 @@ git cliff release-$PREV_RELEASE_VER..HEAD | pbcopy
 git cliff release-$PREV_RELEASE_VER..HEAD | xclip
 ```
 
-In your fork, create a new branch from `main`, prepend the clipboard content to `changelog.md`, then commit and open a PR to merge into `main`.
+In your fork, create a new branch from `main`, prepend the clipboard content to `CHANGELOG.md`, then commit and open a PR to merge into `main`.
 
 ```shell
 git commit -am "chore: update changelog for x.y.z"
