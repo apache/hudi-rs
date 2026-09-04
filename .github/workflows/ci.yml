@@ -153,14 +153,9 @@ jobs:
             fi
           done
 
-  # The MSRV in Cargo.toml `rust-version` is a published promise, but every
-  # other job builds with the rust-toolchain.toml dev pin, so the promise holds
-  # only while the two happen to agree. They diverged from 2026-05 to 2026-09
-  # (dev pin 1.94, declared MSRV 1.91.1) and the declared floor silently became
-  # unbuildable when aws crates raised theirs. This job compiles with the
-  # toolchain the manifest declares, read from Cargo.toml so it follows future
-  # bumps, and starts pulling real weight the moment the dev pin moves ahead of
-  # the MSRV again.
+  # Every other job builds with the rust-toolchain.toml dev pin; this job
+  # compiles with the MSRV that Cargo.toml declares (read at run time so it
+  # follows bumps), keeping the declared floor buildable once the two diverge.
   msrv-check:
     runs-on: ubuntu-latest
     steps:

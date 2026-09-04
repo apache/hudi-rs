@@ -23,9 +23,6 @@ members = [
     "benchmark/tpch",
     "benchmark/filegroup",
 ]
-# Resolver v3 is MSRV-aware: a fresh resolution prefers dependency versions
-# whose rust-version fits the declared MSRV, so the promise stays satisfiable
-# without a committed lockfile (the msrv-check CI job then verifies it).
 resolver = "3"
 
 [workspace.package]
