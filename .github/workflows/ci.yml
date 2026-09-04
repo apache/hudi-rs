@@ -153,6 +153,31 @@ jobs:
             fi
           done
 
+  # Every other job builds with the rust-toolchain.toml dev pin; this job
+  # compiles with the MSRV that Cargo.toml declares (read at run time so it
+  # follows bumps), keeping the declared floor buildable once the two diverge.
+  msrv-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang libclang-dev
+      - name: Install the MSRV toolchain
+        run: |
+          msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          if [ -z "$msrv" ]; then
+            echo "could not read rust-version from Cargo.toml"
+            exit 1
+          fi
+          rustup toolchain install "$msrv" --profile minimal
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - name: Cache dependencies
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: msrv
+      - name: Check the workspace on the MSRV
+        run: cargo +"$MSRV" check --workspace --all-targets --all-features
+
   rust-tests-windows:
     runs-on: windows-2025
     # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
