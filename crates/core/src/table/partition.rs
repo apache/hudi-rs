@@ -24,7 +24,7 @@ use crate::expr::filter::{Filter, SchemableFilter};
 use crate::keygen::KeyGeneratorFilterTransformer;
 use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
 
-use arrow_array::{ArrayRef, Scalar};
+use arrow_array::{Array, ArrayRef, Scalar, new_null_array};
 use arrow_schema::{Field, Schema};
 
 use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType, PartitionFields};
@@ -34,6 +34,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
+
+/// Hive's sentinel for a partition column whose source value was null or empty; Hudi
+/// writers persist it verbatim as the path segment value. It carries SQL-null semantics:
+/// it must never be parsed as a value of the field's real data type, and a comparison
+/// against it is unknown rather than true or false.
+pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 pub const EMPTY_PARTITION_PATH: &str = "";
 
 /// Build the partition [Schema] in the order declared by `partition_field_names`.
@@ -164,8 +170,16 @@ impl PartitionPruner {
         self.and_filters.iter().all(|filter| {
             match segments.get(filter.field.name()) {
                 Some(segment_value) => {
+                    if segment_value.clone().into_inner().is_null(0) {
+                        // SQL-null semantics: a comparison against an unknown value is
+                        // neither true nor false, so retain the partition rather than
+                        // matching or excluding it on a fabricated value.
+                        return true;
+                    }
                     match filter.apply_comparison(segment_value) {
-                        Ok(scalar) => scalar.value(0),
+                        // A null comparison result is equally unknown; BooleanArray::value
+                        // ignores validity, so check it rather than trust an arbitrary bit.
+                        Ok(scalar) => !scalar.is_valid(0) || scalar.value(0),
                         Err(_) => true, // Include the partition when comparison error occurs
                     }
                 }
@@ -210,29 +224,39 @@ impl PartitionPruner {
         Ok(transformed)
     }
 
-    fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
-        let partition_path = if self.is_url_encoded {
-            percent_encoding::percent_decode(partition_path.as_bytes())
-                .decode_utf8()?
-                .into_owned()
+    /// Decodes one already-isolated segment value, or the whole raw path for the opaque
+    /// `_hoodie_partition_path` case.
+    ///
+    /// Must only be called on a string already split on the literal `/` separator and, for
+    /// hive-style paths, on the literal `=` separator. Hudi escapes those characters inside
+    /// a value precisely so the split stays unambiguous, so decoding first would turn an
+    /// escaped `%2F` back into a separator.
+    fn decode_value<'a>(&self, value: &'a str) -> Result<std::borrow::Cow<'a, str>> {
+        if self.is_url_encoded {
+            Ok(percent_encoding::percent_decode(value.as_bytes()).decode_utf8()?)
         } else {
-            partition_path.to_string()
-        };
+            Ok(std::borrow::Cow::Borrowed(value))
+        }
+    }
 
-        // Special case: single _hoodie_partition_path field uses the raw path as-is
+    fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
+        // Special case: a single _hoodie_partition_path field takes the whole path, which is
+        // opaque and has no segment structure to preserve, so decode it in one pass.
         if self.schema.fields().len() == 1
             && self.schema.field(0).name() == MetaField::PartitionPath.as_ref()
         {
-            let scalar = SchemableFilter::cast_value(
-                &[partition_path.as_str()],
-                &arrow_schema::DataType::Utf8,
-            )?;
+            let decoded = self.decode_value(partition_path)?;
+            let scalar =
+                SchemableFilter::cast_value(&[decoded.as_ref()], &arrow_schema::DataType::Utf8)?;
             return Ok(HashMap::from([(
                 MetaField::PartitionPath.as_ref().to_string(),
                 scalar,
             )]));
         }
 
+        // Split on the literal, still-encoded `/`. A value containing an actual `/` is
+        // written as `%2F` by Hudi's writer, so decoding before splitting would tear one
+        // value into two segments and make an encoded table unreadable.
         let parts: Vec<&str> = partition_path.split('/').collect();
 
         if parts.len() != self.schema.fields().len() {
@@ -248,8 +272,11 @@ impl PartitionPruner {
             .iter()
             .zip(parts)
             .map(|(field, part)| {
-                let value = if self.is_hive_style {
-                    let (name, value) = part.split_once('=').ok_or(InvalidPartitionPath(
+                let raw_value = if self.is_hive_style {
+                    // Split on the literal, still-encoded `=`: a value containing an actual
+                    // `=` is written as `%3D`, so the first literal `=` is always the true
+                    // name/value boundary.
+                    let (name, raw_value) = part.split_once('=').ok_or(InvalidPartitionPath(
                         format!("Partition path should be hive-style but got {part}"),
                     ))?;
                     if name != field.name() {
@@ -259,11 +286,25 @@ impl PartitionPruner {
                             name
                         )));
                     }
-                    value
+                    raw_value
                 } else {
                     part
                 };
-                let scalar = SchemableFilter::cast_value(&[value], field.data_type())?;
+
+                let value = self.decode_value(raw_value)?;
+
+                if value.as_ref() == HIVE_DEFAULT_PARTITION {
+                    // SQL-null semantics: never parse the sentinel as the field's real type.
+                    // A timestamp or numeric column would error, and an error here is
+                    // treated as "keep the partition", so the table would silently fall back
+                    // to a full scan.
+                    return Ok((
+                        field.name().to_string(),
+                        Scalar::new(new_null_array(field.data_type(), 1)),
+                    ));
+                }
+
+                let scalar = SchemableFilter::cast_value(&[value.as_ref()], field.data_type())?;
                 Ok((field.name().to_string(), scalar))
             })
             .collect()
@@ -546,6 +587,10 @@ mod tests {
         assert!(segments.contains_key("count"));
     }
 
+    /// Hudi percent-encodes each partition *value* only; the `/` between segments and the
+    /// `=` of a hive-style segment are structural and always written literally, since
+    /// `KeyGenUtils.getRecordPartitionPath` calls `PartitionPathEncodeUtils.escapePathName`
+    /// on the field value alone. So an encoded path still splits on literal `/` and `=`.
     #[test]
     fn test_partition_pruner_url_encoded() {
         let schema = create_test_schema();
@@ -553,12 +598,102 @@ mod tests {
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
         let segments = pruner
-            .parse_segments("date%3D2023-02-01%2Fcategory%3DA%2Fcount%3D10")
+            .parse_segments("date=2023-02-01/category=A/count=10")
             .unwrap();
         assert_eq!(segments.len(), 3);
         assert!(segments.contains_key("date"));
         assert!(segments.contains_key("category"));
         assert!(segments.contains_key("count"));
+    }
+
+    /// A value containing a structural character is escaped by the writer precisely so the
+    /// split stays unambiguous. Decoding before splitting turned `%2F` back into `/` and
+    /// tore one value into two segments, so an encoded table could not be read at all.
+    #[test]
+    fn test_partition_pruner_url_encoded_value_contains_separators() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        for (encoded, decoded) in [
+            ("category=a%2Fb", "a/b"),
+            ("category=a%3Db", "a=b"),
+            ("category=a%20b", "a b"),
+            ("category=a%25b", "a%b"),
+        ] {
+            let segments = pruner.parse_segments(encoded).unwrap();
+            let expected = SchemableFilter::cast_value(&[decoded], &DataType::Utf8).unwrap();
+            assert_eq!(
+                segments["category"].clone().into_inner().as_ref(),
+                expected.into_inner().as_ref(),
+                "decoding {encoded}"
+            );
+        }
+    }
+
+    /// Decoding happens exactly once: a literal `%2F` in the source value is written as
+    /// `%252F`, and one decode pass must yield `%2F`, not `/`.
+    #[test]
+    fn test_partition_pruner_url_decodes_exactly_once() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner.parse_segments("category=a%252Fb").unwrap();
+        let expected = SchemableFilter::cast_value(&["a%2Fb"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments["category"].clone().into_inner().as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
+    /// With url-encoding off, a `%` in a value is a literal `%` and must survive untouched.
+    #[test]
+    fn test_partition_pruner_no_decode_when_urlencode_disabled() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, false);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner.parse_segments("category=a%2Fb").unwrap();
+        let expected = SchemableFilter::cast_value(&["a%2Fb"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments["category"].clone().into_inner().as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
+    /// The Hive null sentinel must not be coerced into a value of the column's type;
+    /// parsing it as an integer would either error into a full scan or invent a number.
+    #[test]
+    fn hive_default_partition_parses_as_null_not_a_value() {
+        let schema = Schema::new(vec![Field::new("count", DataType::Int32, true)]);
+        let pruner = PartitionPruner::new(&[], &schema, &create_hudi_configs(true, false)).unwrap();
+
+        let segments = pruner
+            .parse_segments(&format!("count={HIVE_DEFAULT_PARTITION}"))
+            .unwrap();
+        assert!(segments["count"].clone().into_inner().is_null(0));
+    }
+
+    /// A comparison against the sentinel is unknown, so the partition is retained rather
+    /// than matched or excluded.
+    #[test]
+    fn hive_default_partition_comparison_is_unknown() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, true)]);
+        let pruner = PartitionPruner::new(
+            &[Filter {
+                field: "category".to_string(),
+                operator: ExprOperator::Eq,
+                values: vec!["A".to_string()],
+            }],
+            &schema,
+            &create_hudi_configs(true, false),
+        )
+        .unwrap();
+
+        assert!(pruner.should_include(&format!("category={HIVE_DEFAULT_PARTITION}")));
+        assert!(pruner.should_include("category=A"));
+        assert!(!pruner.should_include("category=B"));
     }
 
     #[test]
