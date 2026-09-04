@@ -264,7 +264,7 @@ impl PartitionPruner {
             match TimestampBasedKeyGenerator::from_configs(hudi_configs) {
                 Ok(transformer) => {
                     return Ok((
-                        Self::apply_transformer_to_filters(filters, &transformer)?,
+                        Self::apply_transformer_to_filters(filters, &transformer),
                         false,
                     ));
                 }
@@ -284,16 +284,35 @@ impl PartitionPruner {
         Ok((filters.to_vec(), false))
     }
 
+    /// Rewrites each filter through the key generator.
+    ///
+    /// A filter the generator cannot rewrite — typically a literal it cannot parse — is
+    /// kept as it was rather than turned into an error. Pruning is an optimization, and
+    /// being unable to compute it is no reason to refuse the query: the untransformed
+    /// filter still names the source data column, which is absent from the partition
+    /// schema, so it fails to bind, prunes nothing, is reported through
+    /// [`PartitionPruner::unapplied_filters`], and is enforced per row like any other
+    /// data-column predicate.
     fn apply_transformer_to_filters(
         filters: &[Filter],
         transformer: &dyn KeyGeneratorFilterTransformer,
-    ) -> Result<Vec<Filter>> {
+    ) -> Vec<Filter> {
         let mut transformed = Vec::new();
         for filter in filters {
-            let partition_filters = transformer.transform_filter(filter)?;
-            transformed.extend(partition_filters);
+            match transformer.transform_filter(filter) {
+                Ok(partition_filters) => transformed.extend(partition_filters),
+                Err(e) => {
+                    log::warn!(
+                        "Filter on `{}` could not be rewritten into a partition-path \
+                         predicate ({e}); it will not prune any partition and is enforced \
+                         per row instead.",
+                        filter.field
+                    );
+                    transformed.push(filter.clone());
+                }
+            }
         }
-        Ok(transformed)
+        transformed
     }
 
     /// Decodes one already-isolated segment value, or the whole raw path for the opaque
@@ -1215,5 +1234,35 @@ mod tests {
 
         assert!(pruner.unapplied_filters().is_empty());
         assert!(!pruner.is_keygen_config_unavailable());
+    }
+
+    /// Pruning is an optimization. A literal the key generator cannot turn into a
+    /// partition path is no reason to refuse the query: the filter is left untransformed,
+    /// fails to bind to the partition schema, prunes nothing, and is reported — the same
+    /// route an unbuildable key generator takes — while the read goes ahead and enforces
+    /// the predicate per row.
+    #[test]
+    fn unparseable_literal_is_reported_as_unapplied_instead_of_failing_the_read() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Eq, "yesterday"),
+                ts_filter(ExprOperator::Gte, "2024-03-01T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .expect("an unparseable literal must not fail construction");
+
+        assert_eq!(pruner.unapplied_filters().len(), 1);
+        assert_eq!(pruner.unapplied_filters()[0].field, "ts");
+        assert_eq!(pruner.unapplied_filters()[0].values, vec!["yesterday"]);
+        assert!(
+            !pruner.is_keygen_config_unavailable(),
+            "the key generator was built; only this literal was unusable"
+        );
+
+        // The filter that could be rewritten still prunes.
+        assert!(pruner.should_include("ts=2024-03-01"));
+        assert!(!pruner.should_include("ts=2024-02-29"));
     }
 }
