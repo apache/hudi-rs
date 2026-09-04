@@ -143,7 +143,8 @@ Maven downloads.
 Run the bootstrap script on the instance as the login user (not as user data,
 which would install the toolchain into root's home). It installs Rust, Java,
 PySpark, and the S3A connector, and mounts a local NVMe instance store at
-`/mnt/nvme` when the instance type has one (e.g. `r6id.4xlarge` for SF100).
+`/mnt/nvme` when the instance type has one (e.g. `r8gd.4xlarge` for SF100).
+The packages are architecture-neutral, so Graviton and x86 instances both work.
 
 ```bash
 bash benchmark/tpch/infra/aws/bootstrap.sh

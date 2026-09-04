@@ -74,9 +74,9 @@ sudo dnf install -y gcc gcc-c++ make git pkgconfig openssl-devel \
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 . "$HOME/.cargo/env"
 
-# arrow/DataFusion kernels rely on LLVM auto-vectorization, and rustc's
-# default x86-64 baseline is SSE2 only; target the local CPU so the wide
-# vector units (AVX2/AVX-512) are actually used.
+# arrow/DataFusion kernels rely on LLVM auto-vectorization, and rustc targets a
+# conservative baseline for each architecture (SSE2 on x86-64, plain NEON on
+# aarch64); target the local CPU so the wider vector units are actually used.
 mkdir -p "$HOME/.cargo"
 cat > "$HOME/.cargo/config.toml" <<'EOF'
 [build]
