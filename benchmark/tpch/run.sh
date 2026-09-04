@@ -64,6 +64,18 @@ is_cloud_url() {
   esac
 }
 
+# A data dir symlinked to an instance store dangles once a stop/start wipes it.
+# Name that, because the failure it otherwise produces is create_dir_all
+# reporting EEXIST for a directory that does not exist.
+require_usable_data_dir() {
+  local data_root="$SCRIPT_DIR/data"
+  if [ -L "$data_root" ] && [ ! -d "$data_root" ]; then
+    echo "Error: $data_root links to $(readlink "$data_root"), which is missing." >&2
+    echo "Recreate that directory, or remove the symlink to use local storage." >&2
+    exit 1
+  fi
+}
+
 # Fail with the missing table names rather than letting the engine report a
 # missing path once the run is already under way.
 require_hudi_tables() {
@@ -118,6 +130,8 @@ cmd_generate() {
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+
+  require_usable_data_dir
 
   local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
   if [ -d "$parquet_dir" ]; then

@@ -57,6 +57,10 @@ if [[ -n "${NVME_DEV:-}" ]]; then
   sudo chown "$(id -un):$(id -gn)" /mnt/nvme
   mkdir -p /mnt/nvme/spark-local
   ln -sfn /mnt/nvme/spark-local /tmp/spark-local
+  # Target for an optional benchmark/tpch/data symlink. Created here so that
+  # linking to it cannot leave a dangling symlink, which surfaces much later as
+  # an EEXIST from the generator's create_dir_all.
+  mkdir -p /mnt/nvme/tpch-data
 else
   # No instance store on this type; shuffle stays on the root volume. Clear any
   # symlink left by a run on an instance that had one, which would otherwise
