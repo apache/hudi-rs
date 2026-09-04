@@ -40,6 +40,12 @@ hudi_version=$1
 signing_key=$2
 repo=dev
 
+version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$"
+if [[ ! "$hudi_version" =~ $version_pattern ]]; then
+    echo "❌  Version must be in format X.Y.Z or X.Y.Z-{alpha|beta|rc}.W"
+    exit 1
+fi
+
 echo "❗️  Releasing Hudi version $hudi_version"
 echo "❗️  Uploading to https://dist.apache.org/repos/dist/$repo/hudi/"
 echo "❗️  Using signing key: $signing_key"
@@ -55,7 +61,8 @@ fi
 
 dist_repo_subpath=hudi-rs-$hudi_version
 
-work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')"
+tmp_root="${TMPDIR:-/tmp}"
+work_dir="${tmp_root%/}/$(date +'%Y-%m-%d-%H-%M-%S')"
 src_rel_dir="$work_dir/$dist_repo_subpath"
 echo ">>> Archiving branch $curr_branch to $src_rel_dir"
 mkdir -p "$src_rel_dir"

@@ -29,14 +29,15 @@ fi
 hudi_version=$1
 repo=$2
 
-version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$"
+version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$"
 
 if [[ ! "$hudi_version" =~ $version_pattern ]]; then
-    echo "ERROR: version must be in format X.Y.Z or X.Y.Z-rc.W"
+    echo "ERROR: version must be in format X.Y.Z or X.Y.Z-{alpha|beta|rc}.W"
     exit 1
 fi
 
-work_dir="$TMPDIR$(date +'%Y-%m-%d-%H-%M-%S')/svn_dir"
+tmp_root="${TMPDIR:-/tmp}"
+work_dir="${tmp_root%/}/$(date +'%Y-%m-%d-%H-%M-%S')/svn_dir"
 hudi_artifact="hudi-rs-$hudi_version"
 svn_url="https://dist.apache.org/repos/dist/$repo/hudi/$hudi_artifact"
 echo "Checking out src release from $svn_url to $work_dir"
