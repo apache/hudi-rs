@@ -84,6 +84,10 @@ jobs:
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           MATURIN_REPOSITORY: pypi
+          # RocksDB uses C++17 aligned allocation, available on macOS 10.13+,
+          # while the x86_64 build otherwise runs at rustc's 10.12 floor and
+          # fails to compile. arm64 already floors at 11.0.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target == 'x86_64-apple-darwin' && '10.13' || '11.0' }}
         with:
           target: ${{ matrix.target }}
           command: publish
