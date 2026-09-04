@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
     let columns = vec!["rider", "city", "ts", "fare"];
     for col_name in columns {
         let idx = batch.schema().index_of(col_name).unwrap();
-        println!("{}: {}", col_name, batch.column(idx));
+        println!("{col_name}: {:?}", batch.column(idx));
     }
     Ok(())
 }
@@ -343,8 +343,8 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 | Stage           | API                                                              | Description                                                                                              |
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi::util::collection::split_into_chunks` on the result. |
-|                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning. Snapshot (default) uses the metadata table; incremental aggregates from changed file slices. Returns `None` when stats cannot be computed. |
-| Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. Both args are optional. Timestamps are resolved automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same options used for `get_file_slices`. |
+|                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning, derived from the metadata table. Snapshot only. Returns `None` for incremental queries, and whenever the estimate cannot be computed (no metadata table, non-Parquet base files, footer sampling failure). |
+| Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. In Python both args are optional; in Rust `read_options` is an `Option` and `extra_storage_overrides` takes a (possibly empty) iterator. Timestamps are resolved automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same options used for `get_file_slices`. |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
 
 ### Read configs
@@ -451,7 +451,7 @@ ctx.sql("SELECT max(fare), city from trips group by city order by 1 desc").show(
 
 Hudi is also integrated with
 
-- [Daft](https://www.getdaft.io/projects/docs/en/stable/integrations/hudi/)
+- [Daft](https://docs.daft.ai/en/stable/connectors/hudi/)
 - [Ray](https://docs.ray.io/en/latest/data/api/doc/ray.data.read_hudi.html#ray.data.read_hudi)
 
 ### Work with cloud storage
