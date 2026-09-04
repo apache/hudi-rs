@@ -713,4 +713,47 @@ mod tests {
         assert!(!pruner.should_include("2024/01/16"));
         assert!(!pruner.should_include("2023/12/31"));
     }
+
+    /// A negated predicate must not drop a partition. The transform reduces a timestamp to
+    /// a day, so `2024-03-01` holds every row of that day and all but one instant of it
+    /// satisfies `ts != 2024-03-01T14:30:00Z`. Pruning the partition would lose them all.
+    #[test]
+    fn ne_does_not_prune_a_partition_that_holds_matching_rows() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "false"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+
+        let pruner = PartitionPruner::new(
+            &[Filter {
+                field: "ts".to_string(),
+                operator: ExprOperator::Ne,
+                values: vec!["2024-03-01T14:30:00Z".to_string()],
+            }],
+            &partition_schema,
+            &configs,
+        )
+        .unwrap();
+
+        assert!(
+            pruner.should_include("2024-03-01"),
+            "the day containing the excluded instant still holds matching rows"
+        );
+        assert!(pruner.should_include("2024-03-02"));
+    }
 }
