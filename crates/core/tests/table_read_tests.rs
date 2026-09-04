@@ -3616,4 +3616,81 @@ mod hive_style_keygen_partition_pruning {
         assert_eq!(got, vec![1, 2]);
         Ok(())
     }
+
+    /// The partition column here is a real TIMESTAMP, so the writer declared
+    /// `EPOCHMICROSECONDS`, which is what Spark hands its key generator. A filter literal
+    /// is never spelled that way by a query; before the reader parsed a literal by its own
+    /// spelling, this read failed outright with
+    /// "Failed to parse epoch microseconds '2024-03-01T00:00:00Z'".
+    #[tokio::test]
+    async fn timestamp_column_prunes_on_a_datetime_literal() -> Result<()> {
+        let base_url = SampleTable::V9TimebasedkeygenHivestyleEpochmicros.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert_eq!(
+            partitions_of(&all),
+            vec![
+                "ts=2024-02-29",
+                "ts=2024-03-01",
+                "ts=2024-03-02",
+                "ts=2024-03-03",
+            ]
+        );
+
+        let opts = ReadOptions::new().with_filters([
+            ("ts", ">=", "2024-03-01T00:00:00Z"),
+            ("ts", "<", "2024-03-03T00:00:00Z"),
+        ])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["ts=2024-03-01", "ts=2024-03-02"],
+            "the boundary day is retained by the widened bound and dropped by column stats"
+        );
+
+        // A bare date is a datetime literal too, naming midnight UTC.
+        let opts = ReadOptions::new()
+            .with_filters([("ts", ">=", "2024-03-02"), ("ts", "<", "2024-03-03")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["ts=2024-03-02"]
+        );
+
+        // The declared encoding is still honoured first: this is 2024-03-01T08:00:00Z.
+        let opts = ReadOptions::new().with_filters([("ts", "=", "1709280000000000")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["ts=2024-03-01"]
+        );
+
+        let opts = ReadOptions::new().with_filters([("ts", "=", "1900-01-01T00:00:00Z")])?;
+        assert!(hudi_table.get_file_slices(&opts).await?.is_empty());
+        Ok(())
+    }
+
+    /// Rows returned must agree with the partitions selected: the row-level filter parses
+    /// the same literal against the timestamp column and keeps exactly the matching rows.
+    #[tokio::test]
+    async fn timestamp_column_pruned_read_returns_exactly_the_matching_rows() -> Result<()> {
+        let base_url = SampleTable::V9TimebasedkeygenHivestyleEpochmicros.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let opts = ReadOptions::new().with_filters([
+            ("ts", ">=", "2024-03-01T00:00:00Z"),
+            ("ts", "<", "2024-03-02T00:00:00Z"),
+        ])?;
+        let records = hudi_table.read(&opts).await?;
+        let schema = records[0].schema();
+        let records = concat_batches(&schema, &records)?;
+        let ids = records
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        let mut got: Vec<i32> = (0..ids.len()).map(|i| ids.value(i)).collect();
+        got.sort();
+        assert_eq!(got, vec![1, 2]);
+        Ok(())
+    }
 }

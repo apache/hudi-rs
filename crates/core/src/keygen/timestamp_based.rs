@@ -26,7 +26,7 @@ use crate::expr::ExprOperator;
 use crate::expr::filter::Filter;
 use crate::keygen::KeyGeneratorFilterTransformer;
 use crate::metadata::meta_field::MetaField;
-use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::HashMap;
 
@@ -270,8 +270,68 @@ impl TimestampBasedKeyGenerator {
         options.get(&key).or_else(|| options.get(&alt_key)).cloned()
     }
 
-    /// Parses a timestamp value into a DateTime<Utc>.
+    /// Parses a filter literal into the instant it names.
+    ///
+    /// The configured `timestamp.type` describes how the *source column* stores its value;
+    /// a *literal* is spelled by whoever wrote the query, and the two need not agree. The
+    /// configured encoding is still tried first, so every input that works today keeps
+    /// working: an epoch integer for the epoch types, `input.dateformat` for
+    /// `DATE_STRING`/`MIXED`. That is also what a DataFusion timestamp literal arrives as,
+    /// because `ScalarValue`'s `Display` prints the raw epoch integer in the column's unit.
+    /// What the epoch types cannot take is a datetime spelled as text —
+    /// `2024-03-01T08:00:00Z`, `2024-03-01 08:00:00`, `2024-03-01` — which is how the
+    /// string filter API (Python, C++, `ReadOptions::with_filters`) hands one over, and a
+    /// table whose partition column really is a timestamp can only declare an epoch type
+    /// honestly. Such a literal is parsed by its own spelling instead.
+    ///
+    /// The two families are disjoint: an epoch integer never parses as a datetime and a
+    /// datetime never parses as an integer, so the fallback cannot reinterpret an input the
+    /// configured type already accepts. `input.dateformat` is not consulted here; it
+    /// describes the source column, not the query.
     fn parse_timestamp(&self, value: &str) -> Result<DateTime<Utc>> {
+        let source_err = match self.parse_source_encoded(value) {
+            Ok(dt) => return Ok(dt),
+            Err(e) => e,
+        };
+        Self::parse_datetime_literal(value).ok_or_else(|| {
+            CoreError::TimestampParsingError(format!(
+                "Failed to parse filter literal '{value}' either as the source column's \
+                 {:?} encoding ({source_err}) or as an ISO-8601 datetime or date",
+                self.timestamp_type
+            ))
+        })
+    }
+
+    /// Parses a datetime literal by its own spelling: RFC 3339 / ISO 8601 with an offset,
+    /// a naive datetime (`T` or space separated, optional fractional seconds), or a date.
+    /// Naive spellings are taken as UTC, matching the `DATE_STRING` path when no input
+    /// timezone is configured.
+    fn parse_datetime_literal(value: &str) -> Option<DateTime<Utc>> {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+            return Some(dt.with_timezone(&Utc));
+        }
+        for format in [
+            "%Y-%m-%d %H:%M:%S%.f%:z",
+            "%Y-%m-%dT%H:%M:%S%.f%z",
+            "%Y-%m-%d %H:%M:%S%.f%z",
+        ] {
+            if let Ok(dt) = DateTime::parse_from_str(value, format) {
+                return Some(dt.with_timezone(&Utc));
+            }
+        }
+        for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+            if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+                return Some(Utc.from_utc_datetime(&naive));
+            }
+        }
+        NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .ok()
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|naive| Utc.from_utc_datetime(&naive))
+    }
+
+    /// Parses a value in the source column's configured encoding.
+    fn parse_source_encoded(&self, value: &str) -> Result<DateTime<Utc>> {
         match self.timestamp_type {
             TimestampType::UnixTimestamp => {
                 let secs: i64 = value.parse().map_err(|e| {
@@ -1015,5 +1075,145 @@ mod tests {
         assert!(!make_keygen("MM/dd/yyyy").is_lex_sortable_format());
         assert!(!make_keygen("dd/MM/yyyy").is_lex_sortable_format());
         assert!(!make_keygen("ddMMyyyy").is_lex_sortable_format());
+    }
+
+    fn epoch_keygen(timestamp_type: &str) -> TimestampBasedKeyGenerator {
+        TimestampBasedKeyGenerator::from_configs(&HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", timestamp_type),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+            ("hoodie.keygen.timebased.timezone", "UTC"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]))
+        .unwrap()
+    }
+
+    fn partition_path_for(keygen: &TimestampBasedKeyGenerator, literal: &str) -> String {
+        let filter = Filter {
+            field: keygen.source_field.clone(),
+            operator: ExprOperator::Eq,
+            values: vec![literal.to_string()],
+        };
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1, "{literal}");
+        transformed[0].values[0].clone()
+    }
+
+    /// A table whose partition column is a real timestamp can only declare an epoch type
+    /// honestly, but a query never spells a timestamp as an epoch integer. The literal is
+    /// parsed by its own spelling when the configured encoding rejects it.
+    #[test]
+    fn test_parse_timestamp_epoch_types_accept_datetime_literals() {
+        for timestamp_type in ["UNIX_TIMESTAMP", "EPOCHMILLISECONDS", "EPOCHMICROSECONDS"] {
+            let keygen = epoch_keygen(timestamp_type);
+            for literal in [
+                "2024-03-01T08:00:00Z",
+                "2024-03-01T08:00:00.123Z",
+                "2024-03-01T09:00:00+01:00",
+                "2024-03-01 09:00:00+01:00",
+                "2024-03-01T09:00:00.000+0100",
+                "2024-03-01T08:00:00",
+                "2024-03-01 08:00:00",
+                "2024-03-01 08:00:00.5",
+                "2024-03-01",
+            ] {
+                assert_eq!(
+                    partition_path_for(&keygen, literal),
+                    "ts=2024-03-01",
+                    "{timestamp_type} with literal {literal}"
+                );
+            }
+            // An offset moves the instant across the day boundary in UTC.
+            assert_eq!(
+                partition_path_for(&keygen, "2024-03-01T00:30:00+01:00"),
+                "ts=2024-02-29",
+                "{timestamp_type}"
+            );
+        }
+    }
+
+    /// The configured encoding is tried first, so an epoch integer means exactly what it
+    /// meant before the fallback existed, in the declared unit.
+    #[test]
+    fn test_parse_timestamp_epoch_integers_keep_their_configured_unit() {
+        // 2024-03-01T08:00:00Z
+        for (timestamp_type, literal) in [
+            ("UNIX_TIMESTAMP", "1709280000"),
+            ("EPOCHMILLISECONDS", "1709280000000"),
+            ("EPOCHMICROSECONDS", "1709280000000000"),
+        ] {
+            assert_eq!(
+                partition_path_for(&epoch_keygen(timestamp_type), literal),
+                "ts=2024-03-01",
+                "{timestamp_type}"
+            );
+        }
+    }
+
+    /// The two spellings are disjoint, so the fallback cannot reinterpret an input the
+    /// configured type already accepts: no epoch integer parses as a datetime, and no
+    /// datetime parses as an integer.
+    #[test]
+    fn test_parse_timestamp_literal_families_are_disjoint() {
+        for epoch in [
+            "0",
+            "1709280000",
+            "1709280000000",
+            "1709280000000000",
+            "-86400",
+        ] {
+            assert!(
+                TimestampBasedKeyGenerator::parse_datetime_literal(epoch).is_none(),
+                "{epoch} must not read as a datetime"
+            );
+        }
+        for datetime in ["2024-03-01T08:00:00Z", "2024-03-01 08:00:00", "2024-03-01"] {
+            assert!(
+                datetime.parse::<i64>().is_err(),
+                "{datetime} must not read as an integer"
+            );
+        }
+    }
+
+    /// `DATE_STRING` keeps `input.dateformat` as the description of the source column and
+    /// still parses the literal by that format first; a literal in another spelling is
+    /// taken by its own. A bare date used to fail here because the format demands a time.
+    #[test]
+    fn test_parse_timestamp_date_string_falls_back_for_other_spellings() {
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01T12:01:00.123Z"),
+            "ts_str=2023/04/01/12",
+            "the configured input format still applies"
+        );
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01 12:30:00"),
+            "ts_str=2023/04/01/12"
+        );
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01"),
+            "ts_str=2023/04/01/00"
+        );
+    }
+
+    /// A literal that is neither an epoch integer nor a datetime still errors, and the
+    /// error names both attempts so the reader knows what was tried.
+    #[test]
+    fn test_parse_timestamp_rejects_unparseable_literal_with_both_attempts_named() {
+        let keygen = epoch_keygen("EPOCHMICROSECONDS");
+        let filter = Filter {
+            field: "ts".to_string(),
+            operator: ExprOperator::Eq,
+            values: vec!["yesterday".to_string()],
+        };
+        let err = keygen.transform_filter(&filter).unwrap_err().to_string();
+        assert!(err.contains("'yesterday'"), "{err}");
+        assert!(err.contains("EpochMicroseconds"), "{err}");
+        assert!(err.contains("ISO-8601"), "{err}");
     }
 }
