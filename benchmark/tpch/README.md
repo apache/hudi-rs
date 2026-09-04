@@ -60,7 +60,17 @@ make bench-tpch QUERIES=1,6,17 SF=10
 
 # Run against cloud-hosted data
 make bench-tpch ENGINE=datafusion SF=100 HUDI_DIR=gs://bucket/sf100-hudi
+make bench-tpch ENGINE=datafusion SF=100 HUDI_DIR=s3://bucket/sf100-hudi
 ```
+
+Credentials come from the environment for both engines: DataFusion reads the
+`AWS_*` / `GOOGLE_*` / `AZURE_*` variables, and on a cloud VM with an attached
+instance role or service account neither engine needs any variable set. For S3
+outside `us-east-1`, set `AWS_REGION` (`object_store` defaults to `us-east-1`
+when the region is neither configured nor derivable from the URL).
+
+The two sections below cover running on a cloud VM, one per provider; they are
+alternatives, so follow whichever matches your setup.
 
 ## GCP VM
 
@@ -119,3 +129,55 @@ gcloud compute instances start bench-vm --zone=us-central1-a
 
 The bootstrap script only runs once (guarded by a sentinel file),
 so restarting the VM is fast.
+
+## AWS EC2
+
+### One-time setup
+
+Launch an Amazon Linux 2023 instance with an instance profile that grants
+S3 access to the benchmark bucket and includes the
+`AmazonSSMManagedInstanceCore` policy (for Session Manager access). The
+instance needs outbound internet access for the package, crate, PyPI and
+Maven downloads.
+
+Run the bootstrap script on the instance as the login user (not as user data,
+which would install the toolchain into root's home). It installs Rust, Java,
+PySpark, and the S3A connector, and mounts a local NVMe instance store at
+`/mnt/nvme` when the instance type has one (e.g. `r6id.4xlarge` for SF100).
+
+```bash
+bash benchmark/tpch/infra/aws/bootstrap.sh
+```
+
+Both engines resolve instance-profile credentials automatically: DataFusion
+through `object_store`, Spark through the S3A default credential chain, so no
+keys need to be configured. The script also persists `AWS_REGION` from the
+instance metadata, which DataFusion does need (see the note above).
+
+### Sync code and build
+
+From local, sync the repo and build the benchmark binary on the instance.
+Re-run this whenever local code changes.
+
+```bash
+bash benchmark/tpch/infra/aws/sync.sh i-0123456789abcdef0 us-west-2 ~/.ssh/key.pem
+```
+
+### Run benchmarks on the instance
+
+Same commands as on GCP, with `s3://` data URLs:
+
+```bash
+benchmark/tpch/run.sh bench-datafusion --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
+benchmark/tpch/run.sh bench-spark --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
+benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
+```
+
+Pass `--output-dir benchmark/tpch/results` to the `bench-*` commands for
+`compare` to find their results.
+
+### Stop/start the instance
+
+Stopping wipes the NVMe instance store; after starting again, re-run the
+bootstrap script to re-mount it (the package installs are sentinel-guarded
+and skipped, so this is fast).

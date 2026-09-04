@@ -51,6 +51,8 @@ setup_spark() {
   fi
 
   echo "Configuring Spark at $SPARK_HOME..."
+  # A pip-installed PySpark ships without a conf directory.
+  mkdir -p "$SPARK_HOME/conf"
   cp "$SCRIPT_DIR/infra/spark/spark-defaults.conf" "$SPARK_HOME/conf/spark-defaults.conf"
   cp "$SCRIPT_DIR/infra/spark/log4j2.properties" "$SPARK_HOME/conf/log4j2.properties"
 }
