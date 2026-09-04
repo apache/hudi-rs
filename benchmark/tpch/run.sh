@@ -64,6 +64,16 @@ is_cloud_url() {
   esac
 }
 
+# Fail with the missing table names rather than letting the engine report a
+# missing path once the run is already under way.
+require_hudi_tables() {
+  local hudi_dir="$1"
+  if ! "$TPCH_BIN" check-tables --hudi-base "$hudi_dir"; then
+    echo "Error: run 'create-tables' first, or point --hudi-dir at existing tables." >&2
+    exit 1
+  fi
+}
+
 usage() {
   cat <<EOF
 Usage: $0 <command> [options]
@@ -78,6 +88,7 @@ Commands:
 Options (per command):
   --scale-factor N  TPC-H scale factor [all commands] (default: $DEFAULT_SCALE_FACTOR)
   --format F        Table format: hudi or parquet [bench-*, compare] (default: auto)
+  --recreate        Rebuild tables that already exist [create-tables] (default: reuse them)
   --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
   --parquet-dir D   Parquet data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-parquet)
   --queries Q       Comma-separated query numbers [bench-*] (default: all 22)
@@ -122,14 +133,28 @@ cmd_create_tables() {
   local sf="$DEFAULT_SCALE_FACTOR"
   local custom_hudi_dir=""
   local custom_parquet_dir=""
+  local recreate=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
       --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
       --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --recreate) recreate=1; shift ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+
+  build_tpch
+
+  # Rebuilding is the expensive step at scale, so existing tables are reused
+  # unless --recreate says otherwise.
+  if [ "$recreate" -eq 0 ] && "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" 2>/dev/null; then
+    echo "Reusing existing Hudi tables at: $hudi_dir"
+    echo "Pass --recreate to rebuild them."
+    return 0
+  fi
 
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
   if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
@@ -137,9 +162,6 @@ cmd_create_tables() {
     exit 1
   fi
 
-  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
-
-  build_tpch
   setup_spark
 
   # Spark creates the cloud prefix itself; only a local target needs clearing
@@ -225,6 +247,9 @@ cmd_bench_spark() {
   if ! is_cloud_url "$data_dir" && [ ! -d "$data_dir" ]; then
     echo "Error: $format data not found at $data_dir." >&2
     exit 1
+  fi
+  if [ "$format" = "hudi" ]; then
+    require_hudi_tables "$data_dir"
   fi
 
   read_spark_args --scale-factor "$sf" --command bench
@@ -325,6 +350,10 @@ cmd_bench_datafusion() {
   fi
 
   build_tpch
+
+  if [ "$use_hudi" = true ]; then
+    require_hudi_tables "$hudi_dir"
+  fi
 
   local bench_args=(bench --scale-factor "$sf")
   [ "$use_hudi" = true ] && bench_args+=(--hudi-dir "$hudi_dir")

@@ -188,6 +188,7 @@ parquet:
 
 ```bash
 benchmark/tpch/run.sh generate --scale-factor 100
+# reuses the tables if they are already there; --recreate rebuilds them
 benchmark/tpch/run.sh create-tables --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
 
 benchmark/tpch/run.sh bench-datafusion --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi \

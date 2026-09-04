@@ -211,6 +211,7 @@ impl ScaleFactorConfig {
         // Register Hudi tables
         for &name in TABLE_ORDER {
             if self.tables.contains_key(name) {
+                writeln!(sql, "DROP TABLE IF EXISTS {name};").unwrap();
                 writeln!(
                     sql,
                     "CREATE TABLE {name} USING hudi LOCATION '{hudi_base}/{name}';"
