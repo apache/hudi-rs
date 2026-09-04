@@ -25,6 +25,73 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 DEFAULT_SCALE_FACTOR=1
 TPCH_BIN="$REPO_ROOT/target/release/tpch"
+HUDI_SPARK_BUNDLE="org.apache.hudi:hudi-spark3.5-bundle_2.12:1.1.1"
+
+# Record what the numbers were produced on. A timing is only comparable against
+# another run on the same hardware, build and data, and none of that is
+# recoverable from the results afterwards.
+write_env_report() {
+  local out_file="$1"
+  local sf="$2"
+  local data_dir="$3"
+
+  local cpu_model cpu_count mem_total
+  if [ -r /proc/cpuinfo ]; then
+    cpu_model=$(awk -F': ' '/^model name|^Model name/ {print $2; exit}' /proc/cpuinfo)
+    [ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')
+    cpu_count=$(nproc)
+    mem_total=$(awk '/^MemTotal/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)
+  else
+    cpu_model=$(sysctl -n machdep.cpu.brand_string 2>/dev/null)
+    cpu_count=$(sysctl -n hw.ncpu 2>/dev/null)
+    mem_total=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GiB", $1/1073741824}')
+  fi
+
+  # Instance identity, when this is an EC2 box. IMDSv2, and short timeouts so a
+  # non-EC2 machine costs nothing.
+  local instance_type="" instance_region=""
+  local imds_token
+  imds_token=$(curl -fsS --max-time 1 -X PUT \
+    -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' \
+    http://169.254.169.254/latest/api/token 2>/dev/null) || true
+  if [ -n "$imds_token" ]; then
+    instance_type=$(curl -fsS --max-time 1 -H "X-aws-ec2-metadata-token: $imds_token" \
+      http://169.254.169.254/latest/meta-data/instance-type 2>/dev/null) || true
+    instance_region=$(curl -fsS --max-time 1 -H "X-aws-ec2-metadata-token: $imds_token" \
+      http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null) || true
+  fi
+
+  local git_rev git_dirty=""
+  git_rev=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
+  git -C "$REPO_ROOT" diff --quiet 2>/dev/null || git_dirty=" (modified)"
+
+  # Where the data physically sits: an EBS root and an instance store give very
+  # different read numbers for the same command.
+  local data_backing="n/a (cloud storage)"
+  if ! is_cloud_url "$data_dir"; then
+    data_backing=$(df -h "$data_dir" 2>/dev/null | awk 'NR==2 {print $1" "$2}')
+  fi
+
+  {
+    echo "# Benchmark environment"
+    echo "captured:        $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    echo "scale factor:    $sf"
+    echo "data location:   $data_dir"
+    echo "data backing:    $data_backing"
+    [ -n "$instance_type" ] && echo "instance:        $instance_type ($instance_region)"
+    echo "cpu:             ${cpu_model:-unknown} x ${cpu_count:-?}"
+    echo "memory:          ${mem_total:-unknown}"
+    echo "os:              $(uname -srm)"
+    echo "hudi-rs commit:  ${git_rev}${git_dirty}"
+    echo "rustc:           $(rustc --version 2>/dev/null || echo unknown)"
+    echo "RUSTFLAGS:       ${RUSTFLAGS:-<from cargo config>}"
+    echo "cargo build:     release"
+    echo "java:            $(java -version 2>&1 | head -1)"
+    echo "spark:           $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | awk '/version/ {print $NF; exit}')"
+    echo "hudi bundle:     $HUDI_SPARK_BUNDLE"
+    echo "config:          config/sf$sf.yaml"
+  } > "$out_file"
+}
 
 build_tpch() {
   echo "Building TPC-H tool..."
@@ -197,7 +264,7 @@ cmd_create_tables() {
 
   echo "Creating Hudi COW tables from parquet (sf$sf)..."
   "$SPARK_HOME/bin/spark-sql" \
-    --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:1.1.1 \
+    --packages "$HUDI_SPARK_BUNDLE" \
     "${SPARK_ARGS[@]}" \
     -f "$sql_file"
 
@@ -287,7 +354,7 @@ cmd_bench_spark() {
 
   echo "Running Spark SQL benchmark ($format)..."
   "$SPARK_HOME/bin/spark-submit" \
-    --packages org.apache.hudi:hudi-spark3.5-bundle_2.12:1.1.1 \
+    --packages "$HUDI_SPARK_BUNDLE" \
     "${SPARK_ARGS[@]}" \
     "$SCRIPT_DIR/infra/spark/bench.py" \
     "${bench_args[@]}"
@@ -297,6 +364,7 @@ cmd_bench_spark() {
   if [ -n "$output_dir" ]; then
     mkdir -p "$output_dir"
     parse_args+=(--output-dir "$output_dir" --engine-label spark --format-label "$format" --display-name "spark+hudi" --scale-factor "$sf")
+    write_env_report "$output_dir/environment.txt" "$sf" "$data_dir"
   fi
   "$TPCH_BIN" "${parse_args[@]}"
   rm -rf "$tmp_dir"
@@ -380,6 +448,7 @@ cmd_bench_datafusion() {
     mkdir -p "$output_dir"
     output_dir="$(cd "$output_dir" && pwd)"
     bench_args+=(--output-dir "$output_dir" --engine-label datafusion --format-label "${format:-hudi}" --display-name "datafusion+hudi-rs")
+    write_env_report "$output_dir/environment.txt" "$sf" "$hudi_dir"
   fi
 
   echo "Running DataFusion benchmark..."
@@ -419,6 +488,14 @@ cmd_compare() {
   "$TPCH_BIN" compare \
     --results-dir "$SCRIPT_DIR/results" \
     --runs "$runs"
+
+  # Print alongside the chart so a copied result carries the conditions that
+  # produced it.
+  local env_file="$SCRIPT_DIR/results/environment.txt"
+  if [ -f "$env_file" ]; then
+    echo ""
+    cat "$env_file"
+  fi
 }
 
 # --- Main ---
