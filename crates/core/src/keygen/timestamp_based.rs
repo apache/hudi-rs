@@ -509,7 +509,13 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
         let field = MetaField::PartitionPath.as_ref().to_string();
 
         match filter.operator {
-            ExprOperator::Eq | ExprOperator::Ne => {
+            // A negated predicate cannot prune, because this transform is lossy: a
+            // partition holds every instant of its period, so `ts != 2024-03-01T14:30:00Z`
+            // is satisfied by almost every row of `ts=2024-03-01`. Mapping the negation
+            // onto the path would drop that whole partition and lose all of them. Emit no
+            // partition filter and let the predicate be enforced per row.
+            ExprOperator::Ne | ExprOperator::NotIn => Ok(vec![]),
+            ExprOperator::Eq => {
                 let dt = self.parse_timestamp(&filter.values[0])?;
                 let path = self.format_partition_path(&dt);
                 Ok(vec![Filter {
@@ -518,7 +524,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                     values: vec![path],
                 }])
             }
-            ExprOperator::In | ExprOperator::NotIn => {
+            ExprOperator::In => {
                 let paths: Result<Vec<String>> = filter
                     .values
                     .iter()
@@ -909,7 +915,11 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].values[0], "2024/01/25");
 
-        // Not-equal: now supported
+        // Not-equal emits no partition filter. The transform is lossy — the partition for
+        // that hour covers the whole hour — so almost every row in it satisfies
+        // `ts_str != 2023-04-01T12:01:00.123Z`. Turning the negation into a partition
+        // predicate would discard the entire hour and lose those rows, so the predicate is
+        // left to row-level evaluation instead.
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
         let filter = Filter {
@@ -918,12 +928,7 @@ mod tests {
             values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].operator, ExprOperator::Ne);
-        assert_eq!(
-            transformed[0].values[0],
-            "year=2023/month=04/day=01/hour=12"
-        );
+        assert!(transformed.is_empty());
 
         // Range operators: Gt/Gte → Gte, Lt/Lte → Lte (safe widening)
         let keygen =
@@ -1000,7 +1005,7 @@ mod tests {
             ]
         );
 
-        // NOT IN
+        // NOT IN emits no partition filter, for the same reason as Ne above.
         let filter = Filter::new(
             "ts_str".to_string(),
             ExprOperator::NotIn,
@@ -1008,8 +1013,7 @@ mod tests {
         )
         .unwrap();
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].operator, ExprOperator::NotIn);
+        assert!(transformed.is_empty());
     }
 
     #[test]
