@@ -230,9 +230,10 @@ mod tests {
         )]))
     }
 
-    /// A metadata table is refused rather than attempted. The merge-on-read
-    /// reader has no HFile support, so letting it try would fail somewhere
-    /// deeper and less clearly.
+    /// A metadata table is refused rather than attempted. Not for want of
+    /// HFile support: its record key, merge rule and partition come from its
+    /// own configuration, so letting this path try would fail somewhere deeper
+    /// and less clearly.
     #[test]
     fn refuses_a_metadata_table() {
         let reason = refuse_reason(true, Some(&schema())).expect("should refuse");
