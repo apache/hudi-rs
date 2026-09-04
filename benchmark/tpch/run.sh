@@ -37,8 +37,11 @@ write_env_report() {
 
   local cpu_model cpu_count mem_total
   if [ -r /proc/cpuinfo ]; then
-    cpu_model=$(awk -F': ' '/^model name|^Model name/ {print $2; exit}' /proc/cpuinfo)
-    [ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')
+    # lscpu first: aarch64 /proc/cpuinfo carries no model name at all, only
+    # implementer and part numbers.
+    cpu_model=$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')
+    [ -z "$cpu_model" ] && cpu_model=$(awk -F': +' '/^model name/ {print $2; exit}' /proc/cpuinfo)
+    [ -z "$cpu_model" ] && cpu_model=$(uname -m)
     cpu_count=$(nproc)
     mem_total=$(awk '/^MemTotal/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)
   else
@@ -67,8 +70,13 @@ write_env_report() {
 
   # Where the data physically sits: an EBS root and an instance store give very
   # different read numbers for the same command.
-  local data_backing="n/a (cloud storage)"
-  if ! is_cloud_url "$data_dir"; then
+  # Report the scheme without the bucket: the results are meant to be pasted
+  # somewhere public, and the bucket name identifies private infrastructure.
+  local data_location="$data_dir"
+  local data_backing="n/a (object storage)"
+  if is_cloud_url "$data_dir"; then
+    data_location="${data_dir%%://*}:// (bucket omitted)"
+  else
     data_backing=$(df -h "$data_dir" 2>/dev/null | awk 'NR==2 {print $1" "$2}')
   fi
 
@@ -76,15 +84,16 @@ write_env_report() {
     echo "# Benchmark environment"
     echo "captured:        $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "scale factor:    $sf"
-    echo "data location:   $data_dir"
+    echo "data location:   $data_location"
     echo "data backing:    $data_backing"
     [ -n "$instance_type" ] && echo "instance:        $instance_type ($instance_region)"
     echo "cpu:             ${cpu_model:-unknown} x ${cpu_count:-?}"
     echo "memory:          ${mem_total:-unknown}"
     echo "os:              $(uname -srm)"
+    echo "spark master:    local[*] on ${cpu_count:-?} cores"
     echo "hudi-rs commit:  ${git_rev}${git_dirty}"
     echo "rustc:           $(rustc --version 2>/dev/null || echo unknown)"
-    echo "RUSTFLAGS:       ${RUSTFLAGS:-<from cargo config>}"
+    echo "RUSTFLAGS:       ${RUSTFLAGS:-(unset, see ~/.cargo/config.toml)}"
     echo "cargo build:     release"
     echo "java:            $(java -version 2>&1 | head -1)"
     echo "spark:           $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | awk '/version/ {print $NF; exit}')"
