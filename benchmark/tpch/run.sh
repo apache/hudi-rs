@@ -172,6 +172,7 @@ Commands:
   bench-spark       Run TPC-H queries against Hudi tables via Spark SQL
   bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
   compare           Compare persisted benchmark results with bar charts
+  env-report        Rewrite the environment report for results already collected
 
 Options (per command):
   --scale-factor N  TPC-H scale factor [all commands] (default: $DEFAULT_SCALE_FACTOR)
@@ -467,6 +468,26 @@ cmd_bench_datafusion() {
   "$TPCH_BIN" "${bench_args[@]}"
 }
 
+# Rewrite the environment report against results that already exist, so a run
+# whose report is wrong or missing does not have to be repeated to correct it.
+cmd_env_report() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local results_dir="$SCRIPT_DIR/results"
+  mkdir -p "$results_dir"
+  write_env_report "$results_dir/environment.txt" "$sf" \
+    "${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  cat "$results_dir/environment.txt"
+}
+
 cmd_compare() {
   local sf="$DEFAULT_SCALE_FACTOR"
   local engines=""
@@ -523,6 +544,7 @@ case "$COMMAND" in
   bench-spark)      cmd_bench_spark "$@" ;;
   bench-datafusion) cmd_bench_datafusion "$@" ;;
   compare)          cmd_compare "$@" ;;
+  env-report)       cmd_env_report "$@" ;;
   *)
     echo "Unknown command: $COMMAND" >&2
     usage
