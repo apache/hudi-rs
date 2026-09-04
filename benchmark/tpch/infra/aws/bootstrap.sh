@@ -70,7 +70,9 @@ SENTINEL="/var/lib/bootstrap-done"
 [[ -f "$SENTINEL" ]] && exit 0
 
 # System packages
-sudo dnf install -y gcc gcc-c++ make git pkgconfig openssl-devel \
+# clang-devel supplies the libclang that bindgen loads: hudi enables
+# spill-rocksdb by default, and rocksdb generates its bindings at build time.
+sudo dnf install -y gcc gcc-c++ clang-devel make git pkgconfig openssl-devel \
   protobuf-compiler protobuf-devel java-17-amazon-corretto-headless \
   python3-pip rsync tmux sysstat
 
