@@ -610,6 +610,7 @@ pub enum SampleTable {
     V8SimplekeygenNonhivestyle,
     V9NonpartitionedRollback,
     V9TimebasedkeygenEpochmillis,
+    V9TimebasedkeygenHivestyleEpochmicros,
     V9TimebasedkeygenNonhivestyle,
     V9TimebasedkeygenUnixtimestamp,
     V9CustomkeygenHivestyle,
@@ -685,6 +686,7 @@ impl SampleTable {
             | Self::V8SimplekeygenHivestyleNoMetafields
             | Self::V8SimplekeygenNonhivestyle
             | Self::V9TimebasedkeygenEpochmillis
+            | Self::V9TimebasedkeygenHivestyleEpochmicros
             | Self::V9TimebasedkeygenUnixtimestamp
             | Self::V9LanceNonpartitioned
             | Self::V9LanceTxnsNonpart
