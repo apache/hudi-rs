@@ -29,10 +29,10 @@ fi
 hudi_version=$1
 repo=$2
 
-version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$"
+version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$"
 
 if [[ ! "$hudi_version" =~ $version_pattern ]]; then
-    echo "ERROR: version must be in format X.Y.Z or X.Y.Z-{alpha|beta|rc}.W"
+    echo "ERROR: version must be in format X.Y.Z or X.Y.Z-rc.W"
     exit 1
 fi
 
