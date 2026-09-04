@@ -26,7 +26,7 @@ use crate::expr::ExprOperator;
 use crate::expr::filter::Filter;
 use crate::keygen::KeyGeneratorFilterTransformer;
 use crate::metadata::meta_field::MetaField;
-use chrono::{DateTime, Datelike, NaiveDateTime, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use std::collections::HashMap;
 
@@ -57,11 +57,10 @@ pub struct TimestampBasedKeyGenerator {
     /// Output timezone for converting timestamps to partition values
     output_timezone: Tz,
 
-    /// Whether partitions use Hive-style naming (e.g., year=2024 vs 2024)
+    /// Whether partitions use Hive-style naming, i.e. `ts=2024/01/24` rather than
+    /// `2024/01/24`. The prefix is the declared partition field name, applied once to the
+    /// whole formatted value — see [`Self::format_partition_path`].
     is_hive_style: bool,
-
-    /// Partition field names derived from output format (e.g., ["year", "month", "day", "hour"])
-    partition_fields: Vec<String>,
 }
 
 /// Type of timestamp value in the source field.
@@ -235,8 +234,6 @@ impl TimestampBasedKeyGenerator {
             .get_or_default(HudiTableConfig::IsHiveStylePartitioning)
             .into();
 
-        let partition_fields = Self::parse_partition_fields(&output_dateformat, is_hive_style);
-
         Ok(Self {
             source_field,
             timestamp_type,
@@ -246,7 +243,6 @@ impl TimestampBasedKeyGenerator {
             output_dateformat,
             output_timezone,
             is_hive_style,
-            partition_fields,
         })
     }
 
@@ -274,35 +270,68 @@ impl TimestampBasedKeyGenerator {
         options.get(&key).or_else(|| options.get(&alt_key)).cloned()
     }
 
-    /// Parses the output date format to determine partition field names.
+    /// Parses a filter literal into the instant it names.
     ///
-    /// For hive-style: "yyyy/MM/dd/HH" → ["year", "month", "day", "hour"]
-    /// For non-hive-style: "yyyy/MM/dd" → ["yyyy", "MM", "dd"]
-    fn parse_partition_fields(output_format: &str, is_hive_style: bool) -> Vec<String> {
-        if !is_hive_style {
-            return output_format.split('/').map(|s| s.to_string()).collect();
-        }
-
-        output_format
-            .split('/')
-            .map(Self::format_segment_to_field_name)
-            .collect()
-    }
-
-    fn format_segment_to_field_name(segment: &str) -> String {
-        match segment {
-            "yyyy" => "year".to_string(),
-            "MM" => "month".to_string(),
-            "dd" => "day".to_string(),
-            "HH" => "hour".to_string(),
-            "mm" => "minute".to_string(),
-            "ss" => "second".to_string(),
-            _ => segment.to_string(),
-        }
-    }
-
-    /// Parses a timestamp value into a DateTime<Utc>.
+    /// The configured `timestamp.type` describes how the *source column* stores its value;
+    /// a *literal* is spelled by whoever wrote the query, and the two need not agree. The
+    /// configured encoding is still tried first, so every input that works today keeps
+    /// working: an epoch integer for the epoch types, `input.dateformat` for
+    /// `DATE_STRING`/`MIXED`. That is also what a DataFusion timestamp literal arrives as,
+    /// because `ScalarValue`'s `Display` prints the raw epoch integer in the column's unit.
+    /// What the epoch types cannot take is a datetime spelled as text —
+    /// `2024-03-01T08:00:00Z`, `2024-03-01 08:00:00`, `2024-03-01` — which is how the
+    /// string filter API (Python, C++, `ReadOptions::with_filters`) hands one over, and a
+    /// table whose partition column really is a timestamp can only declare an epoch type
+    /// honestly. Such a literal is parsed by its own spelling instead.
+    ///
+    /// The two families are disjoint: an epoch integer never parses as a datetime and a
+    /// datetime never parses as an integer, so the fallback cannot reinterpret an input the
+    /// configured type already accepts. `input.dateformat` is not consulted here; it
+    /// describes the source column, not the query.
     fn parse_timestamp(&self, value: &str) -> Result<DateTime<Utc>> {
+        let source_err = match self.parse_source_encoded(value) {
+            Ok(dt) => return Ok(dt),
+            Err(e) => e,
+        };
+        Self::parse_datetime_literal(value).ok_or_else(|| {
+            CoreError::TimestampParsingError(format!(
+                "Failed to parse filter literal '{value}' either as the source column's \
+                 {:?} encoding ({source_err}) or as an ISO-8601 datetime or date",
+                self.timestamp_type
+            ))
+        })
+    }
+
+    /// Parses a datetime literal by its own spelling: RFC 3339 / ISO 8601 with an offset,
+    /// a naive datetime (`T` or space separated, optional fractional seconds), or a date.
+    /// Naive spellings are taken as UTC, matching the `DATE_STRING` path when no input
+    /// timezone is configured.
+    fn parse_datetime_literal(value: &str) -> Option<DateTime<Utc>> {
+        if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
+            return Some(dt.with_timezone(&Utc));
+        }
+        for format in [
+            "%Y-%m-%d %H:%M:%S%.f%:z",
+            "%Y-%m-%dT%H:%M:%S%.f%z",
+            "%Y-%m-%d %H:%M:%S%.f%z",
+        ] {
+            if let Ok(dt) = DateTime::parse_from_str(value, format) {
+                return Some(dt.with_timezone(&Utc));
+            }
+        }
+        for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+            if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+                return Some(Utc.from_utc_datetime(&naive));
+            }
+        }
+        NaiveDate::parse_from_str(value, "%Y-%m-%d")
+            .ok()
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .map(|naive| Utc.from_utc_datetime(&naive))
+    }
+
+    /// Parses a value in the source column's configured encoding.
+    fn parse_source_encoded(&self, value: &str) -> Result<DateTime<Utc>> {
         match self.timestamp_type {
             TimestampType::UnixTimestamp => {
                 let secs: i64 = value.parse().map_err(|e| {
@@ -418,29 +447,33 @@ impl TimestampBasedKeyGenerator {
             .replace("'T'", "T")
     }
 
-    /// Formats a datetime into the full partition path string.
+    /// Formats a datetime into the partition path Hudi's writer would produce for it.
     ///
-    /// For non-hive-style with format `yyyy/MM/dd`: `"2023/04/15"`
-    /// For hive-style with format `yyyy/MM/dd`: `"year=2023/month=04/day=15"`
+    /// Mirrors `TimestampBasedAvroKeyGenerator.getPartitionPath`, whose final line is:
+    ///
+    /// ```java
+    /// return hiveStylePartitioning ? getPartitionPathFields().get(0) + "=" + partitionPath : partitionPath;
+    /// ```
+    ///
+    /// Two properties of that are load-bearing:
+    ///
+    /// 1. `output.dateformat` is applied to the timestamp **as a whole**, so any `/` in the
+    ///    format stays in the value and becomes a nested directory. It is not a list of
+    ///    independently-named partition columns.
+    /// 2. Hive-style prepends `<declared partition field>=` **exactly once**, to the whole
+    ///    formatted string, using the field named in `hoodie.table.partition.fields`.
+    ///
+    /// So field `ts` with format `yyyy/MM/dd` yields `ts=2024/03/01` — one hive prefix and
+    /// three directory levels — and format `yyyy-MM-dd` yields `ts=2024-03-01`.
     fn format_partition_path(&self, dt: &DateTime<Utc>) -> String {
         let local_dt = dt.with_timezone(&self.output_timezone);
+        let value = Self::format_segment_value(&self.output_dateformat, &local_dt);
 
-        let segments: Vec<String> = self
-            .output_dateformat
-            .split('/')
-            .enumerate()
-            .map(|(i, segment)| {
-                let value = Self::format_segment_value(segment, &local_dt);
-                if self.is_hive_style {
-                    let field_name = &self.partition_fields[i];
-                    format!("{field_name}={value}")
-                } else {
-                    value
-                }
-            })
-            .collect();
-
-        segments.join("/")
+        if self.is_hive_style {
+            format!("{}={}", self.source_field, value)
+        } else {
+            value
+        }
     }
 
     /// Formats a single date segment into its value string.
@@ -509,7 +542,13 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
         let field = MetaField::PartitionPath.as_ref().to_string();
 
         match filter.operator {
-            ExprOperator::Eq | ExprOperator::Ne => {
+            // A negated predicate cannot prune, because this transform is lossy: a
+            // partition holds every instant of its period, so `ts != 2024-03-01T14:30:00Z`
+            // is satisfied by almost every row of `ts=2024-03-01`. Mapping the negation
+            // onto the path would drop that whole partition and lose all of them. Emit no
+            // partition filter and let the predicate be enforced per row.
+            ExprOperator::Ne | ExprOperator::NotIn => Ok(vec![]),
+            ExprOperator::Eq => {
                 let dt = self.parse_timestamp(&filter.values[0])?;
                 let path = self.format_partition_path(&dt);
                 Ok(vec![Filter {
@@ -518,7 +557,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                     values: vec![path],
                 }])
             }
-            ExprOperator::In | ExprOperator::NotIn => {
+            ExprOperator::In => {
                 let paths: Result<Vec<String>> = filter
                     .values
                     .iter()
@@ -597,18 +636,6 @@ mod tests {
             TimestampBasedKeyGenerator::java_to_chrono_format("yyyy-MM-dd'T'HH:mm:ss.SSSZ"),
             "%Y-%m-%dT%H:%M:%S.%3f%#z"
         );
-
-        // Hive-style: format segments → semantic names
-        assert_eq!(
-            TimestampBasedKeyGenerator::parse_partition_fields("yyyy/MM/dd/HH", true),
-            vec!["year", "month", "day", "hour"]
-        );
-
-        // Non-hive-style: format segments used as-is
-        assert_eq!(
-            TimestampBasedKeyGenerator::parse_partition_fields("yyyy/MM/dd", false),
-            vec!["yyyy", "MM", "dd"]
-        );
     }
 
     #[test]
@@ -618,10 +645,6 @@ mod tests {
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
         assert_eq!(keygen.source_field, "ts_str");
         assert_eq!(keygen.timestamp_type, TimestampType::DateString);
-        assert_eq!(
-            keygen.partition_fields,
-            vec!["year", "month", "day", "hour"]
-        );
         assert!(keygen.is_hive_style);
         let dt = keygen.parse_timestamp("2023-04-01T12:01:00.123Z").unwrap();
         assert_eq!(
@@ -672,7 +695,6 @@ mod tests {
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_unix_timestamp())
                 .unwrap();
         assert_eq!(keygen.timestamp_type, TimestampType::UnixTimestamp);
-        assert_eq!(keygen.partition_fields, vec!["yyyy", "MM", "dd"]);
         assert!(!keygen.is_hive_style);
         // 2024-01-25 00:00:00 UTC = 1706140800 seconds
         let dt = keygen.parse_timestamp("1706140800").unwrap();
@@ -836,10 +858,7 @@ mod tests {
 
         // 2024-01-25 03:00:00 UTC = 2024-01-24 22:00:00 EST
         let dt = keygen.parse_timestamp("1706151600").unwrap();
-        assert_eq!(
-            keygen.format_partition_path(&dt),
-            "year=2024/month=01/day=24"
-        );
+        assert_eq!(keygen.format_partition_path(&dt), "ts=2024/01/24");
 
         // Fallback: hoodie.keygen.timebased.timezone used when output.timezone absent
         let configs = HudiConfigs::new([
@@ -854,10 +873,7 @@ mod tests {
 
         // 2024-01-25 20:00:00 UTC = 2024-01-26 05:00:00 JST
         let dt = keygen.parse_timestamp("1706212800").unwrap();
-        assert_eq!(
-            keygen.format_partition_path(&dt),
-            "year=2024/month=01/day=26"
-        );
+        assert_eq!(keygen.format_partition_path(&dt), "ts=2024/01/26");
 
         // Precedence: deprecated shared `timezone` wins over specific `output.timezone`
         let configs = HudiConfigs::new([
@@ -890,10 +906,7 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field, "_hoodie_partition_path");
         assert_eq!(transformed[0].operator, ExprOperator::Eq);
-        assert_eq!(
-            transformed[0].values[0],
-            "year=2023/month=04/day=01/hour=12"
-        );
+        assert_eq!(transformed[0].values[0], "ts_str=2023/04/01/12");
 
         // Non-hive-style equality
         let keygen =
@@ -909,7 +922,11 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].values[0], "2024/01/25");
 
-        // Not-equal: now supported
+        // Not-equal emits no partition filter. The transform is lossy — the partition for
+        // that hour covers the whole hour — so almost every row in it satisfies
+        // `ts_str != 2023-04-01T12:01:00.123Z`. Turning the negation into a partition
+        // predicate would discard the entire hour and lose those rows, so the predicate is
+        // left to row-level evaluation instead.
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
         let filter = Filter {
@@ -918,12 +935,7 @@ mod tests {
             values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].operator, ExprOperator::Ne);
-        assert_eq!(
-            transformed[0].values[0],
-            "year=2023/month=04/day=01/hour=12"
-        );
+        assert!(transformed.is_empty());
 
         // Range operators: Gt/Gte → Gte, Lt/Lte → Lte (safe widening)
         let keygen =
@@ -994,13 +1006,10 @@ mod tests {
         assert_eq!(transformed[0].operator, ExprOperator::In);
         assert_eq!(
             transformed[0].values,
-            vec![
-                "year=2023/month=04/day=01/hour=12",
-                "year=2023/month=06/day=15/hour=08"
-            ]
+            vec!["ts_str=2023/04/01/12", "ts_str=2023/06/15/08"]
         );
 
-        // NOT IN
+        // NOT IN emits no partition filter, for the same reason as Ne above.
         let filter = Filter::new(
             "ts_str".to_string(),
             ExprOperator::NotIn,
@@ -1008,8 +1017,7 @@ mod tests {
         )
         .unwrap();
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].operator, ExprOperator::NotIn);
+        assert!(transformed.is_empty());
     }
 
     #[test]
@@ -1067,5 +1075,145 @@ mod tests {
         assert!(!make_keygen("MM/dd/yyyy").is_lex_sortable_format());
         assert!(!make_keygen("dd/MM/yyyy").is_lex_sortable_format());
         assert!(!make_keygen("ddMMyyyy").is_lex_sortable_format());
+    }
+
+    fn epoch_keygen(timestamp_type: &str) -> TimestampBasedKeyGenerator {
+        TimestampBasedKeyGenerator::from_configs(&HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", timestamp_type),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+            ("hoodie.keygen.timebased.timezone", "UTC"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]))
+        .unwrap()
+    }
+
+    fn partition_path_for(keygen: &TimestampBasedKeyGenerator, literal: &str) -> String {
+        let filter = Filter {
+            field: keygen.source_field.clone(),
+            operator: ExprOperator::Eq,
+            values: vec![literal.to_string()],
+        };
+        let transformed = keygen.transform_filter(&filter).unwrap();
+        assert_eq!(transformed.len(), 1, "{literal}");
+        transformed[0].values[0].clone()
+    }
+
+    /// A table whose partition column is a real timestamp can only declare an epoch type
+    /// honestly, but a query never spells a timestamp as an epoch integer. The literal is
+    /// parsed by its own spelling when the configured encoding rejects it.
+    #[test]
+    fn test_parse_timestamp_epoch_types_accept_datetime_literals() {
+        for timestamp_type in ["UNIX_TIMESTAMP", "EPOCHMILLISECONDS", "EPOCHMICROSECONDS"] {
+            let keygen = epoch_keygen(timestamp_type);
+            for literal in [
+                "2024-03-01T08:00:00Z",
+                "2024-03-01T08:00:00.123Z",
+                "2024-03-01T09:00:00+01:00",
+                "2024-03-01 09:00:00+01:00",
+                "2024-03-01T09:00:00.000+0100",
+                "2024-03-01T08:00:00",
+                "2024-03-01 08:00:00",
+                "2024-03-01 08:00:00.5",
+                "2024-03-01",
+            ] {
+                assert_eq!(
+                    partition_path_for(&keygen, literal),
+                    "ts=2024-03-01",
+                    "{timestamp_type} with literal {literal}"
+                );
+            }
+            // An offset moves the instant across the day boundary in UTC.
+            assert_eq!(
+                partition_path_for(&keygen, "2024-03-01T00:30:00+01:00"),
+                "ts=2024-02-29",
+                "{timestamp_type}"
+            );
+        }
+    }
+
+    /// The configured encoding is tried first, so an epoch integer means exactly what it
+    /// meant before the fallback existed, in the declared unit.
+    #[test]
+    fn test_parse_timestamp_epoch_integers_keep_their_configured_unit() {
+        // 2024-03-01T08:00:00Z
+        for (timestamp_type, literal) in [
+            ("UNIX_TIMESTAMP", "1709280000"),
+            ("EPOCHMILLISECONDS", "1709280000000"),
+            ("EPOCHMICROSECONDS", "1709280000000000"),
+        ] {
+            assert_eq!(
+                partition_path_for(&epoch_keygen(timestamp_type), literal),
+                "ts=2024-03-01",
+                "{timestamp_type}"
+            );
+        }
+    }
+
+    /// The two spellings are disjoint, so the fallback cannot reinterpret an input the
+    /// configured type already accepts: no epoch integer parses as a datetime, and no
+    /// datetime parses as an integer.
+    #[test]
+    fn test_parse_timestamp_literal_families_are_disjoint() {
+        for epoch in [
+            "0",
+            "1709280000",
+            "1709280000000",
+            "1709280000000000",
+            "-86400",
+        ] {
+            assert!(
+                TimestampBasedKeyGenerator::parse_datetime_literal(epoch).is_none(),
+                "{epoch} must not read as a datetime"
+            );
+        }
+        for datetime in ["2024-03-01T08:00:00Z", "2024-03-01 08:00:00", "2024-03-01"] {
+            assert!(
+                datetime.parse::<i64>().is_err(),
+                "{datetime} must not read as an integer"
+            );
+        }
+    }
+
+    /// `DATE_STRING` keeps `input.dateformat` as the description of the source column and
+    /// still parses the literal by that format first; a literal in another spelling is
+    /// taken by its own. A bare date used to fail here because the format demands a time.
+    #[test]
+    fn test_parse_timestamp_date_string_falls_back_for_other_spellings() {
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01T12:01:00.123Z"),
+            "ts_str=2023/04/01/12",
+            "the configured input format still applies"
+        );
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01 12:30:00"),
+            "ts_str=2023/04/01/12"
+        );
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01"),
+            "ts_str=2023/04/01/00"
+        );
+    }
+
+    /// A literal that is neither an epoch integer nor a datetime still errors, and the
+    /// error names both attempts so the reader knows what was tried.
+    #[test]
+    fn test_parse_timestamp_rejects_unparseable_literal_with_both_attempts_named() {
+        let keygen = epoch_keygen("EPOCHMICROSECONDS");
+        let filter = Filter {
+            field: "ts".to_string(),
+            operator: ExprOperator::Eq,
+            values: vec!["yesterday".to_string()],
+        };
+        let err = keygen.transform_filter(&filter).unwrap_err().to_string();
+        assert!(err.contains("'yesterday'"), "{err}");
+        assert!(err.contains("EpochMicroseconds"), "{err}");
+        assert!(err.contains("ISO-8601"), "{err}");
     }
 }
