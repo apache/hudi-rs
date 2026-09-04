@@ -205,10 +205,13 @@ mounts at `/mnt/nvme`; where one is present, keeping the generated parquet on
 it is faster than EBS and leaves the root volume alone:
 
 ```bash
-# optional, only if /mnt/nvme is mounted
-mountpoint -q /mnt/nvme && ln -sfn /mnt/nvme/tpch-data benchmark/tpch/data
+# optional, only if /mnt/nvme is mounted. Create the target before linking:
+# a dangling symlink here fails later as "File exists" from the output dir.
+mountpoint -q /mnt/nvme && mkdir -p /mnt/nvme/tpch-data \
+  && ln -sfn /mnt/nvme/tpch-data benchmark/tpch/data
 
-# the instance store is wiped by a stop/start, so regenerate after one
+# the instance store is wiped by a stop/start, so recreate the directory and
+# regenerate after one
 ```
 
 Instance types without a local disk work unchanged; everything simply stays on
