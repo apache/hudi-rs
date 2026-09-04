@@ -163,40 +163,21 @@ architecture-neutral, so Graviton and x86 instances both work.
 ```bash
 cd ~/hudi-rs
 bash benchmark/tpch/infra/aws/bootstrap.sh
-exec bash -l   # pick up SPARK_HOME and AWS_REGION from .bashrc
+
+exec bash -l                       # pick up the variables it appended
+echo "$SPARK_HOME" "$AWS_REGION"   # both must be non-empty
 ```
+
+The new shell matters: the one that ran bootstrap does not yet have those
+variables, and an unset `AWS_REGION` sends DataFusion to `us-east-1` rather
+than the bucket's region.
 
 Both engines resolve instance-profile credentials automatically: DataFusion
 through `object_store`, Spark through the S3A default credential chain, so no
-keys need to be configured. The script also persists `AWS_REGION` from the
-instance metadata, which DataFusion does need (see the note above).
+keys need to be configured. The region is the one thing neither infers, which
+is why bootstrap persists it from the instance metadata.
 
-### Sync code and build
-
-From local, sync the repo and build the benchmark binary on the instance.
-Re-run this whenever local code changes.
-
-```bash
-bash benchmark/tpch/infra/aws/sync.sh i-0123456789abcdef0 us-west-2 ~/.ssh/key.pem
-```
-
-### Run benchmarks on the instance
-
-Same commands as on GCP, with `s3://` data URLs. `create-tables` writes the
-Hudi tables straight to the bucket, so the instance only holds the generated
-parquet:
-
-```bash
-benchmark/tpch/run.sh generate --scale-factor 100
-# reuses the tables if they are already there; --recreate rebuilds them
-benchmark/tpch/run.sh create-tables --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
-
-benchmark/tpch/run.sh bench-datafusion --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi \
-  --output-dir benchmark/tpch/results
-benchmark/tpch/run.sh bench-spark --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi \
-  --output-dir benchmark/tpch/results
-benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
-```
+### Choose where the generated data lands
 
 `generate` writes to `benchmark/tpch/data`, so size the root volume for the
 scale factor (SF100 parquet is roughly 40 GB). Instance types ending in `d`
@@ -205,23 +186,48 @@ mounts at `/mnt/nvme`; where one is present, keeping the generated parquet on
 it is faster than EBS and leaves the root volume alone:
 
 ```bash
-# optional, only if /mnt/nvme is mounted. Create the target before linking:
-# a dangling symlink here fails later as "File exists" from the output dir.
-mountpoint -q /mnt/nvme && mkdir -p /mnt/nvme/tpch-data \
-  && ln -sfn /mnt/nvme/tpch-data benchmark/tpch/data
-
-# the instance store is wiped by a stop/start, so recreate the directory and
-# regenerate after one
+# optional, and only before generating
+mountpoint -q /mnt/nvme && ln -sfn /mnt/nvme/tpch-data benchmark/tpch/data
 ```
 
 Instance types without a local disk work unchanged; everything simply stays on
 the root volume, so provision it accordingly.
 
-Pass `--output-dir benchmark/tpch/results` to the `bench-*` commands for
-`compare` to find their results.
+### Run benchmarks on the instance
+
+Same commands as on GCP, with `s3://` data URLs. `create-tables` writes the
+Hudi tables straight to the bucket, so the instance only holds the generated
+parquet. Run these under `tmux`: at SF100 they take hours, and a dropped SSM
+session would otherwise kill them.
+
+```bash
+S3=s3://bucket/sf100-hudi
+
+benchmark/tpch/run.sh generate --scale-factor 100
+# reuses the tables if they are already there; --recreate rebuilds them
+benchmark/tpch/run.sh create-tables --scale-factor 100 --hudi-dir $S3
+
+benchmark/tpch/run.sh bench-datafusion --scale-factor 100 --hudi-dir $S3 \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh bench-spark --scale-factor 100 --hudi-dir $S3 \
+  --output-dir benchmark/tpch/results
+
+benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
+```
+
+`--output-dir` is what makes the `bench-*` commands persist their results, and
+`compare` reads them from there, so omitting it leaves nothing to compare once
+the runs have finished. To check credentials, region and the S3 path before
+committing hours to a full run, benchmark a couple of queries first with
+`--queries 1,6`.
+
+Re-run `sync.sh` from your local checkout whenever local code changes; it
+rebuilds the binary on the instance.
 
 ### Stop/start the instance
 
-Stopping wipes the NVMe instance store; after starting again, re-run the
-bootstrap script to re-mount it (the package installs are sentinel-guarded
-and skipped, so this is fast).
+Stopping wipes the NVMe instance store, taking the mount, any generated data on
+it, and the shuffle directory with it. Re-run the bootstrap script after
+starting again to restore them, then regenerate. The package installs are
+sentinel-guarded and skipped, so that is fast. Tables already written to the
+bucket are unaffected, and `create-tables` reuses them.
