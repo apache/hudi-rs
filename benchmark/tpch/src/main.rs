@@ -86,6 +86,12 @@ enum Commands {
         #[arg(long)]
         hudi_base: String,
     },
+    /// Verify every TPC-H Hudi table is readable at a base path
+    CheckTables {
+        /// Hudi tables base path (e.g., /opt/hudi or s3://bucket/path)
+        #[arg(long)]
+        hudi_base: String,
+    },
     /// Render benchmark SQL (table registrations + query iterations)
     RenderBenchSql {
         /// TPC-H scale factor (loads config/sf{N}.yaml)
@@ -354,6 +360,17 @@ async fn main() -> Result<()> {
             print!("{}", cfg.render_ctas_sql(&parquet_base, &hudi_base));
             Ok(())
         }
+        Commands::CheckTables { hudi_base } => {
+            let missing = missing_hudi_tables(&hudi_base).await?;
+            if missing.is_empty() {
+                Ok(())
+            } else {
+                Err(datafusion::error::DataFusionError::Plan(format!(
+                    "Hudi tables not found at {hudi_base}: {}",
+                    missing.join(", ")
+                )))
+            }
+        }
         Commands::RenderBenchSql {
             scale_factor,
             hudi_base,
@@ -484,24 +501,50 @@ fn load_query(query_num: usize, scale_factor: f64) -> std::result::Result<String
     Ok(sql.replace("${Q11_FRACTION}", &q11_fraction))
 }
 
+/// Names of the TPC-H tables that cannot be opened under `base_dir`.
+///
+/// Opens each through the same `HudiDataSource` the benchmark uses, so a table
+/// that passes here is one the benchmark can actually read, not merely a
+/// directory that exists.
+async fn missing_hudi_tables(base_dir: &str) -> Result<Vec<String>> {
+    let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
+
+    let mut missing = Vec::new();
+    for table_name in TPCH_TABLES {
+        let table_uri = hudi_table_uri(&resolved, table_name)?;
+        if HudiDataSource::new(&table_uri).await.is_err() {
+            missing.push((*table_name).to_string());
+        }
+    }
+    Ok(missing)
+}
+
+/// Build the URI for one Hudi table under a local path or cloud URL.
+fn hudi_table_uri(resolved_base: &str, table_name: &str) -> Result<String> {
+    if is_cloud_url(resolved_base) {
+        Ok(format!(
+            "{}/{table_name}",
+            resolved_base.trim_end_matches('/')
+        ))
+    } else {
+        let table_path = Path::new(resolved_base).join(table_name);
+        Ok(url::Url::from_file_path(&table_path)
+            .map_err(|_| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "Failed to create file URL for {}",
+                    table_path.display()
+                ))
+            })?
+            .to_string())
+    }
+}
+
 /// Register all 8 TPC-H Hudi tables. Supports local paths and cloud URLs.
 async fn register_hudi_tables(ctx: &SessionContext, base_dir: &str) -> Result<()> {
     let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
 
     for table_name in TPCH_TABLES {
-        let table_uri = if is_cloud_url(&resolved) {
-            format!("{}/{table_name}", resolved.trim_end_matches('/'))
-        } else {
-            let table_path = Path::new(&resolved).join(table_name);
-            url::Url::from_file_path(&table_path)
-                .map_err(|_| {
-                    datafusion::error::DataFusionError::Plan(format!(
-                        "Failed to create file URL for {}",
-                        table_path.display()
-                    ))
-                })?
-                .to_string()
-        };
+        let table_uri = hudi_table_uri(&resolved, table_name)?;
         let hudi = HudiDataSource::new(&table_uri).await?;
         ctx.register_table(*table_name, Arc::new(hudi))?;
     }
