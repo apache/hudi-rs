@@ -27,6 +27,15 @@ DEFAULT_SCALE_FACTOR=1
 TPCH_BIN="$REPO_ROOT/target/release/tpch"
 HUDI_SPARK_BUNDLE="org.apache.hudi:hudi-spark3.5-bundle_2.12:1.1.1"
 
+# Version of one crate as resolved in a Cargo.lock, ignoring any later package
+# whose name merely starts with it (datafusion-common, arrow-array).
+locked_version() {
+  awk -v pkg="$1" '
+    $0 == "name = \"" pkg "\"" { found = 1; next }
+    found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+  ' "$2" 2>/dev/null
+}
+
 # Record what the numbers were produced on. A timing is only comparable against
 # another run on the same hardware, build and data, and none of that is
 # recoverable from the results afterwards.
@@ -68,6 +77,13 @@ write_env_report() {
   git_rev=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
   git -C "$REPO_ROOT" diff --quiet 2>/dev/null || git_dirty=" (modified)"
 
+  # The versions the DataFusion leg is built against, read from the lock file so
+  # they are what was resolved rather than what was requested.
+  local lock="$REPO_ROOT/Cargo.lock"
+  local df_version arrow_version
+  df_version=$(locked_version datafusion "$lock")
+  arrow_version=$(locked_version arrow "$lock")
+
   # Where the data physically sits: an EBS root and an instance store give very
   # different read numbers for the same command.
   # Report the scheme without the bucket: the results are meant to be pasted
@@ -95,6 +111,8 @@ write_env_report() {
     echo "rustc:           $(rustc --version 2>/dev/null || echo unknown)"
     echo "RUSTFLAGS:       ${RUSTFLAGS:-(unset, see ~/.cargo/config.toml)}"
     echo "cargo build:     release"
+    echo "datafusion:      ${df_version:-unknown}"
+    echo "arrow:           ${arrow_version:-unknown}"
     echo "java:            $(java -version 2>&1 | head -1)"
     echo "spark:           $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | awk '/version/ {print $NF; exit}')"
     echo "hudi bundle:     $HUDI_SPARK_BUNDLE"
