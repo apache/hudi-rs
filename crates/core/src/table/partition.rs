@@ -105,6 +105,14 @@ pub struct PartitionPruner {
     is_url_encoded: bool,
     is_partitioned: bool,
     and_filters: Vec<SchemableFilter>,
+    /// Filters that reached the pruner but could not be bound to the partition schema, and
+    /// so prune nothing. Retained so a caller can tell "no partition matches your
+    /// predicate" apart from "your predicate was discarded and every partition was
+    /// scanned" — otherwise indistinguishable, since neither returns an error.
+    unapplied_filters: Vec<Filter>,
+    /// True when the table declares a key generator that needs filter rewriting but whose
+    /// configuration could not be loaded, so no rewriting happened.
+    keygen_unavailable: bool,
 }
 
 impl PartitionPruner {
@@ -114,13 +122,35 @@ impl PartitionPruner {
         hudi_configs: &HudiConfigs,
     ) -> Result<Self> {
         // Transform filters based on key generator configuration
-        let transformed_filters =
+        let (transformed_filters, keygen_unavailable) =
             Self::transform_filters_for_keygen(and_filters, partition_schema, hudi_configs)?;
 
-        let and_filters: Vec<SchemableFilter> = transformed_filters
-            .iter()
-            .filter_map(|filter| SchemableFilter::try_from((filter.clone(), partition_schema)).ok())
-            .collect();
+        // A filter that does not bind to the partition schema is dropped here, which is
+        // correct for a genuine data-column predicate but is also how a partition predicate
+        // silently disappears when its key generator could not rewrite it. Dropping it
+        // quietly then reads as a successful unfiltered scan, so record every drop.
+        let mut unapplied_filters = Vec::new();
+        let mut and_filters: Vec<SchemableFilter> = Vec::new();
+        for filter in &transformed_filters {
+            match SchemableFilter::try_from((filter.clone(), partition_schema)) {
+                Ok(bound) => and_filters.push(bound),
+                Err(e) => {
+                    log::warn!(
+                        "Filter on `{}` does not apply to the partition schema ({e}); it will \
+                         not prune any partition{}.",
+                        filter.field,
+                        if keygen_unavailable {
+                            ", because this table's key-generator configuration could not be \
+                             loaded and the filter was therefore never rewritten to a \
+                             partition-path predicate"
+                        } else {
+                            ""
+                        }
+                    );
+                    unapplied_filters.push(filter.clone());
+                }
+            }
+        }
 
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs
@@ -136,6 +166,8 @@ impl PartitionPruner {
             is_url_encoded,
             is_partitioned,
             and_filters,
+            unapplied_filters,
+            keygen_unavailable,
         })
     }
 
@@ -147,7 +179,34 @@ impl PartitionPruner {
             is_url_encoded: false,
             is_partitioned: false,
             and_filters: Vec::new(),
+            unapplied_filters: Vec::new(),
+            keygen_unavailable: false,
         }
+    }
+
+    /// Filters that reached the pruner but prune nothing, because they could not be bound
+    /// to the partition schema.
+    ///
+    /// A non-empty result means the returned partitions are wider than the caller's
+    /// predicate asked for. That is not in itself an error — a predicate on a non-partition
+    /// data column belongs here and is enforced when rows are read — but a caller that
+    /// requires partition pruning to happen, rather than degrade to a full scan, should
+    /// check this and treat a partition-column entry as a failure.
+    pub fn unapplied_filters(&self) -> &[Filter] {
+        &self.unapplied_filters
+    }
+
+    /// Whether this table declares a key generator that needs filter rewriting but whose
+    /// configuration could not be loaded.
+    ///
+    /// The `hoodie.keygen.timebased.*` options are writer-side and are not guaranteed to be
+    /// persisted into `hoodie.properties`, so a table can name `TimestampBasedKeyGenerator`
+    /// while carrying nothing that says which timestamp type, timezone or output format it
+    /// used. There is no safe way to guess a granularity from the class name alone, so
+    /// pruning is skipped rather than approximated — and reported here rather than passed
+    /// off as a successful scan.
+    pub fn is_keygen_config_unavailable(&self) -> bool {
+        self.keygen_unavailable
     }
 
     /// Returns `true` if the partition pruner does not have any filters.
@@ -190,26 +249,39 @@ impl PartitionPruner {
 
     /// Transforms user filters on data columns to filters on partition path columns
     /// based on the configured key generator.
+    ///
+    /// Returns the (possibly rewritten) filters and whether a key generator was declared but
+    /// could not be built. The second value matters because failing to build one is not
+    /// benign: the untransformed filter still names the source data column, which is absent
+    /// from the partition schema, so it is dropped when bound and the table is scanned in
+    /// full. Reporting it lets the caller say so instead of returning a silent full scan.
     fn transform_filters_for_keygen(
         filters: &[Filter],
         _partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
-    ) -> Result<Vec<Filter>> {
+    ) -> Result<(Vec<Filter>, bool)> {
         if is_timestamp_based_keygen(hudi_configs)? {
             match TimestampBasedKeyGenerator::from_configs(hudi_configs) {
                 Ok(transformer) => {
-                    return Self::apply_transformer_to_filters(filters, &transformer);
+                    return Ok((
+                        Self::apply_transformer_to_filters(filters, &transformer)?,
+                        false,
+                    ));
                 }
                 Err(e) => {
                     log::warn!(
-                        "Failed to create TimestampBasedKeyGenerator: {e}. \
-                         Filters will not be transformed."
+                        "Table declares TimestampBasedKeyGenerator but one could not be built \
+                         ({e}); the hoodie.keygen.timebased.* options are writer-side and may \
+                         not be present in hoodie.properties. Filters on the timestamp source \
+                         column cannot be rewritten into partition-path predicates and will \
+                         not prune; every partition will be read."
                     );
+                    return Ok((filters.to_vec(), true));
                 }
             }
         }
 
-        Ok(filters.to_vec())
+        Ok((filters.to_vec(), false))
     }
 
     fn apply_transformer_to_filters(
@@ -805,7 +877,7 @@ mod tests {
             values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
             &partition_schema,
             &configs,
@@ -836,7 +908,7 @@ mod tests {
             values: vec!["1706140800".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
             &partition_schema,
             &configs,
@@ -866,7 +938,7 @@ mod tests {
             values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
             &partition_schema,
             &configs,
@@ -896,7 +968,7 @@ mod tests {
             values: vec!["us-west".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             std::slice::from_ref(&user_filter),
             &partition_schema,
             &configs,
@@ -1201,5 +1273,77 @@ mod tests {
         assert!(pruner.should_include("ts=2025-01-01"));
         assert!(!pruner.should_include("ts=2024-12-30"));
         assert!(!pruner.should_include("ts=2025-01-02"));
+    }
+
+    /// A table can name TimestampBasedKeyGenerator while carrying none of the writer-side
+    /// `hoodie.keygen.timebased.*` options that say which granularity, timezone or format
+    /// it used. Guessing is unsafe, so pruning is skipped — but the caller must be able to
+    /// see that. Previously the filter was discarded without a trace and the resulting full
+    /// scan was indistinguishable from a successful one.
+    #[test]
+    fn missing_timebased_config_is_reported_rather_than_silently_ignored() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+        let pruner = PartitionPruner::new(
+            &[ts_filter(ExprOperator::Eq, "1900-01-01T00:00:00Z")],
+            &partition_path_schema(),
+            &configs,
+        )
+        .unwrap();
+
+        assert!(
+            pruner.is_keygen_config_unavailable(),
+            "the reader must report that it could not load the key-generator config"
+        );
+        assert_eq!(
+            pruner.unapplied_filters().len(),
+            1,
+            "the discarded predicate must be reported, not dropped in silence"
+        );
+        assert_eq!(pruner.unapplied_filters()[0].field, "ts");
+
+        // Pruning is deliberately skipped rather than approximated, so every partition is
+        // still returned; the point is that the accessors above make that visible.
+        assert!(pruner.should_include("ts=2024-03-01"));
+    }
+
+    /// A predicate on a plain data column legitimately prunes nothing and is reported as
+    /// unapplied, but it must not be mistaken for a broken key generator.
+    #[test]
+    fn data_column_filter_is_unapplied_without_blaming_the_keygen() {
+        let pruner = PartitionPruner::new(
+            &[Filter {
+                field: "amount".to_string(),
+                operator: ExprOperator::Gt,
+                values: vec!["100".to_string()],
+            }],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        assert_eq!(pruner.unapplied_filters().len(), 1);
+        assert!(!pruner.is_keygen_config_unavailable());
+        assert!(pruner.should_include("ts=2024-03-01"));
+    }
+
+    /// When the key generator is usable, nothing is left unapplied.
+    #[test]
+    fn a_usable_keygen_leaves_no_unapplied_filter() {
+        let pruner = PartitionPruner::new(
+            &[ts_filter(ExprOperator::Eq, "2024-03-01T00:00:00Z")],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        assert!(pruner.unapplied_filters().is_empty());
+        assert!(!pruner.is_keygen_config_unavailable());
     }
 }
