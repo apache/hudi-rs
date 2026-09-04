@@ -40,9 +40,9 @@ hudi_version=$1
 signing_key=$2
 repo=dev
 
-version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$"
+version_pattern="^[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$"
 if [[ ! "$hudi_version" =~ $version_pattern ]]; then
-    echo "❌  Version must be in format X.Y.Z or X.Y.Z-rc.W"
+    echo "❌  Version must be in format X.Y.Z or X.Y.Z-{alpha|beta|rc}.W"
     exit 1
 fi
 

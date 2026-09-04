@@ -93,8 +93,11 @@ Create and merge a PR to bump the major or minor version on the `main` branch, u
 `./release/bump_version_in_main.sh`. For example, if the current version is `0.5.0-dev`, bump it to
 `0.6.0-dev` (minor) or `1.0.0-dev` (major); `main` always carries the `-dev` suffix.
 
-On the release branch, bump the version to indicate pre-release by pushing a commit. Pre-releases
-use `rc.1`, `rc.2`, etc; the release scripts accept only `X.Y.Z` and `X.Y.Z-rc.W` versions.
+On the release branch, bump the version to indicate pre-release by pushing a commit.
+
+- If it is meant for internal testing, go with `alpha.1`, `alpha.2`, etc
+- If it is meant for public testing, go with `beta.1`, `beta.2`, etc
+- If it is ready for voting, go with `rc.1`, `rc.2`, etc
 
 ```shell
 RELEASE_VER=x.y.z-rc.1
@@ -115,7 +118,7 @@ Once the "bump version" commit is pushed, the CI tests will be triggered and run
 Tag the revision locally for the RC. The tag should match to the version in the form of `release-*`. For example,
 
 - If the release is `0.1.0-rc.1`, the tag should `release-0.1.0-rc.1`
-- If the release is `2.0.0-rc.2`, the tag should `release-2.0.0-rc.2`
+- If the release is `2.0.0-beta.2`, the tag should `release-2.0.0-beta.2`
 
 > [!NOTE]
 > The local tag is required by the script for source release upload in the next step.
