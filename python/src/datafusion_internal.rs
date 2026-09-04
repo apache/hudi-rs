@@ -56,7 +56,7 @@ fn extract_codec(session: Bound<PyAny>) -> PyResult<FFI_LogicalExtensionCodec> {
     // holds. It does not settle which `datafusion-ffi` built it, because the
     // name carries no version: a `datafusion` wheel built against another major
     // would present the same name over a different layout. Holding the two in
-    // step is what the pinned `datafusion` extra in pyproject.toml is for.
+    // step is what the major-bounded `datafusion` extra in pyproject.toml is for.
     let codec = unsafe { codec.cast::<FFI_LogicalExtensionCodec>().as_ref() };
     Ok(codec.clone())
 }

@@ -18,6 +18,9 @@
 
 [package]
 name = "hudi-jvm-ffi"
+# Not published to crates.io yet; the release workflow's publish matrix
+# deliberately excludes it.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

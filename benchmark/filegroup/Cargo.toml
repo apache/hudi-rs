@@ -19,6 +19,7 @@
 name = "fg-bench"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "fg-bench"
