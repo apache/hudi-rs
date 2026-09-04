@@ -146,8 +146,9 @@ class HudiFileGroupReader:
         Reads a file slice as a stream of record batches.
 
         For COW tables or read-optimized mode, this yields batches as they are read
-        without loading all data into memory. For MOR tables with log files, this
-        currently falls back to a single merged batch.
+        without loading all data into memory. For MOR slices with log files, file
+        group reader version 2 (the default) yields merged chunks incrementally;
+        version 1 falls back to a single merged batch.
         """
         ...
 

@@ -9,13 +9,16 @@ Arrow-native, `object_store` for all I/O, timeline-based MVCC.
 
 ```
 crates/
-  core/         hudi-core — config, expr, file_group, merge, metadata, schema, storage, table, timeline, hfile
+  core/         hudi-core — avro_to_arrow, config, expr, file_group, hfile, keygen, merge, metadata,
+                record, schema, statistics, storage, table, timeline, util
   datafusion/   hudi-datafusion — DataFusion TableProvider (feature: datafusion)
   hudi/         public umbrella crate; re-exports core + (optional) datafusion
+  jvm-ffi/      hudi-jvm-ffi — plain C ABI for JVM callers via the Arrow C Data Interface
   test/         shared test fixtures
 python/         PyO3 bindings (module hudi._internal); tests in python/tests
 cpp/            cxx bindings; bridge in cpp/src/lib.rs
 benchmark/tpch/ TPC-H benchmark harness
+benchmark/filegroup/ file-group read benchmark (fg-bench / fg-gen)
 ```
 
 ## Commands
@@ -126,7 +129,7 @@ single translation point exists to prevent.
 
 Storage backends route by URI scheme (`file://`, `s3://`, `az://`, `gs://`) through
 [`object_store`](https://docs.rs/object_store) — don't hand-roll per-scheme paths. Table options
-are typed: `HudiTableConfig`, `HudiReadConfig` (also Python enums). Prefer enum members over raw
+are typed: `HudiTableConfig`, `HudiReadConfig`, `HudiPlanConfig` (also Python enums). Prefer enum members over raw
 string keys; bulk variants (`with_hudi_options` / `with_options`) currently expect string keys.
 
 ## Code review
