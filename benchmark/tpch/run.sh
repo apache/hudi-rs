@@ -78,8 +78,8 @@ Commands:
 Options (per command):
   --scale-factor N  TPC-H scale factor [all commands] (default: $DEFAULT_SCALE_FACTOR)
   --format F        Table format: hudi or parquet [bench-*, compare] (default: auto)
-  --hudi-dir D      Hudi data directory or cloud URL [bench-*] (default: data/sf{N}-hudi)
-  --parquet-dir D   Parquet data directory or cloud URL [bench-*] (default: data/sf{N}-parquet)
+  --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
+  --parquet-dir D   Parquet data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-parquet)
   --queries Q       Comma-separated query numbers [bench-*] (default: all 22)
   --iterations N    Number of measured iterations per query [bench-*] (from config)
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
@@ -89,6 +89,7 @@ Options (per command):
 Examples:
   $0 generate --scale-factor 1
   $0 create-tables --scale-factor 1
+  $0 create-tables --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
   $0 bench-spark --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 100 --hudi-dir gs://bucket/sf100-hudi
@@ -119,28 +120,37 @@ cmd_generate() {
 
 cmd_create_tables() {
   local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
-  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
-  if [ ! -d "$parquet_dir" ]; then
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
+  if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
     echo "Error: parquet data not found at $parquet_dir. Run 'generate' first." >&2
     exit 1
   fi
 
-  local hudi_dir="$SCRIPT_DIR/data/sf$sf-hudi"
-  if [ -d "$hudi_dir" ]; then
-    echo "Removing existing Hudi data at $hudi_dir..."
-    rm -rf "$hudi_dir"
-  fi
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
 
   build_tpch
   setup_spark
-  mkdir -p "$hudi_dir"
+
+  # Spark creates the cloud prefix itself; only a local target needs clearing
+  # and pre-creating, and only there would stale files survive a rerun.
+  if ! is_cloud_url "$hudi_dir"; then
+    if [ -d "$hudi_dir" ]; then
+      echo "Removing existing Hudi data at $hudi_dir..."
+      rm -rf "$hudi_dir"
+    fi
+    mkdir -p "$hudi_dir"
+  fi
 
   local sql_file
   sql_file="$(mktemp)"

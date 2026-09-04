@@ -58,6 +58,10 @@ if [[ -n "${NVME_DEV:-}" ]]; then
   mkdir -p /mnt/nvme/spark-local
   ln -sfn /mnt/nvme/spark-local /tmp/spark-local
 else
+  # No instance store on this type; shuffle stays on the root volume. Clear any
+  # symlink left by a run on an instance that had one, which would otherwise
+  # point at an empty mount point.
+  [[ -L /tmp/spark-local ]] && rm -f /tmp/spark-local
   mkdir -p /tmp/spark-local
 fi
 mkdir -p /tmp/spark-events

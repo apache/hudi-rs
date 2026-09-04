@@ -140,14 +140,30 @@ S3 access to the benchmark bucket and includes the
 instance needs outbound internet access for the package, crate, PyPI and
 Maven downloads.
 
-Run the bootstrap script on the instance as the login user (not as user data,
-which would install the toolchain into root's home). It installs Rust, Java,
-PySpark, and the S3A connector, and mounts a local NVMe instance store at
-`/mnt/nvme` when the instance type has one (e.g. `r8gd.4xlarge` for SF100).
-The packages are architecture-neutral, so Graviton and x86 instances both work.
+Get the repo onto the instance first. A fresh Amazon Linux 2023 image has no
+`git` (bootstrap is what installs it), so either sync from a local checkout,
+which needs nothing preinstalled on the instance:
 
 ```bash
+bash benchmark/tpch/infra/aws/sync.sh i-0123456789abcdef0 us-west-2 ~/.ssh/key.pem
+```
+
+or install `git` on the instance and clone there:
+
+```bash
+sudo dnf install -y git && git clone <repo-url> ~/hudi-rs
+```
+
+Then run the bootstrap script as the login user (not as user data, which would
+install the toolchain into root's home). It installs Rust, Java, PySpark, and
+the S3A connector, and mounts a local NVMe instance store at `/mnt/nvme` when
+the instance type has one (e.g. `r8gd.4xlarge` for SF100). The packages are
+architecture-neutral, so Graviton and x86 instances both work.
+
+```bash
+cd ~/hudi-rs
 bash benchmark/tpch/infra/aws/bootstrap.sh
+exec bash -l   # pick up SPARK_HOME and AWS_REGION from .bashrc
 ```
 
 Both engines resolve instance-profile credentials automatically: DataFusion
@@ -166,13 +182,36 @@ bash benchmark/tpch/infra/aws/sync.sh i-0123456789abcdef0 us-west-2 ~/.ssh/key.p
 
 ### Run benchmarks on the instance
 
-Same commands as on GCP, with `s3://` data URLs:
+Same commands as on GCP, with `s3://` data URLs. `create-tables` writes the
+Hudi tables straight to the bucket, so the instance only holds the generated
+parquet:
 
 ```bash
-benchmark/tpch/run.sh bench-datafusion --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
-benchmark/tpch/run.sh bench-spark --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
+benchmark/tpch/run.sh generate --scale-factor 100
+benchmark/tpch/run.sh create-tables --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
+
+benchmark/tpch/run.sh bench-datafusion --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh bench-spark --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi \
+  --output-dir benchmark/tpch/results
 benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
 ```
+
+`generate` writes to `benchmark/tpch/data`, so size the root volume for the
+scale factor (SF100 parquet is roughly 40 GB). Instance types ending in `d`
+(`r8gd`, `r7gd`, `m7gd`) carry a local NVMe instance store, which bootstrap
+mounts at `/mnt/nvme`; where one is present, keeping the generated parquet on
+it is faster than EBS and leaves the root volume alone:
+
+```bash
+# optional, only if /mnt/nvme is mounted
+mountpoint -q /mnt/nvme && ln -sfn /mnt/nvme/tpch-data benchmark/tpch/data
+
+# the instance store is wiped by a stop/start, so regenerate after one
+```
+
+Instance types without a local disk work unchanged; everything simply stays on
+the root volume, so provision it accordingly.
 
 Pass `--output-dir benchmark/tpch/results` to the `bench-*` commands for
 `compare` to find their results.
