@@ -201,7 +201,8 @@ Options (per command):
   --format F        Table format: hudi or parquet [bench-*, compare] (default: auto)
   --recreate        Rebuild tables that already exist [create-tables] (default: reuse them)
   --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
-  --parquet-dir D   Parquet data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-parquet)
+  --parquet-dir D   Parquet data directory or cloud URL [generate, create-tables, bench-*,
+                    validate] (default: data/sf{N}-parquet)
   --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
   --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
                     holds two sessions at once, so a lower value may be needed)
@@ -228,23 +229,28 @@ EOF
 
 cmd_generate() {
   local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_parquet_dir=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
-  require_usable_data_dir
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
-  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
-  if [ -d "$parquet_dir" ]; then
-    echo "Removing existing parquet data at $parquet_dir..."
-    rm -rf "$parquet_dir"
+  # Only a local target can be cleared, or be a symlink into a vanished mount.
+  if ! is_cloud_url "$parquet_dir"; then
+    require_usable_data_dir
+    if [ -d "$parquet_dir" ]; then
+      echo "Removing existing parquet data at $parquet_dir..."
+      rm -rf "$parquet_dir"
+    fi
   fi
 
   build_tpch
-  "$TPCH_BIN" generate --scale-factor "$sf"
+  "$TPCH_BIN" generate --scale-factor "$sf" --output-dir "$parquet_dir"
 }
 
 cmd_create_tables() {
