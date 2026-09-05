@@ -76,7 +76,7 @@ gpg -q --import "$work_dir/KEYS"
 # human-readable output goes to stderr and stays visible; status goes to the file
 gpg --verify --status-fd 1 "$pub_key" "$src" >"$work_dir/gpg_status"
 if ! grep -q '^\[GNUPG:\] GOODSIG ' "$work_dir/gpg_status"; then
-  echo "ERROR: signature is not a GOODSIG (expired, revoked, or untrusted key)."
+  echo "ERROR: signature is not a GOODSIG (expired or revoked signing key)."
   exit 1
 fi
 echo "<<< OK"
