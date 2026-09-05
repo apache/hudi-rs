@@ -27,6 +27,15 @@ DEFAULT_SCALE_FACTOR=1
 TPCH_BIN="$REPO_ROOT/target/release/tpch"
 HUDI_SPARK_BUNDLE="org.apache.hudi:hudi-spark3.5-bundle_2.12:1.1.1"
 
+# Version of one crate as resolved in a Cargo.lock, ignoring any later package
+# whose name merely starts with it (datafusion-common, arrow-array).
+locked_version() {
+  awk -v pkg="$1" '
+    $0 == "name = \"" pkg "\"" { found = 1; next }
+    found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+  ' "$2" 2>/dev/null
+}
+
 # Record what the numbers were produced on. A timing is only comparable against
 # another run on the same hardware, build and data, and none of that is
 # recoverable from the results afterwards.
@@ -37,8 +46,11 @@ write_env_report() {
 
   local cpu_model cpu_count mem_total
   if [ -r /proc/cpuinfo ]; then
-    cpu_model=$(awk -F': ' '/^model name|^Model name/ {print $2; exit}' /proc/cpuinfo)
-    [ -z "$cpu_model" ] && cpu_model=$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')
+    # lscpu first: aarch64 /proc/cpuinfo carries no model name at all, only
+    # implementer and part numbers.
+    cpu_model=$(lscpu 2>/dev/null | awk -F': +' '/^Model name/ {print $2; exit}')
+    [ -z "$cpu_model" ] && cpu_model=$(awk -F': +' '/^model name/ {print $2; exit}' /proc/cpuinfo)
+    [ -z "$cpu_model" ] && cpu_model=$(uname -m)
     cpu_count=$(nproc)
     mem_total=$(awk '/^MemTotal/ {printf "%.0f GiB", $2/1048576}' /proc/meminfo)
   else
@@ -65,27 +77,45 @@ write_env_report() {
   git_rev=$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)
   git -C "$REPO_ROOT" diff --quiet 2>/dev/null || git_dirty=" (modified)"
 
+  # The versions the DataFusion leg is built against, read from the lock file so
+  # they are what was resolved rather than what was requested.
+  local lock="$REPO_ROOT/Cargo.lock"
+  local df_version arrow_version
+  df_version=$(locked_version datafusion "$lock")
+  arrow_version=$(locked_version arrow "$lock")
+
   # Where the data physically sits: an EBS root and an instance store give very
   # different read numbers for the same command.
-  local data_backing="n/a (cloud storage)"
-  if ! is_cloud_url "$data_dir"; then
-    data_backing=$(df -h "$data_dir" 2>/dev/null | awk 'NR==2 {print $1" "$2}')
+  # Report the scheme without the bucket: the results are meant to be pasted
+  # somewhere public, and the bucket name identifies private infrastructure.
+  local data_location="$data_dir"
+  local data_backing="n/a (object storage)"
+  if is_cloud_url "$data_dir"; then
+    data_location="${data_dir%%://*}:// (bucket omitted)"
+  else
+    # df fails on a path that does not exist, and pipefail would make that
+    # failure abort the benchmark rather than the report.
+    data_backing=$(df -h "$data_dir" 2>/dev/null | awk 'NR==2 {print $1" "$2}' || true)
+    [ -n "$data_backing" ] || data_backing="unknown"
   fi
 
   {
     echo "# Benchmark environment"
     echo "captured:        $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "scale factor:    $sf"
-    echo "data location:   $data_dir"
+    echo "data location:   $data_location"
     echo "data backing:    $data_backing"
     [ -n "$instance_type" ] && echo "instance:        $instance_type ($instance_region)"
     echo "cpu:             ${cpu_model:-unknown} x ${cpu_count:-?}"
     echo "memory:          ${mem_total:-unknown}"
     echo "os:              $(uname -srm)"
+    echo "spark master:    local[*] on ${cpu_count:-?} cores"
     echo "hudi-rs commit:  ${git_rev}${git_dirty}"
     echo "rustc:           $(rustc --version 2>/dev/null || echo unknown)"
-    echo "RUSTFLAGS:       ${RUSTFLAGS:-<from cargo config>}"
+    echo "RUSTFLAGS:       ${RUSTFLAGS:-(unset, see ~/.cargo/config.toml)}"
     echo "cargo build:     release"
+    echo "datafusion:      ${df_version:-unknown}"
+    echo "arrow:           ${arrow_version:-unknown}"
     echo "java:            $(java -version 2>&1 | head -1)"
     echo "spark:           $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | awk '/version/ {print $NF; exit}')"
     echo "hudi bundle:     $HUDI_SPARK_BUNDLE"
@@ -163,18 +193,26 @@ Commands:
   bench-spark       Run TPC-H queries against Hudi tables via Spark SQL
   bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
   compare           Compare persisted benchmark results with bar charts
+  validate          Check Hudi query results against the same queries on parquet
+  env-report        Rewrite the environment report for results already collected
 
 Options (per command):
   --scale-factor N  TPC-H scale factor [all commands] (default: $DEFAULT_SCALE_FACTOR)
   --format F        Table format: hudi or parquet [bench-*, compare] (default: auto)
   --recreate        Rebuild tables that already exist [create-tables] (default: reuse them)
   --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
-  --parquet-dir D   Parquet data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-parquet)
-  --queries Q       Comma-separated query numbers [bench-*] (default: all 22)
+  --parquet-dir D   Parquet data directory or cloud URL [generate, create-tables, bench-*,
+                    validate] (default: data/sf{N}-parquet)
+  --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
+  --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
+                    holds two sessions at once, so a lower value may be needed)
   --iterations N    Number of measured iterations per query [bench-*] (from config)
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
   --output-dir D    Directory to persist results as JSON [bench-*]
   --engines E       Comma-separated engine names to compare [compare]
+  --runs R          Comma-separated result file stems to compare [compare], e.g.
+                    datafusion_hudi_sf100,datafusion_parquet_sf100; overrides --engines
+                    and is the way to compare two formats
 
 Examples:
   $0 generate --scale-factor 1
@@ -191,23 +229,28 @@ EOF
 
 cmd_generate() {
   local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_parquet_dir=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
-  require_usable_data_dir
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
-  local parquet_dir="$SCRIPT_DIR/data/sf$sf-parquet"
-  if [ -d "$parquet_dir" ]; then
-    echo "Removing existing parquet data at $parquet_dir..."
-    rm -rf "$parquet_dir"
+  # Only a local target can be cleared, or be a symlink into a vanished mount.
+  if ! is_cloud_url "$parquet_dir"; then
+    require_usable_data_dir
+    if [ -d "$parquet_dir" ]; then
+      echo "Removing existing parquet data at $parquet_dir..."
+      rm -rf "$parquet_dir"
+    fi
   fi
 
   build_tpch
-  "$TPCH_BIN" generate --scale-factor "$sf"
+  "$TPCH_BIN" generate --scale-factor "$sf" --output-dir "$parquet_dir"
 }
 
 cmd_create_tables() {
@@ -437,52 +480,134 @@ cmd_bench_datafusion() {
     require_hudi_tables "$hudi_dir"
   fi
 
-  local bench_args=(bench --scale-factor "$sf")
-  [ "$use_hudi" = true ] && bench_args+=(--hudi-dir "$hudi_dir")
-  [ "$use_parquet" = true ] && bench_args+=(--parquet-dir "$parquet_dir")
-  [ -n "$queries" ] && bench_args+=(--queries "$queries")
-  [ -n "$iterations" ] && bench_args+=(--iterations "$iterations")
-  [ -n "$warmup" ] && bench_args+=(--warmup "$warmup")
+  local base_args=(bench --scale-factor "$sf")
+  [ -n "$queries" ] && base_args+=(--queries "$queries")
+  [ -n "$iterations" ] && base_args+=(--iterations "$iterations")
+  [ -n "$warmup" ] && base_args+=(--warmup "$warmup")
 
+  local persisting=false
   if [ -n "$output_dir" ]; then
     mkdir -p "$output_dir"
     output_dir="$(cd "$output_dir" && pwd)"
-    bench_args+=(--output-dir "$output_dir" --engine-label datafusion --format-label "${format:-hudi}" --display-name "datafusion+hudi-rs")
-    write_env_report "$output_dir/environment.txt" "$sf" "$hudi_dir"
+    persisting=true
+    # Describe the data actually being read, which is not the Hudi directory
+    # when only the parquet leg runs.
+    local reported_dir="$hudi_dir"
+    [ "$use_hudi" = false ] && reported_dir="$parquet_dir"
+    write_env_report "$output_dir/environment.txt" "$sf" "$reported_dir"
   fi
 
-  echo "Running DataFusion benchmark..."
-  TPCH_CONFIG_DIR="$SCRIPT_DIR/config" \
-  TPCH_QUERY_DIR="$SCRIPT_DIR/queries" \
-  RUST_LOG="${RUST_LOG:-warn}" \
-  "$TPCH_BIN" "${bench_args[@]}"
+  # One invocation per format. Results are keyed by engine and format label, so
+  # labelling a parquet run "hudi" writes it over the Hudi run's results.
+  run_datafusion_bench() {
+    local fmt="$1" data_flag="$2" data_dir="$3" display="$4"
+    local args=("${base_args[@]}" "$data_flag" "$data_dir")
+    if [ "$persisting" = true ]; then
+      args+=(--output-dir "$output_dir" --engine-label datafusion \
+             --format-label "$fmt" --display-name "$display")
+    fi
+    echo "Running DataFusion benchmark ($fmt)..."
+    TPCH_CONFIG_DIR="$SCRIPT_DIR/config" \
+    TPCH_QUERY_DIR="$SCRIPT_DIR/queries" \
+    RUST_LOG="${RUST_LOG:-warn}" \
+    "$TPCH_BIN" "${args[@]}"
+  }
+
+  if [ "$use_hudi" = true ]; then
+    run_datafusion_bench hudi --hudi-dir "$hudi_dir" "datafusion+hudi-rs"
+  fi
+  if [ "$use_parquet" = true ]; then
+    run_datafusion_bench parquet --parquet-dir "$parquet_dir" "datafusion+parquet"
+  fi
+}
+
+# Check the Hudi read path against the parquet the tables were built from, so a
+# timing cannot come from a read that returned less than it should have.
+cmd_validate() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
+  local queries=""
+  local memory_limit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --memory-limit) memory_limit="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
+
+  if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
+    echo "Error: parquet data not found at $parquet_dir." >&2
+    echo "Validation compares the Hudi tables against it, so it cannot run without it." >&2
+    exit 1
+  fi
+
+  build_tpch
+  require_hudi_tables "$hudi_dir"
+
+  local validate_args=(validate --scale-factor "$sf" --hudi-dir "$hudi_dir" --parquet-dir "$parquet_dir")
+  [ -n "$queries" ] && validate_args+=(--queries "$queries")
+  [ -n "$memory_limit" ] && validate_args+=(--memory-limit "$memory_limit")
+
+  "$TPCH_BIN" "${validate_args[@]}"
+}
+
+# Rewrite the environment report against results that already exist, so a run
+# whose report is wrong or missing does not have to be repeated to correct it.
+cmd_env_report() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local results_dir="$SCRIPT_DIR/results"
+  mkdir -p "$results_dir"
+  write_env_report "$results_dir/environment.txt" "$sf" \
+    "${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  cat "$results_dir/environment.txt"
 }
 
 cmd_compare() {
   local sf="$DEFAULT_SCALE_FACTOR"
   local engines=""
   local format="hudi"
+  local runs=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
       --engines) engines="$2"; shift 2 ;;
       --format) format="$2"; shift 2 ;;
+      --runs) runs="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
-  if [ -z "$engines" ]; then
+  if [ -z "$engines" ] && [ -z "$runs" ]; then
     echo "Error: --engines is required (e.g., --engines datafusion,spark)" >&2
     exit 1
   fi
 
-  # Convert "datafusion,spark" → "datafusion_hudi_sf1,spark_hudi_sf1"
-  local runs=""
-  IFS=',' read -ra engine_arr <<< "$engines"
-  for e in "${engine_arr[@]}"; do
-    [ -n "$runs" ] && runs+=","
-    runs+="${e}_${format}_sf${sf}"
-  done
+  # --engines pairs each engine with one format; --runs names result files
+  # directly, which is how two formats get compared against each other.
+  if [ -z "$runs" ]; then
+    IFS=',' read -ra engine_arr <<< "$engines"
+    for e in "${engine_arr[@]}"; do
+      [ -n "$runs" ] && runs+=","
+      runs+="${e}_${format}_sf${sf}"
+    done
+  fi
 
   build_tpch
   "$TPCH_BIN" compare \
@@ -514,6 +639,8 @@ case "$COMMAND" in
   bench-spark)      cmd_bench_spark "$@" ;;
   bench-datafusion) cmd_bench_datafusion "$@" ;;
   compare)          cmd_compare "$@" ;;
+  validate)         cmd_validate "$@" ;;
+  env-report)       cmd_env_report "$@" ;;
   *)
     echo "Unknown command: $COMMAND" >&2
     usage

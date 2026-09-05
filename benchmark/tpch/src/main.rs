@@ -560,8 +560,12 @@ async fn register_parquet_tables(ctx: &SessionContext, base_dir: &str) -> Result
     }
 
     for table_name in TPCH_TABLES {
+        // The trailing slash is what marks the path as a directory to list. A
+        // local path can be stat'ed, but an object store prefix cannot, so
+        // without it each table reads as a single file and is rejected for not
+        // ending in the parquet extension.
         let table_path = if is_cloud_url(&resolved) {
-            format!("{}/{table_name}", resolved.trim_end_matches('/'))
+            format!("{}/{table_name}/", resolved.trim_end_matches('/'))
         } else {
             Path::new(&resolved)
                 .join(table_name)
@@ -911,9 +915,17 @@ async fn run_validate(
     println!("Running Parquet queries...");
     let parquet_results = bench_source(&parquet_ctx, &query_nums, 0, 1, scale_factor).await;
 
-    print_validation_table(&query_nums, &hudi_results, &parquet_results);
+    let failed = print_validation_table(&query_nums, &hudi_results, &parquet_results);
 
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        let names: Vec<String> = failed.iter().map(|qn| format!("Q{qn:02}")).collect();
+        Err(datafusion::error::DataFusionError::Plan(format!(
+            "Hudi results differ from parquet for {}",
+            names.join(", ")
+        )))
+    }
 }
 
 /// Parse Spark benchmark JSON output into a timing table.
@@ -1157,11 +1169,14 @@ fn print_single_table(label: &str, results: &[QueryResult]) {
     println!("{table}");
 }
 
+/// Returns the queries that did not match, so the caller can fail the run
+/// rather than leave a mismatch to be noticed in the output.
 fn print_validation_table(
     query_nums: &[usize],
     hudi_results: &[QueryResult],
     parquet_results: &[QueryResult],
-) {
+) -> Vec<usize> {
+    let mut failed = Vec::new();
     let mut table = Table::new();
     table.set_header(vec![
         Cell::new("Query"),
@@ -1179,6 +1194,7 @@ fn print_validation_table(
 
         if h_err.is_some() || p_err.is_some() {
             let err_msg = h_err.or(p_err).unwrap_or("unknown error");
+            failed.push(*qn);
             table.add_row(vec![
                 Cell::new(format!("Q{qn:02}")),
                 Cell::new(if h_err.is_some() { "-" } else { "OK" }),
@@ -1199,6 +1215,9 @@ fn print_validation_table(
             .map(|t| format!("{t:.1}"))
             .unwrap_or("-".into());
         let validation = compare_batches(&hr.last_batches, &pr.last_batches);
+        if validation != "PASS" {
+            failed.push(*qn);
+        }
 
         table.add_row(vec![
             Cell::new(format!("Q{qn:02}")),
@@ -1209,6 +1228,7 @@ fn print_validation_table(
     }
 
     println!("{table}");
+    failed
 }
 
 /// Compare two sets of record batches for correctness validation.
