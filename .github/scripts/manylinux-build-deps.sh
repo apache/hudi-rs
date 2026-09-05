@@ -38,6 +38,11 @@
 #
 # perl-IPC-Cmd: needed by openssl.
 
+# This script is sourced, not executed, so that the exports below land in the
+# same shell the build runs in. Keep the caller's shell options: the strictness
+# is for this script, and leaking `set -u` in particular would turn any unset
+# variable in a future maturin-action release into a release-time failure.
+_deps_saved_opts=$(set +o)
 set -euo pipefail
 
 PROTOC_VERSION=36.1
@@ -73,22 +78,34 @@ yum install -y llvm-toolset-7.0-clang llvm-toolset-7.0-clang-libs perl-IPC-Cmd
 # libclang.so links against the LLVM runtime in the same prefix, so make the
 # loader aware of it rather than relying on a symlink out of the prefix.
 libclang_dir=/opt/rh/llvm-toolset-7.0/root/usr/lib64
-test -e "$libclang_dir/libclang.so" || {
+if [ ! -e "$libclang_dir/libclang.so" ]; then
   echo "libclang.so not found under $libclang_dir" >&2
-  exit 1
-}
+  return 1 2>/dev/null || exit 1
+fi
 
 # Register the prefix so the LLVM runtime libclang links against resolves.
 echo "$libclang_dir" >/etc/ld.so.conf.d/llvm-toolset-7.0.conf
 ldconfig
 
-clang_include=$(ls -d "$libclang_dir"/clang/*/include 2>/dev/null | head -n 1)
-test -n "$clang_include" || {
+# Assign in a condition context: a bare `var=$(...)` takes the substitution's
+# status, so a non-matching glob would trip errexit before the check below.
+clang_include=""
+for candidate in "$libclang_dir"/clang/*/include; do
+  if [ -e "$candidate/stdbool.h" ]; then
+    clang_include=$candidate
+    break
+  fi
+done
+if [ -z "$clang_include" ]; then
   echo "clang builtin headers not found under $libclang_dir/clang" >&2
-  exit 1
-}
+  return 1 2>/dev/null || exit 1
+fi
 
 export LIBCLANG_PATH="$libclang_dir"
 export BINDGEN_EXTRA_CLANG_ARGS="-I$clang_include"
 echo "libclang: $LIBCLANG_PATH"
 echo "clang builtin headers: $clang_include"
+
+# Restore the caller's shell options; the exports above survive.
+eval "$_deps_saved_opts"
+unset _deps_saved_opts
