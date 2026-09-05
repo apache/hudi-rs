@@ -579,6 +579,207 @@ mod tests {
     }
 
     #[test]
+    fn test_scalar_time_unit_parsing_and_conversion() {
+        for (unit, spelled) in [
+            (ScalarTimeUnit::Nanoseconds, "NANOSECONDS"),
+            (ScalarTimeUnit::Microseconds, "microseconds"),
+            (ScalarTimeUnit::Milliseconds, "MILLISECONDS"),
+            (ScalarTimeUnit::Seconds, "seconds"),
+            (ScalarTimeUnit::Minutes, "MINUTES"),
+            (ScalarTimeUnit::Hours, "hours"),
+            (ScalarTimeUnit::Days, "DAYS"),
+        ] {
+            assert_eq!(ScalarTimeUnit::from_str(spelled).unwrap(), unit);
+        }
+        let err = ScalarTimeUnit::from_str("fortnights").unwrap_err();
+        assert!(err.to_string().contains("Unsupported scalar time unit"));
+
+        // Every unit resolves 2024-01-25T00:00:00Z to the same millisecond instant.
+        assert_eq!(
+            ScalarTimeUnit::Nanoseconds.to_millis(1_706_140_800_000_000_000),
+            1_706_140_800_000
+        );
+        assert_eq!(
+            ScalarTimeUnit::Microseconds.to_millis(1_706_140_800_000_000),
+            1_706_140_800_000
+        );
+        assert_eq!(
+            ScalarTimeUnit::Milliseconds.to_millis(1_706_140_800_000),
+            1_706_140_800_000
+        );
+        assert_eq!(
+            ScalarTimeUnit::Seconds.to_millis(1_706_140_800),
+            1_706_140_800_000
+        );
+        assert_eq!(
+            ScalarTimeUnit::Minutes.to_millis(28_435_680),
+            1_706_140_800_000
+        );
+        assert_eq!(ScalarTimeUnit::Hours.to_millis(473_928), 1_706_140_800_000);
+        assert_eq!(ScalarTimeUnit::Days.to_millis(19_747), 1_706_140_800_000);
+    }
+
+    #[test]
+    fn test_invalid_timezones_are_config_errors() {
+        let base = [
+            ("hoodie.table.partition.fields", "ts"),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            ("hoodie.keygen.timebased.input.dateformat", "yyyy-MM-dd"),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+        ];
+        let configs = HudiConfigs::new(
+            base.iter()
+                .cloned()
+                .chain([("hoodie.keygen.timebased.input.timezone", "Solar/Mars")]),
+        );
+        let err = TimestampBasedKeyGenerator::from_configs(&configs).unwrap_err();
+        assert!(err.to_string().contains("Invalid input timezone"));
+
+        let configs = HudiConfigs::new(
+            base.iter()
+                .cloned()
+                .chain([("hoodie.keygen.timebased.output.timezone", "Solar/Mars")]),
+        );
+        let err = TimestampBasedKeyGenerator::from_configs(&configs).unwrap_err();
+        assert!(err.to_string().contains("Invalid output timezone"));
+    }
+
+    #[test]
+    fn test_epoch_literals_beyond_datetime_range_fail() {
+        let unix = TimestampBasedKeyGenerator::from_configs(&create_test_configs_unix_timestamp())
+            .unwrap();
+        for bad in [i64::MAX.to_string(), (-i64::MAX).to_string()] {
+            let err = unix.parse_timestamp(&bad).unwrap_err();
+            assert!(err.to_string().contains("Invalid unix timestamp"), "{bad}");
+        }
+
+        let millis_configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.keygen.timebased.timestamp.type",
+                "EPOCHMILLISECONDS",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+        ]);
+        let millis = TimestampBasedKeyGenerator::from_configs(&millis_configs).unwrap();
+        let err = millis.parse_timestamp(&i64::MAX.to_string()).unwrap_err();
+        assert!(err.to_string().contains("Invalid epoch milliseconds"));
+
+        let micros_configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.keygen.timebased.timestamp.type",
+                "EPOCHMICROSECONDS",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+        ]);
+        let micros = TimestampBasedKeyGenerator::from_configs(&micros_configs).unwrap();
+        let err = micros.parse_timestamp(&i64::MAX.to_string()).unwrap_err();
+        assert!(err.to_string().contains("Invalid epoch microseconds"));
+    }
+
+    #[test]
+    fn test_scalar_type_parsing_and_errors() {
+        let scalar_configs = |unit: Option<&str>| {
+            HudiConfigs::new(
+                [
+                    ("hoodie.table.partition.fields", "ts"),
+                    ("hoodie.keygen.timebased.timestamp.type", "SCALAR"),
+                    ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+                ]
+                .into_iter()
+                .chain(unit.map(|u| ("hoodie.keygen.timebased.timestamp.scalar.time.unit", u))),
+            )
+        };
+
+        // An unconfigured unit defaults to seconds.
+        let keygen = TimestampBasedKeyGenerator::from_configs(&scalar_configs(None)).unwrap();
+        let dt = keygen.parse_timestamp("1").unwrap();
+        assert_eq!(
+            (dt.year(), dt.month(), dt.day(), dt.hour()),
+            (1970, 1, 1, 0)
+        );
+
+        // Every other unit converts through to the same instant.
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&scalar_configs(Some("days"))).unwrap();
+        let dt = keygen.parse_timestamp("19747").unwrap();
+        assert_eq!((dt.year(), dt.month(), dt.day()), (2024, 1, 25));
+
+        // A literal that is not an integer cannot be a scalar.
+        let err = keygen.parse_timestamp("2024-01-25").unwrap_err();
+        assert!(err.to_string().contains("Failed to parse scalar timestamp"));
+
+        // A scalar within i64 but beyond the datetime range overflows.
+        let err = keygen.parse_timestamp("200000000").unwrap_err();
+        assert!(err.to_string().contains("Invalid scalar timestamp"));
+    }
+
+    #[test]
+    fn test_defensive_parse_errors_for_unset_configuration() {
+        // from_configs always sets these, so the parse-time guards are reached only by a
+        // mis-assembled generator; they must fail as config errors, not panic.
+        let missing_dateformat = TimestampBasedKeyGenerator {
+            source_field: "ts".to_string(),
+            timestamp_type: TimestampType::DateString,
+            input_dateformat: None,
+            input_timezone: None,
+            scalar_time_unit: None,
+            output_dateformat: "yyyy-MM-dd".to_string(),
+            output_timezone: "UTC".parse().unwrap(),
+            is_hive_style: false,
+        };
+        let err = missing_dateformat
+            .parse_timestamp("2024-01-25")
+            .unwrap_err();
+        assert!(err.to_string().contains("Input date format is required"));
+
+        let missing_scalar_unit = TimestampBasedKeyGenerator {
+            source_field: "ts".to_string(),
+            timestamp_type: TimestampType::Scalar,
+            input_dateformat: None,
+            input_timezone: None,
+            scalar_time_unit: None,
+            output_dateformat: "yyyy-MM-dd".to_string(),
+            output_timezone: "UTC".parse().unwrap(),
+            is_hive_style: false,
+        };
+        let err = missing_scalar_unit.parse_timestamp("1").unwrap_err();
+        assert!(err.to_string().contains("Scalar time unit not configured"));
+    }
+
+    #[test]
+    fn test_ambiguous_wall_clock_datetime_is_rejected() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd HH:mm:ss",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+            ("hoodie.keygen.timebased.input.timezone", "America/New_York"),
+        ]);
+        let keygen = TimestampBasedKeyGenerator::from_configs(&configs).unwrap();
+
+        // Spring forward: 02:30 does not exist on 2024-03-10 in New York.
+        let err = keygen.parse_timestamp("2024-03-10 02:30:00").unwrap_err();
+        assert!(err.to_string().contains("Ambiguous or invalid datetime"));
+
+        // Fall back: 01:30 occurs twice on 2024-11-03, so it is equally ambiguous.
+        let err = keygen.parse_timestamp("2024-11-03 01:30:00").unwrap_err();
+        assert!(err.to_string().contains("Ambiguous or invalid datetime"));
+    }
+
+    #[test]
+    fn test_source_field_trait_accessor() {
+        let keygen =
+            TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
+        let transformer: &dyn KeyGeneratorFilterTransformer = &keygen;
+        assert_eq!(transformer.source_field(), "ts_str");
+    }
+
+    #[test]
     fn test_construction_and_parsing() {
         // DATE_STRING: hive-style with timezone in input
         let keygen =
