@@ -28,8 +28,8 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-hudi-core = { version = "0.5.0-dev", path = "../core", default-features = false }
-hudi-datafusion = { version = "0.5.0-dev", path = "../datafusion", optional = true, default-features = false }
+hudi-core = { version = "0.5.0-rc.1", path = "../core", default-features = false }
+hudi-datafusion = { version = "0.5.0-rc.1", path = "../datafusion", optional = true, default-features = false }
 
 [features]
 default = ["spill-rocksdb"]
