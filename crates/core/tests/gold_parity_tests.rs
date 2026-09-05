@@ -96,6 +96,7 @@ const EXPECTED_WITHOUT_GOLD: &[&str] = &[
     "v9_lance_nonpartitioned [Cow]",
     "v9_lance_txns_nonpart [Cow]",
     "v9_lance_txns_simple [Cow]",
+    "v9_timebasedkeygen_hivestyle_epochmicros [Cow]",
     "v9_trips_lance [Cow]",
     "v9_trips_lance [MorAvro]",
 ];
