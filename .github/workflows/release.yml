@@ -150,6 +150,6 @@ jobs:
           target: ${{ matrix.target }}
           command: publish
           args: ${{ matrix.args }}
-          manylinux: '2014'
+          manylinux: '2_28'
           before-script-linux: |
-            source .github/scripts/manylinux-build-deps.sh
+            bash .github/scripts/manylinux-build-deps.sh
