@@ -41,7 +41,7 @@ usage() {
   echo "Usage: $0 <version> [--skip-functional]"
   echo
   echo "  version           release version, e.g. 0.5.0 or 0.5.0-rc.2"
-  echo "  --skip-functional skip the container install-and-read test (needs docker)"
+  echo "  --skip-functional skip the install-and-read tests"
   exit 1
 }
 
@@ -115,35 +115,44 @@ else
 fi
 
 # -------------------------------------------------------------- functional --
-# Installing in a clean image is the part that catches a wheel that builds and
-# then does not load: the rocksdb bindings come from the build container's
+# Installing in a clean environment is the part that catches a wheel that builds
+# and then does not load: the rocksdb bindings come from the build container's
 # libclang, and bad bindings surface on import or first read, not at compile
 # time. Reading a table exercises the merge path rather than just the module.
+#
+# A wheel is per-platform, so each one has to be installed on its own platform.
+# A leg that cannot run here says so: it must not be reported as passing, and an
+# environment that cannot run a leg must not be reported as a broken release.
 if [ "$skip_functional" = true ]; then
-  echo ">>> Skipping the functional test (--skip-functional)"
-elif ! command -v docker >/dev/null 2>&1; then
-  echo ">>> Skipping the functional test (docker not found)"
+  echo ">>> Skipping the install-and-read tests (--skip-functional)"
 else
   echo ">>> Verifying the wheels install and read a table..."
   work_dir=$(mktemp -d)
   trap 'rm -rf "$work_dir"' EXIT
 
+  have_fixture=true
   fixture=$repo_root/crates/test/data/quickstart_trips_table/mor/avro/v8_trips_8i3u1d.zip
   if [ ! -f "$fixture" ]; then
     note_failure "table fixture not found at $fixture"
+    have_fixture=false
   else
     unzip -q "$fixture" -d "$work_dir/tables"
+  fi
 
-    cat >"$work_dir/check.py" <<'PY'
+  # One copy of the read, run by every leg. Two copies drift, and the check that
+  # a leg read anything at all is the one worth not losing to that.
+  check_py=$work_dir/check.py
+  cat >"$check_py" <<'CHECK_PY'
 import glob
 import os
 import sys
 
 import hudi
 
-tables = [p for p in sorted(glob.glob("/data/*")) if os.path.isdir(f"{p}/.hoodie")]
+root = sys.argv[1]
+tables = [p for p in sorted(glob.glob(f"{root}/*")) if os.path.isdir(f"{p}/.hoodie")]
 if not tables:
-    sys.exit("no table fixture mounted")
+    sys.exit(f"no table fixture found under {root}")
 
 for path in tables:
     table = hudi.HudiTable(path)
@@ -152,23 +161,32 @@ for path in tables:
         sys.exit(f"{os.path.basename(path)}: read returned no rows")
     print(f"    {os.path.basename(path)}: {table.table_type}, {rows} rows, "
           f"{len(table.get_schema())} columns")
-PY
+CHECK_PY
 
-    # Both linux wheels, not just the host's. One of them runs emulated and is
-    # slow, but a wheel is per-architecture and testing only the native one
-    # leaves the other exactly as unverified as it was before this script.
+  if [ "$have_fixture" != true ]; then
+    echo "  linux: not tested (no table fixture)"
+  elif ! command -v docker >/dev/null 2>&1; then
+    echo "  linux: not tested (docker not found)"
+  else
     # A stock python image, not the image the wheel was built in: that is what
     # makes this a test of the platform tag rather than of the build container.
     for docker_platform in linux/amd64 linux/arm64; do
+      # An architecture this host cannot execute is a missing binfmt handler,
+      # not a bad wheel. The two must not reach the same verdict, because the
+      # remedy for a bad wheel is an entire new release candidate.
+      if ! docker run --rm --platform "$docker_platform" python:3.11-slim true >/dev/null 2>&1; then
+        echo "  $docker_platform: not tested (this host cannot run that architecture)"
+        continue
+      fi
       echo "  $docker_platform:"
       if docker run --rm --platform "$docker_platform" \
           -v "$work_dir/tables:/data:ro" \
-          -v "$work_dir/check.py:/check.py:ro" \
+          -v "$check_py:/check.py:ro" \
           python:3.11-slim bash -c "
             set -e
             pip install --quiet --only-binary=:all: 'hudi==$pypi_version'
             python -c 'import hudi; print(\"    import: ok\")'
-            python /check.py
+            python /check.py /data
           "; then
         echo "    installs and reads: ok"
       else
@@ -177,34 +195,35 @@ PY
     done
   fi
 
-  # The macOS wheels can only be exercised on macOS, and the windows wheel not
-  # at all from here. Say so rather than letting the linux results read as
-  # coverage of everything the presence check above lists.
-  if [ "$(uname -s)" = "Darwin" ] && command -v python3 >/dev/null 2>&1; then
+  # The macOS wheel needs no container, so it must not sit behind the docker
+  # check: on a mac without docker this is the one leg that can still run.
+  if [ "$have_fixture" != true ]; then
+    echo "  macos: not tested (no table fixture)"
+  elif [ "$(uname -s)" != "Darwin" ]; then
+    echo "  macos: not tested (run this on macOS to cover it)"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    echo "  macos: not tested (python3 not found)"
+  else
     echo "  macos/$(uname -m):"
     venv=$work_dir/venv
     python3 -m venv "$venv"
     if "$venv/bin/pip" install --quiet --only-binary=:all: "hudi==$pypi_version" &&
         "$venv/bin/python" -c 'import hudi; print("    import: ok")' &&
-        DATA="$work_dir/tables" "$venv/bin/python" -c '
-import glob, os, sys
-import hudi
-for path in sorted(glob.glob(os.environ["DATA"] + "/*")):
-    if not os.path.isdir(f"{path}/.hoodie"):
-        continue
-    table = hudi.HudiTable(path)
-    rows = sum(batch.num_rows for batch in table.read())
-    if rows == 0:
-        sys.exit(f"{os.path.basename(path)}: read returned no rows")
-    print(f"    {os.path.basename(path)}: {table.table_type}, {rows} rows, "
-          f"{len(table.get_schema())} columns")
-'; then
+        "$venv/bin/python" "$check_py" "$work_dir/tables"; then
       echo "    installs and reads: ok"
     else
       note_failure "macos/$(uname -m): the wheel failed to install, import, or read a table"
     fi
-  else
-    echo "  macos: not tested (run this on macOS to cover it)"
+  fi
+
+  # Name what is still uncovered, so the legs that did run are not read as
+  # standing in for the whole set the presence check above lists.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    if [ "$(uname -m)" = "arm64" ]; then
+      echo "  macos/x86_64: not tested (needs an intel mac)"
+    else
+      echo "  macos/arm64: not tested (needs an apple silicon mac)"
+    fi
   fi
   echo "  windows: not tested (no way to exercise it from here)"
 fi

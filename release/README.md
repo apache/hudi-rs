@@ -57,6 +57,7 @@ This issue tracks the release process as instructed in the [release guide](https
 
 - [ ] Bump the version in the release branch for the official release
 - [ ] Push the official release git tag to the release branch
+- [ ] Verify the published crates.io and pypi.org artifacts
 - [ ] Upload the release artifacts to the ASF release repo (SVN)
 - [ ] Merge a PR to update the changelog in `main` branch
 - [ ] Publish release notes in https://github.com/apache/hudi-rs/releases
