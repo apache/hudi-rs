@@ -560,8 +560,12 @@ async fn register_parquet_tables(ctx: &SessionContext, base_dir: &str) -> Result
     }
 
     for table_name in TPCH_TABLES {
+        // The trailing slash is what marks the path as a directory to list. A
+        // local path can be stat'ed, but an object store prefix cannot, so
+        // without it each table reads as a single file and is rejected for not
+        // ending in the parquet extension.
         let table_path = if is_cloud_url(&resolved) {
-            format!("{}/{table_name}", resolved.trim_end_matches('/'))
+            format!("{}/{table_name}/", resolved.trim_end_matches('/'))
         } else {
             Path::new(&resolved)
                 .join(table_name)
