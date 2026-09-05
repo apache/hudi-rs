@@ -36,7 +36,7 @@ default = ["spill-rocksdb"]
 spill-rocksdb = ["hudi-core/spill-rocksdb"]
 
 [dependencies]
-hudi-core = { version = "0.5.0-dev", path = "../core", default-features = false, features = [
+hudi-core = { version = "0.6.0-dev", path = "../core", default-features = false, features = [
     "datafusion",
 ] }
 # arrow
