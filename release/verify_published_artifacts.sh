@@ -127,9 +127,21 @@ else
   filenames=$(echo "$pypi_json" | python3 -c \
     'import json,sys; print("\n".join(f["filename"] for f in json.load(sys.stdin)["urls"]))')
   # The floor the wheels were built against, so a leg can tell "this interpreter
-  # is too old" apart from "this wheel is broken".
+  # is too old" apart from "this wheel is broken". Only the lower bound matters
+  # here, and a spec this cannot read yields nothing rather than a wrong number:
+  # a leg that cannot establish the floor runs anyway rather than skipping on a
+  # parse it got wrong.
   pypi_requires_python=$(echo "$pypi_json" | python3 -c \
     'import json,sys; print(json.load(sys.stdin)["info"].get("requires_python") or "")')
+  pypi_floor=$(python3 - "$pypi_requires_python" <<'FLOOR_PY'
+import re
+import sys
+
+spec = sys.argv[1] if len(sys.argv) > 1 else ""
+match = re.search(r">=\s*(\d+)\.(\d+)", spec)
+print(f"{match.group(1)}.{match.group(2)}" if match else "")
+FLOOR_PY
+)
 
   # Substrings rather than exact names: the abi3 tag tracks the python floor and
   # the manylinux tag tracks the build image, and neither should fail this check
@@ -196,7 +208,16 @@ for path in tables:
           f"{len(table.get_schema())} columns")
 CHECK_PY
 
-  if [ "$have_fixture" != true ]; then
+  # Track the wheels' own floor rather than pinning a version that a later abi3
+  # bump would leave below it, which would read as a broken wheel.
+  python_image=python:${pypi_floor:-3.11}-slim
+
+  if [ "${pypi_code:-}" != "200" ]; then
+    # The metadata check already called this an unknown. pip cannot reach the
+    # index either, so letting the legs run would turn one outage into several
+    # failures and a verdict of "cut a new release candidate".
+    echo "  linux: not tested (could not reach pypi.org)"
+  elif [ "$have_fixture" != true ]; then
     echo "  linux: not tested (no table fixture)"
   elif ! command -v docker >/dev/null 2>&1; then
     echo "  linux: not tested (docker not found)"
@@ -212,7 +233,7 @@ CHECK_PY
       # An architecture this host cannot execute is a missing binfmt handler,
       # not a bad wheel. The two must not reach the same verdict, because the
       # remedy for a bad wheel is an entire new release candidate.
-      if ! docker run --rm --platform "$docker_platform" python:3.11-slim true >/dev/null 2>&1; then
+      if ! docker run --rm --platform "$docker_platform" "$python_image" true >/dev/null 2>&1; then
         echo "  $docker_platform: not tested (this host cannot run that architecture)"
         continue
       fi
@@ -220,7 +241,7 @@ CHECK_PY
       if docker run --rm --platform "$docker_platform" \
           -v "$work_dir/tables:/data:ro" \
           -v "$check_py:/check.py:ro" \
-          python:3.11-slim bash -c "
+          "$python_image" bash -c "
             set -e
             pip install --quiet --only-binary=:all: 'hudi==$pypi_version'
             python -c 'import hudi; print(\"    import: ok\")'
@@ -235,24 +256,23 @@ CHECK_PY
 
   # The macOS wheel needs no container, so it must not sit behind the docker
   # check: on a mac without docker this is the one leg that can still run.
-  if [ "$have_fixture" != true ]; then
+  if [ "${pypi_code:-}" != "200" ]; then
+    echo "  macos: not tested (could not reach pypi.org)"
+  elif [ "$have_fixture" != true ]; then
     echo "  macos: not tested (no table fixture)"
   elif [ "$(uname -s)" != "Darwin" ]; then
     echo "  macos: not tested (run this on macOS to cover it)"
   elif ! command -v python3 >/dev/null 2>&1; then
     echo "  macos: not tested (python3 not found)"
-  elif ! python3 -c "
+  elif [ -n "$pypi_floor" ] && ! python3 -c "
 import sys
-spec = '''${pypi_requires_python:-}'''
-floor = spec.split('>=')[-1].strip() if '>=' in spec else ''
-sys.exit(0 if not floor else
-         0 if sys.version_info >= tuple(int(p) for p in floor.split('.')) else 1)
-" >/dev/null 2>&1; then
-    # The container leg pins its interpreter; this one takes what PATH gives it,
-    # and macOS still ships 3.9. Below the wheel's abi3 floor pip reports no
-    # matching distribution, which is the interpreter being too old rather than
-    # anything wrong with the wheel.
-    echo "  macos: not tested (python3 is $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))'), the wheel needs ${pypi_requires_python:-a newer python})"
+sys.exit(0 if sys.version_info >= tuple(int(p) for p in '$pypi_floor'.split('.')) else 1)
+"; then
+    # The container leg picks an interpreter; this one takes what PATH gives it,
+    # and macOS still ships 3.9. Below the wheels' floor pip reports no matching
+    # distribution, which is this interpreter being too old rather than anything
+    # wrong with the wheel.
+    echo "  macos: not tested (python3 is $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))'), the wheels need >= $pypi_floor)"
   else
     echo "  macos/$(uname -m):"
     venv=$work_dir/venv
@@ -281,6 +301,9 @@ fi
 echo
 if [ "$failures" -ne 0 ]; then
   echo "FAILED: $failures problem(s) found. Do not start the VOTE thread."
+  if [ "$unknowns" -ne 0 ]; then
+    echo "($unknowns further check(s) could not run, so this run was also incomplete.)"
+  fi
   exit 1
 fi
 if [ "$unknowns" -ne 0 ]; then
