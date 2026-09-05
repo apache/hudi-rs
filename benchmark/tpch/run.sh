@@ -93,7 +93,10 @@ write_env_report() {
   if is_cloud_url "$data_dir"; then
     data_location="${data_dir%%://*}:// (bucket omitted)"
   else
-    data_backing=$(df -h "$data_dir" 2>/dev/null | awk 'NR==2 {print $1" "$2}')
+    # df fails on a path that does not exist, and pipefail would make that
+    # failure abort the benchmark rather than the report.
+    data_backing=$(df -h "$data_dir" 2>/dev/null | awk 'NR==2 {print $1" "$2}' || true)
+    [ -n "$data_backing" ] || data_backing="unknown"
   fi
 
   {
@@ -481,7 +484,11 @@ cmd_bench_datafusion() {
     mkdir -p "$output_dir"
     output_dir="$(cd "$output_dir" && pwd)"
     persisting=true
-    write_env_report "$output_dir/environment.txt" "$sf" "$hudi_dir"
+    # Describe the data actually being read, which is not the Hudi directory
+    # when only the parquet leg runs.
+    local reported_dir="$hudi_dir"
+    [ "$use_hudi" = false ] && reported_dir="$parquet_dir"
+    write_env_report "$output_dir/environment.txt" "$sf" "$reported_dir"
   fi
 
   # One invocation per format. Results are keyed by engine and format label, so
