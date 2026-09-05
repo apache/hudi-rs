@@ -135,9 +135,25 @@ jobs:
           target: x86_64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml
-          # protobuf-compiler is needed by lance-encoding/lance-file's prost-build;
+          # CentOS 7's protobuf-compiler package is protoc 2.5.0, which predates
+          # the --experimental_allow_proto3_optional flag that prost-build passes
+          # when it compiles lance-encoding/lance-file's .proto files. Install an
+          # official protoc release instead of the distro one.
           # perl-IPC-Cmd is needed by openssl.
-          before-script-linux: yum install -y protobuf-compiler perl-IPC-Cmd
+          before-script-linux: |
+            set -eu
+            PROTOC_VERSION=36.1
+            case "$(uname -m)" in
+              x86_64)  protoc_arch=x86_64 ;;
+              aarch64) protoc_arch=aarch_64 ;;
+              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl -fsSL -o /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
+            unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            chmod +x /usr/local/bin/protoc
+            protoc --version
+            yum install -y perl-IPC-Cmd
 
       - name: Publish manylinux to pypi aarch64 (without sdist)
         uses: PyO3/maturin-action@v1
@@ -148,8 +164,23 @@ jobs:
           target: aarch64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml --no-sdist
+          # CentOS 7's protobuf-compiler package is protoc 2.5.0, which predates
+          # the --experimental_allow_proto3_optional flag that prost-build passes
+          # when it compiles lance-encoding/lance-file's .proto files. Install an
+          # official protoc release instead of the distro one.
           before-script-linux: |
-            yum install -y protobuf-compiler
+            set -eu
+            PROTOC_VERSION=36.1
+            case "$(uname -m)" in
+              x86_64)  protoc_arch=x86_64 ;;
+              aarch64) protoc_arch=aarch_64 ;;
+              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
+            esac
+            curl -fsSL -o /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
+            unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            chmod +x /usr/local/bin/protoc
+            protoc --version
             # We can remove this once we upgrade to 2_28.
             # https://github.com/briansmith/ring/issues/1728
             export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
