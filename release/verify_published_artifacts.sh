@@ -124,7 +124,7 @@ if [ "$skip_functional" = true ]; then
 elif ! command -v docker >/dev/null 2>&1; then
   echo ">>> Skipping the functional test (docker not found)"
 else
-  echo ">>> Verifying the wheel installs and reads a table..."
+  echo ">>> Verifying the wheels install and read a table..."
   work_dir=$(mktemp -d)
   trap 'rm -rf "$work_dir"' EXIT
 
@@ -154,22 +154,59 @@ for path in tables:
           f"{len(table.get_schema())} columns")
 PY
 
+    # Both linux wheels, not just the host's. One of them runs emulated and is
+    # slow, but a wheel is per-architecture and testing only the native one
+    # leaves the other exactly as unverified as it was before this script.
     # A stock python image, not the image the wheel was built in: that is what
     # makes this a test of the platform tag rather than of the build container.
-    if docker run --rm \
-        -v "$work_dir/tables:/data:ro" \
-        -v "$work_dir/check.py:/check.py:ro" \
-        python:3.11-slim bash -c "
-          set -e
-          pip install --quiet --only-binary=:all: 'hudi==$pypi_version'
-          python -c 'import hudi; print(\"    import: ok\")'
-          python /check.py
-        "; then
-      echo "    wheel installs and reads: ok"
-    else
-      note_failure "the wheel failed to install, import, or read a table"
-    fi
+    for docker_platform in linux/amd64 linux/arm64; do
+      echo "  $docker_platform:"
+      if docker run --rm --platform "$docker_platform" \
+          -v "$work_dir/tables:/data:ro" \
+          -v "$work_dir/check.py:/check.py:ro" \
+          python:3.11-slim bash -c "
+            set -e
+            pip install --quiet --only-binary=:all: 'hudi==$pypi_version'
+            python -c 'import hudi; print(\"    import: ok\")'
+            python /check.py
+          "; then
+        echo "    installs and reads: ok"
+      else
+        note_failure "$docker_platform: the wheel failed to install, import, or read a table"
+      fi
+    done
   fi
+
+  # The macOS wheels can only be exercised on macOS, and the windows wheel not
+  # at all from here. Say so rather than letting the linux results read as
+  # coverage of everything the presence check above lists.
+  if [ "$(uname -s)" = "Darwin" ] && command -v python3 >/dev/null 2>&1; then
+    echo "  macos/$(uname -m):"
+    venv=$work_dir/venv
+    python3 -m venv "$venv"
+    if "$venv/bin/pip" install --quiet --only-binary=:all: "hudi==$pypi_version" &&
+        "$venv/bin/python" -c 'import hudi; print("    import: ok")' &&
+        DATA="$work_dir/tables" "$venv/bin/python" -c '
+import glob, os, sys
+import hudi
+for path in sorted(glob.glob(os.environ["DATA"] + "/*")):
+    if not os.path.isdir(f"{path}/.hoodie"):
+        continue
+    table = hudi.HudiTable(path)
+    rows = sum(batch.num_rows for batch in table.read())
+    if rows == 0:
+        sys.exit(f"{os.path.basename(path)}: read returned no rows")
+    print(f"    {os.path.basename(path)}: {table.table_type}, {rows} rows, "
+          f"{len(table.get_schema())} columns")
+'; then
+      echo "    installs and reads: ok"
+    else
+      note_failure "macos/$(uname -m): the wheel failed to install, import, or read a table"
+    fi
+  else
+    echo "  macos: not tested (run this on macOS to cover it)"
+  fi
+  echo "  windows: not tested (no way to exercise it from here)"
 fi
 
 echo
