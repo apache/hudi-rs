@@ -39,6 +39,6 @@ crate-type = ["cdylib", "rlib"]
 ffi-test-hooks = []
 
 [dependencies]
-hudi = { path = "../hudi", version = "0.5.0-dev" }
+hudi = { path = "../hudi", version = "0.6.0-dev" }
 arrow = { workspace = true, features = ["ffi"] }
 tokio = { workspace = true }
