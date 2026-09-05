@@ -43,6 +43,16 @@ make bench-tpch ENGINE=spark SF=1
 make tpch-compare ENGINES=datafusion,spark SF=1
 ```
 
+`create-tables` reuses tables that already exist and takes `--recreate` to
+rebuild them, so step 2 is cheap to repeat. Before publishing timings, check
+that the Hudi read path returns what the parquet it was built from returns:
+
+```bash
+benchmark/tpch/run.sh validate --scale-factor 1
+```
+
+It reports per query and exits non-zero if any of them differ.
+
 ### Options
 
 | Variable  | Values                                            | Default      |
@@ -51,6 +61,10 @@ make tpch-compare ENGINES=datafusion,spark SF=1
 | `SF`      | TPC-H scale factor                                | `0.001`      |
 | `QUERIES` | Comma-separated query numbers                     | all 22       |
 | `ENGINES` | Comma-separated engine names (for `tpch-compare`) |              |
+
+`run.sh` takes the same options plus `--recreate`, `--runs`, `--memory-limit`
+and the `--hudi-dir` / `--parquet-dir` overrides; run it with no arguments for
+the full list.
 
 ### More examples
 
@@ -62,6 +76,22 @@ make bench-tpch QUERIES=1,6,17 SF=10
 make bench-tpch ENGINE=datafusion SF=100 HUDI_DIR=gs://bucket/sf100-hudi
 make bench-tpch ENGINE=datafusion SF=100 HUDI_DIR=s3://bucket/sf100-hudi
 ```
+
+`bench-datafusion` benchmarks both formats when it finds data for both, writing
+one result file per format. Pass `--format hudi` to run only the Hudi leg.
+
+`compare --engines` pairs every engine with a single format. To chart one
+engine's two formats against each other, name the result files instead:
+
+```bash
+benchmark/tpch/run.sh compare --scale-factor 100 \
+  --runs datafusion_hudi_sf100,datafusion_parquet_sf100
+```
+
+Keep both sides of any such comparison on the same storage. Hudi tables on
+object storage against parquet on a local disk measures the storage far more
+than it measures the format, so upload the parquet alongside the tables and
+point `--parquet-dir` at it.
 
 Credentials come from the environment for both engines: DataFusion reads the
 `AWS_*` / `GOOGLE_*` / `AZURE_*` variables, and on a cloud VM with an attached
@@ -220,6 +250,13 @@ benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
 the runs have finished. To check credentials, region and the S3 path before
 committing hours to a full run, benchmark a couple of queries first with
 `--queries 1,6`.
+
+Alongside the results the `bench-*` commands write an environment report, which
+`compare` prints under the chart so a copied result carries the hardware, build
+and storage that produced it. `env-report` rewrites it for results already
+collected, for when a run predates a change to the report; re-running a
+benchmark leg to refresh it would overwrite that leg's results with whatever
+subset of queries the rerun covered.
 
 Re-run `sync.sh` from your local checkout whenever local code changes; it
 rebuilds the binary on the instance.
