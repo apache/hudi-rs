@@ -190,6 +190,7 @@ Commands:
   bench-spark       Run TPC-H queries against Hudi tables via Spark SQL
   bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
   compare           Compare persisted benchmark results with bar charts
+  validate          Check Hudi query results against the same queries on parquet
   env-report        Rewrite the environment report for results already collected
 
 Options (per command):
@@ -198,7 +199,9 @@ Options (per command):
   --recreate        Rebuild tables that already exist [create-tables] (default: reuse them)
   --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
   --parquet-dir D   Parquet data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-parquet)
-  --queries Q       Comma-separated query numbers [bench-*] (default: all 22)
+  --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
+  --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
+                    holds two sessions at once, so a lower value may be needed)
   --iterations N    Number of measured iterations per query [bench-*] (from config)
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
   --output-dir D    Directory to persist results as JSON [bench-*]
@@ -465,25 +468,79 @@ cmd_bench_datafusion() {
     require_hudi_tables "$hudi_dir"
   fi
 
-  local bench_args=(bench --scale-factor "$sf")
-  [ "$use_hudi" = true ] && bench_args+=(--hudi-dir "$hudi_dir")
-  [ "$use_parquet" = true ] && bench_args+=(--parquet-dir "$parquet_dir")
-  [ -n "$queries" ] && bench_args+=(--queries "$queries")
-  [ -n "$iterations" ] && bench_args+=(--iterations "$iterations")
-  [ -n "$warmup" ] && bench_args+=(--warmup "$warmup")
+  local base_args=(bench --scale-factor "$sf")
+  [ -n "$queries" ] && base_args+=(--queries "$queries")
+  [ -n "$iterations" ] && base_args+=(--iterations "$iterations")
+  [ -n "$warmup" ] && base_args+=(--warmup "$warmup")
 
+  local persisting=false
   if [ -n "$output_dir" ]; then
     mkdir -p "$output_dir"
     output_dir="$(cd "$output_dir" && pwd)"
-    bench_args+=(--output-dir "$output_dir" --engine-label datafusion --format-label "${format:-hudi}" --display-name "datafusion+hudi-rs")
+    persisting=true
     write_env_report "$output_dir/environment.txt" "$sf" "$hudi_dir"
   fi
 
-  echo "Running DataFusion benchmark..."
-  TPCH_CONFIG_DIR="$SCRIPT_DIR/config" \
-  TPCH_QUERY_DIR="$SCRIPT_DIR/queries" \
-  RUST_LOG="${RUST_LOG:-warn}" \
-  "$TPCH_BIN" "${bench_args[@]}"
+  # One invocation per format. Results are keyed by engine and format label, so
+  # labelling a parquet run "hudi" writes it over the Hudi run's results.
+  run_datafusion_bench() {
+    local fmt="$1" data_flag="$2" data_dir="$3" display="$4"
+    local args=("${base_args[@]}" "$data_flag" "$data_dir")
+    if [ "$persisting" = true ]; then
+      args+=(--output-dir "$output_dir" --engine-label datafusion \
+             --format-label "$fmt" --display-name "$display")
+    fi
+    echo "Running DataFusion benchmark ($fmt)..."
+    TPCH_CONFIG_DIR="$SCRIPT_DIR/config" \
+    TPCH_QUERY_DIR="$SCRIPT_DIR/queries" \
+    RUST_LOG="${RUST_LOG:-warn}" \
+    "$TPCH_BIN" "${args[@]}"
+  }
+
+  if [ "$use_hudi" = true ]; then
+    run_datafusion_bench hudi --hudi-dir "$hudi_dir" "datafusion+hudi-rs"
+  fi
+  if [ "$use_parquet" = true ]; then
+    run_datafusion_bench parquet --parquet-dir "$parquet_dir" "datafusion+parquet"
+  fi
+}
+
+# Check the Hudi read path against the parquet the tables were built from, so a
+# timing cannot come from a read that returned less than it should have.
+cmd_validate() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
+  local queries=""
+  local memory_limit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --memory-limit) memory_limit="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
+
+  if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
+    echo "Error: parquet data not found at $parquet_dir." >&2
+    echo "Validation compares the Hudi tables against it, so it cannot run without it." >&2
+    exit 1
+  fi
+
+  build_tpch
+  require_hudi_tables "$hudi_dir"
+
+  local validate_args=(validate --scale-factor "$sf" --hudi-dir "$hudi_dir" --parquet-dir "$parquet_dir")
+  [ -n "$queries" ] && validate_args+=(--queries "$queries")
+  [ -n "$memory_limit" ] && validate_args+=(--memory-limit "$memory_limit")
+
+  "$TPCH_BIN" "${validate_args[@]}"
 }
 
 # Rewrite the environment report against results that already exist, so a run
@@ -562,6 +619,7 @@ case "$COMMAND" in
   bench-spark)      cmd_bench_spark "$@" ;;
   bench-datafusion) cmd_bench_datafusion "$@" ;;
   compare)          cmd_compare "$@" ;;
+  validate)         cmd_validate "$@" ;;
   env-report)       cmd_env_report "$@" ;;
   *)
     echo "Unknown command: $COMMAND" >&2
