@@ -331,8 +331,6 @@ jobs:
       # version is burnt on crates.io and cannot be reused.
       - name: Build wheel
         uses: PyO3/maturin-action@v1
-        env:
-          LIBCLANG_PATH: /opt/rh/llvm-toolset-7.0/root/usr/lib64
         with:
           target: ${{ matrix.target }}
           command: build

@@ -28,8 +28,9 @@
 #
 # libclang: librocksdb-sys generates its bindings with bindgen, which needs a
 # libclang the base image does not carry; the distro clang is 3.4, older than
-# bindgen supports. Callers must point LIBCLANG_PATH at the directory printed
-# at the end, since an exported variable would not survive this subshell.
+# bindgen supports. It is linked into a standard directory rather than exported
+# through LIBCLANG_PATH, because maturin-action forwards only its own env vars
+# into the container and would drop one set on the step.
 #
 # perl-IPC-Cmd: needed by openssl.
 
@@ -68,11 +69,20 @@ yum install -y llvm-toolset-7.0-clang-libs perl-IPC-Cmd
 # libclang.so links against the LLVM runtime in the same prefix, so make the
 # loader aware of it rather than relying on a symlink out of the prefix.
 libclang_dir=/opt/rh/llvm-toolset-7.0/root/usr/lib64
-echo "$libclang_dir" >/etc/ld.so.conf.d/llvm-toolset-7.0.conf
-ldconfig
-
 test -e "$libclang_dir/libclang.so" || {
   echo "libclang.so not found under $libclang_dir" >&2
   exit 1
 }
-echo "libclang: $libclang_dir"
+
+# Register the prefix so the LLVM runtime libclang links against resolves, then
+# link libclang itself where bindgen already looks.
+echo "$libclang_dir" >/etc/ld.so.conf.d/llvm-toolset-7.0.conf
+ln -sf "$libclang_dir/libclang.so" /usr/lib64/libclang.so
+ln -sf "$libclang_dir/libclang.so.7" /usr/lib64/libclang.so.7
+ldconfig
+
+ldconfig -p | grep -q 'libclang\.so ' || {
+  echo "libclang.so is not in the loader cache" >&2
+  exit 1
+}
+echo "libclang: $(ldconfig -p | grep -m1 'libclang\.so ')"

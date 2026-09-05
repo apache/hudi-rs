@@ -131,8 +131,6 @@ jobs:
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           MATURIN_REPOSITORY: pypi
-          # bindgen finds libclang here; the install script prints this path.
-          LIBCLANG_PATH: /opt/rh/llvm-toolset-7.0/root/usr/lib64
         with:
           target: x86_64-unknown-linux-gnu
           command: publish
@@ -145,8 +143,6 @@ jobs:
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           MATURIN_REPOSITORY: pypi
-          # bindgen finds libclang here; the install script prints this path.
-          LIBCLANG_PATH: /opt/rh/llvm-toolset-7.0/root/usr/lib64
         with:
           target: aarch64-unknown-linux-gnu
           command: publish
