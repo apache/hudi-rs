@@ -327,6 +327,10 @@ jobs:
           target: x86_64-unknown-linux-gnu
           command: build
           args: --release -m python/Cargo.toml
+          # Pin the container explicitly. Left at the default the action builds
+          # this target straight on the runner, which defeats the point of the
+          # job and is not what the release publishes from.
+          manylinux: '2014'
           before-script-linux: |
             set -eu
             PROTOC_VERSION=36.1

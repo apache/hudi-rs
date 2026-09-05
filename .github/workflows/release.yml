@@ -135,6 +135,7 @@ jobs:
           target: x86_64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml
+          manylinux: '2014'
           # CentOS 7's protobuf-compiler package is protoc 2.5.0, which predates
           # the --experimental_allow_proto3_optional flag that prost-build passes
           # when it compiles lance-encoding/lance-file's .proto files. Install an
@@ -164,6 +165,7 @@ jobs:
           target: aarch64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml --no-sdist
+          manylinux: '2014'
           # CentOS 7's protobuf-compiler package is protoc 2.5.0, which predates
           # the --experimental_allow_proto3_optional flag that prost-build passes
           # when it compiles lance-encoding/lance-file's .proto files. Install an
