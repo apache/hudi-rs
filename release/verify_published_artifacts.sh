@@ -62,10 +62,21 @@ pypi_version=$(echo "$version" |
   sed -E 's/-alpha\.([0-9]+)$/a\1/; s/-beta\.([0-9]+)$/b\1/; s/-rc\.([0-9]+)$/rc\1/')
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+work_root=$(mktemp -d)
+trap 'rm -rf "$work_root"' EXIT
+
 failures=0
 note_failure() {
   echo "    $1"
   failures=$((failures + 1))
+}
+
+# A check that could not run is not a broken release. Counted separately so the
+# summary can say the run was incomplete without sending anyone to cut a new RC.
+unknowns=0
+note_unknown() {
+  echo "    $1"
+  unknowns=$((unknowns + 1))
 }
 
 echo "Verifying published artifacts for $version (pypi: $pypi_version)"
@@ -75,13 +86,28 @@ echo "Verifying published artifacts for $version (pypi: $pypi_version)"
 # publish died part-way and the version can never be re-published.
 echo ">>> Verifying crates.io..."
 for crate in hudi-core hudi-datafusion hudi; do
-  if curl -sf -H 'User-Agent: hudi-rs release verification' \
-      "https://crates.io/api/v1/crates/$crate/$version" |
-      grep -q "\"num\":\"$version\""; then
-    echo "    $crate $version: present"
-  else
-    note_failure "$crate $version: MISSING from crates.io"
-  fi
+  # Distinguish a registry we could not reach from a version that is not there.
+  # Only the second means the release is broken, and the remedy for that is a
+  # whole new release candidate.
+  body=$work_root/crates-$crate.json
+  http_code=$(curl -s -o "$body" -w '%{http_code}' \
+    -H 'User-Agent: hudi-rs release verification' \
+    "https://crates.io/api/v1/crates/$crate/$version" || true)
+  case "$http_code" in
+    200)
+      if grep -q "\"num\":\"$version\"" "$body"; then
+        echo "    $crate $version: present"
+      else
+        note_failure "$crate $version: MISSING from crates.io"
+      fi
+      ;;
+    404)
+      note_failure "$crate $version: MISSING from crates.io"
+      ;;
+    *)
+      note_unknown "$crate $version: not checked (crates.io returned $http_code)"
+      ;;
+  esac
 done
 
 # -------------------------------------------------------------------- PyPI --
@@ -89,12 +115,21 @@ done
 # sends that platform to the sdist, which needs protoc and a C++ toolchain, so
 # in practice it is an install failure rather than a slow install.
 echo ">>> Verifying pypi.org..."
-pypi_json=$(curl -sf "https://pypi.org/pypi/hudi/$pypi_version/json" || true)
-if [ -z "$pypi_json" ]; then
+pypi_body=$work_root/pypi.json
+pypi_code=$(curl -s -o "$pypi_body" -w '%{http_code}' \
+  "https://pypi.org/pypi/hudi/$pypi_version/json" || true)
+if [ "$pypi_code" = "404" ]; then
   note_failure "hudi $pypi_version: NOT FOUND on pypi.org"
+elif [ "$pypi_code" != "200" ]; then
+  note_unknown "hudi $pypi_version: not checked (pypi.org returned ${pypi_code:-no response})"
 else
+  pypi_json=$(cat "$pypi_body")
   filenames=$(echo "$pypi_json" | python3 -c \
     'import json,sys; print("\n".join(f["filename"] for f in json.load(sys.stdin)["urls"]))')
+  # The floor the wheels were built against, so a leg can tell "this interpreter
+  # is too old" apart from "this wheel is broken".
+  pypi_requires_python=$(echo "$pypi_json" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["info"].get("requires_python") or "")')
 
   # Substrings rather than exact names: the abi3 tag tracks the python floor and
   # the manylinux tag tracks the build image, and neither should fail this check
@@ -127,9 +162,7 @@ if [ "$skip_functional" = true ]; then
   echo ">>> Skipping the install-and-read tests (--skip-functional)"
 else
   echo ">>> Verifying the wheels install and read a table..."
-  work_dir=$(mktemp -d)
-  trap 'rm -rf "$work_dir"' EXIT
-
+  work_dir=$work_root
   have_fixture=true
   fixture=$repo_root/crates/test/data/quickstart_trips_table/mor/avro/v8_trips_8i3u1d.zip
   if [ ! -f "$fixture" ]; then
@@ -167,6 +200,11 @@ CHECK_PY
     echo "  linux: not tested (no table fixture)"
   elif ! command -v docker >/dev/null 2>&1; then
     echo "  linux: not tested (docker not found)"
+  elif ! docker info >/dev/null 2>&1; then
+    # Without this, the per-architecture probe below swallows the daemon error
+    # and reports both wheels as an architecture this host cannot run, which is
+    # both untrue and silent about the two artifacts that motivated this script.
+    echo "  linux: not tested (docker found but the daemon is not reachable)"
   else
     # A stock python image, not the image the wheel was built in: that is what
     # makes this a test of the platform tag rather than of the build container.
@@ -203,6 +241,18 @@ CHECK_PY
     echo "  macos: not tested (run this on macOS to cover it)"
   elif ! command -v python3 >/dev/null 2>&1; then
     echo "  macos: not tested (python3 not found)"
+  elif ! python3 -c "
+import sys
+spec = '''${pypi_requires_python:-}'''
+floor = spec.split('>=')[-1].strip() if '>=' in spec else ''
+sys.exit(0 if not floor else
+         0 if sys.version_info >= tuple(int(p) for p in floor.split('.')) else 1)
+" >/dev/null 2>&1; then
+    # The container leg pins its interpreter; this one takes what PATH gives it,
+    # and macOS still ships 3.9. Below the wheel's abi3 floor pip reports no
+    # matching distribution, which is the interpreter being too old rather than
+    # anything wrong with the wheel.
+    echo "  macos: not tested (python3 is $(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))'), the wheel needs ${pypi_requires_python:-a newer python})"
   else
     echo "  macos/$(uname -m):"
     venv=$work_dir/venv
@@ -232,5 +282,10 @@ echo
 if [ "$failures" -ne 0 ]; then
   echo "FAILED: $failures problem(s) found. Do not start the VOTE thread."
   exit 1
+fi
+if [ "$unknowns" -ne 0 ]; then
+  echo "INCOMPLETE: $unknowns check(s) could not run. Nothing looks broken, but"
+  echo "this run did not cover everything; re-run it before starting the VOTE thread."
+  exit 2
 fi
 echo "OK: published artifacts for $version look complete and usable."

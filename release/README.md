@@ -186,8 +186,13 @@ RELEASE_VER=x.y.z-rc.1
 ```
 
 This checks all three crates on crates.io, the full wheel set plus the sdist on pypi.org, and then
-installs the wheel in a clean container and reads a table with it. Pass `--skip-functional` to skip
-the container step.
+installs and reads a table with each wheel it can reach from the machine you run it on: both linux
+wheels through docker, and the macOS wheel when run on macOS. Pass `--skip-functional` to skip the
+install-and-read tests.
+
+It exits 0 when everything it checked passed, 1 when an artifact is missing or broken, and 2 when a
+check could not run at all, which is a reason to re-run rather than to cut a new release candidate.
+Anything it could not cover is named in the output.
 
 > [!IMPORTANT]
 > A publish job can fail after its siblings have already uploaded, which leaves a version that looks
