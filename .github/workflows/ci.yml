@@ -309,42 +309,39 @@ jobs:
 
   manylinux-wheel-build:
     name: Build the manylinux wheel
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-      # Builds the wheel in the same container, with the same before-script, that
-      # the release workflow publishes from. Regular CI runs on ubuntu-latest,
-      # whose apt protoc is new enough for lance-encoding's prost-build, so a
-      # container-only break (see #750) stays invisible until a release tag is
-      # pushed - by which point the version is burnt on crates.io and cannot be
-      # reused. This job is the same build minus the upload.
-      - name: Build manylinux x86_64 wheel
+      # Builds the wheel in the same container, running the same dependency
+      # script, that the release workflow publishes from. Regular CI runs on the
+      # host, whose apt protoc is new enough for lance-encoding's prost-build and
+      # which carries libclang for librocksdb-sys, so a container-only break (see
+      # #750) stays invisible until a release tag is pushed - by which point the
+      # version is burnt on crates.io and cannot be reused.
+      - name: Build wheel
         uses: PyO3/maturin-action@v1
+        env:
+          LIBCLANG_PATH: /opt/rh/llvm-toolset-7.0/root/usr/lib64
         with:
-          target: x86_64-unknown-linux-gnu
+          target: ${{ matrix.target }}
           command: build
           args: --release -m python/Cargo.toml
-          # Pin the container explicitly. Left at the default the action builds
-          # this target straight on the runner, which defeats the point of the
-          # job and is not what the release publishes from.
+          # Pin the image rather than relying on the default, so this job and the
+          # release steps are provably the same environment.
           manylinux: '2014'
           before-script-linux: |
-            set -eu
-            PROTOC_VERSION=36.1
-            case "$(uname -m)" in
-              x86_64)  protoc_arch=x86_64 ;;
-              aarch64) protoc_arch=aarch_64 ;;
-              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-            esac
-            curl -fsSL -o /tmp/protoc.zip \
-              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
-            unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
-            chmod +x /usr/local/bin/protoc
-            protoc --version
-            yum install -y perl-IPC-Cmd
+            bash .github/scripts/manylinux-build-deps.sh
 
   publish-coverage:
     name: Publish coverage reports to codecov.io

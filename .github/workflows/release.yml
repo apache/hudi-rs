@@ -131,58 +131,29 @@ jobs:
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           MATURIN_REPOSITORY: pypi
+          # bindgen finds libclang here; the install script prints this path.
+          LIBCLANG_PATH: /opt/rh/llvm-toolset-7.0/root/usr/lib64
         with:
           target: x86_64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml
           manylinux: '2014'
-          # CentOS 7's protobuf-compiler package is protoc 2.5.0, which predates
-          # the --experimental_allow_proto3_optional flag that prost-build passes
-          # when it compiles lance-encoding/lance-file's .proto files. Install an
-          # official protoc release instead of the distro one.
-          # perl-IPC-Cmd is needed by openssl.
           before-script-linux: |
-            set -eu
-            PROTOC_VERSION=36.1
-            case "$(uname -m)" in
-              x86_64)  protoc_arch=x86_64 ;;
-              aarch64) protoc_arch=aarch_64 ;;
-              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-            esac
-            curl -fsSL -o /tmp/protoc.zip \
-              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
-            unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
-            chmod +x /usr/local/bin/protoc
-            protoc --version
-            yum install -y perl-IPC-Cmd
-
+            bash .github/scripts/manylinux-build-deps.sh
       - name: Publish manylinux to pypi aarch64 (without sdist)
         uses: PyO3/maturin-action@v1
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
           MATURIN_REPOSITORY: pypi
+          # bindgen finds libclang here; the install script prints this path.
+          LIBCLANG_PATH: /opt/rh/llvm-toolset-7.0/root/usr/lib64
         with:
           target: aarch64-unknown-linux-gnu
           command: publish
           args: --skip-existing -m python/Cargo.toml --no-sdist
           manylinux: '2014'
-          # CentOS 7's protobuf-compiler package is protoc 2.5.0, which predates
-          # the --experimental_allow_proto3_optional flag that prost-build passes
-          # when it compiles lance-encoding/lance-file's .proto files. Install an
-          # official protoc release instead of the distro one.
           before-script-linux: |
-            set -eu
-            PROTOC_VERSION=36.1
-            case "$(uname -m)" in
-              x86_64)  protoc_arch=x86_64 ;;
-              aarch64) protoc_arch=aarch_64 ;;
-              *) echo "unsupported arch: $(uname -m)" >&2; exit 1 ;;
-            esac
-            curl -fsSL -o /tmp/protoc.zip \
-              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip"
-            unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
-            chmod +x /usr/local/bin/protoc
-            protoc --version
+            bash .github/scripts/manylinux-build-deps.sh
             # We can remove this once we upgrade to 2_28.
             # https://github.com/briansmith/ring/issues/1728
             export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
