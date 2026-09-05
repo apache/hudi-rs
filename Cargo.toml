@@ -101,7 +101,7 @@ base64 = { version = "0.22" }
 # (bindgen), which every consumer would otherwise pay for — including the Python
 # wheel and the cxx bridge — for a disk tier that only engages on spill.
 # Licenses: rocksdb Apache-2.0; librocksdb-sys MIT/Apache-2.0/BSD-3-Clause.
-rocksdb = { version = "0.22" }
+rocksdb = { version = "0.25" }
 # Fast hasher for the merge map (folded multiply, no hardware-AES dependency).
 foldhash = { version = "0.2" }
 roaring = { version = "0.11" }
