@@ -103,6 +103,9 @@ pub(crate) fn resolve_reader_context(
         row_group_selector: None,
         key_predicate: None,
         mor_pk_safe: false,
+        // No pushed predicate, so no column can be misread by one and the
+        // per-file repair check never arms.
+        repair_risk_columns: Vec::new(),
         // The table-version < 8 completion gate needs a timeline the caller
         // has not loaded; leaving it unset keeps the gate a no-op.
         completion_gate_inputs: None,

@@ -180,6 +180,34 @@ pub struct ReaderContext {
     /// post-merge evaluation (handled by the caller — Velox/Spark — above
     /// the FG reader).
     pub mor_pk_safe: bool,
+    /// Predicate columns the TABLE schema declares tz-aware millis, i.e. the only
+    /// columns the apache/hudi#18132 logical-type repair can reinterpret on read.
+    ///
+    /// Parquet evaluates a pushed predicate against a file's PHYSICAL values,
+    /// before `project_batch_to_schema` runs. That is sound only while a physical
+    /// value means what its physical type says, which the repair breaks: a legacy
+    /// file labels the column micros while the stored i64 is millis, so a
+    /// millis-semantics literal reads those rows as 1970 and the scan drops rows
+    /// that match. A post-scan filter cannot restore them.
+    ///
+    /// Computed once per scan by whoever supplies [`Self::row_filter_builder`], from
+    /// that predicate's referenced columns and the table schema, via
+    /// [`crate::schema::batch_evolution::repair_risk_columns`]; routed here by
+    /// [`HoodieFileGroupReaderBuilder::with_repair_risk_columns`](crate::file_group::reader_v2::HoodieFileGroupReaderBuilder::with_repair_risk_columns).
+    /// **Empty on every table whose predicate touches no tz-aware millis column,
+    /// which is the common case**; the base read then skips the per-file footer
+    /// comparison entirely and keeps all pushdown.
+    ///
+    /// Non-empty only arms the check. Whether a given file actually mislabels one
+    /// of these columns is decided per file against its footer schema, in
+    /// `HoodieFileGroupReader::make_base_file_source`.
+    ///
+    /// Empty is also the default, so a caller that pushes a filter without setting
+    /// this gets no guard. That is deliberate — the reader cannot derive a
+    /// predicate's columns from an opaque [`RowFilterBuilder`] — and it is why
+    /// `with_repair_risk_columns` is documented as required alongside
+    /// `with_row_filter_builder` rather than as a tuning knob.
+    pub repair_risk_columns: Vec<String>,
     /// Gate-3 completed/inflight inputs (completed/inflight/archived sets).
     /// Carried here mirroring [`Self::instant_range`]. `Some` only when the caller holds a
     /// timeline *and* the table version is below 8 — see
@@ -230,6 +258,7 @@ impl std::fmt::Debug for ReaderContext {
                 &self.row_group_selector.as_ref().map(|_| "<closure>"),
             )
             .field("mor_pk_safe", &self.mor_pk_safe)
+            .field("repair_risk_columns", &self.repair_risk_columns)
             .field("completion_gate_inputs", &self.completion_gate_inputs)
             .finish()
     }
@@ -338,6 +367,7 @@ impl ReaderContext {
             row_group_selector: None,
             key_predicate: None,
             mor_pk_safe: false,
+            repair_risk_columns: Vec::new(),
             completion_gate_inputs: None,
         }
     }
