@@ -93,6 +93,138 @@ pub(crate) fn index_of_ci(schema: &arrow_schema::Schema, name: &str) -> Result<O
     Ok(found)
 }
 
+/// True when evolving `file` → `table` REINTERPRETS the stored buffer instead of
+/// preserving what the value means.
+///
+/// Only the apache/hudi#18132 arm below does this: it relabels the i64 because the
+/// value was always millis and only the label was wrong, so for that pairing alone
+/// the physical value does not mean what the physical type says. Every other arm
+/// (int widening, decimal rescale, millis→micros cast, the NTZ divide) denotes the
+/// same logical value before and after.
+///
+/// That distinction is what makes base-read predicate pushdown sound — see
+/// `HoodieFileGroupReader::make_base_file_source`.
+fn is_value_reinterpreting(file: &DataType, table: &DataType) -> bool {
+    matches!(
+        (file, table),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, Some(_)),
+            DataType::Timestamp(TimeUnit::Millisecond, Some(_)),
+        )
+    )
+}
+
+/// [`is_value_reinterpreting`] lifted through the container arms, mirroring the
+/// recursion in [`evolve_array`] so a nested affected field is not missed.
+/// Container drift returns `false`; the read itself rejects that pairing.
+fn pair_is_value_reinterpreting(file: &DataType, table: &DataType) -> bool {
+    if is_value_reinterpreting(file, table) {
+        return true;
+    }
+    match (file, table) {
+        (DataType::Struct(ff), DataType::Struct(tf)) => tf.iter().any(|t| {
+            ff.iter()
+                .find(|f| f.name().eq_ignore_ascii_case(t.name()))
+                .is_some_and(|f| pair_is_value_reinterpreting(f.data_type(), t.data_type()))
+        }),
+        (DataType::List(f), DataType::List(t))
+        | (DataType::LargeList(f), DataType::LargeList(t))
+        | (DataType::Map(f, _), DataType::Map(t, _)) => {
+            pair_is_value_reinterpreting(f.data_type(), t.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// The TABLE half of [`is_value_reinterpreting`], recursed through containers.
+///
+/// The repair arm fires only when the table side is tz-aware millis, so a column
+/// the table declares as anything else can never carry the #18132 mislabel — no
+/// matter what any file says. That makes this decidable from the table schema
+/// alone, without opening a file.
+fn is_repair_target(table: &DataType) -> bool {
+    match table {
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_)) => true,
+        DataType::Struct(fields) => fields.iter().any(|f| is_repair_target(f.data_type())),
+        DataType::List(f) | DataType::LargeList(f) | DataType::Map(f, _) => {
+            is_repair_target(f.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// Which of `predicate_columns` could ever be misread by a pushed predicate,
+/// judged from the TABLE schema alone.
+///
+/// Meant to be computed ONCE per scan by whoever supplies the predicate, and handed
+/// to the reader via [`HoodieFileGroupReaderBuilder::with_repair_risk_columns`]
+/// (crate::file_group::reader_v2). Two properties earn it that place:
+///
+/// * **It is usually empty.** Spark's `TimestampType` maps to micros, so a
+///   tz-aware *millis* column is the legacy shape the #18132 repair exists for.
+///   An empty result means no base read in the scan needs any per-file check,
+///   and no file loses pushdown.
+/// * **It is scoped to the predicate.** A mislabelled column the predicate never
+///   references cannot make the predicate wrong, so it must not cost pushdown.
+///   `predicate_columns` must therefore be the columns the expression references,
+///   not every column in the schema the predicate was compiled against.
+///
+/// A name that resolves ambiguously is reported AS at risk rather than raising:
+/// this decides only whether to push a predicate, and over-reporting costs
+/// pushdown while under-reporting drops rows.
+pub fn repair_risk_columns(
+    table_schema: &arrow_schema::Schema,
+    predicate_columns: &[String],
+) -> Vec<String> {
+    predicate_columns
+        .iter()
+        .filter(|name| match index_of_ci(table_schema, name) {
+            Ok(Some(idx)) => is_repair_target(table_schema.fields()[idx].data_type()),
+            Ok(None) => false,
+            Err(_) => true,
+        })
+        .cloned()
+        .collect()
+}
+
+/// Which of `candidates` this file actually mislabels, i.e. evolving it to
+/// `table_schema` would reinterpret the buffer rather than preserve its meaning.
+///
+/// `candidates` is [`repair_risk_columns`]'s output, so this walks a handful of
+/// named columns rather than the whole footer schema. A candidate missing from
+/// either schema is skipped: absent from the file there is nothing to misread,
+/// and absent from the table there is no repair to reinterpret it. Names come
+/// back in the FILE's spelling, which is how a pushed predicate addresses the
+/// parquet column.
+///
+/// The table side is deliberately the table schema, not the projected one: a pushed
+/// predicate reads its columns whether or not they were projected, because the
+/// `RowFilter` builder derives its own `ProjectionMask` from the parquet schema
+/// rather than from the read's projection.
+pub(crate) fn reinterpreted_columns(
+    file_schema: &arrow_schema::Schema,
+    table_schema: &arrow_schema::Schema,
+    candidates: &[String],
+) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(candidates.len());
+    for name in candidates {
+        let (Some(fi), Some(ti)) = (
+            index_of_ci(file_schema, name)?,
+            index_of_ci(table_schema, name)?,
+        ) else {
+            continue;
+        };
+        let file_field = &file_schema.fields()[fi];
+        if pair_is_value_reinterpreting(
+            file_field.data_type(),
+            table_schema.fields()[ti].data_type(),
+        ) {
+            out.push(file_field.name().clone());
+        }
+    }
+    Ok(out)
+}
+
 /// True for any nested/container Arrow type the recursion arms care about.
 /// Matching variants (List/Struct/Map) are handled by the recursion arms above
 /// the guard; this catches everything else (LargeList, FixedSizeList, and any
@@ -1254,6 +1386,354 @@ mod tests {
                 .unwrap()
                 .values(),
             &[5_000_000_000.0f64]
+        );
+    }
+
+    // The two pushdown classifiers. Flagging too little drops rows silently;
+    // flagging too much only costs pushdown. These pin both directions.
+
+    fn ts(unit: TimeUnit, tz: Option<&str>) -> DataType {
+        DataType::Timestamp(unit, tz.map(Into::into))
+    }
+
+    /// Every file column is offered as a candidate, so these pin the per-file rule
+    /// itself. `repair_risk_columns` decides which candidates a real scan supplies.
+    fn reinterpreted(file: Vec<Field>, required: Vec<Field>) -> Vec<String> {
+        let file_schema = Schema::new(file);
+        let candidates: Vec<String> = file_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        super::reinterpreted_columns(&file_schema, &Schema::new(required), &candidates).unwrap()
+    }
+
+    fn risk(table: Vec<Field>, predicate_columns: &[&str]) -> Vec<String> {
+        let cols: Vec<String> = predicate_columns.iter().map(|c| c.to_string()).collect();
+        super::repair_risk_columns(&Schema::new(table), &cols)
+    }
+
+    #[test]
+    fn repair_risk_columns_is_empty_when_the_predicate_touches_no_millis_column() {
+        // THE GATE THAT PAYS FOR ITSELF. A predicate over honest columns arms
+        // nothing, so no base read in the scan opens a footer for this check and
+        // no file loses pushdown. This is the common case on any table Spark wrote.
+        assert!(
+            risk(
+                vec![
+                    Field::new("id", DataType::Int64, true),
+                    Field::new("ts", ts(TimeUnit::Microsecond, Some("UTC")), true),
+                ],
+                &["id", "ts"],
+            )
+            .is_empty(),
+            "a table declaring micros can never be the TARGET of the #18132 repair"
+        );
+    }
+
+    #[test]
+    fn repair_risk_columns_flags_only_the_predicate_columns_at_risk() {
+        // Scope is the predicate, not the table. `other` is at risk but unreferenced,
+        // so it must not cost this scan its pushdown.
+        assert_eq!(
+            risk(
+                vec![
+                    Field::new("ts", ts(TimeUnit::Millisecond, Some("UTC")), true),
+                    Field::new("other", ts(TimeUnit::Millisecond, Some("UTC")), true),
+                    Field::new("id", DataType::Int64, true),
+                ],
+                &["ts", "id"],
+            ),
+            vec!["ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn repair_risk_columns_ignores_ntz_and_sees_through_containers() {
+        // NTZ millis is not the repair's target (it matches only the tz-aware
+        // logical classes), while a tz-aware millis field nested in a struct is.
+        assert!(
+            risk(
+                vec![Field::new("ntz", ts(TimeUnit::Millisecond, None), true)],
+                &["ntz"],
+            )
+            .is_empty()
+        );
+        let nested = DataType::Struct(
+            vec![Field::new(
+                "inner",
+                ts(TimeUnit::Millisecond, Some("UTC")),
+                true,
+            )]
+            .into(),
+        );
+        assert_eq!(
+            risk(vec![Field::new("s", nested, true)], &["s"]),
+            vec!["s".to_string()]
+        );
+    }
+
+    #[test]
+    fn repair_risk_columns_matches_names_case_insensitively() {
+        assert_eq!(
+            risk(
+                vec![Field::new(
+                    "TS",
+                    ts(TimeUnit::Millisecond, Some("UTC")),
+                    true
+                )],
+                &["ts"],
+            ),
+            vec!["ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_checks_only_the_candidates_it_is_given() {
+        // The per-file walk is scoped to the risk set. A mislabelled column the
+        // predicate never references is not a candidate, so it must not be
+        // reported -- it cannot make the predicate wrong.
+        let file = Schema::new(vec![
+            Field::new("ts", ts(TimeUnit::Microsecond, Some("UTC")), true),
+            Field::new("unreferenced", ts(TimeUnit::Microsecond, Some("UTC")), true),
+        ]);
+        let required = Schema::new(vec![
+            Field::new("ts", ts(TimeUnit::Millisecond, Some("UTC")), true),
+            Field::new("unreferenced", ts(TimeUnit::Millisecond, Some("UTC")), true),
+        ]);
+        assert_eq!(
+            super::reinterpreted_columns(&file, &required, &["ts".to_string()]).unwrap(),
+            vec!["ts".to_string()],
+            "only the candidate is reported, though both columns are mislabelled"
+        );
+        assert!(
+            super::reinterpreted_columns(&file, &required, &[])
+                .unwrap()
+                .is_empty(),
+            "no candidates means no work and no refusal"
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_skips_a_candidate_missing_from_either_schema() {
+        // Absent from the file: nothing to misread. Absent from required: never
+        // projected, so never repaired. Neither may panic on the index lookup.
+        let file = Schema::new(vec![Field::new(
+            "ts",
+            ts(TimeUnit::Microsecond, Some("UTC")),
+            true,
+        )]);
+        let required = Schema::new(vec![Field::new(
+            "ts",
+            ts(TimeUnit::Millisecond, Some("UTC")),
+            true,
+        )]);
+        let absent = ["nope".to_string()];
+        assert!(
+            super::reinterpreted_columns(&file, &required, &absent)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::reinterpreted_columns(&Schema::empty(), &required, &["ts".to_string()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_flags_the_hudi_18132_pair() {
+        // File says tz-aware micros, table says tz-aware millis, stored i64 was
+        // millis all along — the only pairing a predicate can misread.
+        assert_eq!(
+            reinterpreted(
+                vec![Field::new(
+                    "ts",
+                    ts(TimeUnit::Microsecond, Some("UTC")),
+                    true
+                )],
+                vec![Field::new(
+                    "ts",
+                    ts(TimeUnit::Millisecond, Some("UTC")),
+                    true
+                )],
+            ),
+            vec!["ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_flags_the_pair_across_differing_timezones() {
+        // The repair arm accepts a tz mismatch (it warns, then reinterprets, since
+        // the i64 epoch is instant-preserving). The rule must agree, or a predicate
+        // would be pushed into a read the repair still rewrites.
+        assert_eq!(
+            reinterpreted(
+                vec![Field::new(
+                    "ts",
+                    ts(TimeUnit::Microsecond, Some("UTC")),
+                    true
+                )],
+                vec![Field::new(
+                    "ts",
+                    ts(TimeUnit::Millisecond, Some("America/New_York")),
+                    true
+                )],
+            ),
+            vec!["ts".to_string()]
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_reports_every_affected_column() {
+        // A file can carry more than one affected column; the log line names them,
+        // so all of them must come back, and unaffected siblings must not.
+        assert_eq!(
+            reinterpreted(
+                vec![
+                    Field::new("a", ts(TimeUnit::Microsecond, Some("UTC")), true),
+                    Field::new("ok", DataType::Int32, true),
+                    Field::new("b", ts(TimeUnit::Microsecond, Some("UTC")), true),
+                ],
+                vec![
+                    Field::new("a", ts(TimeUnit::Millisecond, Some("UTC")), true),
+                    Field::new("ok", DataType::Int64, true),
+                    Field::new("b", ts(TimeUnit::Millisecond, Some("UTC")), true),
+                ],
+            ),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_ignores_value_preserving_evolutions() {
+        // Each of these evolves the column but PRESERVES what the value denotes,
+        // so pushdown stays sound and must not be declined.
+        let cases: Vec<(&str, DataType, DataType)> = vec![
+            // NTZ micros→millis is an arithmetic ÷1000, not a relabel: same instant.
+            (
+                "ntz_micros_to_millis",
+                ts(TimeUnit::Microsecond, None),
+                ts(TimeUnit::Millisecond, None),
+            ),
+            // The reverse direction is a legitimate widening via arrow_cast (×1000).
+            (
+                "millis_to_micros",
+                ts(TimeUnit::Millisecond, Some("UTC")),
+                ts(TimeUnit::Microsecond, Some("UTC")),
+            ),
+            // Same unit on both sides: no evolution at all.
+            (
+                "micros_to_micros",
+                ts(TimeUnit::Microsecond, Some("UTC")),
+                ts(TimeUnit::Microsecond, Some("UTC")),
+            ),
+            // Ordinary promotions.
+            ("int_widening", DataType::Int32, DataType::Int64),
+            ("float_widening", DataType::Float32, DataType::Float64),
+            // Mixed tz-awareness is NOT the #18132 shape (Java matches only the
+            // tz-aware logical classes), so it must not be flagged either way.
+            (
+                "ntz_file_to_tz_table",
+                ts(TimeUnit::Microsecond, None),
+                ts(TimeUnit::Millisecond, Some("UTC")),
+            ),
+            (
+                "tz_file_to_ntz_table",
+                ts(TimeUnit::Microsecond, Some("UTC")),
+                ts(TimeUnit::Millisecond, None),
+            ),
+            // Seconds and nanos are outside the repair entirely.
+            (
+                "seconds_to_millis",
+                ts(TimeUnit::Second, Some("UTC")),
+                ts(TimeUnit::Millisecond, Some("UTC")),
+            ),
+            (
+                "micros_to_nanos",
+                ts(TimeUnit::Microsecond, Some("UTC")),
+                ts(TimeUnit::Nanosecond, Some("UTC")),
+            ),
+        ];
+        for (name, file, required) in cases {
+            assert!(
+                reinterpreted(
+                    vec![Field::new("c", file, true)],
+                    vec![Field::new("c", required, true)],
+                )
+                .is_empty(),
+                "{name} preserves the value's meaning and must keep its pushdown"
+            );
+        }
+    }
+
+    #[test]
+    fn reinterpreted_columns_ignores_a_column_absent_from_the_table_schema() {
+        // A file column the table does not ask for is never projected, so it is
+        // never repaired and cannot be misread.
+        assert!(
+            reinterpreted(
+                vec![Field::new(
+                    "ts",
+                    ts(TimeUnit::Microsecond, Some("UTC")),
+                    true
+                )],
+                vec![Field::new("other", DataType::Int32, true)],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_matches_names_case_insensitively() {
+        // The projection resolves names case-insensitively (index_of_ci), so this
+        // must too, or a file spelling the column `TS` would push unsafely.
+        assert_eq!(
+            reinterpreted(
+                vec![Field::new(
+                    "TS",
+                    ts(TimeUnit::Microsecond, Some("UTC")),
+                    true
+                )],
+                vec![Field::new(
+                    "ts",
+                    ts(TimeUnit::Millisecond, Some("UTC")),
+                    true
+                )],
+            ),
+            vec!["TS".to_string()],
+            "the returned name is the FILE's spelling, which is how a predicate \
+             addresses the parquet column"
+        );
+    }
+
+    #[test]
+    fn reinterpreted_columns_sees_through_containers() {
+        // The repair recurses into structs/lists/maps, so the rule must too --
+        // otherwise an affected field nested one level down keeps its pushdown and
+        // drops rows silently.
+        let nested = |unit: TimeUnit| {
+            DataType::Struct(vec![Field::new("inner", ts(unit, Some("UTC")), true)].into())
+        };
+        assert_eq!(
+            reinterpreted(
+                vec![Field::new("s", nested(TimeUnit::Microsecond), true)],
+                vec![Field::new("s", nested(TimeUnit::Millisecond), true)],
+            ),
+            vec!["s".to_string()],
+            "an affected field inside a struct must flag its top-level column"
+        );
+
+        let listed = |unit: TimeUnit| {
+            DataType::List(Arc::new(Field::new("item", ts(unit, Some("UTC")), true)))
+        };
+        assert_eq!(
+            reinterpreted(
+                vec![Field::new("l", listed(TimeUnit::Microsecond), true)],
+                vec![Field::new("l", listed(TimeUnit::Millisecond), true)],
+            ),
+            vec!["l".to_string()],
+            "and so must one inside a list"
         );
     }
 }
