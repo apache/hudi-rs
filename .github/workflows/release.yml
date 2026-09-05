@@ -137,7 +137,7 @@ jobs:
           args: --skip-existing -m python/Cargo.toml
           manylinux: '2014'
           before-script-linux: |
-            bash .github/scripts/manylinux-build-deps.sh
+            source .github/scripts/manylinux-build-deps.sh
       - name: Publish manylinux to pypi aarch64 (without sdist)
         uses: PyO3/maturin-action@v1
         env:
@@ -149,7 +149,7 @@ jobs:
           args: --skip-existing -m python/Cargo.toml --no-sdist
           manylinux: '2014'
           before-script-linux: |
-            bash .github/scripts/manylinux-build-deps.sh
+            source .github/scripts/manylinux-build-deps.sh
             # We can remove this once we upgrade to 2_28.
             # https://github.com/briansmith/ring/issues/1728
             export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"

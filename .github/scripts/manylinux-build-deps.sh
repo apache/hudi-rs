@@ -28,9 +28,13 @@
 #
 # libclang: librocksdb-sys generates its bindings with bindgen, which needs a
 # libclang the base image does not carry; the distro clang is 3.4, older than
-# bindgen supports. It is linked into a standard directory rather than exported
-# through LIBCLANG_PATH, because maturin-action forwards only its own env vars
-# into the container and would drop one set on the step.
+# bindgen supports. bindgen also needs clang's builtin headers (stdbool.h and
+# friends), which libclang cannot locate on its own when loaded from the SCL
+# prefix, so both are handed over explicitly. The exports only reach the build
+# if this script is SOURCED from before-script-linux, not executed: a step-level
+# `env:` never enters the container (maturin-action forwards only its own
+# variables), while the before-script runs in the same shell as the build - the
+# long-standing CFLAGS_aarch64 export below relies on the same behavior.
 #
 # perl-IPC-Cmd: needed by openssl.
 
@@ -64,7 +68,7 @@ unzip -qo /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
 chmod +x /usr/local/bin/protoc
 protoc --version
 
-yum install -y llvm-toolset-7.0-clang-libs perl-IPC-Cmd
+yum install -y llvm-toolset-7.0-clang llvm-toolset-7.0-clang-libs perl-IPC-Cmd
 
 # libclang.so links against the LLVM runtime in the same prefix, so make the
 # loader aware of it rather than relying on a symlink out of the prefix.
@@ -74,15 +78,17 @@ test -e "$libclang_dir/libclang.so" || {
   exit 1
 }
 
-# Register the prefix so the LLVM runtime libclang links against resolves, then
-# link libclang itself where bindgen already looks.
+# Register the prefix so the LLVM runtime libclang links against resolves.
 echo "$libclang_dir" >/etc/ld.so.conf.d/llvm-toolset-7.0.conf
-ln -sf "$libclang_dir/libclang.so" /usr/lib64/libclang.so
-ln -sf "$libclang_dir/libclang.so.7" /usr/lib64/libclang.so.7
 ldconfig
 
-ldconfig -p | grep -q 'libclang\.so ' || {
-  echo "libclang.so is not in the loader cache" >&2
+clang_include=$(ls -d "$libclang_dir"/clang/*/include 2>/dev/null | head -n 1)
+test -n "$clang_include" || {
+  echo "clang builtin headers not found under $libclang_dir/clang" >&2
   exit 1
 }
-echo "libclang: $(ldconfig -p | grep -m1 'libclang\.so ')"
+
+export LIBCLANG_PATH="$libclang_dir"
+export BINDGEN_EXTRA_CLANG_ARGS="-I$clang_include"
+echo "libclang: $LIBCLANG_PATH"
+echo "clang builtin headers: $clang_include"

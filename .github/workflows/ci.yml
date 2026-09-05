@@ -339,7 +339,7 @@ jobs:
           # release steps are provably the same environment.
           manylinux: '2014'
           before-script-linux: |
-            bash .github/scripts/manylinux-build-deps.sh
+            source .github/scripts/manylinux-build-deps.sh
 
   publish-coverage:
     name: Publish coverage reports to codecov.io
