@@ -90,8 +90,26 @@ benchmark/tpch/run.sh compare --scale-factor 100 \
 
 Keep both sides of any such comparison on the same storage. Hudi tables on
 object storage against parquet on a local disk measures the storage far more
-than it measures the format, so upload the parquet alongside the tables and
+than it measures the format, so keep the parquet alongside the tables and
 point `--parquet-dir` at it.
+
+Every data directory, `--hudi-dir` and `--parquet-dir` alike, takes either a
+local path or a cloud URL, on every command that reads or writes one. So the
+whole run can stay in object storage:
+
+```bash
+S3=s3://bucket/sf100
+benchmark/tpch/run.sh generate --scale-factor 100 --parquet-dir $S3-parquet
+benchmark/tpch/run.sh create-tables --scale-factor 100 \
+  --parquet-dir $S3-parquet --hudi-dir $S3-hudi
+```
+
+Pointing `--parquet-dir` at the Hudi table itself is a further option: a
+parquet scan of that directory reads the same files the Hudi tables are made
+of, so file sizing and sort order are held constant and only the read path
+differs. That is sound only for a table with a single commit, as here, since a
+plain scan has no notion of file slices and would read superseded versions of
+an updated table.
 
 Credentials come from the environment for both engines: DataFusion reads the
 `AWS_*` / `GOOGLE_*` / `AZURE_*` variables, and on a cloud VM with an attached
