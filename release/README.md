@@ -47,6 +47,7 @@ This issue tracks the release process as instructed in the [release guide](https
 - [ ] Upload the target RC artifacts to the ASF dev repo (SVN)
 - [ ] Verify the target RC artifacts
 - [ ] Push a desired RC release git tag to the release branch
+- [ ] Verify the published crates.io and pypi.org artifacts
 - [ ] Start VOTE in `dev@hudi.apache.org`
 
 > [!IMPORTANT]
@@ -56,6 +57,7 @@ This issue tracks the release process as instructed in the [release guide](https
 
 - [ ] Bump the version in the release branch for the official release
 - [ ] Push the official release git tag to the release branch
+- [ ] Verify the published crates.io and pypi.org artifacts
 - [ ] Upload the release artifacts to the ASF release repo (SVN)
 - [ ] Merge a PR to update the changelog in `main` branch
 - [ ] Publish release notes in https://github.com/apache/hudi-rs/releases
@@ -172,7 +174,31 @@ RELEASE_VER=x.y.z-rc.1
 git push origin release-$RELEASE_VER
 ```
 
-Once the CI completes, check crates.io and pypi.org for the new release artifacts.
+### Verify the published artifacts
+
+Once the CI completes, check that every artifact the publish workflow builds actually reached
+crates.io and pypi.org, and that the wheel works once installed.
+
+```shell
+RELEASE_VER=x.y.z-rc.1
+
+./release/verify_published_artifacts.sh $RELEASE_VER
+```
+
+This checks all three crates on crates.io, the full wheel set plus the sdist on pypi.org, and then
+installs and reads a table with each wheel it can reach from the machine you run it on: both linux
+wheels through docker, and the macOS wheel when run on macOS. Pass `--skip-functional` to skip the
+install-and-read tests.
+
+It exits 0 when everything it checked passed, 1 when an artifact is missing or broken, and 2 when a
+check could not run at all, which is a reason to re-run rather than to cut a new release candidate.
+Anything it could not cover is named in the output.
+
+> [!IMPORTANT]
+> A publish job can fail after its siblings have already uploaded, which leaves a version that looks
+> published but is missing a platform. crates.io does not allow re-publishing a version, so a gap
+> found here means starting a new release candidate, not repairing this one. Do not start the VOTE
+> thread until this passes.
 
 ### Generate changelog
 
@@ -303,7 +329,13 @@ RELEASE_VER=x.y.z
 git push origin release-$RELEASE_VER
 ```
 
-Once the CI completes, check crates.io and pypi.org for the new release artifacts.
+Once the CI completes, verify the published artifacts again for the official version.
+
+```shell
+RELEASE_VER=x.y.z
+
+./release/verify_published_artifacts.sh $RELEASE_VER
+```
 
 ### Update the change log
 
