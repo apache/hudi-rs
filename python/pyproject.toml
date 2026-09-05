@@ -22,6 +22,9 @@ build-backend = "maturin"
 [project]
 name = "hudi"
 description = "Native Python binding for Apache Hudi, based on hudi-rs."
+# maturin stopped falling back to the crate's readme for this metadata, so
+# without this the published package has no description at all.
+readme = "../README.md"
 urls = { repository = "https://github.com/apache/hudi-rs/tree/main/python/" }
 requires-python = ">=3.10"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
