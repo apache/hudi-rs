@@ -402,6 +402,136 @@ mod tests {
     }
 
     #[test]
+    fn test_hoodie_partition_path_whole_path_pruning() {
+        // A timestamp key generator rewrites a source-column predicate into a predicate on
+        // the opaque whole-path meta field, so the pruner holds a single-field schema and
+        // must compare the path as one string rather than split it into segments.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        assert!(!pruner.is_empty());
+        assert!(pruner.should_include("ts_str=2023/04/01/12"));
+        assert!(!pruner.should_include("ts_str=2023/05/01/08"));
+    }
+
+    #[test]
+    fn test_hoodie_partition_path_whole_path_pruning_url_encoded() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "true"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        // The encoded path decodes to `ts_str=2023/04/01/12` before comparison.
+        assert!(pruner.should_include("ts_str%3D2023%2F04%2F01%2F12"));
+        assert!(!pruner.should_include("ts_str%3D2023%2F05%2F01%2F08"));
+    }
+
+    #[test]
+    fn test_is_table_partitioned_keygen_declarations() {
+        // Declaring partition fields alone keeps the table partitioned.
+        let configs = HudiConfigs::new([("hoodie.table.partition.fields", "ts")]);
+        assert!(is_table_partitioned(&configs).unwrap());
+
+        // The non-partitioned key generator class cancels the partition fields.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.NonpartitionedKeyGenerator",
+            ),
+        ]);
+        assert!(!is_table_partitioned(&configs).unwrap());
+
+        // So does the short key-generator type, in either accepted spelling.
+        for keygen_type in ["non_partition", "NON_PARTITION_AVRO"] {
+            let configs = HudiConfigs::new([
+                ("hoodie.table.partition.fields", "ts"),
+                ("hoodie.table.keygenerator.type", keygen_type),
+            ]);
+            assert!(!is_table_partitioned(&configs).unwrap(), "{keygen_type}");
+        }
+    }
+
+    #[test]
+    fn test_should_include_tolerates_foreign_field_and_comparison_error() {
+        // Fail-open arms of should_include: a filter whose field is not among the path
+        // segments, and a comparison that fails on a type mismatch, must both keep the
+        // partition rather than silently dropping data.
+        let bound = SchemableFilter::try_from((
+            Filter::try_from(("count", ">", "5")).unwrap(),
+            &create_test_schema(),
+        ))
+        .unwrap();
+
+        // The bound field `count` is not part of this path's segment map.
+        let foreign_field = PartitionPruner {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "date",
+                DataType::Date32,
+                false,
+            )])),
+            is_hive_style: false,
+            is_url_encoded: false,
+            is_partitioned: true,
+            and_filters: vec![bound.clone()],
+        };
+        assert!(foreign_field.should_include("2023-02-01"));
+
+        // The same Int32-bound filter meets a Utf8 segment value: the arrow kernel
+        // rejects the comparison and the partition is kept.
+        let mismatched = PartitionPruner {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "count",
+                DataType::Utf8,
+                false,
+            )])),
+            is_hive_style: false,
+            is_url_encoded: false,
+            is_partitioned: true,
+            and_filters: vec![bound],
+        };
+        assert!(mismatched.should_include("not_a_number"));
+    }
+
+    #[test]
     fn test_partition_pruner_parse_segments() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
