@@ -110,6 +110,6 @@ roaring = { version = "0.11" }
 flate2 = { version = "1" }
 
 # testing
-serial_test = { version = "3" }
+serial_test = { version = "4" }
 tempfile = { version = "3" }
 zip = { version = "8", default-features = false, features = ["deflate"] }
