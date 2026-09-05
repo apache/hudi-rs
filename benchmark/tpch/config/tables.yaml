@@ -17,37 +17,47 @@
 
 # Common TPC-H table definitions shared across all scale factors.
 # Per-scale-factor configs (sf*.yaml) override shuffle_parallelism.
+#
+# pre_combine_field is set only where the table has a real ordering column;
+# the others merge by commit time, since ordering a table by its own key
+# would give every record the same ordering value as its update.
+#
+# update_field is the column the merge-on-read update commit assigns. It is
+# assigned its own value: the update exists to give every file group a log
+# file to merge, not to change what a query returns.
 
 tables:
   customer:
     primary_key: c_custkey
-    pre_combine_field: c_custkey
     record_size_estimate: 87
+    update_field: c_comment
   lineitem:
     primary_key: l_orderkey,l_linenumber
     pre_combine_field: l_shipdate
     record_size_estimate: 36
+    update_field: l_comment
   nation:
     primary_key: n_nationkey
-    pre_combine_field: n_nationkey
     record_size_estimate: 160
+    update_field: n_comment
   orders:
     primary_key: o_orderkey
     pre_combine_field: o_orderdate
     record_size_estimate: 35
+    update_field: o_comment
   part:
     primary_key: p_partkey
-    pre_combine_field: p_partkey
     record_size_estimate: 32
+    update_field: p_comment
   partsupp:
     primary_key: ps_partkey,ps_suppkey
-    pre_combine_field: ps_partkey
     record_size_estimate: 48
+    update_field: ps_comment
   region:
     primary_key: r_regionkey
-    pre_combine_field: r_regionkey
     record_size_estimate: 800
+    update_field: r_comment
   supplier:
     primary_key: s_suppkey
-    pre_combine_field: s_suppkey
     record_size_estimate: 88
+    update_field: s_comment

@@ -32,7 +32,7 @@
 # 1. Generate parquet data
 make tpch-generate SF=1
 
-# 2. Create Hudi COW tables from parquet
+# 2. Create Hudi tables from parquet (COW by default; TABLE_TYPE=mor for merge-on-read)
 make tpch-create-tables SF=1
 
 # 3. Run benchmarks
@@ -53,18 +53,62 @@ benchmark/tpch/run.sh validate --scale-factor 1
 
 It reports per query and exits non-zero if any of them differ.
 
+### Merge-on-read tables
+
+`--table-type mor` builds the same tables as merge-on-read and follows the bulk
+insert with one update commit, so that every file group carries a log file and
+every read goes through the merge path:
+
+```bash
+benchmark/tpch/run.sh create-tables --scale-factor 1 --table-type mor
+benchmark/tpch/run.sh validate --scale-factor 1 --table-type mor
+benchmark/tpch/run.sh bench-datafusion --scale-factor 1 --table-type mor \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh compare --scale-factor 1 \
+  --runs datafusion_hudi_sf1,datafusion_hudi-mor_sf1
+```
+
+The update rewrites `--update-fraction` of each table's rows (default 0.001,
+applied as one row in every `round(1/F)` by key hash) with their own values,
+plus the smallest key in every file group so the small tables get their log
+file too. Nothing a query can see changes: the merged rows
+equal the parquet the tables were built from, and `validate` passes unchanged.
+Tables with a real ordering column (`lineitem`, `orders`) keep event-time
+ordering, where the update ties with the base row and the later commit wins;
+the rest merge by commit time.
+
+Because the values are unchanged, `validate` proves the merge a different way:
+for each merge-on-read table it counts the rows whose `_hoodie_commit_time` is
+the update commit's and requires the count to equal the update records that
+commit wrote. A reader that skipped the log files, or let the base row win the
+tie, would come up short. `create-tables` also prints the file layout per table
+and fails if any file group is missing its log file.
+
+Merge-on-read tables live in `data/sf{N}-hudi-mor` by default and persist
+results under the `hudi-mor` format label, so both types can be built from one
+parquet set and compared. `--reader-version 1` pins hudi-rs's previous file
+group reader for a baseline; its results get a `-r1` suffix. That reader has no
+commit-time merge and reads a merge-on-read table without an ordering field
+append-only, so the harness refuses the pin on the default merge-on-read tables
+rather than chart a baseline that merged nothing; to compare the two readers on
+merge-on-read, give every table a `pre_combine_field` in `tables.yaml` and
+rebuild. To see which reader served each file slice, run with
+`RUST_LOG=hudi_core::file_group::reader=debug` and count the lines naming
+"file group reader version 2".
+
 ### Options
 
-| Variable  | Values                                            | Default      |
-|-----------|---------------------------------------------------|--------------|
-| `ENGINE`  | `datafusion`, `spark`                             | `datafusion` |
-| `SF`      | TPC-H scale factor                                | `0.001`      |
-| `QUERIES` | Comma-separated query numbers                     | all 22       |
-| `ENGINES` | Comma-separated engine names (for `tpch-compare`) |              |
+| Variable     | Values                                            | Default      |
+|--------------|---------------------------------------------------|--------------|
+| `ENGINE`     | `datafusion`, `spark`                             | `datafusion` |
+| `SF`         | TPC-H scale factor                                | `0.001`      |
+| `TABLE_TYPE` | `cow`, `mor`                                      | `cow`        |
+| `QUERIES`    | Comma-separated query numbers                     | all 22       |
+| `ENGINES`    | Comma-separated engine names (for `tpch-compare`) |              |
 
-`run.sh` takes the same options plus `--recreate`, `--runs`, `--memory-limit`
-and the `--hudi-dir` / `--parquet-dir` overrides; run it with no arguments for
-the full list.
+`run.sh` takes the same options plus `--recreate`, `--runs`, `--memory-limit`,
+`--update-fraction`, `--reader-version` and the `--hudi-dir` / `--parquet-dir`
+overrides; run it with no arguments for the full list.
 
 ### More examples
 
@@ -107,9 +151,9 @@ benchmark/tpch/run.sh create-tables --scale-factor 100 \
 Pointing `--parquet-dir` at the Hudi table itself is a further option: a
 parquet scan of that directory reads the same files the Hudi tables are made
 of, so file sizing and sort order are held constant and only the read path
-differs. That is sound only for a table with a single commit, as here, since a
-plain scan has no notion of file slices and would read superseded versions of
-an updated table.
+differs. That is sound only for a copy-on-write table, which has a single
+commit: a plain scan has no notion of file slices, so on a merge-on-read table
+it would read the base files and miss the log files.
 
 Credentials come from the environment for both engines: DataFusion reads the
 `AWS_*` / `GOOGLE_*` / `AZURE_*` variables, and on a cloud VM with an attached
