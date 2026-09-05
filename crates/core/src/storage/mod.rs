@@ -136,17 +136,35 @@ pub struct ReadVolume {
     /// same whether the selector ran and found nothing or was never installed.
     /// Only this counter separates them.
     pub row_group_selector_calls: AtomicU64,
-    /// Times a selector WAS installed by the caller but the merge-safety gate
-    /// refused to pass it down.
+    /// Times a selector WAS installed by the caller but a gate refused to pass it
+    /// down — either the merge-safety gate or a value-reinterpreting logical-type
+    /// repair on the file.
     ///
-    /// Without this the gate silently defeats the counter above: a suppressed
-    /// selector is a third state that also reads zero calls. Read the two
-    /// together:
+    /// Without this a gate silently defeats the counter above: a suppressed
+    /// selector is a third state that also reads zero calls.
+    ///
+    /// Counted regardless of cause, so it stays a faithful answer to "was one
+    /// installed but not passed down"; [`Self::pushdown_suppressed_by_repair`]
+    /// says which cause. Read them together:
     ///   calls > 0                   the selector ran
-    ///   calls == 0, suppressed > 0  the gate refused it (the read merges, and
-    ///                               the predicate is not primary-key-safe)
+    ///   calls == 0, suppressed > 0  a gate refused it; by_repair == 0 means the
+    ///                               merge-safety gate (the read merges, and the
+    ///                               predicate is not primary-key-safe),
+    ///                               by_repair > 0 means a repair conflict
     ///   calls == 0, suppressed == 0 no caller ever installed one
     pub row_group_selector_suppressed: AtomicU64,
+    /// Base files where a pushed predicate read a column THIS file mislabels, so
+    /// every pushdown mechanism was withdrawn for it.
+    ///
+    /// Counted once per such file whether or not a selector was installed, so
+    /// unlike [`Self::row_group_selector_suppressed`] it also covers the
+    /// row-filter side.
+    ///
+    /// Non-zero is expected on a table with legacy `parquet-mr` base files and a
+    /// predicate over a tz-aware millis column: those files fell back to the
+    /// post-scan filter, they did not lose rows. Rising on a table that should be
+    /// all-micros is the signal worth chasing.
+    pub pushdown_suppressed_by_repair: AtomicU64,
     /// Rows the file contains, from parquet metadata.
     pub file_rows: AtomicU64,
     /// Rows the stream actually yielded, after any row filter. `file_rows -
@@ -182,6 +200,15 @@ impl ReadVolume {
     /// A caller installed a selector and the safety gate declined to pass it on.
     pub(crate) fn record_selector_suppressed(&self) {
         self.row_group_selector_suppressed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This base file mislabels a column the pushed predicate reads, so every
+    /// pushdown mechanism was withdrawn for it. Counted separately from
+    /// `record_selector_suppressed` because it fires with no selector installed
+    /// too, and because the two causes must stay distinguishable.
+    pub(crate) fn record_pushdown_suppressed_by_repair(&self) {
+        self.pushdown_suppressed_by_repair
             .fetch_add(1, Ordering::Relaxed);
     }
 
