@@ -170,6 +170,9 @@ impl ScaleFactorConfig {
             let Some(table) = self.tables.get(name) else {
                 continue;
             };
+            // The catalog registration outlives the data it points at, so
+            // without this a rerun fails on the previous run's entry.
+            writeln!(sql, "DROP TABLE IF EXISTS {name};").unwrap();
             writeln!(sql, "CREATE TABLE {name} USING hudi").unwrap();
             writeln!(sql, "LOCATION '{hudi_base}/{name}'").unwrap();
             writeln!(sql, "TBLPROPERTIES (").unwrap();
@@ -208,6 +211,7 @@ impl ScaleFactorConfig {
         // Register Hudi tables
         for &name in TABLE_ORDER {
             if self.tables.contains_key(name) {
+                writeln!(sql, "DROP TABLE IF EXISTS {name};").unwrap();
                 writeln!(
                     sql,
                     "CREATE TABLE {name} USING hudi LOCATION '{hudi_base}/{name}';"
