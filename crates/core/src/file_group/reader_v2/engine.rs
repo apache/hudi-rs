@@ -812,7 +812,7 @@ impl HoodieFileGroupReader {
         // and pruning is the one that must not be left behind — it drops rows
         // before the merge can see them.
         let pushdown_is_safe = self.base_read_pushdown_is_safe();
-        let row_filter = if pushdown_is_safe {
+        let mut row_filter = if pushdown_is_safe {
             self.reader_context.row_filter_builder.clone()
         } else {
             if self.reader_context.row_filter_builder.is_some() {
@@ -824,7 +824,7 @@ impl HoodieFileGroupReader {
             }
             None
         };
-        let row_group_selector = if pushdown_is_safe {
+        let mut row_group_selector = if pushdown_is_safe {
             self.reader_context.row_group_selector.clone()
         } else {
             // Record the suppression. The gate and the selector are each correct
@@ -931,6 +931,63 @@ impl HoodieFileGroupReader {
             required_schema.fields().len(),
             present_len
         );
+
+        // Parquet evaluates a pushed predicate against the file's PHYSICAL values,
+        // before `project_batch_to_schema` runs. Sound only while a physical value
+        // means what its physical type says, which the apache/hudi#18132 repair
+        // breaks: the file labels a tz-aware column micros while the stored i64 is
+        // MILLIS, so a millis-semantics literal reads those rows as 1970 and the
+        // filter drops rows that match. The post-scan filter cannot restore them.
+        //
+        // Two gates, cheapest first. `repair_risk_columns` was decided ONCE per scan
+        // from the table schema and the predicate's own referenced columns, and is
+        // empty unless the predicate touches a tz-aware millis column — so the
+        // common scan never reaches the footer comparison below and never loses
+        // pushdown. The footer schema itself is already fetched unconditionally
+        // above, so gate 1 buys predicate scoping and the per-file name walk, not
+        // avoided IO.
+        //
+        // The table side is `table_schema`, NOT `required_schema`: a filter column
+        // absent from the projection is still decoded and still misread, because a
+        // `RowFilter` builder derives its own `ProjectionMask` from the parquet
+        // schema rather than from `intersection`.
+        let repair_conflict =
+            if pushdown_is_safe && !self.reader_context.repair_risk_columns.is_empty() {
+                let table_side = self
+                    .schema_handler
+                    .table_schema
+                    .as_ref()
+                    .unwrap_or(&required_schema);
+                crate::schema::batch_evolution::reinterpreted_columns(
+                    &file_schema,
+                    table_side,
+                    &self.reader_context.repair_risk_columns,
+                )?
+            } else {
+                Vec::new()
+            };
+
+        // ONE verdict, both consumers, withdrawn in one block. That is the same
+        // property the merge-safety gate is bound once for, one layer in: an edit
+        // to the condition cannot leave the row-group selector behind, and pruning
+        // is the one that must not be left behind — it drops rows before anything
+        // downstream can see them.
+        if !repair_conflict.is_empty() {
+            let volume = self.storage.read_volume();
+            // Counted for every withdrawal; `row_group_selector_suppressed` can
+            // only speak for a selector the caller actually installed.
+            volume.record_pushdown_suppressed_by_repair();
+            if row_group_selector.is_some() {
+                volume.record_selector_suppressed();
+            }
+            log::debug!(
+                "base file '{path}' needs a value-reinterpreting logical-type repair \
+                 on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
+                 row-group pruning (post-merge filter still runs)"
+            );
+            row_filter = None;
+            row_group_selector = None;
+        }
 
         let base_read_schema: SchemaRef = if use_position {
             let mut fields: Vec<arrow_schema::FieldRef> =
@@ -1187,6 +1244,9 @@ pub struct HoodieFileGroupReaderBuilder {
     row_group_selector: Option<RowGroupSelector>,
     /// Set by `with_mor_pk_safe`; copied onto the cloned reader_context.
     mor_pk_safe: Option<bool>,
+    /// Set by `with_repair_risk_columns`; copied onto the cloned reader_context.
+    /// Absent leaves the repair guard OFF.
+    repair_risk_columns: Option<Vec<String>>,
 }
 
 /// Reached only from the test harness — see the builder's own note.
@@ -1236,6 +1296,9 @@ impl HoodieFileGroupReaderBuilder {
     ///
     /// The builder is also visible to the parquet log block decoder via the
     /// same `reader_context` channel.
+    ///
+    /// Pair this with [`Self::with_repair_risk_columns`], or the repair guard is
+    /// off and a base file mislabelling a predicate column over-drops rows.
     pub fn with_row_filter_builder(mut self, b: RowFilterBuilder) -> Self {
         self.row_filter_builder = Some(b);
         self
@@ -1265,6 +1328,20 @@ impl HoodieFileGroupReaderBuilder {
         self
     }
 
+    /// Arm the value-reinterpreting repair guard with the predicate columns the
+    /// apache/hudi#18132 logical-type repair could make a pushed filter misread.
+    ///
+    /// Required alongside [`Self::with_row_filter_builder`] whenever the table may
+    /// hold legacy base files labelling a tz-aware column micros while the stored
+    /// i64 is millis. Left unset the guard is OFF and such a file over-drops rows —
+    /// this is not a perf knob. Compute via
+    /// [`crate::schema::batch_evolution::repair_risk_columns`]; the empty vec is the
+    /// explicit "no column is at risk".
+    pub fn with_repair_risk_columns(mut self, columns: Vec<String>) -> Self {
+        self.repair_risk_columns = Some(columns);
+        self
+    }
+
     pub fn build(self) -> Result<HoodieFileGroupReader> {
         let reader_context = self
             .reader_context
@@ -1283,6 +1360,7 @@ impl HoodieFileGroupReaderBuilder {
         let reader_context = if self.row_filter_builder.is_some()
             || self.row_group_selector.is_some()
             || self.mor_pk_safe.is_some()
+            || self.repair_risk_columns.is_some()
         {
             let mut updated = (*reader_context).clone();
             if let Some(b) = self.row_filter_builder {
@@ -1293,6 +1371,9 @@ impl HoodieFileGroupReaderBuilder {
             }
             if let Some(s) = self.mor_pk_safe {
                 updated.mor_pk_safe = s;
+            }
+            if let Some(cols) = self.repair_risk_columns {
+                updated.repair_risk_columns = cols;
             }
             Arc::new(updated)
         } else {
@@ -2587,6 +2668,524 @@ mod tests {
             render(&streamed),
             render(std::slice::from_ref(&eager)),
             "the streamed read must return the same rows as the single-batch read"
+        );
+    }
+
+    // ── pushdown vs. the apache/hudi#18132 logical-type repair ────────────────
+
+    /// A `ts > threshold` row filter that normalises the column to NANOSECONDS
+    /// from its own DECLARED unit — the shape an engine's timestamp comparison
+    /// takes when it reconciles a literal against the column type parquet reports.
+    /// Counts its own invocations, so a test can assert the filter was never even
+    /// built rather than inferring it from rows.
+    fn nanos_gt_filter_builder(
+        column: &'static str,
+        threshold_nanos: i64,
+        invocations: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> RowFilterBuilder {
+        use parquet::arrow::ProjectionMask;
+        use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter};
+        use std::sync::atomic::Ordering::Relaxed;
+        Arc::new(move |parquet_schema, _projected_schema| {
+            invocations.fetch_add(1, Relaxed);
+            let root = parquet_schema.root_schema();
+            let idx = root.get_fields().iter().position(|f| f.name() == column)?;
+            let mask = ProjectionMask::roots(parquet_schema, [idx]);
+            let predicate = ArrowPredicateFn::new(mask, move |batch: RecordBatch| {
+                use arrow_array::cast::AsArray;
+                use arrow_array::types::{TimestampMicrosecondType, TimestampMillisecondType};
+                let col = batch.column_by_name(column).ok_or_else(|| {
+                    arrow_schema::ArrowError::ComputeError(format!(
+                        "predicate column '{column}' missing from the predicate batch"
+                    ))
+                })?;
+                // Scale the raw i64 to nanos using the unit the column DECLARES.
+                // That declaration is precisely what a mislabelled file gets wrong,
+                // so the scaling inherits the lie.
+                let (values, per_unit): (Vec<i64>, i64) = match col.data_type() {
+                    arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, _) => {
+                        let a = col.as_primitive::<TimestampMicrosecondType>();
+                        ((0..a.len()).map(|i| a.value(i)).collect(), 1_000)
+                    }
+                    arrow_schema::DataType::Timestamp(arrow_schema::TimeUnit::Millisecond, _) => {
+                        let a = col.as_primitive::<TimestampMillisecondType>();
+                        ((0..a.len()).map(|i| a.value(i)).collect(), 1_000_000)
+                    }
+                    other => {
+                        return Err(arrow_schema::ArrowError::ComputeError(format!(
+                            "unsupported predicate column type {other}"
+                        )));
+                    }
+                };
+                Ok(arrow_array::BooleanArray::from_iter(
+                    values.iter().map(|v| Some(v * per_unit > threshold_nanos)),
+                ))
+            });
+            Some(RowFilter::new(vec![Box::new(predicate)]))
+        })
+    }
+
+    /// Like [`test_file_group_reader_for_base_file`], but also installs a row
+    /// filter builder so the base read exercises the pushdown path.
+    async fn test_file_group_reader_with_row_filter(
+        dir: &std::path::Path,
+        base_name: &str,
+        required: SchemaRef,
+        row_filter_builder: RowFilterBuilder,
+        row_group_selector: Option<RowGroupSelector>,
+        repair_risk_columns: &[&str],
+    ) -> HoodieFileGroupReader {
+        let mut reader = test_file_group_reader_for_base_file(dir, base_name, required).await;
+        let mut context = (*reader.reader_context).clone();
+        context.row_filter_builder = Some(row_filter_builder);
+        context.row_group_selector = row_group_selector;
+        // What `batch_evolution::repair_risk_columns` would have produced for this
+        // predicate against this table schema — the gate that arms the per-file check.
+        context.repair_risk_columns = repair_risk_columns.iter().map(|c| c.to_string()).collect();
+        reader.reader_context = Arc::new(context);
+        reader
+    }
+
+    /// 2020-01-01T00:00:00Z — the threshold the failing fixtures straddle.
+    const THRESHOLD_NANOS: i64 = 1_577_836_800_000_000_000;
+    /// 2020-01-01T00:00:00.001Z as MILLIS — above the threshold.
+    const ABOVE_MS: i64 = 1_577_836_800_001;
+    /// 2019-12-31T23:59:59.999Z as MILLIS — below it.
+    const BELOW_MS: i64 = 1_577_836_799_999;
+
+    fn ts_field(name: &str, unit: arrow_schema::TimeUnit) -> arrow_schema::Field {
+        arrow_schema::Field::new(
+            name,
+            arrow_schema::DataType::Timestamp(unit, Some("UTC".into())),
+            true,
+        )
+    }
+
+    /// The table's view of the straddling file: `ts` is tz-aware MILLIS, which is
+    /// what the stored i64s have always been.
+    fn straddling_table_schema() -> SchemaRef {
+        Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, true),
+            ts_field("ts", arrow_schema::TimeUnit::Millisecond),
+        ]))
+    }
+
+    /// Write a two-row base file whose `ts` column is DECLARED with `declared_unit`
+    /// while its values are always the millisecond counts above. When
+    /// `declared_unit` is micros this is the apache/hudi#18132 shape: the label is
+    /// a lie and the repair has to reinterpret it on read.
+    fn write_straddling_base_file(
+        dir: &std::path::Path,
+        name: &str,
+        declared_unit: arrow_schema::TimeUnit,
+    ) {
+        let file_schema = Arc::new(arrow_schema::Schema::new(vec![
+            arrow_schema::Field::new("_hoodie_record_key", arrow_schema::DataType::Utf8, true),
+            ts_field("ts", declared_unit),
+        ]));
+        let ts: arrow_array::ArrayRef = match declared_unit {
+            arrow_schema::TimeUnit::Microsecond => Arc::new(
+                arrow_array::TimestampMicrosecondArray::from(vec![ABOVE_MS, BELOW_MS])
+                    .with_timezone("UTC"),
+            ),
+            _ => Arc::new(
+                arrow_array::TimestampMillisecondArray::from(vec![ABOVE_MS, BELOW_MS])
+                    .with_timezone("UTC"),
+            ),
+        };
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["k1", "k2"])),
+                ts,
+            ],
+        )
+        .unwrap();
+        write_parquet_file(dir, name, &batch);
+    }
+
+    /// THE REGRESSION. The file declares `ts` as tz-aware micros while the stored
+    /// i64s are MILLIS, so a nanos-normalised predicate reads them as 1970 and
+    /// `ts > 2020-01-01` matches nothing. The post-scan filter cannot restore the
+    /// rows the scan already dropped.
+    #[tokio::test]
+    async fn base_read_declines_pushdown_when_the_file_needs_a_reinterpreting_repair() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(
+            tmp.path(),
+            base_name,
+            arrow_schema::TimeUnit::Microsecond, // the LIE
+        );
+
+        let required = straddling_table_schema();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required.clone(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        // The existing merge gate is satisfied: no log files, so nothing merges.
+        assert!(
+            reader.base_read_pushdown_is_safe(),
+            "a slice with no log files clears the merge gate; the repair check \
+             is what must decline this read"
+        );
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "the row filter must never even be BUILT for a file whose physical \
+             timestamp labelling is repaired on read"
+        );
+        assert_eq!(out.schema(), required);
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "both rows must reach the post-scan filter; dropping one inside the \
+             scan is unrecoverable"
+        );
+        let ts = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::TimestampMillisecondArray>()
+            .expect("the repair must relabel the column to millis");
+        assert_eq!(
+            (ts.value(0), ts.value(1)),
+            (ABOVE_MS, BELOW_MS),
+            "and it must relabel the i64, not rescale it"
+        );
+    }
+
+    /// The other half of the rule. Same values and predicate, but the file declares
+    /// the unit it actually uses, so no repair applies and pushdown must survive —
+    /// otherwise the guard is a blanket regression on every well-formed table.
+    #[tokio::test]
+    async fn base_read_keeps_pushdown_when_the_file_is_honestly_labelled() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
+
+        let required = straddling_table_schema();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required.clone(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            1,
+            "an honestly labelled file must keep its pushdown — the guard keys on \
+             the FILE's own schema, not on the table's"
+        );
+        assert_eq!(
+            out.num_rows(),
+            1,
+            "the pushed predicate keeps only the row above the threshold"
+        );
+    }
+
+    /// The narrowing. A file mislabels `ts`, but the predicate reads `other`, so
+    /// nothing the predicate touches is misread and pushdown must be kept. Without
+    /// the per-column scoping this file would lose pushdown for a predicate the
+    /// repair cannot affect.
+    #[tokio::test]
+    async fn base_read_keeps_pushdown_for_a_predicate_on_an_unaffected_column() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        // `ts` mislabelled micros; `other` is honestly labelled millis.
+        let file_schema = Arc::new(arrow_schema::Schema::new(vec![
+            ts_field("ts", arrow_schema::TimeUnit::Microsecond),
+            ts_field("other", arrow_schema::TimeUnit::Millisecond),
+        ]));
+        let batch = RecordBatch::try_new(
+            file_schema,
+            vec![
+                Arc::new(
+                    arrow_array::TimestampMicrosecondArray::from(vec![ABOVE_MS, BELOW_MS])
+                        .with_timezone("UTC"),
+                ),
+                Arc::new(
+                    arrow_array::TimestampMillisecondArray::from(vec![ABOVE_MS, BELOW_MS])
+                        .with_timezone("UTC"),
+                ),
+            ],
+        )
+        .unwrap();
+        write_parquet_file(tmp.path(), base_name, &batch);
+
+        let required: SchemaRef = Arc::new(arrow_schema::Schema::new(vec![
+            ts_field("ts", arrow_schema::TimeUnit::Millisecond),
+            ts_field("other", arrow_schema::TimeUnit::Millisecond),
+        ]));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("other", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required,
+            builder,
+            None,
+            // Gate 1 saw only `other`: it is the sole column the predicate reads.
+            &["other"],
+        )
+        .await;
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            1,
+            "a mislabelled column the predicate never reads must not cost pushdown"
+        );
+        assert_eq!(out.num_rows(), 1);
+    }
+
+    /// The unarmed gate. Same mislabelled file and same predicate column, but gate 1
+    /// reported nothing at risk — the case of every table Spark wrote with micros.
+    /// The per-file check must not run at all, so pushdown survives.
+    #[tokio::test]
+    async fn base_read_keeps_pushdown_when_no_predicate_column_is_at_risk() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let required = straddling_table_schema();
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required,
+            builder,
+            None,
+            &[], // gate 1 disarmed
+        )
+        .await;
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            1,
+            "an empty repair_risk_columns must skip the per-file check entirely"
+        );
+    }
+
+    /// The table side of gate 2 is the TABLE schema, not the projection. A pushed
+    /// predicate reads its columns whether or not they were projected, because the
+    /// `RowFilter` builder derives its own `ProjectionMask` from the parquet schema.
+    /// Here `ts` is mislabelled and absent from `required_schema`; reading the
+    /// projection instead of the table schema would find nothing and push anyway.
+    #[tokio::test]
+    async fn base_read_declines_pushdown_for_an_unprojected_predicate_column() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        // Projection keeps only the key; `ts` is filtered on but never returned.
+        let required: SchemaRef =
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                "_hoodie_record_key",
+                arrow_schema::DataType::Utf8,
+                true,
+            )]));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            required,
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        reader.schema_handler.table_schema = Some(straddling_table_schema());
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            invocations.load(Relaxed),
+            0,
+            "the guard must consult the TABLE schema; a filter column outside the \
+             projection is still decoded and still misread"
+        );
+        assert_eq!(out.num_rows(), 2);
+    }
+
+    /// A withdrawal takes the row-group selector with it, and is counted on both
+    /// counters: `row_group_selector_suppressed` so the existing "installed but
+    /// never passed down" question stays answerable, and
+    /// `pushdown_suppressed_by_repair` so its cause is separable from a
+    /// merge-gate refusal.
+    #[tokio::test]
+    async fn repair_suppression_counts_the_row_group_selector() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations.clone());
+        let selector_calls = Arc::new(AtomicUsize::new(0));
+        let seen = selector_calls.clone();
+        let selector: RowGroupSelector = Arc::new(move |_| {
+            seen.fetch_add(1, Relaxed);
+            Some(vec![0])
+        });
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            Some(selector),
+            &["ts"],
+        )
+        .await;
+        let volume = reader.storage.read_volume();
+        let out = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(out.num_rows(), 2);
+        assert_eq!(selector_calls.load(Relaxed), 0, "the selector never ran");
+        assert_eq!(volume.row_group_selector_calls.load(Relaxed), 0);
+        assert_eq!(volume.row_group_selector_suppressed.load(Relaxed), 1);
+        assert_eq!(
+            volume.pushdown_suppressed_by_repair.load(Relaxed),
+            1,
+            "the cause must be separable from a merge-gate refusal"
+        );
+    }
+
+    /// The row-filter-only case, which `row_group_selector_suppressed` structurally
+    /// cannot see: no selector was ever installed, so that counter stays zero while
+    /// pushdown was still withdrawn.
+    #[tokio::test]
+    async fn repair_suppression_is_counted_without_a_row_group_selector() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Microsecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations);
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        let volume = reader.storage.read_volume();
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(
+            volume.row_group_selector_suppressed.load(Relaxed),
+            0,
+            "no selector was installed, so that counter cannot speak for this case"
+        );
+        assert_eq!(volume.pushdown_suppressed_by_repair.load(Relaxed), 1);
+    }
+
+    /// And it must stay at zero when pushdown survives, or the counter cannot
+    /// distinguish "a file was withdrawn" from "the scan ran".
+    #[tokio::test]
+    async fn repair_suppression_is_not_counted_when_pushdown_survives() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_name = "f1-0_0-1-1_001.parquet";
+        write_straddling_base_file(tmp.path(), base_name, arrow_schema::TimeUnit::Millisecond);
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let builder = nanos_gt_filter_builder("ts", THRESHOLD_NANOS, invocations);
+
+        let mut reader = test_file_group_reader_with_row_filter(
+            tmp.path(),
+            base_name,
+            straddling_table_schema(),
+            builder,
+            None,
+            &["ts"],
+        )
+        .await;
+        let volume = reader.storage.read_volume();
+        let _ = drain_base_source(reader.base_file_source().await.unwrap()).await;
+
+        assert_eq!(volume.pushdown_suppressed_by_repair.load(Relaxed), 0);
+    }
+
+    #[test]
+    fn builder_routes_repair_risk_columns_into_reader_context() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_filter_builder(make_row_filter_builder())
+            .with_repair_risk_columns(vec!["ts".to_string()])
+            .build()
+            .unwrap();
+        assert_eq!(
+            reader.reader_context.repair_risk_columns,
+            vec!["ts".to_string()],
+            "with_repair_risk_columns should land on reader_context"
+        );
+    }
+
+    #[test]
+    fn builder_leaves_repair_risk_columns_empty_by_default() {
+        let storage = Storage::new_with_base_url(parse_uri("file:///tmp").unwrap()).unwrap();
+        let reader = HoodieFileGroupReader::builder()
+            .with_reader_context(dummy_reader_context("MERGE_ON_READ"))
+            .with_storage(storage)
+            .with_input_split(dummy_input_split())
+            .with_row_filter_builder(make_row_filter_builder())
+            .build()
+            .unwrap();
+        assert!(
+            reader.reader_context.repair_risk_columns.is_empty(),
+            "unset must leave the guard disarmed, not populated by accident"
         );
     }
 }

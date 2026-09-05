@@ -31,8 +31,10 @@ SENTINEL="/var/lib/bootstrap-done"
 
 # System packages
 sudo apt-get update
-sudo apt-get install -y build-essential protobuf-compiler pkg-config git curl \
-  openjdk-17-jdk-headless python3-pip sysstat tmux glances
+# libclang-dev is what bindgen loads: hudi enables spill-rocksdb by default,
+# and rocksdb generates its bindings at build time.
+sudo apt-get install -y build-essential clang libclang-dev protobuf-compiler \
+  pkg-config git curl openjdk-17-jdk-headless python3-pip sysstat tmux glances
 
 # Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y

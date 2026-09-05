@@ -91,7 +91,7 @@ jobs:
   rust-tests-no-spill-backend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -306,6 +306,49 @@ jobs:
         if: always()
         run: |
           sudo chown -R $(id -u):$(id -g) $GITHUB_WORKSPACE/.cargo $GITHUB_WORKSPACE/target $GITHUB_WORKSPACE/python/target $GITHUB_WORKSPACE/.uv-cache || true
+
+  manylinux-wheel-build:
+    name: Build the manylinux wheel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      # Builds the wheel in the same container, running the same dependency
+      # script, that the release workflow publishes from. Regular CI runs on the
+      # host, whose apt protoc is new enough for lance-encoding's prost-build and
+      # which carries libclang for librocksdb-sys, so a container-only break (see
+      # #750) stays invisible until a release tag is pushed - by which point the
+      # version is burnt on crates.io and cannot be reused.
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          command: build
+          args: --release -m python/Cargo.toml --out dist
+          # Pin the image rather than relying on the default, so this job and the
+          # release steps are provably the same environment.
+          manylinux: '2014'
+          before-script-linux: |
+            source .github/scripts/manylinux-build-deps.sh
+      # A wheel that compiles is not necessarily a wheel that loads: the
+      # bindings rocksdb generates come from the container's older libclang, and
+      # bad bindings tend to surface on import or first use rather than at
+      # compile time. Each runner installs the wheel it just built.
+      - name: Import the built wheel
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -c "import hudi; print(hudi.__file__)"
 
   publish-coverage:
     name: Publish coverage reports to codecov.io
