@@ -206,6 +206,9 @@ Options (per command):
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
   --output-dir D    Directory to persist results as JSON [bench-*]
   --engines E       Comma-separated engine names to compare [compare]
+  --runs R          Comma-separated result file stems to compare [compare], e.g.
+                    datafusion_hudi_sf100,datafusion_parquet_sf100; overrides --engines
+                    and is the way to compare two formats
 
 Examples:
   $0 generate --scale-factor 1
@@ -567,27 +570,31 @@ cmd_compare() {
   local sf="$DEFAULT_SCALE_FACTOR"
   local engines=""
   local format="hudi"
+  local runs=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
       --engines) engines="$2"; shift 2 ;;
       --format) format="$2"; shift 2 ;;
+      --runs) runs="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
 
-  if [ -z "$engines" ]; then
+  if [ -z "$engines" ] && [ -z "$runs" ]; then
     echo "Error: --engines is required (e.g., --engines datafusion,spark)" >&2
     exit 1
   fi
 
-  # Convert "datafusion,spark" → "datafusion_hudi_sf1,spark_hudi_sf1"
-  local runs=""
-  IFS=',' read -ra engine_arr <<< "$engines"
-  for e in "${engine_arr[@]}"; do
-    [ -n "$runs" ] && runs+=","
-    runs+="${e}_${format}_sf${sf}"
-  done
+  # --engines pairs each engine with one format; --runs names result files
+  # directly, which is how two formats get compared against each other.
+  if [ -z "$runs" ]; then
+    IFS=',' read -ra engine_arr <<< "$engines"
+    for e in "${engine_arr[@]}"; do
+      [ -n "$runs" ] && runs+=","
+      runs+="${e}_${format}_sf${sf}"
+    done
+  fi
 
   build_tpch
   "$TPCH_BIN" compare \
