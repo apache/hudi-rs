@@ -3497,10 +3497,20 @@ mod hive_style_keygen_partition_pruning {
 
     /// Day-granularity hive-style table written by Hudi 0.15.0. Its paths are
     /// `ts_str=2024-03-01`, so the reader must build the same shape to prune at all.
+    ///
+    /// The 0.15 writer does not persist `hoodie.keygen.timebased.timestamp.type`
+    /// (it is set at write time only), so the table is opened with it supplied as
+    /// a read option — without it the keygen cannot be built and the transform
+    /// never engages. That half of the story, where column statistics alone do
+    /// the pruning, is covered by `custom_keygen_partition_paths`.
     #[tokio::test]
     async fn day_granularity_selects_only_the_requested_days() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleDay.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
         assert_eq!(
@@ -3534,12 +3544,17 @@ mod hive_style_keygen_partition_pruning {
         Ok(())
     }
 
-    /// A predicate no partition can satisfy must select nothing at all. Before the reader
-    /// built hive paths correctly this returned every file instead.
+    /// A predicate no partition can satisfy must select nothing at all. With the
+    /// transform engaged this is a genuine partition-path mismatch: the literal
+    /// names 1900-01-01, no partition carries that path, and none is read.
     #[tokio::test]
     async fn impossible_predicate_selects_no_files() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleDay.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let opts =
             ReadOptions::new().with_filters([("ts_str", "=", "1900-01-01T00:00:00.000Z")])?;
@@ -3560,7 +3575,11 @@ mod hive_style_keygen_partition_pruning {
     #[tokio::test]
     async fn hour_granularity_keeps_one_hive_prefix_over_nested_directories() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleHour.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
         assert_eq!(
@@ -3587,12 +3606,53 @@ mod hive_style_keygen_partition_pruning {
         Ok(())
     }
 
+    /// A 1.x-written table persists `timestamp.type` in `hoodie.properties`, so the
+    /// keygen transform engages from table config alone. Its `input.dateformat` is
+    /// stored through `Properties.store` and arrives Java-escaped
+    /// (`yyyy-MM-dd'T'HH\:mm\:ss.SSSZ`); before config values were unescaped, any
+    /// filter on the timestamp source column failed outright with
+    /// `TimestampParsingError` instead of pruning.
+    #[tokio::test]
+    async fn v9_table_prunes_through_its_persisted_keygen_config() -> Result<()> {
+        let base_url = SampleTable::V9TimebasedkeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert_eq!(
+            partitions_of(&all),
+            vec![
+                "2024/01/15/10",
+                "2024/01/15/11",
+                "2024/01/16/09",
+                "2024/01/17/14",
+                "2024/01/18/16",
+            ]
+        );
+
+        let opts = ReadOptions::new().with_filters([
+            ("ts_str", ">=", "2024-01-16T00:00:00.000Z"),
+            ("ts_str", "<", "2024-01-18T00:00:00.000Z"),
+        ])?;
+        // The widened bounds retain the boundary hours; file-level column
+        // statistics on the source column drop their files, whose rows all fall
+        // outside the predicate.
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["2024/01/16/09", "2024/01/17/14"]
+        );
+        Ok(())
+    }
+
     /// Rows returned must agree with the partitions selected, so pruning cannot be hiding a
     /// row that the predicate should have kept.
     #[tokio::test]
     async fn pruned_read_returns_exactly_the_matching_rows() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleDay.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let opts = ReadOptions::new().with_filters([
             ("ts_str", ">=", "2024-03-01T00:00:00.000Z"),
@@ -3614,6 +3674,98 @@ mod hive_style_keygen_partition_pruning {
         // Rows 1 and 2 fall on 2024-03-01; row 3 is on 2024-03-02, whose partition is
         // retained by the widened bound but whose rows the row-level filter removes.
         assert_eq!(got, vec![1, 2]);
+        Ok(())
+    }
+}
+
+/// A custom key generator combines an identity partition field with a
+/// time-derived one, so the on-disk shape is `region=eu/ts_str=2024-03-01`. The
+/// reader does not transform filters through `CustomKeyGenerator` — no keygen
+/// rewrite runs — but plain partition-column predicates must still prune.
+///
+/// The pair also pins how each table version spells `partition.fields`: version
+/// 6 records bare names and persists no per-field types at all, while version 9
+/// records `region:SIMPLE,ts_str:TIMESTAMP`, which must not leak the annotation
+/// into schema lookups.
+mod custom_keygen_partition_paths {
+    use super::*;
+    use hudi_core::table::{ReadOptions, Table};
+
+    fn partitions_of(slices: &[hudi_core::file_group::file_slice::FileSlice]) -> Vec<String> {
+        let mut p: Vec<String> = slices
+            .iter()
+            .map(|s| s.partition_path.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        p.sort();
+        p
+    }
+
+    async fn table_and_partitions(table: SampleTable) -> Result<(Table, Vec<String>)> {
+        let base_url = table.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        let partitions = partitions_of(&all);
+        Ok((hudi_table, partitions))
+    }
+
+    #[tokio::test]
+    async fn identity_field_prunes_like_a_plain_partition_column() -> Result<()> {
+        let (hudi_table, partitions) =
+            table_and_partitions(SampleTable::V6CustomkeygenHivestyle).await?;
+        assert_eq!(
+            partitions,
+            vec![
+                "region=eu/ts_str=2024-03-01",
+                "region=eu/ts_str=2024-03-02",
+                "region=eu/ts_str=2024-03-03",
+                "region=us/ts_str=2024-03-01",
+                "region=us/ts_str=2024-03-02",
+            ]
+        );
+
+        let opts = ReadOptions::new().with_filters([("region", "=", "eu")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec![
+                "region=eu/ts_str=2024-03-01",
+                "region=eu/ts_str=2024-03-02",
+                "region=eu/ts_str=2024-03-03",
+            ],
+            "a plain partition-column predicate prunes without any keygen rewrite"
+        );
+
+        let opts = ReadOptions::new().with_filters([("ts_str", "=", "2024-03-02")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["region=eu/ts_str=2024-03-02", "region=us/ts_str=2024-03-02",]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn annotated_partition_field_names_still_resolve_v9() -> Result<()> {
+        let (hudi_table, partitions) =
+            table_and_partitions(SampleTable::V9CustomkeygenHivestyle).await?;
+        assert_eq!(
+            partitions,
+            vec![
+                "region=eu/ts_str=2024-03-01",
+                "region=eu/ts_str=2024-03-02",
+                "region=us/ts_str=2024-03-01",
+            ]
+        );
+
+        // The `:SIMPLE`/`:TIMESTAMP` annotations must not reach the schema
+        // lookup; before they were stripped this read failed with
+        // "Partition field `region\:SIMPLE` ... is not present in the table
+        // schema" (the `\:` itself a Java properties escape artifact).
+        let opts = ReadOptions::new().with_filters([("region", "=", "eu")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["region=eu/ts_str=2024-03-01", "region=eu/ts_str=2024-03-02",]
+        );
         Ok(())
     }
 }
