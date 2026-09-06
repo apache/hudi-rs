@@ -509,12 +509,16 @@ mod tests {
             "hoodie.table.partition.fields",
             "region:SIMPLE,ts_str:TIMESTAMP",
         )]);
-        let fields: Vec<String> = configs.get_or_default(HudiTableConfig::PartitionFields).into();
+        let fields: Vec<String> = configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into();
         assert_eq!(fields, vec!["region".to_string(), "ts_str".to_string()]);
 
         // Unannotated spellings are unchanged.
         let configs = HudiConfigs::new([("hoodie.table.partition.fields", "region,ts_str")]);
-        let fields: Vec<String> = configs.get_or_default(HudiTableConfig::PartitionFields).into();
+        let fields: Vec<String> = configs
+            .get_or_default(HudiTableConfig::PartitionFields)
+            .into();
         assert_eq!(fields, vec!["region".to_string(), "ts_str".to_string()]);
     }
 
