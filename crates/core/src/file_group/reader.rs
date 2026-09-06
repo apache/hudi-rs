@@ -436,10 +436,15 @@ impl FileGroupReader {
 
     /// Which merge implementation serves this read.
     ///
-    /// A metadata table is always served by version 1 whatever the
-    /// setting says: its base files and log blocks are HFile, which the
-    /// file group reader version 2 has no support for. That is permanent, not
-    /// transitional.
+    /// A metadata table is always served by version 1 whatever the setting
+    /// says. Not for want of HFile support — the version 2 engine reads HFile
+    /// base files and log blocks — but because a metadata table's record key,
+    /// merge rule and partition come from its own configuration rather than
+    /// the data table's. The version 2 path for metadata tables is
+    /// the dedicated [`MetadataTableV2Reader`], which reads through the same
+    /// engine with that configuration in hand.
+    ///
+    /// [`MetadataTableV2Reader`]: crate::metadata::table::v2_reader::MetadataTableV2Reader
     ///
     /// The value is read raw rather than through `get_or_default`, which falls
     /// back to the default when a value fails to parse. A typo in the version
@@ -523,11 +528,14 @@ impl FileGroupReader {
 
         // Unreachable while `file_group_reader_version` routes a metadata table
         // to version 1 above; kept so a future change to that routing fails
-        // loudly here rather than reaching a reader that cannot read HFile.
+        // loudly here rather than merging metadata records under the data
+        // table's key, merge rule and partition semantics.
         if self.is_metadata_table() {
             return Err(CoreError::Unsupported(
-                "File group reader version 2 cannot read a metadata table's HFile \
-                 base files and log blocks"
+                "A metadata table is not read through the generic version 2 path: \
+                 its record key, merge rule and partition come from its own \
+                 configuration. Version 1 serves it here; MetadataTableV2Reader \
+                 is the version 2 path for metadata tables"
                     .to_string(),
             ));
         }
@@ -2301,8 +2309,8 @@ mod file_group_reader_version_tests {
     /// The guard inside the check, reached only if the dispatch's metadata
     /// routing were ever removed. Asserted directly because the dispatch answers
     /// metadata tables before the check runs, so no read can reach it today —
-    /// which is exactly why it must keep erroring rather than fall through to a
-    /// reader that cannot read HFile.
+    /// which is exactly why it must keep erroring rather than merge metadata
+    /// records under the data table's key, merge rule and partition semantics.
     #[tokio::test]
     async fn test_version_two_unsupported_reason_metadata_table_returns_error() -> Result<()> {
         use crate::config::HudiConfigs;
