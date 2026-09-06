@@ -77,10 +77,42 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
             .trim()
             .to_owned();
         let value = parts.next().unwrap_or("").trim().to_owned();
-        options.insert(key, value);
+        options.insert(
+            unescape_java_properties(&key),
+            unescape_java_properties(&value),
+        );
     }
 
     Ok(options)
+}
+
+/// Unescapes a token the way `java.util.Properties.load` does: a backslash
+/// followed by `t`, `n`, `r` or `f` becomes that control character, and a
+/// backslash followed by anything else — `\\`, `\:`, `\=`, `\ `, `\#`, `\!` —
+/// drops the backslash. A trailing lone backslash is dropped.
+///
+/// Hudi's writer stores `hoodie.properties` through `Properties.store`, so
+/// values reach this reader with those backslashes in place — an Avro schema
+/// (`{"type"\:"record"...}`) or a `SimpleDateFormat` (`HH\:mm\:ss`) reads back
+/// wrongly without this.
+fn unescape_java_properties(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{000C}'),
+            Some(other) => out.push(other),
+            None => break,
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -200,5 +232,39 @@ mod tests {
         expected.insert("invalid_line".to_string(), "".to_string());
         expected.insert("key2".to_string(), "value2".to_string());
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_data_unescapes_java_properties_escapes() {
+        // How a Java Properties.store writer spells values, taken from a
+        // Spark-written hoodie.properties: escaped separators in the Avro
+        // create-schema and in a SimpleDateFormat, plus control characters.
+        let data = Bytes::from(
+            "hoodie.table.create.schema={\"type\"\\:\"record\",\"fields\"\\:[{\"name\"\\:\"id\"}]}\n\
+             hoodie.keygen.timebased.input.dateformat=yyyy-MM-dd'T'HH\\:mm\\:ss.SSSZ\n\
+             hoodie.table.partition.fields=region\\:SIMPLE,ts_str\\:TIMESTAMP\n\
+             path=C:\\\\dir\n\
+             tab=a\\tb\n\
+             newline=a\\nb\n\
+             trailing_backslash=abc\\",
+        );
+        let result = parse_data_for_options(&data, "=").unwrap();
+
+        assert_eq!(
+            result["hoodie.table.create.schema"],
+            r#"{"type":"record","fields":[{"name":"id"}]}"#
+        );
+        assert_eq!(
+            result["hoodie.keygen.timebased.input.dateformat"],
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ"
+        );
+        assert_eq!(
+            result["hoodie.table.partition.fields"],
+            "region:SIMPLE,ts_str:TIMESTAMP"
+        );
+        assert_eq!(result["path"], "C:\\dir");
+        assert_eq!(result["tab"], "a\tb");
+        assert_eq!(result["newline"], "a\nb");
+        assert_eq!(result["trailing_backslash"], "abc");
     }
 }
