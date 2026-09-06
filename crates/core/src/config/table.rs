@@ -261,10 +261,15 @@ impl ConfigParser for HudiTableConfig {
             // A table written without partitioning records the key with an
             // empty value rather than omitting it; splitting that yields one
             // field named "", which no schema contains.
+            //
+            // `CustomKeyGenerator` annotates each field with its key type
+            // (`region:SIMPLE,ts_str:TIMESTAMP`); the field name is what
+            // precedes the annotation.
             Self::PartitionFields => get_result.map(|v| {
                 HudiConfigValue::List(
                     v.split(',')
                         .map(str::trim)
+                        .map(|field| field.split(':').next().unwrap_or_default().trim())
                         .filter(|field| !field.is_empty())
                         .map(str::to_string)
                         .collect(),
@@ -494,6 +499,24 @@ impl FromStr for TimelineTimezoneValue {
 mod tests {
     use super::*;
     use crate::config::HudiConfigs;
+
+    #[test]
+    fn partition_fields_strips_custom_keygen_annotations() {
+        // Table version 9 persists CustomKeyGenerator's per-field key types in
+        // hoodie.table.partition.fields; the names the reader uses are the parts
+        // before the annotations.
+        let configs = HudiConfigs::new([(
+            "hoodie.table.partition.fields",
+            "region:SIMPLE,ts_str:TIMESTAMP",
+        )]);
+        let fields: Vec<String> = configs.get_or_default(HudiTableConfig::PartitionFields).into();
+        assert_eq!(fields, vec!["region".to_string(), "ts_str".to_string()]);
+
+        // Unannotated spellings are unchanged.
+        let configs = HudiConfigs::new([("hoodie.table.partition.fields", "region,ts_str")]);
+        let fields: Vec<String> = configs.get_or_default(HudiTableConfig::PartitionFields).into();
+        assert_eq!(fields, vec!["region".to_string(), "ts_str".to_string()]);
+    }
 
     #[test]
     fn create_table_type() {
