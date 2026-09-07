@@ -772,6 +772,33 @@ mod tests {
         assert!(!pruner.should_include("category=B"));
     }
 
+    /// The `_hoodie_partition_path` meta field takes the whole path as a single
+    /// opaque value with no segment structure to preserve, so it is decoded in one
+    /// pass — the separators inside it are part of the value, not delimiters the
+    /// decode has to stay clear of.
+    #[test]
+    fn partition_path_meta_field_decodes_the_whole_path_at_once() {
+        let schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let pruner = PartitionPruner::new(&[], &schema, &create_hudi_configs(true, true)).unwrap();
+
+        let segments = pruner
+            .parse_segments("date%3D2023-02-01%2Fcategory%3DA")
+            .unwrap();
+        let expected =
+            SchemableFilter::cast_value(&["date=2023-02-01/category=A"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments[MetaField::PartitionPath.as_ref()]
+                .clone()
+                .into_inner()
+                .as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
     #[test]
     fn test_partition_pruner_invalid_path() {
         let schema = create_test_schema();
