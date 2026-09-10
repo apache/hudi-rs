@@ -372,7 +372,7 @@ Go to `https://github.com/apache/hudi-rs/releases/new` and draft a new release.
 > [!NOTE]
 > Update the template below in a text editor before pasting it to an email client to avoid hyperlink editing issue.
 
-Send to `dev@hudi.apache.org` and `user@hudi.apache.org`.
+Send to `dev@hudi.apache.org` and `users@hudi.apache.org`.
 
 ```text
 subject: [ANNOUNCE] Hudi-rs 0.5.0 released
