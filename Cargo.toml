@@ -59,7 +59,7 @@ apache-avro-derive = { version = "0.21" }
 
 # datafusion
 datafusion = { version = "54.1" }
-datafusion-expr = { version = "54.1" }
+datafusion-expr = { version = "55.0" }
 datafusion-common = { version = "54.1" }
 datafusion-physical-expr = { version = "54.1" }
 datafusion-ffi = { version = "54.1" }
