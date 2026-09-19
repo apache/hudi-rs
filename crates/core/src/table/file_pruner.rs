@@ -83,6 +83,11 @@ impl FilePruner {
         self.and_filters.is_empty()
     }
 
+    /// Column names the filters reference (for loading targeted stats).
+    pub(crate) fn referenced_columns(&self) -> impl Iterator<Item = &str> {
+        self.and_filters.iter().map(|f| f.field.name().as_str())
+    }
+
     /// Returns `true` if the file should be included based on its statistics.
     ///
     /// A file is included if ANY of its rows MIGHT match all the filters.
