@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::BoxStream;
+use futures::stream::{self, BoxStream};
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectStore, ObjectStoreExt, parse_url_opts};
 use url::Url;
@@ -401,44 +401,38 @@ impl Storage {
         Ok(file_metadata)
     }
 
-    /// Recursively stream files below the table base path.
+    /// Stream leaf directories below `subdir` with exact-once tree traversal.
     ///
-    /// Each item is a table-relative object path.
-    /// Unlike [`Self::list_files`], this uses the object store's paginated
-    /// `list` stream and does not wait for a complete directory result.
-    pub(crate) fn list_relative_paths_stream(&self) -> Result<BoxStream<'static, Result<String>>> {
-        let prefix_url = join_url_segments(&self.base_url, &[""])?;
-        let prefix_path = ObjPath::from_url_path(prefix_url.path())?;
-        let prefix = prefix_path.as_ref().trim_end_matches('/').to_string();
+    /// Delimiter listings define a directory tree: every child prefix has one
+    /// parent, so traversal needs no table-wide set of previously emitted paths.
+    /// The retained state is the current delimiter result plus the unvisited
+    /// traversal frontier, and emitted directory names are released immediately.
+    pub(crate) fn list_leaf_dirs_stream(&self, subdir: &str) -> BoxStream<'static, Result<String>> {
+        let storage = self.clone();
+        let pending = vec![subdir.to_string()];
 
-        Ok(self
-            .object_store
-            .list(Some(&prefix_path))
-            .map(move |result| {
-                let object = result?;
-                let location = object.location.as_ref();
-                let suffix = location.strip_prefix(&prefix).ok_or_else(|| {
-                    InvalidPath(format!(
-                        "Object path '{location}' is not below table prefix '{prefix}'"
-                    ))
-                })?;
-                let relative_path = if prefix.is_empty() {
-                    suffix
-                } else {
-                    suffix.strip_prefix('/').ok_or_else(|| {
-                        InvalidPath(format!(
-                            "Object path '{location}' is not below table prefix '{prefix}'"
-                        ))
-                    })?
-                };
-                if relative_path.is_empty() {
-                    return Err(InvalidPath(format!(
-                        "Object path '{location}' has no path below table prefix '{prefix}'"
-                    )));
+        stream::try_unfold(pending, move |mut pending| {
+            let storage = storage.clone();
+            async move {
+                while let Some(current) = pending.pop() {
+                    let child_dirs = storage.list_dirs(Some(&current)).await?;
+                    if child_dirs.is_empty() {
+                        return Ok(Some((current, pending)));
+                    }
+
+                    // Reverse so a stack preserves the object store's directory
+                    // order while releasing each visited path from the frontier.
+                    pending.extend(
+                        child_dirs
+                            .into_iter()
+                            .rev()
+                            .map(|child| format!("{current}/{child}")),
+                    );
                 }
-                Ok(relative_path.to_string())
-            })
-            .boxed())
+                Ok(None)
+            }
+        })
+        .boxed()
     }
 }
 
@@ -605,50 +599,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_streams_table_relative_paths_recursively() {
-        use futures::TryStreamExt;
-
-        let base_url = Url::from_directory_path(
-            canonicalize(Path::new("tests/data/timeline/commits_stub")).unwrap(),
-        )
-        .unwrap();
-        let storage = Storage::new_with_base_url(base_url).unwrap();
-        let paths: HashSet<String> = storage
-            .list_relative_paths_stream()
-            .unwrap()
-            .try_collect()
-            .await
-            .unwrap();
-
-        assert!(paths.contains("a.parquet"));
-        assert!(paths.contains("part1/b.parquet"));
-        assert!(paths.contains("part2/part22/c.parquet"));
-        assert!(paths.contains("part3/part32/part33/d.parquet"));
-        assert!(paths.iter().all(|path| !path.starts_with('/')));
-    }
-
-    #[tokio::test]
-    async fn storage_recursive_stream_respects_non_empty_prefix_boundary() {
+    async fn storage_streams_leaf_dirs_once_despite_multiple_files() {
         use futures::TryStreamExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let table_dir = temp_dir.path().join("table");
-        let sibling_dir = temp_dir.path().join("table-sibling");
-        std::fs::create_dir_all(table_dir.join("partition")).unwrap();
-        std::fs::create_dir_all(&sibling_dir).unwrap();
-        std::fs::write(table_dir.join("partition/inside.parquet"), []).unwrap();
-        std::fs::write(sibling_dir.join("outside.parquet"), []).unwrap();
+        let root = temp_dir.path().join("root");
+        for partition in 0..512 {
+            let leaf = root.join(format!("region={}/day=01", partition % 8));
+            std::fs::create_dir_all(&leaf).unwrap();
+            std::fs::write(leaf.join(format!("{partition}-a.parquet")), []).unwrap();
+            std::fs::write(leaf.join(format!("{partition}-b.parquet")), []).unwrap();
+        }
 
-        let base_url = Url::from_directory_path(&table_dir).unwrap();
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let paths = storage
-            .list_relative_paths_stream()
-            .unwrap()
+            .list_leaf_dirs_stream("root")
             .try_collect::<Vec<_>>()
             .await
             .unwrap();
 
-        assert_eq!(paths, vec!["partition/inside.parquet"]);
+        assert_eq!(paths.len(), 8);
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), paths.len());
+        assert!(paths.iter().all(|path| path.starts_with("root/region=")));
     }
 
     #[tokio::test]

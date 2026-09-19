@@ -25,7 +25,7 @@ use std::str::FromStr;
 use strum_macros::{EnumIter, IntoStaticStr};
 
 use crate::config::Result;
-use crate::config::error::ConfigError::{NotFound, ParseInt};
+use crate::config::error::ConfigError::{InvalidValue, NotFound, ParseInt};
 use crate::config::{ConfigParser, HudiConfigValue};
 
 /// Configurations for query planning in Hudi.
@@ -89,11 +89,17 @@ impl ConfigParser for HudiPlanConfig {
             .ok_or(NotFound(self.key()));
 
         match self {
-            Self::ListingParallelism => get_result
-                .and_then(|v| {
-                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))
-                })
-                .map(HudiConfigValue::UInteger),
+            Self::ListingParallelism => get_result.and_then(|v| {
+                let parsed =
+                    usize::from_str(v).map_err(|e| ParseInt(self.key(), v.to_string(), e))?;
+                if parsed == 0 {
+                    return Err(InvalidValue(format!(
+                        "{} must be > 0, got 0",
+                        self.key_str()
+                    )));
+                }
+                Ok(HudiConfigValue::UInteger(parsed))
+            }),
         }
     }
 }
@@ -120,6 +126,16 @@ mod tests {
         ));
         let actual: usize = ListingParallelism.parse_value_or_default(&options).into();
         assert_eq!(actual, 10);
+    }
+
+    #[test]
+    fn parse_zero_listing_parallelism_errors() {
+        let options = HashMap::from([(ListingParallelism.as_ref().to_string(), "0".to_string())]);
+
+        assert!(matches!(
+            ListingParallelism.parse_value(&options).unwrap_err(),
+            InvalidValue(message) if message.contains("must be > 0")
+        ));
     }
 
     #[test]
