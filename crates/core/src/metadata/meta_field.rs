@@ -88,6 +88,11 @@ lazy_static! {
 }
 
 impl MetaField {
+    /// Whether `name` is a reserved `_hoodie_*` meta field.
+    pub fn is_meta_field(name: &str) -> bool {
+        name.starts_with("_hoodie_")
+    }
+
     #[inline]
     pub fn field_index(&self) -> usize {
         self.clone() as usize
