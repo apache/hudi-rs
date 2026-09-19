@@ -648,6 +648,17 @@ impl Table {
         } else {
             None
         };
+        let valid_instants = match metadata_table {
+            Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
+            None => None,
+        };
+        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
+            (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
+                table,
+                valid_instants,
+            }),
+            _ => None,
+        };
         let estimator = self.get_or_init_estimator(timestamp).await.cloned();
         let stream = self
             .file_system_view
@@ -656,7 +667,7 @@ impl Table {
                 &file_pruner,
                 &table_schema,
                 timeline_view,
-                metadata_table,
+                metadata_listing,
                 estimator,
             )
             .await?;

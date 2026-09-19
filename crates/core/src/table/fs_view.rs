@@ -342,15 +342,18 @@ impl FileSystemView {
         file_pruner: &FilePruner,
         table_schema: &Schema,
         timeline_view: Arc<TimelineView>,
-        metadata_table: Option<&Table>,
+        metadata_table: Option<MetadataListing<'_>>,
         estimator: Option<FileStatsEstimator>,
     ) -> Result<BoxStream<'static, Result<FileSlice>>> {
         let configured_base_file_format = self.configured_base_file_format()?;
         let metadata_backed = metadata_table.is_some();
 
         let file_groups_stream: BoxStream<'static, Result<(String, Vec<FileGroup>)>> =
-            if let Some(mdt) = metadata_table {
-                let records = mdt.fetch_files_partition_records(partition_pruner).await?;
+            if let Some(listing) = metadata_table {
+                let records = listing
+                    .table
+                    .fetch_files_partition_records(partition_pruner, listing.valid_instants)
+                    .await?;
                 let file_groups = file_groups_from_files_partition_records(
                     &records,
                     configured_base_file_format.as_ref(),
