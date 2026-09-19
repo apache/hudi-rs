@@ -35,8 +35,15 @@ use crate::timeline::completion_time::CompletionTimeView;
 use dashmap::DashMap;
 use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// A storage-backed streamed scan fails closed before retaining more unique
+/// partition paths or path text than these bounds. Tables beyond this scale
+/// should use the metadata table, whose files partition avoids object-path
+/// deduplication.
+const MAX_STREAMED_PARTITION_PATHS: usize = 100_000;
+const MAX_STREAMED_PARTITION_PATH_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -202,35 +209,84 @@ impl FileLister {
             .collect())
     }
 
-    /// Discover relevant partitions by traversing the object store's directory
-    /// prefixes without materializing all leaf paths or retaining emitted names.
+    fn relevant_partition_paths_from_objects(
+        paths: BoxStream<'static, Result<String>>,
+        partition_pruner: PartitionPruner,
+        max_partition_paths: usize,
+        max_partition_path_bytes: usize,
+    ) -> BoxStream<'static, Result<String>> {
+        stream::try_unfold(
+            (paths, HashSet::new(), 0usize),
+            move |(mut paths, mut seen, mut retained_path_bytes)| {
+                let partition_pruner = partition_pruner.clone();
+                async move {
+                    while let Some(relative_path) = paths.try_next().await? {
+                        let first_segment = relative_path.split('/').next().unwrap_or_default();
+                        if LAKE_FORMAT_METADATA_DIRS.contains(&first_segment) {
+                            continue;
+                        }
+
+                        let Some((partition_path, _)) = relative_path.rsplit_once('/') else {
+                            continue;
+                        };
+                        if (!partition_pruner.is_empty()
+                            && !partition_pruner.should_include(partition_path))
+                            || seen.contains(partition_path)
+                        {
+                            continue;
+                        }
+                        if seen.len() >= max_partition_paths {
+                            return Err(CoreError::MemoryLimitExceeded(format!(
+                                "Storage-backed streamed partition discovery exceeds the safety limit of {max_partition_paths} unique partitions; enable the metadata table or use the eager file-slice API"
+                            )));
+                        }
+                        if partition_path.len()
+                            > max_partition_path_bytes.saturating_sub(retained_path_bytes)
+                        {
+                            return Err(CoreError::MemoryLimitExceeded(format!(
+                                "Storage-backed streamed partition discovery exceeds the safety limit of {max_partition_path_bytes} retained path bytes; enable the metadata table or use the eager file-slice API"
+                            )));
+                        }
+
+                        let partition_path = partition_path.to_string();
+                        retained_path_bytes += partition_path.len();
+                        seen.insert(partition_path.clone());
+                        return Ok(Some((
+                            partition_path,
+                            (paths, seen, retained_path_bytes),
+                        )));
+                    }
+                    Ok(None)
+                }
+            },
+        )
+        .boxed()
+    }
+
+    /// Discover relevant partitions from the object store's paginated recursive
+    /// listing without materializing a delimiter-wide sibling vector.
+    ///
+    /// Object order is not guaranteed, so exact-once emission retains previously
+    /// emitted partition paths up to [`MAX_STREAMED_PARTITION_PATHS`] and
+    /// [`MAX_STREAMED_PARTITION_PATH_BYTES`]. Discovery fails closed before
+    /// exceeding either fixed memory-safety ceiling.
     fn list_relevant_partition_paths_stream(&self) -> Result<BoxStream<'static, Result<String>>> {
         if !is_table_partitioned(&self.hudi_configs)? {
             return Ok(stream::once(async { Ok(EMPTY_PARTITION_PATH.to_string()) }).boxed());
         }
 
-        let storage = self.storage.clone();
-        let top_level_dirs =
-            stream::once(async move { storage.list_dirs(None).await.map_err(CoreError::from) })
-                .map_ok(|dirs| {
-                    stream::iter(
-                        dirs.into_iter()
-                            .filter(|dir| !LAKE_FORMAT_METADATA_DIRS.contains(&dir.as_str()))
-                            .map(Ok::<_, CoreError>),
-                    )
-                })
-                .try_flatten();
-        let storage = self.storage.clone();
+        let paths = self
+            .storage
+            .list_relative_paths_stream()?
+            .map_err(CoreError::from)
+            .boxed();
         let partition_pruner = self.partition_pruner.clone();
-        Ok(top_level_dirs
-            .map_ok(move |dir| storage.list_leaf_dirs_stream(&dir).map_err(CoreError::from))
-            .try_flatten()
-            .try_filter(move |partition_path| {
-                futures::future::ready(
-                    partition_pruner.is_empty() || partition_pruner.should_include(partition_path),
-                )
-            })
-            .boxed())
+        Ok(Self::relevant_partition_paths_from_objects(
+            paths,
+            partition_pruner,
+            MAX_STREAMED_PARTITION_PATHS,
+            MAX_STREAMED_PARTITION_PATH_BYTES,
+        ))
     }
 
     fn listing_parallelism(&self) -> Result<usize> {
@@ -401,46 +457,61 @@ mod test {
     }
 
     #[tokio::test]
-    async fn stream_discovers_many_partitions_once_without_object_path_deduplication() {
-        let temp_dir = tempdir().unwrap();
-        for partition in 0..512 {
-            let partition_dir = temp_dir.path().join(format!("partition={partition:04}"));
-            std::fs::create_dir_all(&partition_dir).unwrap();
-            std::fs::write(partition_dir.join("first.parquet"), []).unwrap();
-            std::fs::write(partition_dir.join("second.parquet"), []).unwrap();
-        }
-        std::fs::create_dir_all(temp_dir.path().join(".hoodie/metadata/files")).unwrap();
-        std::fs::write(
-            temp_dir
-                .path()
-                .join(".hoodie/metadata/files/ignored.parquet"),
-            [],
-        )
-        .unwrap();
-
-        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
-        let hudi_configs = Arc::new(HudiConfigs::new([
-            (BasePath.as_ref(), base_url.as_str()),
-            (PartitionFields.as_ref(), "partition"),
-        ]));
-        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
-        let lister = FileLister::new(hudi_configs, storage, PartitionPruner::empty());
-
-        let partition_paths = lister
-            .list_relevant_partition_paths_stream()
-            .unwrap()
-            .try_collect::<Vec<_>>()
-            .await
-            .unwrap();
-        let unique_paths: HashSet<_> = partition_paths.iter().collect();
-
-        assert_eq!(partition_paths.len(), 512);
-        assert_eq!(unique_paths.len(), partition_paths.len());
-        assert!(
-            partition_paths
-                .iter()
-                .all(|path| path.starts_with("partition="))
+    async fn streamed_partition_discovery_fails_before_exceeding_its_path_bound() {
+        let object_paths = stream::iter([
+            Ok(".hoodie/metadata/ignored".to_string()),
+            Ok("partition=0000/first.parquet".to_string()),
+            Ok("partition=0000/second.parquet".to_string()),
+            Ok("partition=0001/first.parquet".to_string()),
+            Ok("partition=0002/first.parquet".to_string()),
+        ])
+        .boxed();
+        let mut partitions = FileLister::relevant_partition_paths_from_objects(
+            object_paths,
+            PartitionPruner::empty(),
+            2,
+            usize::MAX,
         );
+
+        assert_eq!(
+            partitions.try_next().await.unwrap().as_deref(),
+            Some("partition=0000")
+        );
+        assert_eq!(
+            partitions.try_next().await.unwrap().as_deref(),
+            Some("partition=0001")
+        );
+        let error = partitions
+            .try_next()
+            .await
+            .expect_err("a third unique partition must fail before it is retained");
+
+        assert!(matches!(
+            error,
+            CoreError::MemoryLimitExceeded(message)
+                if message.contains("safety limit of 2 unique partitions")
+        ));
+    }
+
+    #[tokio::test]
+    async fn streamed_partition_discovery_fails_before_exceeding_its_byte_bound() {
+        let object_paths = stream::iter([Ok("long-partition/first.parquet".to_string())]).boxed();
+        let mut partitions = FileLister::relevant_partition_paths_from_objects(
+            object_paths,
+            PartitionPruner::empty(),
+            usize::MAX,
+            "long-partition".len() - 1,
+        );
+
+        let error = partitions
+            .try_next()
+            .await
+            .expect_err("an over-budget path must fail before it is retained");
+        assert!(matches!(
+            error,
+            CoreError::MemoryLimitExceeded(message)
+                if message.contains("retained path bytes")
+        ));
     }
 
     #[tokio::test]
