@@ -409,8 +409,16 @@ impl Storage {
 /// - /usr/hudi/table_name/dt=2025/month=02
 ///
 /// the result is \[".hoodie", "dt=2024/mont=01/day=01", "dt=2025/month=02"\]
+///
+/// `should_descend` is checked before recursing into each child directory, so a
+/// directory a filter already rules out never incurs the storage `list` call
+/// its own children would otherwise need.
 #[async_recursion]
-pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Vec<String>> {
+pub async fn get_leaf_dirs(
+    storage: &Storage,
+    subdir: Option<&str>,
+    should_descend: &(dyn Fn(&str) -> bool + Sync),
+) -> Result<Vec<String>> {
     let mut leaf_dirs = Vec::new();
     let child_dirs = storage.list_dirs(subdir).await?;
     if child_dirs.is_empty() {
@@ -425,7 +433,10 @@ pub async fn get_leaf_dirs(storage: &Storage, subdir: Option<&str>) -> Result<Ve
             let next_subdir = next_subdir
                 .to_str()
                 .ok_or_else(|| InvalidPath(format!("Failed to convert path: {next_subdir:?}")))?;
-            let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir)).await?;
+            if !should_descend(next_subdir) {
+                continue;
+            }
+            let curr_leaf_dir = get_leaf_dirs(storage, Some(next_subdir), should_descend).await?;
             leaf_dirs.extend(curr_leaf_dir);
         }
     }
@@ -569,7 +580,9 @@ mod tests {
         )
         .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
+        let leaf_dirs = get_leaf_dirs(&storage, None, &|_: &str| true)
+            .await
+            .unwrap();
         assert_eq!(
             leaf_dirs,
             vec![".hoodie", "part1", "part2/part22", "part3/part32/part33"]
@@ -582,7 +595,9 @@ mod tests {
             Url::from_directory_path(canonicalize(Path::new("tests/data/leaf_dir")).unwrap())
                 .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let leaf_dirs = get_leaf_dirs(&storage, None).await.unwrap();
+        let leaf_dirs = get_leaf_dirs(&storage, None, &|_: &str| true)
+            .await
+            .unwrap();
         assert_eq!(
             leaf_dirs,
             vec![""],

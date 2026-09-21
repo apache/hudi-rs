@@ -177,17 +177,20 @@ impl FileLister {
             return Ok(vec![EMPTY_PARTITION_PATH.to_string()]);
         }
 
+        let should_descend = |prefix: &str| self.partition_pruner.should_include_prefix(prefix);
+
         let top_level_dirs: Vec<String> = self
             .storage
             .list_dirs(None)
             .await?
             .into_iter()
-            .filter(|dir| !LAKE_FORMAT_METADATA_DIRS.contains(&dir.as_str()))
+            .filter(|dir| !LAKE_FORMAT_METADATA_DIRS.contains(&dir.as_str()) && should_descend(dir))
             .collect();
 
         let mut partition_paths = Vec::new();
         for dir in top_level_dirs {
-            partition_paths.extend(get_leaf_dirs(&self.storage, Some(&dir)).await?);
+            partition_paths
+                .extend(get_leaf_dirs(&self.storage, Some(&dir), &should_descend).await?);
         }
 
         if partition_paths.is_empty() || self.partition_pruner.is_empty() {
@@ -309,6 +312,182 @@ mod test {
                 "byteField=30/shortField=100"
             ])
         )
+    }
+
+    /// `V6ComplexkeygenHivestyle` is hive-style but has url-encoding disabled
+    /// (`hoodie.datasource.write.partitionpath.urlencode=false`), so it does not
+    /// satisfy the `is_hive_style && is_url_encoded` gate in
+    /// `should_include_prefix`: positionally binding a split segment to a
+    /// schema field isn't provably safe without url-encoding (a literal `/`
+    /// in a value would fragment into extra, misaligned segments), so descent
+    /// pruning must fail open here — a selective filter should not reduce the
+    /// storage `list` calls for this table. Correctness over the optimization.
+    ///
+    /// For this fixture (3 leaf partitions under two hive-style levels,
+    /// `byteField`/`shortField`), every run — filtered or not — issues 7 `list`
+    /// calls: 1 for the top-level `byteField=*` dirs, then for each of the 3,
+    /// 1 to find its `shortField=*` child and 1 more on that leaf to confirm
+    /// it has no children.
+    #[tokio::test]
+    async fn partition_filter_pruning_fails_open_without_url_encoding() {
+        use crate::storage::counting::CountingObjectStore;
+        use object_store::local::LocalFileSystem;
+
+        let base_url = SampleTable::V6ComplexkeygenHivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_configs = hudi_table.hudi_configs.clone();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+
+        let list_calls_for = |pruner: PartitionPruner| {
+            let base_url = base_url.clone();
+            let hudi_configs = hudi_configs.clone();
+            async move {
+                let (object_store, counts) =
+                    CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+                let storage = Storage::new_with_object_store(base_url, object_store, hudi_configs);
+                let lister = FileLister::new(storage.hudi_configs.clone(), storage, pruner);
+                let partition_paths = lister.list_relevant_partition_paths().await.unwrap();
+                (partition_paths.len(), counts.lists())
+            }
+        };
+
+        let (unfiltered_partitions, unfiltered_lists) =
+            list_calls_for(PartitionPruner::empty()).await;
+        assert_eq!(unfiltered_partitions, 3);
+        assert_eq!(unfiltered_lists, 7);
+
+        let filter_eq_10 = crate::expr::filter::Filter::try_from(("byteField", "=", "10")).unwrap();
+        let selective_pruner =
+            PartitionPruner::new(&[filter_eq_10], &partition_schema, &hudi_configs).unwrap();
+        let (filtered_partitions, filtered_lists) = list_calls_for(selective_pruner).await;
+        // The final `should_include` filter on the fully-listed leaf paths still
+        // narrows the returned partitions down to the one that matches...
+        assert_eq!(filtered_partitions, 1);
+        // ...but no `list` call was skipped along the way, since descent-time
+        // pruning fails open for this config.
+        assert_eq!(filtered_lists, unfiltered_lists);
+    }
+
+    /// Regression test for descent-time partition pruning: for a table that
+    /// actually satisfies the `is_hive_style && is_url_encoded` gate, a
+    /// selective filter must skip the storage `list` calls under directories
+    /// it already rules out, not merely filter the leaf paths after every
+    /// directory is listed.
+    ///
+    /// Builds a synthetic two-level hive-style, url-encoded table (no real
+    /// fixture in this repo has both flags set) with the same
+    /// `byteField`/`shortField` shape as `V6ComplexkeygenHivestyle`: 3 leaf
+    /// partitions, `byteField` in `{10, 20, 30}`. An unfiltered run issues 7
+    /// `list` calls (as above). A filter matching only `byteField=10` issues
+    /// 3: the same unavoidable top-level call, then only `byteField=10`'s two
+    /// levels are ever listed — `byteField=20`/`byteField=30` are pruned
+    /// before incurring any `list` call under them.
+    #[tokio::test]
+    async fn partition_filter_pruning_reduces_storage_list_calls() {
+        use crate::config::table::HudiTableConfig::{
+            IsHiveStylePartitioning, IsPartitionPathUrlencoded, PartitionFields,
+        };
+        use crate::storage::counting::CountingObjectStore;
+        use arrow_schema::{DataType, Field, Schema};
+        use object_store::local::LocalFileSystem;
+
+        let temp_dir = tempdir().unwrap();
+        for (byte_field, short_field) in [(10, 300), (20, 100), (30, 100)] {
+            std::fs::create_dir_all(
+                temp_dir
+                    .path()
+                    .join(format!("byteField={byte_field}/shortField={short_field}")),
+            )
+            .unwrap();
+        }
+
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (BasePath.as_ref(), base_url.as_str()),
+            (PartitionFields.as_ref(), "byteField,shortField"),
+            (IsHiveStylePartitioning.as_ref(), "true"),
+            (IsPartitionPathUrlencoded.as_ref(), "true"),
+        ]));
+        let partition_schema = Schema::new(vec![
+            Field::new("byteField", DataType::Utf8, false),
+            Field::new("shortField", DataType::Utf8, false),
+        ]);
+
+        let list_calls_for = |pruner: PartitionPruner| {
+            let base_url = base_url.clone();
+            let hudi_configs = hudi_configs.clone();
+            async move {
+                let (object_store, counts) =
+                    CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+                let storage = Storage::new_with_object_store(base_url, object_store, hudi_configs);
+                let lister = FileLister::new(storage.hudi_configs.clone(), storage, pruner);
+                let partition_paths = lister.list_relevant_partition_paths().await.unwrap();
+                (partition_paths.len(), counts.lists())
+            }
+        };
+
+        let (unfiltered_partitions, unfiltered_lists) =
+            list_calls_for(PartitionPruner::empty()).await;
+        assert_eq!(unfiltered_partitions, 3);
+        assert_eq!(unfiltered_lists, 7);
+
+        let filter_eq_10 = crate::expr::filter::Filter::try_from(("byteField", "=", "10")).unwrap();
+        let selective_pruner =
+            PartitionPruner::new(&[filter_eq_10], &partition_schema, &hudi_configs).unwrap();
+        let (filtered_partitions, filtered_lists) = list_calls_for(selective_pruner).await;
+        assert_eq!(filtered_partitions, 1);
+        assert_eq!(filtered_lists, 3);
+    }
+
+    /// A single-column hive-style layout (`byteField=...`, no metafields) with
+    /// `urlencode=false` — the common `dt=...`-style table shape, and the
+    /// default for `urlencode` in real tables. Even with only one partition
+    /// field, `is_url_encoded` is still required: without it, a value
+    /// containing a literal `/` would split across an extra physical
+    /// directory level that a mid-descent prefix can't distinguish from a
+    /// genuinely short value (see `should_include_prefix`'s doc comment), so
+    /// descent pruning must fail open here — correctness over the
+    /// optimization, exactly as `partition_filter_pruning_fails_open_without_url_encoding`
+    /// demonstrates for the multi-field case.
+    ///
+    /// For `V6SimplekeygenHivestyleNoMetafields` (3 leaf partitions, one level
+    /// deep), every run — filtered or not — issues 4 `list` calls: 1 for the
+    /// top-level `byteField=*` dirs, then 1 more on each of the 3 leaves to
+    /// confirm it has no children.
+    #[tokio::test]
+    async fn partition_filter_pruning_fails_open_without_url_encoding_single_field() {
+        use crate::storage::counting::CountingObjectStore;
+        use object_store::local::LocalFileSystem;
+
+        let base_url = SampleTable::V6SimplekeygenHivestyleNoMetafields.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let hudi_configs = hudi_table.hudi_configs.clone();
+        let partition_schema = hudi_table.get_partition_schema().await.unwrap();
+
+        let list_calls_for = |pruner: PartitionPruner| {
+            let base_url = base_url.clone();
+            let hudi_configs = hudi_configs.clone();
+            async move {
+                let (object_store, counts) =
+                    CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+                let storage = Storage::new_with_object_store(base_url, object_store, hudi_configs);
+                let lister = FileLister::new(storage.hudi_configs.clone(), storage, pruner);
+                let partition_paths = lister.list_relevant_partition_paths().await.unwrap();
+                (partition_paths.len(), counts.lists())
+            }
+        };
+
+        let (unfiltered_partitions, unfiltered_lists) =
+            list_calls_for(PartitionPruner::empty()).await;
+        assert_eq!(unfiltered_partitions, 3);
+        assert_eq!(unfiltered_lists, 4);
+
+        let filter_eq_10 = crate::expr::filter::Filter::try_from(("byteField", "=", "10")).unwrap();
+        let selective_pruner =
+            PartitionPruner::new(&[filter_eq_10], &partition_schema, &hudi_configs).unwrap();
+        let (filtered_partitions, filtered_lists) = list_calls_for(selective_pruner).await;
+        assert_eq!(filtered_partitions, 1);
+        assert_eq!(filtered_lists, unfiltered_lists);
     }
 
     #[tokio::test]

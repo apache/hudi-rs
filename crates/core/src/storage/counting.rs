@@ -43,6 +43,8 @@ pub(crate) struct RequestCounts {
     gets: AtomicUsize,
     /// Metadata-only lookups.
     heads: AtomicUsize,
+    /// Delimiter-bounded directory listings.
+    lists: AtomicUsize,
 }
 
 impl RequestCounts {
@@ -52,6 +54,10 @@ impl RequestCounts {
 
     pub(crate) fn heads(&self) -> usize {
         self.heads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn lists(&self) -> usize {
+        self.lists.load(Ordering::Relaxed)
     }
 }
 
@@ -124,6 +130,7 @@ impl ObjectStore for CountingObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.counts.lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list_with_delimiter(prefix).await
     }
 
