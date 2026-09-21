@@ -15,13 +15,17 @@
 # specific language governing permissions and limitations
 # under the License.
 
+# MinIO stopped serving client binaries from dl.min.io (the release and
+# archive paths now answer 410 Gone), so the client is taken from its
+# container image instead. Pinned: the tag is the only thing that makes
+# this build reproducible.
+FROM quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z AS mc
+
 FROM alpine
 
 RUN apk update && apk add --no-cache \
-	wget ca-certificates bash unzip
+	ca-certificates bash unzip
 
-RUN cd /usr/local/bin && \
-  wget -q --show-progress https://dl.min.io/client/mc/release/linux-amd64/mc && \
-  chmod +x mc
+COPY --from=mc /usr/bin/mc /usr/local/bin/mc
 
 WORKDIR /opt/data
