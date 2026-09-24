@@ -172,6 +172,32 @@ enum Commands {
         #[arg(long)]
         display_name: Option<String>,
     },
+    /// Print DataFusion plans (EXPLAIN / EXPLAIN ANALYZE) for TPC-H queries
+    Explain {
+        /// Hudi tables location (local path or cloud URL)
+        #[arg(long)]
+        hudi_dir: Option<String>,
+
+        /// Parquet tables location (local path or cloud URL)
+        #[arg(long)]
+        parquet_dir: Option<String>,
+
+        /// TPC-H scale factor (used for query parameter substitution and config loading)
+        #[arg(long, default_value_t = 1.0)]
+        scale_factor: f64,
+
+        /// Comma-separated query numbers to run (e.g., "1,3,6"); defaults to all 22
+        #[arg(long)]
+        queries: Option<String>,
+
+        /// Execute the queries and report per-operator runtime metrics (EXPLAIN ANALYZE)
+        #[arg(long)]
+        analyze: bool,
+
+        /// DataFusion memory limit (e.g., "3g", "512m"); unlimited if not set
+        #[arg(long)]
+        memory_limit: Option<String>,
+    },
     /// Validate Hudi query results against Parquet (runs each query once, compares output)
     Validate {
         /// Hudi tables location (local path or cloud URL)
@@ -443,6 +469,30 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Commands::Explain {
+            hudi_dir,
+            parquet_dir,
+            scale_factor,
+            queries,
+            analyze,
+            memory_limit,
+        } => {
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
+            let mut df_conf = cfg.bench.datafusion_conf;
+            if memory_limit.is_some() {
+                df_conf.memory_limit = memory_limit;
+            }
+            run_explain(
+                hudi_dir.as_deref(),
+                parquet_dir.as_deref(),
+                scale_factor,
+                queries,
+                analyze,
+                &df_conf,
+            )
+            .await
+        }
         Commands::Validate {
             hudi_dir,
             parquet_dir,
@@ -583,6 +633,160 @@ async fn collect_results(df: DataFrame) -> Result<Vec<RecordBatch>> {
     df.collect().await
 }
 
+/// Split a query file into executable statements. Comment lines are stripped
+/// first so semicolons inside comments (e.g., license headers) don't produce
+/// spurious empty statements; Q15 is CREATE VIEW; SELECT; DROP VIEW.
+fn split_statements(sql: &str) -> Vec<String> {
+    let sql_no_comments: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    sql_no_comments
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn explain_keyword(analyze: bool) -> &'static str {
+    if analyze {
+        "EXPLAIN ANALYZE"
+    } else {
+        "EXPLAIN"
+    }
+}
+
+/// Wrap a statement in EXPLAIN when it is a query; returns None for DDL
+/// (e.g., Q15's CREATE VIEW / DROP VIEW), which must run unwrapped so the
+/// query statement can plan against it.
+fn wrap_in_explain(stmt: &str, analyze: bool) -> Option<String> {
+    let head: String = stmt.chars().take(6).collect::<String>().to_uppercase();
+    if head.starts_with("SELECT") || head.starts_with("WITH") || head.starts_with("VALUES") {
+        Some(format!("{} {stmt}", explain_keyword(analyze)))
+    } else {
+        None
+    }
+}
+
+/// Print EXPLAIN result batches as raw text; a bordered table wraps badly for
+/// wide plans.
+fn print_plan_batches(batches: &[RecordBatch]) -> Result<()> {
+    let options = FormatOptions::default();
+    for batch in batches {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            for (i, field) in schema.fields().iter().enumerate() {
+                println!("{}:", field.name());
+                println!("{}", formatters[i].value(row));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run EXPLAIN (or EXPLAIN ANALYZE) for each query against one registered source.
+///
+/// `plan` is the time spent in `SessionContext::sql` (parsing + logical
+/// planning); `collect` is the time to produce the EXPLAIN output, which covers
+/// physical planning including `TableProvider::scan` (for Hudi: timeline load
+/// and file listing), and with --analyze also full query execution. The
+/// hudi-vs-parquet difference in plain EXPLAIN's `collect` is therefore the
+/// per-query planning overhead.
+async fn explain_source(
+    ctx: &SessionContext,
+    label: &str,
+    query_nums: &[usize],
+    scale_factor: f64,
+    analyze: bool,
+) -> Result<()> {
+    let mode = explain_keyword(analyze);
+    for query_num in query_nums {
+        let sql = load_query(*query_num, scale_factor)
+            .map_err(datafusion::error::DataFusionError::Plan)?;
+        println!();
+        println!("=== Q{query_num:02} [{label}] {mode} ===");
+        // One failing query shouldn't kill the remaining queries or the other
+        // source's pass; report it under the query header and move on.
+        if let Err(e) = explain_query(ctx, &sql, analyze).await {
+            println!("ERROR: {e}");
+        }
+    }
+    Ok(())
+}
+
+async fn explain_query(ctx: &SessionContext, sql: &str, analyze: bool) -> Result<()> {
+    for stmt in &split_statements(sql) {
+        match wrap_in_explain(stmt, analyze) {
+            Some(explain_sql) => {
+                let start = Instant::now();
+                let df = ctx.sql(&explain_sql).await?;
+                let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let start = Instant::now();
+                let batches = df.collect().await?;
+                let collect_ms = start.elapsed().as_secs_f64() * 1000.0;
+                println!("plan: {plan_ms:.1} ms, collect: {collect_ms:.1} ms");
+                print_plan_batches(&batches)?;
+            }
+            None => {
+                let head = stmt.lines().next().unwrap_or_default();
+                println!("running without EXPLAIN (not a query statement): {head}");
+                ctx.sql(stmt).await?.collect().await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run EXPLAIN / EXPLAIN ANALYZE against Hudi and/or Parquet registrations.
+async fn run_explain(
+    hudi_dir: Option<&str>,
+    parquet_dir: Option<&str>,
+    scale_factor: f64,
+    queries: Option<String>,
+    analyze: bool,
+    df_conf: &config::DataFusionConfig,
+) -> Result<()> {
+    if hudi_dir.is_none() && parquet_dir.is_none() {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "At least one of --hudi-dir or --parquet-dir must be provided".to_string(),
+        ));
+    }
+
+    let query_nums = parse_query_numbers(queries);
+
+    if let Some(hudi_dir) = hudi_dir {
+        let ctx =
+            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
+        let start = Instant::now();
+        register_hudi_tables(&ctx, hudi_dir).await?;
+        println!(
+            "Registered Hudi tables from {hudi_dir} in {:.1} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        explain_source(&ctx, "hudi", &query_nums, scale_factor, analyze).await?;
+    }
+
+    if let Some(parquet_dir) = parquet_dir {
+        let ctx =
+            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
+        let start = Instant::now();
+        register_parquet_tables(&ctx, parquet_dir).await?;
+        println!(
+            "Registered Parquet tables from {parquet_dir} in {:.1} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        explain_source(&ctx, "parquet", &query_nums, scale_factor, analyze).await?;
+    }
+
+    Ok(())
+}
+
 /// Benchmark a single source (hudi or parquet) and return per-query timings and last batches.
 async fn bench_source(
     ctx: &SessionContext,
@@ -612,20 +816,7 @@ async fn bench_source(
         let mut last_batches: Vec<RecordBatch> = Vec::new();
         let mut error = None;
 
-        // Strip SQL comment lines before splitting, so semicolons inside
-        // comments (e.g., license headers) don't produce spurious empty statements.
-        let sql_no_comments: String = sql
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Split multi-statement queries (e.g., Q15: CREATE VIEW; SELECT; DROP VIEW)
-        let statements: Vec<&str> = sql_no_comments
-            .split(';')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let statements = split_statements(&sql);
 
         for i in 0..total_runs {
             if i < warmup {
@@ -1332,4 +1523,43 @@ fn batches_to_csv_rows(batches: &[RecordBatch]) -> std::result::Result<Vec<Strin
     }
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_statements_strips_comments_and_splits_on_semicolons() {
+        let sql = "-- Licensed to the ASF;\n-- under the License.\nselect 1;\n\ncreate view v as\nselect 2;\ndrop view v;\n";
+        let statements = split_statements(sql);
+        assert_eq!(
+            statements,
+            vec!["select 1", "create view v as\nselect 2", "drop view v"]
+        );
+    }
+
+    #[test]
+    fn test_split_statements_single_query_without_trailing_semicolon() {
+        assert_eq!(split_statements("select 1"), vec!["select 1"]);
+    }
+
+    #[test]
+    fn test_wrap_in_explain_wraps_queries_only() {
+        assert_eq!(
+            wrap_in_explain("select 1", false).as_deref(),
+            Some("EXPLAIN select 1")
+        );
+        assert_eq!(
+            wrap_in_explain("with t as (select 1) select * from t", true).as_deref(),
+            Some("EXPLAIN ANALYZE with t as (select 1) select * from t")
+        );
+        assert_eq!(
+            wrap_in_explain("values (1)", false).as_deref(),
+            Some("EXPLAIN values (1)")
+        );
+        assert_eq!(wrap_in_explain("create view v as select 1", true), None);
+        assert_eq!(wrap_in_explain("drop view v", false), None);
+        assert_eq!(wrap_in_explain("(select 1) union (select 2)", false), None);
+    }
 }
