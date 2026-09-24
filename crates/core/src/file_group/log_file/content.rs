@@ -264,19 +264,24 @@ impl Decoder {
         }
     }
 
-    /// Validate the log block version (first 4 bytes of block content).
+    /// Read the log block version (first 4 bytes of block content) and check it
+    /// is one of `supported`.
     ///
     /// This is NOT the same as [`LogFormatVersion`] (read from the file header).
-    /// Modern Hudi tables use [`LogBlockVersion::V3`].
-    fn validate_log_block_version(mut reader: impl Read) -> Result<()> {
+    /// Modern Hudi tables use [`LogBlockVersion::V3`]; writers before table
+    /// version 6 (Hudi 0.13 and earlier) use [`LogBlockVersion::V2`], and a table
+    /// upgraded from them keeps those blocks until compaction rewrites them.
+    fn validate_log_block_version(
+        mut reader: impl Read,
+        supported: &[LogBlockVersion],
+        block: &str,
+    ) -> Result<()> {
         let mut version_buf = [0u8; 4];
         reader.read_exact(&mut version_buf)?;
         let version = LogBlockVersion::try_from(version_buf)?;
-        if version != LogBlockVersion::V3 {
+        if !supported.contains(&version) {
             return Err(CoreError::LogBlockError(format!(
-                "Only support log block version {} but got: {:?}",
-                LogBlockVersion::V3 as u32,
-                version
+                "Unsupported {block} block version {version:?}; supported: {supported:?}"
             )));
         }
         Ok(())
@@ -435,7 +440,14 @@ impl Decoder {
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<RecordBatches> {
-        Decoder::validate_log_block_version(&mut reader)?;
+        // V2 and V3 Avro data blocks share one layout (version, record count,
+        // records): Hudi's HoodieAvroDataBlockVersion reports a record count for
+        // every version.
+        Decoder::validate_log_block_version(
+            &mut reader,
+            &[LogBlockVersion::V2, LogBlockVersion::V3],
+            "Avro data",
+        )?;
 
         let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
             CoreError::LogBlockError("Schema not found in block header".to_string())
@@ -511,7 +523,9 @@ impl Decoder {
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<RecordBatches> {
-        Decoder::validate_log_block_version(&mut reader)?;
+        // A V2 delete block holds Kryo-serialized DeleteRecord objects rather than
+        // the Avro HoodieDeleteRecordList of V3, which this reader cannot decode.
+        Decoder::validate_log_block_version(&mut reader, &[LogBlockVersion::V3], "delete")?;
 
         let mut datum_len = [0u8; 4];
         reader.read_exact(&mut datum_len)?;
@@ -898,21 +912,67 @@ mod tests {
         );
     }
 
-    /// The block version is the first four bytes of a block's content, and only
-    /// V3 is understood. A block at another version is refused rather than
-    /// decoded as if it were V3, which would misread every byte after it.
+    /// The block version is the first four bytes of a block's content. An Avro
+    /// data block is understood at V2 and V3; any other version is refused rather
+    /// than decoded as if it were V3, which would misread every byte after it.
     #[test]
-    fn test_decode_content_rejects_a_non_v3_block_version() {
+    fn test_decode_content_rejects_an_unsupported_block_version() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u32.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes());
         let header = HashMap::from([(BlockMetadataKey::Schema, "{}".to_string())]);
         let err = Decoder::new(Arc::new(HudiConfigs::empty()))
             .decode_avro_record_content(buf.as_slice(), &header)
-            .expect_err("a non-V3 block must be refused");
+            .expect_err("a V1 block must be refused");
         assert!(
-            err.to_string().contains("log block version"),
+            err.to_string().contains("Avro data block version V1"),
             "the error must name the version, got: {err}"
+        );
+    }
+
+    /// A table version 5 writer stamps its Avro data blocks V2, with the same
+    /// layout as V3 (version, record count, records), so they decode the same.
+    #[test]
+    fn test_decode_avro_content_at_block_version_2() -> Result<()> {
+        let schema_str = r#"{"type": "record", "name": "TestRecord",
+            "fields": [{"name": "id", "type": "long"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(schema_str)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        for id in [7i64, 8] {
+            let mut record = AvroRecord::new(&writer_schema).unwrap();
+            record.put("id", id);
+            let bytes = to_avro_datum(&writer_schema, record)?;
+            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        let header = HashMap::from([(BlockMetadataKey::Schema, schema_str.to_string())]);
+        let batches = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_avro_record_content(Cursor::new(buf), &header)?;
+        assert_eq!(batches.num_data_rows(), 2);
+        let ids = batches.data_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((ids.value(0), ids.value(1)), (7, 8));
+        Ok(())
+    }
+
+    /// A V2 delete block holds Kryo-serialized records, not the Avro list of V3,
+    /// so it is refused by name rather than misread as Avro.
+    #[test]
+    fn test_decode_delete_content_rejects_block_version_2() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let err = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_delete_record_content(buf.as_slice(), &HashMap::new())
+            .expect_err("a V2 delete block must be refused");
+        assert!(
+            err.to_string().contains("delete block version V2"),
+            "the error must name the block and version, got: {err}"
         );
     }
 
