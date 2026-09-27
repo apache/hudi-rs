@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "rustrover": {
+      "url": "http://127.0.0.1:64522/stream",
+      "type": "http"
+    }
+  }
+}
