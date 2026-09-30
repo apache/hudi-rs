@@ -845,4 +845,36 @@ mod tests {
         ));
         assert!(exprs_to_filters(&[non_col]).is_empty());
     }
+
+    /// The timestamp key generator parses this string in the source column's declared
+    /// encoding first, and that only works because a typed timestamp literal is spelled as
+    /// the raw epoch integer in its own unit. A formatted datetime here would not be a bug
+    /// in itself, but it would change which parsing path partition pruning takes.
+    #[test]
+    fn test_convert_timestamp_literal_is_epoch_integer_in_its_unit() {
+        for (literal, expected) in [
+            (
+                ScalarValue::TimestampMicrosecond(Some(1_709_280_000_000_000), Some("UTC".into())),
+                "1709280000000000",
+            ),
+            (
+                ScalarValue::TimestampMillisecond(Some(1_709_280_000_000), None),
+                "1709280000000",
+            ),
+            (
+                ScalarValue::TimestampSecond(Some(1_709_280_000), None),
+                "1709280000",
+            ),
+            (ScalarValue::Date32(Some(19783)), "2024-03-01"),
+        ] {
+            let expr = Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(col("ts")),
+                Operator::GtEq,
+                Box::new(Expr::Literal(literal, None)),
+            ));
+            let result = exprs_to_filters(&[expr]);
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].2, expected);
+        }
+    }
 }
