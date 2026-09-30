@@ -65,16 +65,8 @@ impl RecordMerger {
         }
 
         let precombine_field = hudi_configs.try_get(OrderingFields)?;
-        if precombine_field.is_none()
-            && merge_strategy == RecordMergeStrategyValue::OverwriteWithLatest
-        {
-            return Err(ConfigError::InvalidValue(format!(
-                "When {:?} is {:?}, {:?} must be set.",
-                RecordMergeStrategy,
-                RecordMergeStrategyValue::OverwriteWithLatest,
-                OrderingFields
-            )));
-        }
+        // Ordering/precombine is optional: absent → COMMIT_TIME_ORDERING in Java.
+        let _ = precombine_field;
 
         Ok(())
     }
@@ -100,9 +92,18 @@ impl RecordMerger {
                     return Ok(data_batch.clone());
                 }
 
-                // Use sorting fields to get sorted indices of the data batch (inserts and updates)
-                let ordering_fields: Vec<String> = self.hudi_configs.get(OrderingFields)?.into();
-                let ordering_field = &ordering_fields[0];
+                // Use sorting fields to get sorted indices of the data batch (inserts and updates).
+                // No precombine → COMMIT_TIME_ORDERING (order by _hoodie_commit_time).
+                let ordering_fields: Vec<String> = self
+                    .hudi_configs
+                    .try_get(OrderingFields)?
+                    .map(Into::into)
+                    .unwrap_or_default();
+                let commit_time_field = MetaField::CommitTime.as_ref().to_string();
+                let ordering_field = ordering_fields
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or(commit_time_field.as_str());
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
                 let ordering_array = data_batch.get_array(ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
@@ -151,6 +152,7 @@ impl RecordMerger {
                     extract_commit_time_ordering_values(&commit_time_converter, &data_batch)?;
 
                 let mut last_key: Option<Row> = None;
+                let mut kept_for_key = false;
                 for i in 0..num_records {
                     // Iterator over sorted indices to process records in desc order
                     let idx = desc_indices.value(i) as usize;
@@ -158,27 +160,25 @@ impl RecordMerger {
                     let curr_event_time = event_times.row(idx);
                     let curr_commit_time = commit_times.row(idx);
 
-                    let first_seen = last_key != Some(curr_key);
-                    if first_seen {
+                    if last_key != Some(curr_key) {
                         last_key = Some(curr_key);
-
-                        let should_keep = match delete_orderings.get(&curr_key.owned()) {
-                            Some(delete_max_ordering) => {
-                                // If the delete ordering is not greater than the record's ordering,
-                                // we keep the record.
-                                // Otherwise, we discard it as the delete is more recent.
-                                !delete_max_ordering
-                                    .is_greater_than(curr_event_time, curr_commit_time)
-                            }
-                            None => true, // There is no delete for this key, keep it.
-                        };
-
-                        keep_mask_builder.append_value(should_keep);
-                    } else {
-                        // If the record is not first seen,
-                        // we don't keep it as its latest version has been processed.
-                        keep_mask_builder.append_value(false);
+                        kept_for_key = false;
                     }
+                    // Keep the highest-ordered version the delete does NOT beat.
+                    // A delete may beat the newest version (e.g. ordering-0
+                    // deletes fall back to commit-time) while a later re-insert
+                    // with a lower event time survives — Java's sequential
+                    // merge revives the key in that case.
+                    let should_keep = !kept_for_key
+                        && match delete_orderings.get(&curr_key.owned()) {
+                            Some(delete_max_ordering) => !delete_max_ordering
+                                .is_greater_than(curr_event_time, curr_commit_time),
+                            None => true,
+                        };
+                    if should_keep {
+                        kept_for_key = true;
+                    }
+                    keep_mask_builder.append_value(should_keep);
                 }
 
                 // Filter the sorted indices based on the keep mask
@@ -226,9 +226,10 @@ mod tests {
         let configs = create_configs("APPEND_ONLY", false, None);
         assert!(RecordMerger::validate_configs(&configs).is_ok());
 
-        // Invalid: Overwrite without precombine field
+        // Valid: overwrite without an ordering/precombine field — absent
+        // means COMMIT_TIME_ORDERING, like the Java writer at tv9.
         let configs = create_configs("OVERWRITE_WITH_LATEST", true, None);
-        assert!(RecordMerger::validate_configs(&configs).is_err());
+        assert!(RecordMerger::validate_configs(&configs).is_ok());
 
         // Invalid: No meta fields with overwrite strategy
         let configs = create_configs("OVERWRITE_WITH_LATEST", false, Some("ts"));

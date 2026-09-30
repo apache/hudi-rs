@@ -169,9 +169,11 @@ fn schema_to_field_with_props(
         AvroSchema::TimestampNanos => {
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIMEZONE.into()))
         }
-        AvroSchema::LocalTimestampMillis => todo!(),
-        AvroSchema::LocalTimestampMicros => todo!(),
-        AvroSchema::LocalTimestampNanos => todo!(),
+        // Local (timezone-less) timestamps are Spark's TimestampNTZType; the
+        // absent zone is the meaning, so it must not be filled in with UTC.
+        AvroSchema::LocalTimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+        AvroSchema::LocalTimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
+        AvroSchema::LocalTimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
         AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
     };
 
