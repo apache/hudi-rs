@@ -138,6 +138,9 @@ pub struct Decoder {
     /// it is safe to evaluate before the merge. See
     /// [`Decoder::with_row_filter`].
     row_filter: Option<RowFilterBuilder>,
+    /// Schema a parquet block's columns are checked against before the row
+    /// filter is pushed. See [`Decoder::with_repair_table_schema`].
+    repair_table_schema: Option<arrow_schema::SchemaRef>,
     /// Schema an Avro block is resolved up to, as Avro JSON. See
     /// [`Decoder::with_reader_schema`].
     reader_schema_json: Option<String>,
@@ -172,6 +175,30 @@ impl Decoder {
     pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
         self.row_filter = row_filter;
         self
+    }
+
+    /// The schema a parquet block is read as, for deciding whether the row filter
+    /// may be pushed into it.
+    ///
+    /// A pushed predicate sees the block's physical values. A block whose footer
+    /// needs the logical timestamp repair against this schema stores values its
+    /// labels misdescribe, so the predicate would drop rows that match, and the
+    /// row filter is withheld for that block. With no schema set that cannot be
+    /// ruled out, so the row filter is withheld from every parquet block.
+    pub fn with_repair_table_schema(
+        mut self,
+        repair_table_schema: Option<arrow_schema::SchemaRef>,
+    ) -> Self {
+        self.repair_table_schema = repair_table_schema;
+        self
+    }
+
+    /// The schema installed by [`Self::with_repair_table_schema`]. Test-only,
+    /// because the decision to install one is made a layer up, in the log record
+    /// reader, and that is what its test asserts.
+    #[cfg(test)]
+    pub(crate) fn repair_table_schema(&self) -> Option<&arrow_schema::SchemaRef> {
+        self.repair_table_schema.as_ref()
     }
 
     /// Resolve Avro blocks up to this schema as they are read.
@@ -223,6 +250,7 @@ impl Decoder {
             batch_size: 1024,
             hudi_configs,
             row_filter: None,
+            repair_table_schema: None,
             reader_schema_json: None,
             hfile_as_records: false,
             key_predicate: None,
@@ -502,10 +530,31 @@ impl Decoder {
         // Resolved here rather than by the caller because the predicate has to
         // be matched against this block's own schema, which does not exist until
         // its footer is read. A builder that declines reads every row.
-        let row_filter = self
-            .row_filter
-            .as_ref()
-            .and_then(|build| build(builder.parquet_schema(), builder.schema().as_ref()));
+        // Withheld when the block needs the logical timestamp repair, as the base
+        // file read does (see `with_repair_table_schema`). That costs only the
+        // pushdown, the same as a predicate that is not `mor_pk_safe`.
+        let row_filter = match (&self.row_filter, &self.repair_table_schema) {
+            (Some(build), Some(table))
+                if !crate::schema::batch_evolution::schema_needs_logical_type_repair(
+                    builder.schema(),
+                    table,
+                ) =>
+            {
+                build(builder.parquet_schema(), builder.schema().as_ref())
+            }
+            (Some(_), table) => {
+                log::debug!(
+                    "parquet log block {}; not pushing its row filter",
+                    if table.is_some() {
+                        "needs the logical timestamp repair"
+                    } else {
+                        "has no table schema to check the logical timestamp repair against"
+                    }
+                );
+                None
+            }
+            (None, _) => None,
+        };
         if let Some(row_filter) = row_filter {
             builder = builder.with_row_filter(row_filter);
         }
@@ -656,7 +705,7 @@ mod tests {
     use apache_avro::types::Record as AvroRecord;
     use apache_avro::types::Value as AvroValue;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use std::io::{BufReader, Cursor};
     use std::sync::Arc;
@@ -1362,5 +1411,127 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("mixes"), "got: {err}");
+    }
+
+    /// A parquet log block holding one row: `key` = "k" and `ts` of `file_type`
+    /// storing `stored`.
+    fn one_ts_row_parquet_block(file_type: DataType, stored: i64) -> Bytes {
+        use arrow_array::TimestampMicrosecondArray;
+        let ts: ArrayRef = match &file_type {
+            DataType::Int64 => Arc::new(Int64Array::from(vec![stored])),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => Arc::new(
+                TimestampMicrosecondArray::from(vec![stored]).with_timezone_opt(tz.clone()),
+            ),
+            other => panic!("unsupported type {other:?}"),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", file_type, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["k"])) as ArrayRef, ts],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    /// Keeps rows whose `ts` (column 1), read as the physical i64 the block's
+    /// footer describes, is at least `min`. This is how a pushed predicate sees
+    /// a column: on the block's values, before any repair relabels them.
+    struct TsAtLeast {
+        projection: parquet::arrow::ProjectionMask,
+        min: i64,
+    }
+
+    impl parquet::arrow::arrow_reader::ArrowPredicate for TsAtLeast {
+        fn projection(&self) -> &parquet::arrow::ProjectionMask {
+            &self.projection
+        }
+        fn evaluate(
+            &mut self,
+            batch: RecordBatch,
+        ) -> std::result::Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+            let raw = arrow_cast::cast(batch.column(0), &DataType::Int64)?;
+            let raw = raw.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok((0..raw.len())
+                .map(|i| Some(raw.value(i) >= self.min))
+                .collect())
+        }
+    }
+
+    fn ts_at_least(min: i64) -> RowFilterBuilder {
+        Arc::new(move |parquet_schema, _projected| {
+            Some(parquet::arrow::arrow_reader::RowFilter::new(vec![
+                Box::new(TsAtLeast {
+                    projection: parquet::arrow::ProjectionMask::roots(parquet_schema, vec![1]),
+                    min,
+                }),
+            ]))
+        })
+    }
+
+    fn table_with_ts(ts_type: DataType) -> arrow_schema::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", ts_type, false),
+        ]))
+    }
+
+    /// A predicate pushed into a parquet log block that needs the logical
+    /// timestamp repair is evaluated on mislabelled values and drops a row that
+    /// matches. The gate must withhold it for that block, and only that block.
+    #[test]
+    fn parquet_log_block_withholds_the_row_filter_when_the_block_needs_timestamp_repair() {
+        // 2020-01-01T00:00:00.001Z as millis. The predicate asks for
+        // ts >= 2020-01-01T00:00:00Z in the unit the footer claims.
+        const STORED_MS: i64 = 1_577_836_800_001;
+        let cases = [
+            // Labelled tz-aware micros: the literal is 1_577_836_800_000_000.
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                1_577_836_800_000_000,
+            ),
+            // A plain long the table reads as a local timestamp. Compared as a
+            // bare long against a micros-scaled literal it drops the row too.
+            (
+                DataType::Int64,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                1_577_836_800_000_000,
+            ),
+        ];
+        for (file_type, table_type, literal) in cases {
+            let content = one_ts_row_parquet_block(file_type.clone(), STORED_MS);
+            let decode = |table: Option<arrow_schema::SchemaRef>| {
+                Decoder::new(Arc::new(HudiConfigs::empty()))
+                    .with_row_filter(Some(ts_at_least(literal)))
+                    .with_repair_table_schema(table)
+                    .decode_parquet_record_content(content.as_ref())
+                    .unwrap()
+                    .num_data_rows()
+            };
+
+            // Pushed, the predicate drops the matching row: what the gate prevents.
+            assert_eq!(
+                decode(Some(table_with_ts(file_type.clone()))),
+                0,
+                "{file_type}: a table that agrees with the footer keeps the filter"
+            );
+            assert_eq!(
+                decode(Some(table_with_ts(table_type.clone()))),
+                1,
+                "{file_type} -> {table_type}: the filter must be withheld, not drop the row"
+            );
+            assert_eq!(
+                decode(None),
+                1,
+                "{file_type}: with no table schema the filter must be withheld"
+            );
+        }
     }
 }
