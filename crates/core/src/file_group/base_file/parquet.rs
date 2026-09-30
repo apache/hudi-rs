@@ -133,9 +133,11 @@ impl ParquetBaseFileReader {
         obj_path: ObjPath,
         file_size: u64,
         row_index_column: Option<&str>,
+        load_offset_index: bool,
     ) -> Result<CountedBuilder> {
         let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
-            .with_file_size(file_size);
+            .with_file_size(file_size)
+            .with_preload_offset_index(load_offset_index);
 
         // A parquet-avro writer with `write-old-list-structure=true` encodes an
         // `array<map>` as a legacy 2-level list whose element is a REPEATED map
@@ -164,9 +166,10 @@ impl ParquetBaseFileReader {
         &self,
         relative_path: &str,
         row_index_column: Option<&str>,
+        load_offset_index: bool,
     ) -> Result<CountedBuilder> {
         let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
-        self.open_builder_with_size(obj_path, file_size, row_index_column)
+        self.open_builder_with_size(obj_path, file_size, row_index_column, load_offset_index)
             .await
     }
 
@@ -255,6 +258,9 @@ impl ParquetBaseFileReader {
         // footer is open. A builder that returns `None` — typically because the
         // file does not have a column the predicate names — means no filter,
         // which reads every row rather than guessing at the predicate.
+        if let Some(selection) = &options.row_selection {
+            builder = builder.with_row_selection(selection.clone());
+        }
         let row_filter = options
             .row_filter
             .as_ref()
@@ -304,13 +310,13 @@ impl ParquetBaseFileReader {
     /// Exposed for callers that need format-specific details such as row group
     /// compressed sizes for statistics estimation.
     pub async fn get_parquet_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
-        let builder = self.open_builder(relative_path, None).await?;
+        let builder = self.open_builder(relative_path, None, false).await?;
         Ok(builder.metadata().as_ref().clone())
     }
 
     /// Get the Arrow schema from a Parquet file's footer.
     pub async fn get_schema(&self, relative_path: &str) -> Result<arrow_schema::Schema> {
-        let builder = self.open_builder(relative_path, None).await?;
+        let builder = self.open_builder(relative_path, None, false).await?;
         let parquet_meta = builder.metadata();
         Ok(parquet_to_arrow_schema(
             parquet_meta.file_metadata().schema_descr(),
@@ -327,7 +333,11 @@ impl BaseFileReader for ParquetBaseFileReader {
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
             let builder = self
-                .open_builder(relative_path, options.row_index_column.as_deref())
+                .open_builder(
+                    relative_path,
+                    options.row_index_column.as_deref(),
+                    options.row_selection.is_some() || options.row_filter.is_some(),
+                )
                 .await?;
             let builder = self.apply_options(builder, &options)?;
             let full_schema = builder.schema().clone();
@@ -370,7 +380,7 @@ impl BaseFileReader for ParquetBaseFileReader {
         Box::pin(async move {
             let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
             let builder = self
-                .open_builder_with_size(obj_path, file_size, None)
+                .open_builder_with_size(obj_path, file_size, None, false)
                 .await?;
             let parquet_meta = builder.metadata().as_ref();
 
@@ -421,6 +431,98 @@ mod tests {
     /// rejects with "Map cannot be repeated" unless the schema is normalized
     /// first. Without that step this read fails outright rather than returning
     /// wrong data, so the assertion is that it returns rows at all.
+    #[tokio::test]
+    async fn test_sparse_row_selection_fetches_fewer_data_bytes() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use parquet::arrow::{
+            ArrowWriter,
+            arrow_reader::{RowSelection, RowSelector},
+        };
+        use parquet::file::properties::WriterProperties;
+        use std::sync::atomic::Ordering;
+        let directory = tempfile::tempdir().unwrap();
+        let batch = RecordBatch::try_from_iter(vec![
+            (
+                "id",
+                Arc::new(Int64Array::from_iter_values(0..8192)) as arrow_array::ArrayRef,
+            ),
+            (
+                "payload",
+                Arc::new(StringArray::from_iter_values(
+                    (0..8192).map(|i| format!("{i}:{}", "payload".repeat(32))),
+                )),
+            ),
+        ])
+        .unwrap();
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_write_batch_size(128)
+            .set_data_page_row_count_limit(128)
+            .set_max_row_group_row_count(Some(2048))
+            .build();
+        let file = std::fs::File::create(directory.path().join("rows.parquet")).unwrap();
+        let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let storage =
+            Storage::new_with_base_url(Url::from_directory_path(directory.path()).unwrap())
+                .unwrap();
+        let reader = ParquetBaseFileReader::new(storage.clone());
+        let selected = reader
+            .read_data(
+                "rows.parquet",
+                BaseFileReadOptions::new().with_row_selection(RowSelection::from(vec![
+                    RowSelector::skip(4097),
+                    RowSelector::select(1),
+                ])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(selected.num_rows(), 1);
+        assert_eq!(
+            selected
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            4097
+        );
+        let selected_bytes = storage.read_volume.bytes_read.load(Ordering::Relaxed);
+        let all = reader
+            .read_data("rows.parquet", BaseFileReadOptions::new())
+            .await
+            .unwrap();
+        assert_eq!(all.num_rows(), 8192);
+        let full_bytes = storage.read_volume.bytes_read.load(Ordering::Relaxed) - selected_bytes;
+        assert!(
+            selected_bytes < full_bytes,
+            "selected={selected_bytes}, full={full_bytes}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_row_selection_preserves_physical_row_indices() {
+        use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+        let reader = ParquetBaseFileReader::new(test_storage());
+        let options = BaseFileReadOptions::new()
+            .with_row_index_column("_row_pos")
+            .with_row_selection(RowSelection::from(vec![
+                RowSelector::skip(1),
+                RowSelector::select(1),
+                RowSelector::skip(2),
+                RowSelector::select(1),
+            ]));
+        let batch = reader.read_data("a.parquet", options).await.unwrap();
+        let positions = batch
+            .column_by_name("_row_pos")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .unwrap();
+        assert_eq!(positions.values(), &[1, 4]);
+    }
+
     #[tokio::test]
     async fn test_read_data_accepts_a_legacy_two_level_list() {
         let reader = ParquetBaseFileReader::new(test_storage());
