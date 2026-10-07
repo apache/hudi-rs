@@ -167,8 +167,10 @@ fn base_read_options(
     row_group_selector: Option<RowGroupSelector>,
     key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
     use_record_position: bool,
+    row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
 ) -> BaseFileReadOptions {
     let mut options = BaseFileReadOptions::new();
+    options.row_selection = row_selection;
     options = options.with_batch_size(MERGE_CHUNK_ROWS);
     if let Some(row_filter) = row_filter {
         options = options.with_row_filter(row_filter);
@@ -873,6 +875,7 @@ impl HoodieFileGroupReader {
                         row_group_selector.clone(),
                         key_predicate.clone(),
                         use_position,
+                        self.reader_parameters.base_row_selection.clone(),
                     ),
                 )
                 .await
@@ -1024,6 +1027,7 @@ impl HoodieFileGroupReader {
                     row_group_selector.clone(),
                     key_predicate.clone(),
                     use_position,
+                    self.reader_parameters.base_row_selection.clone(),
                 )
                 .with_projection(intersection.fields().iter().map(|f| f.name())),
             )
@@ -2335,7 +2339,7 @@ mod tests {
         for use_position in [false, true] {
             for filter in [None, Some(make_row_filter_builder())] {
                 assert_eq!(
-                    base_read_options(filter, None, None, use_position).batch_size,
+                    base_read_options(filter, None, None, use_position, None).batch_size,
                     Some(MERGE_CHUNK_ROWS),
                     "the base read must ask for the merge's chunk bound rather than \
                      inherit one (use_position={use_position})"

@@ -317,9 +317,7 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
             // Skip files with unrecognized extensions
         }
 
-        // Build FileGroups from parsed files
-        // Note: Currently only supports file groups with base files.
-        // TODO: Support file groups with only log files (P1 task)
+        // Build FileGroups from parsed files.
         let mut file_groups = Vec::new();
         for (file_id, base_files) in file_id_to_base_files {
             let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
@@ -330,6 +328,13 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 fg.add_log_files(log_files)?;
             }
 
+            file_groups.push(fg);
+        }
+
+        // Inserts can live entirely in logs before the first compaction.
+        for (file_id, log_files) in file_id_to_log_files {
+            let mut fg = FileGroup::new(file_id, partition_path.clone());
+            fg.add_log_files(log_files)?;
             file_groups.push(fg);
         }
 
@@ -1527,7 +1532,7 @@ mod tests {
         }
 
         #[test]
-        fn test_log_files_without_base_file_not_included() {
+        fn test_log_files_without_base_file_are_included_only_when_committed() {
             let mut records = HashMap::new();
             // Only log files, no base file
             let (key, record) = create_files_record(
@@ -1548,8 +1553,21 @@ mod tests {
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
-            // Log-only file groups are not yet supported (see P1 task)
-            assert!(file_groups_map.is_empty());
+            let groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(groups.len(), 1);
+            let slice = groups[0].file_slices.values().next().unwrap();
+            assert!(slice.base_file.is_none());
+            assert_eq!(slice.log_files.len(), 2);
+            assert!(
+                file_groups_from_files_partition_records(
+                    &records,
+                    Some(&BaseFileFormatValue::Parquet),
+                    &create_strict_view(&[]),
+                    None,
+                )
+                .unwrap()
+                .is_empty()
+            );
         }
 
         #[test]

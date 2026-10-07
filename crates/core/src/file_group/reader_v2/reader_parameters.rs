@@ -28,6 +28,8 @@
 /// selection logic in [`super::buffer::loader::DefaultFileGroupRecordBufferLoader`].
 #[derive(Debug, Clone, Default)]
 pub struct ReaderParameters {
+    /// Validated physical base-file rows. Does not restrict log records.
+    pub base_row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
     /// Whether to use record positions for merging (position-based merge).
     pub use_record_position: bool,
 
