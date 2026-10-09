@@ -43,6 +43,8 @@ write_env_report() {
   local out_file="$1"
   local sf="$2"
   local data_dir="$3"
+  local table_type="${4:-cow}"
+  local reader_version="${5:-}"
 
   local cpu_model cpu_count mem_total
   if [ -r /proc/cpuinfo ]; then
@@ -120,6 +122,8 @@ write_env_report() {
     echo "spark:           $("$SPARK_HOME/bin/spark-submit" --version 2>&1 | awk '/version/ {print $NF; exit}')"
     echo "hudi bundle:     $HUDI_SPARK_BUNDLE"
     echo "config:          config/sf$sf.yaml"
+    echo "table type:      $table_type"
+    echo "reader version:  ${reader_version:-(hudi-rs default)}"
   } > "$out_file"
 }
 
@@ -161,6 +165,36 @@ is_cloud_url() {
   esac
 }
 
+require_table_type() {
+  case "$1" in
+    cow|mor) ;;
+    *) echo "Error: unknown table type '$1'. Use 'cow' or 'mor'." >&2; exit 1 ;;
+  esac
+}
+
+# Where tables of one type live by default. The two types get separate
+# directories so both can be built from the same parquet and benchmarked
+# against each other.
+default_hudi_dir() {
+  local sf="$1" table_type="$2"
+  case "$table_type" in
+    mor) echo "$SCRIPT_DIR/data/sf$sf-hudi-mor" ;;
+    *)   echo "$SCRIPT_DIR/data/sf$sf-hudi" ;;
+  esac
+}
+
+# The format label results are persisted under. Merge-on-read gets its own so
+# a run does not overwrite the copy-on-write numbers, and a pinned reader
+# version likewise, since the point of pinning one is to compare against the
+# other.
+hudi_format_label() {
+  local table_type="$1" reader_version="${2:-}"
+  local label="hudi"
+  [ "$table_type" = "mor" ] && label="hudi-mor"
+  [ -n "$reader_version" ] && label="$label-r$reader_version"
+  echo "$label"
+}
+
 # A data dir symlinked to an instance store dangles once a stop/start wipes it.
 # Name that, because the failure it otherwise produces is create_dir_all
 # reporting EEXIST for a directory that does not exist.
@@ -176,9 +210,13 @@ require_usable_data_dir() {
 # Fail with the missing table names rather than letting the engine report a
 # missing path once the run is already under way.
 require_hudi_tables() {
-  local hudi_dir="$1"
-  if ! "$TPCH_BIN" check-tables --hudi-base "$hudi_dir"; then
+  local hudi_dir="$1" table_type="${2:-}"
+  if ! "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" \
+       ${table_type:+--table-type "$table_type"} >/dev/null; then
     echo "Error: run 'create-tables' first, or point --hudi-dir at existing tables." >&2
+    if [ -n "$table_type" ]; then
+      echo "Tables of the other type are refused; --table-type picks which one runs." >&2
+    fi
     exit 1
   fi
 }
@@ -189,7 +227,7 @@ Usage: $0 <command> [options]
 
 Commands:
   generate          Generate TPC-H parquet data
-  create-tables     Create Hudi COW tables from parquet via Spark SQL
+  create-tables     Create Hudi tables from parquet via Spark SQL (COW, or MOR with an update commit)
   bench-spark       Run TPC-H queries against Hudi tables via Spark SQL
   bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
   compare           Compare persisted benchmark results with bar charts
@@ -199,8 +237,18 @@ Commands:
 Options (per command):
   --scale-factor N  TPC-H scale factor [all commands] (default: $DEFAULT_SCALE_FACTOR)
   --format F        Table format: hudi or parquet [bench-*, compare] (default: auto)
+  --table-type T    Hudi table type: cow or mor [create-tables, bench-*, validate, env-report]
+                    (default: cow). mor adds an update commit that leaves one log file in
+                    every file group, and reads it through the merge path.
+  --update-fraction F
+                    Fraction of each table's rows the mor update commit rewrites, applied as
+                    one row in every round(1/F) [create-tables] (default: 0.001)
+  --reader-version N
+                    hudi-rs file group reader version, 1 or 2 [bench-datafusion, validate]
+                    (default: the hudi-rs default, currently 2)
   --recreate        Rebuild tables that already exist [create-tables] (default: reuse them)
-  --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
+  --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default:
+                    data/sf{N}-hudi, or data/sf{N}-hudi-mor with --table-type mor)
   --parquet-dir D   Parquet data directory or cloud URL [generate, create-tables, bench-*,
                     validate] (default: data/sf{N}-parquet)
   --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
@@ -217,7 +265,10 @@ Options (per command):
 Examples:
   $0 generate --scale-factor 1
   $0 create-tables --scale-factor 1
+  $0 create-tables --scale-factor 1 --table-type mor
   $0 create-tables --scale-factor 100 --hudi-dir s3://bucket/sf100-hudi
+  $0 bench-datafusion --scale-factor 1 --table-type mor
+  $0 validate --scale-factor 1 --table-type mor
   $0 bench-spark --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 100 --hudi-dir gs://bucket/sf100-hudi
@@ -258,24 +309,35 @@ cmd_create_tables() {
   local custom_hudi_dir=""
   local custom_parquet_dir=""
   local recreate=0
+  local table_type="cow"
+  local update_fraction=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
       --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
       --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       --recreate) recreate=1; shift ;;
+      --table-type) table_type="$2"; shift 2 ;;
+      --update-fraction) update_fraction="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+  require_table_type "$table_type"
+  if [ -n "$update_fraction" ] && [ "$table_type" != "mor" ]; then
+    echo "Error: --update-fraction applies to --table-type mor only." >&2
+    exit 1
+  fi
 
-  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local hudi_dir="${custom_hudi_dir:-$(default_hudi_dir "$sf" "$table_type")}"
 
   build_tpch
 
   # Rebuilding is the expensive step at scale, so existing tables are reused
-  # unless --recreate says otherwise.
-  if [ "$recreate" -eq 0 ] && "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" 2>/dev/null; then
-    echo "Reusing existing Hudi tables at: $hudi_dir"
+  # unless --recreate says otherwise. The type is checked too, so a directory
+  # of the other type is rebuilt rather than silently benchmarked as this one.
+  if [ "$recreate" -eq 0 ] && \
+     "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" --table-type "$table_type" >/dev/null 2>&1; then
+    echo "Reusing existing Hudi $table_type tables at: $hudi_dir"
     echo "Pass --recreate to rebuild them."
     return 0
   fi
@@ -300,19 +362,35 @@ cmd_create_tables() {
 
   local sql_file
   sql_file="$(mktemp)"
-  "$TPCH_BIN" render-ctas --scale-factor "$sf" \
+  "$TPCH_BIN" render-ctas --scale-factor "$sf" --table-type "$table_type" \
     --parquet-base "$parquet_dir" --hudi-base "$hudi_dir" > "$sql_file"
+  # The update commit runs in the same session as the bulk insert: the tables
+  # are already registered there, and a second session would have to re-register
+  # them against a catalog that may still name another run's location.
+  if [ "$table_type" = "mor" ]; then
+    "$TPCH_BIN" render-updates --scale-factor "$sf" \
+      ${update_fraction:+--update-fraction "$update_fraction"} >> "$sql_file"
+  fi
 
   read_spark_args --scale-factor "$sf" --command create-tables
 
-  echo "Creating Hudi COW tables from parquet (sf$sf)..."
+  if [ "$table_type" = "mor" ]; then
+    echo "Creating Hudi MOR tables from parquet (sf$sf), then an update commit..."
+  else
+    echo "Creating Hudi COW tables from parquet (sf$sf)..."
+  fi
   "$SPARK_HOME/bin/spark-sql" \
     --packages "$HUDI_SPARK_BUNDLE" \
     "${SPARK_ARGS[@]}" \
     -f "$sql_file"
 
   rm -f "$sql_file"
-  echo "Hudi COW tables created at: $hudi_dir"
+  echo "Hudi $table_type tables created at: $hudi_dir"
+
+  # For mor, this also prints the file layout and fails if any file group is
+  # missing its log file, so a benchmark never runs on a merge path that was
+  # never written.
+  "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" --table-type "$table_type"
 }
 
 cmd_bench_spark() {
@@ -324,6 +402,7 @@ cmd_bench_spark() {
   local format="hudi"
   local custom_hudi_dir=""
   local custom_parquet_dir=""
+  local table_type="cow"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
@@ -334,9 +413,11 @@ cmd_bench_spark() {
       --format) format="$2"; shift 2 ;;
       --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
       --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --table-type) table_type="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+  require_table_type "$table_type"
 
   build_tpch
 
@@ -351,15 +432,17 @@ cmd_bench_spark() {
     iterations="${iterations:-$cfg_iterations}"
   fi
 
-  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local hudi_dir="${custom_hudi_dir:-$(default_hudi_dir "$sf" "$table_type")}"
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
   local data_dir=""
   local bench_data_arg=""
+  local format_label="$format"
   case "$format" in
     hudi)
       data_dir="$hudi_dir"
       bench_data_arg="--hudi-base"
+      format_label="$(hudi_format_label "$table_type")"
       ;;
     parquet)
       data_dir="$parquet_dir"
@@ -373,7 +456,7 @@ cmd_bench_spark() {
     exit 1
   fi
   if [ "$format" = "hudi" ]; then
-    require_hudi_tables "$data_dir"
+    require_hudi_tables "$data_dir" "$table_type"
   fi
 
   read_spark_args --scale-factor "$sf" --command bench
@@ -395,7 +478,7 @@ cmd_bench_spark() {
     bench_args+=(--queries "$queries")
   fi
 
-  echo "Running Spark SQL benchmark ($format)..."
+  echo "Running Spark SQL benchmark ($format_label)..."
   "$SPARK_HOME/bin/spark-submit" \
     --packages "$HUDI_SPARK_BUNDLE" \
     "${SPARK_ARGS[@]}" \
@@ -406,8 +489,9 @@ cmd_bench_spark() {
   local parse_args=(parse-spark-output --input "$output_file")
   if [ -n "$output_dir" ]; then
     mkdir -p "$output_dir"
-    parse_args+=(--output-dir "$output_dir" --engine-label spark --format-label "$format" --display-name "spark+hudi" --scale-factor "$sf")
-    write_env_report "$output_dir/environment.txt" "$sf" "$data_dir"
+    parse_args+=(--output-dir "$output_dir" --engine-label spark --format-label "$format_label" \
+                 --display-name "spark+$format_label" --scale-factor "$sf")
+    write_env_report "$output_dir/environment.txt" "$sf" "$data_dir" "$table_type" "n/a (spark)"
   fi
   "$TPCH_BIN" "${parse_args[@]}"
   rm -rf "$tmp_dir"
@@ -422,6 +506,8 @@ cmd_bench_datafusion() {
   local output_dir=""
   local custom_hudi_dir=""
   local custom_parquet_dir=""
+  local table_type="cow"
+  local reader_version=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
@@ -432,11 +518,14 @@ cmd_bench_datafusion() {
       --output-dir) output_dir="$2"; shift 2 ;;
       --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
       --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --table-type) table_type="$2"; shift 2 ;;
+      --reader-version) reader_version="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+  require_table_type "$table_type"
 
-  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local hudi_dir="${custom_hudi_dir:-$(default_hudi_dir "$sf" "$table_type")}"
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
   # Determine which formats to bench
@@ -477,13 +566,14 @@ cmd_bench_datafusion() {
   build_tpch
 
   if [ "$use_hudi" = true ]; then
-    require_hudi_tables "$hudi_dir"
+    require_hudi_tables "$hudi_dir" "$table_type"
   fi
 
   local base_args=(bench --scale-factor "$sf")
   [ -n "$queries" ] && base_args+=(--queries "$queries")
   [ -n "$iterations" ] && base_args+=(--iterations "$iterations")
   [ -n "$warmup" ] && base_args+=(--warmup "$warmup")
+  [ -n "$reader_version" ] && base_args+=(--reader-version "$reader_version")
 
   local persisting=false
   if [ -n "$output_dir" ]; then
@@ -494,7 +584,7 @@ cmd_bench_datafusion() {
     # when only the parquet leg runs.
     local reported_dir="$hudi_dir"
     [ "$use_hudi" = false ] && reported_dir="$parquet_dir"
-    write_env_report "$output_dir/environment.txt" "$sf" "$reported_dir"
+    write_env_report "$output_dir/environment.txt" "$sf" "$reported_dir" "$table_type" "$reader_version"
   fi
 
   # One invocation per format. Results are keyed by engine and format label, so
@@ -514,7 +604,9 @@ cmd_bench_datafusion() {
   }
 
   if [ "$use_hudi" = true ]; then
-    run_datafusion_bench hudi --hudi-dir "$hudi_dir" "datafusion+hudi-rs"
+    local hudi_label
+    hudi_label="$(hudi_format_label "$table_type" "$reader_version")"
+    run_datafusion_bench "$hudi_label" --hudi-dir "$hudi_dir" "datafusion+hudi-rs${hudi_label#hudi}"
   fi
   if [ "$use_parquet" = true ]; then
     run_datafusion_bench parquet --parquet-dir "$parquet_dir" "datafusion+parquet"
@@ -529,6 +621,8 @@ cmd_validate() {
   local custom_parquet_dir=""
   local queries=""
   local memory_limit=""
+  local table_type="cow"
+  local reader_version=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
@@ -536,11 +630,14 @@ cmd_validate() {
       --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
       --queries) queries="$2"; shift 2 ;;
       --memory-limit) memory_limit="$2"; shift 2 ;;
+      --table-type) table_type="$2"; shift 2 ;;
+      --reader-version) reader_version="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+  require_table_type "$table_type"
 
-  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local hudi_dir="${custom_hudi_dir:-$(default_hudi_dir "$sf" "$table_type")}"
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
   if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
@@ -550,11 +647,12 @@ cmd_validate() {
   fi
 
   build_tpch
-  require_hudi_tables "$hudi_dir"
+  require_hudi_tables "$hudi_dir" "$table_type"
 
   local validate_args=(validate --scale-factor "$sf" --hudi-dir "$hudi_dir" --parquet-dir "$parquet_dir")
   [ -n "$queries" ] && validate_args+=(--queries "$queries")
   [ -n "$memory_limit" ] && validate_args+=(--memory-limit "$memory_limit")
+  [ -n "$reader_version" ] && validate_args+=(--reader-version "$reader_version")
 
   "$TPCH_BIN" "${validate_args[@]}"
 }
@@ -564,18 +662,21 @@ cmd_validate() {
 cmd_env_report() {
   local sf="$DEFAULT_SCALE_FACTOR"
   local custom_hudi_dir=""
+  local table_type="cow"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --scale-factor) sf="$2"; shift 2 ;;
       --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --table-type) table_type="$2"; shift 2 ;;
       *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
     esac
   done
+  require_table_type "$table_type"
 
   local results_dir="$SCRIPT_DIR/results"
   mkdir -p "$results_dir"
   write_env_report "$results_dir/environment.txt" "$sf" \
-    "${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+    "${custom_hudi_dir:-$(default_hudi_dir "$sf" "$table_type")}" "$table_type"
   cat "$results_dir/environment.txt"
 }
 
