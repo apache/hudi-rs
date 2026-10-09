@@ -332,7 +332,7 @@ Create a Hudi table instance using its constructor or the `TableBuilder` API.
 
 All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. It stores three fields — `filters`, `projection`, and `hudi_options` — and exposes chainable `with_*` builders for the rest. The available knobs:
 
-- `query_type` (`with_query_type`) — `Snapshot` (default) or `Incremental`. Drives dispatch in `read`, `read_stream`, and `get_file_slices`.
+- `query_type` (`with_query_type`) — `Snapshot` (default) or `Incremental`. Drives dispatch in `read`, `read_stream`, `get_file_slices`, and `get_file_slices_stream`.
 - `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning (snapshot only), and row-level filtering.
 - `projection` — columns to return. Streaming pushes the projection down to the parquet reader; eager reads project after merging.
 - `batch_size` (`with_batch_size`) — rows per batch (streaming only; eager reads return one batch per file slice).
@@ -343,7 +343,8 @@ All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. 
 | Stage           | API                                                              | Description                                                                                              |
 |-----------------|------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
 | Query planning  | `get_file_slices(options)`                                       | Get the file slices the read targets, dispatched on `options.query_type`. To bucket for parallel reads, call `hudi::util::collection::split_into_chunks` on the result. |
-|                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning, derived from the metadata table. Snapshot only. Returns `None` for incremental queries, and whenever the estimate cannot be computed (no metadata table, non-Parquet base files, footer sampling failure). |
+|                 | `get_file_slices_stream(options)` (Rust)                         | Stream targeted file slices as partition planning completes. Global order is unspecified. Storage-backed snapshots use recursive object listing (paginated by cloud backends), bound in-flight partition listings, and fail closed before retaining more than 100,000 unique partition paths or 64 MiB of path text for exact-once emission; use the metadata table or eager API beyond those limits. Metadata-table records and the incremental touched-file-group lookup remain eager. |
+|                 | `compute_table_stats(options)`                                   | Estimated `(num_rows, byte_size)` for scan planning. Snapshot (default) uses the metadata table; incremental aggregates from changed file slices. Returns `None` when stats cannot be computed. |
 | Query execution | `create_file_group_reader_with_options(read_options, extra_storage_overrides)` | Create a file group reader with the table's configs. In Python both args are optional; in Rust `read_options` is an `Option` and `extra_storage_overrides` takes a (possibly empty) iterator. Timestamps are resolved automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same options used for `get_file_slices`. |
 |                 | `read(options)` / `read_stream(options)`                         | Record-read APIs. Dispatch on `options.query_type`. `read_stream` errors on `Incremental` for now. Per-slice streaming lives on `FileGroupReader`. |
 
