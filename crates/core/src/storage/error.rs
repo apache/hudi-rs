@@ -28,6 +28,9 @@ pub enum StorageError {
     #[error("Failed to create storage: {0}")]
     Creation(String),
 
+    #[error("Object already exists at '{0}': {1}")]
+    AlreadyExists(String, Box<dyn std::error::Error + Send + Sync + 'static>),
+
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 

@@ -52,6 +52,7 @@ pub mod error;
 pub mod expr;
 pub mod file_group;
 pub mod hfile;
+pub mod index;
 pub mod keygen;
 pub mod merge;
 pub mod metadata;
@@ -62,5 +63,9 @@ pub mod storage;
 pub mod table;
 pub mod timeline;
 pub mod util;
+pub mod write;
+
+pub use index::{HoodieKey, SimpleIndex};
+pub use write::{UpsertOptions, WriteResult};
 
 use error::Result;
