@@ -117,11 +117,11 @@ fn reconcile_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<Record
     }
 }
 
-/// Reconcile a RecordBatch to a target schema (name-metadata only).
+/// Reconcile a RecordBatch to a target schema: name metadata, allowlisted
+/// promotions, and the logical timestamp repair.
 ///
-/// Schema evolution runs upstream, so every batch reaching the
-/// merge is already REQUIRED-SHAPED: it has exactly the target's columns with the
-/// target's types. The only remaining job of this function is field-NAME
+/// Schema evolution runs upstream for most batches, so a batch reaching the
+/// merge has the target's columns. The main job of this function is field-NAME
 /// metadata reconciliation between Avro-derived schemas (from log files) and
 /// Parquet-derived schemas (from base files). For example:
 /// - List child field: arrow-avro uses "item", Parquet uses "element"
@@ -131,6 +131,10 @@ fn reconcile_to_schema(batch: &RecordBatch, schema: &SchemaRef) -> Result<Record
 /// embeds child field names) but not the underlying buffers, so they are expressed
 /// by rebuilding the column's `ArrayData` under the target `DataType` — the child
 /// `ArrayData` is carried over unchanged.
+///
+/// A parquet log block reaches the merge in its file schema, so the rebuild also
+/// applies the logical timestamp repair the base file path applies (see
+/// [`rebuild_array_data_to_type`]).
 ///
 /// Anything beyond that — a missing column, or a genuine type mismatch that the
 /// ArrayData rebuild rejects — is an upstream evolution bug and is surfaced as a
@@ -202,7 +206,8 @@ pub(crate) fn reconcile_batch_to_schema(
 /// own metadata-laden type, so validation rejects it. Descending into
 /// `child_data` and rewriting each level's `DataType` resolves this.
 ///
-/// A leaf's type is never rewritten — see the refusal below.
+/// A leaf's type is never rewritten, except for the logical timestamp repair.
+/// See the refusal below.
 fn rebuild_array_data_to_type(
     data: arrow::array::ArrayData,
     target_type: &DataType,
@@ -229,6 +234,16 @@ fn rebuild_array_data_to_type(
         // An i64 buffer tagged i32 reads the low word of each value —
         // 5000000000 comes back as 705032704. Refuse instead, and let
         // `reconcile_batch_to_schema`'s promotion arm do the conversion.
+        //
+        // The exception is Java's logical-type repair: a plain long read as a
+        // timezone-less timestamp, or millis values a writer labelled tz-aware
+        // micros. Java relabels the file schema (`SchemaRepair`) for parquet log
+        // blocks as it does for base files, and keeps the i64. Re-tagging does the
+        // same and agrees with `project_batch_to_schema` on a base file.
+        if crate::schema::batch_evolution::needs_logical_type_repair(data.data_type(), target_type)
+        {
+            return data.into_builder().data_type(target_type.clone()).build();
+        }
         if data.data_type() != target_type {
             return Err(arrow_schema::ArrowError::InvalidArgumentError(format!(
                 "reconcile: leaf type {} cannot be re-tagged as {target_type}; a leaf \
@@ -718,5 +733,289 @@ mod tests {
                 .values(),
             &[7i64]
         );
+    }
+
+    /// A one-row batch of a record key and a `ts` column of `data_type` holding
+    /// `value`. `data_type` is `Int64` or a millis/micros/nanos `Timestamp`.
+    fn ts_batch(data_type: DataType, value: i64) -> RecordBatch {
+        use arrow_array::{Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray};
+        use arrow_schema::TimeUnit;
+
+        let col: ArrayRef = match &data_type {
+            DataType::Int64 => Arc::new(Int64Array::from(vec![value])),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+                Arc::new(TimestampMicrosecondArray::from(vec![value]).with_timezone_opt(tz.clone()))
+            }
+            DataType::Timestamp(TimeUnit::Millisecond, tz) => {
+                Arc::new(TimestampMillisecondArray::from(vec![value]).with_timezone_opt(tz.clone()))
+            }
+            DataType::Timestamp(TimeUnit::Nanosecond, tz) => Arc::new(
+                arrow_array::TimestampNanosecondArray::from(vec![value])
+                    .with_timezone_opt(tz.clone()),
+            ),
+            other => panic!("unsupported type {other:?}"),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("ts", data_type, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vec!["k"])) as ArrayRef, col],
+        )
+        .unwrap()
+    }
+
+    fn ts(unit: arrow_schema::TimeUnit, tz: Option<&str>) -> DataType {
+        DataType::Timestamp(unit, tz.map(Into::into))
+    }
+
+    /// A parquet log block reaches the drain in its file schema. Each pairing Java
+    /// repairs (`SchemaRepair.needsLogicalTypeRepair`) must be relabelled with the
+    /// stored i64 kept, matching what the base file path produces for the same
+    /// file schema, rather than failing reconcile.
+    #[test]
+    fn test_records_to_batch_applies_logical_timestamp_repair() {
+        use arrow_schema::TimeUnit::{Microsecond, Millisecond};
+
+        // 2020-01-01T00:00:00.001Z in the target unit.
+        const STORED: i64 = 1_577_836_800_001;
+        let cases = [
+            // Millis values a writer labelled tz-aware micros.
+            (ts(Microsecond, Some("UTC")), ts(Millisecond, Some("UTC"))),
+            // A plain long the table declares as a local timestamp.
+            (DataType::Int64, ts(Millisecond, None)),
+            (DataType::Int64, ts(Microsecond, None)),
+        ];
+        for (file_type, table_type) in cases {
+            let log_batch = Arc::new(ts_batch(file_type.clone(), STORED));
+            let target = ts_batch(table_type.clone(), 0).schema();
+            let records = vec![BufferedRecord::new_batch_ref(
+                "k".into(),
+                log_batch.clone(),
+                0,
+                None,
+            )];
+            let out = records_to_batch(records, target.clone()).unwrap_or_else(|e| {
+                panic!("{file_type} -> {table_type} must be repaired, got: {e}")
+            });
+            assert_eq!(out.schema(), target);
+            assert_eq!(
+                out.column(1).as_ref(),
+                ts_batch(table_type.clone(), STORED).column(1).as_ref(),
+                "{file_type} -> {table_type} must keep the stored i64"
+            );
+
+            let base = crate::schema::batch_evolution::project_batch_to_schema(&log_batch, &target)
+                .unwrap();
+            assert_eq!(
+                base.column(1).as_ref(),
+                out.column(1).as_ref(),
+                "{file_type} -> {table_type} must match the base file path"
+            );
+        }
+    }
+
+    /// The repair applies inside a struct too, as Java's `SchemaRepair` recurses
+    /// into groups.
+    #[test]
+    fn test_reconcile_repairs_nested_tz_aware_timestamp_mislabeled_as_micros() {
+        use arrow_array::{
+            Array, StructArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        };
+        use arrow_schema::{Fields, TimeUnit};
+
+        const STORED_MS: i64 = 1_577_836_799_999;
+        let micros = Field::new("ts", ts(TimeUnit::Microsecond, Some("UTC")), true);
+        let millis = Field::new("ts", ts(TimeUnit::Millisecond, Some("UTC")), true);
+        let inner = StructArray::new(
+            Fields::from(vec![micros]),
+            vec![
+                Arc::new(TimestampMicrosecondArray::from(vec![STORED_MS]).with_timezone("UTC"))
+                    as ArrayRef,
+            ],
+            None,
+        );
+        let src = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "s",
+                inner.data_type().clone(),
+                true,
+            )])),
+            vec![Arc::new(inner) as ArrayRef],
+        )
+        .unwrap();
+        let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Struct(Fields::from(vec![millis])),
+            true,
+        )]));
+
+        let out = reconcile_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.schema(), target);
+        let got = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(got, STORED_MS);
+    }
+
+    /// Pairings outside Java's repair are still refused rather than re-tagged: the
+    /// timezone-less micros -> millis pair is a real unit conversion in Java, the
+    /// reverse direction is not a mislabel, and a plain long is only relabelled as
+    /// a local timestamp.
+    #[test]
+    fn test_reconcile_does_not_repair_other_timestamp_pairs() {
+        use arrow_schema::TimeUnit::{Microsecond, Millisecond, Nanosecond};
+
+        let cases = [
+            (ts(Microsecond, None), ts(Millisecond, None)),
+            (ts(Millisecond, Some("UTC")), ts(Microsecond, Some("UTC"))),
+            (ts(Microsecond, None), ts(Millisecond, Some("UTC"))),
+            (ts(Microsecond, Some("UTC")), ts(Millisecond, None)),
+            (DataType::Int64, ts(Millisecond, Some("UTC"))),
+            // Java only relabels a plain long as local-timestamp millis or micros.
+            (DataType::Int64, ts(Nanosecond, None)),
+        ];
+        for (file_type, table_type) in cases {
+            let src = ts_batch(file_type.clone(), 1_000);
+            let target = ts_batch(table_type.clone(), 0).schema();
+            let err = reconcile_batch_to_schema(&src, &target).expect_err(&format!(
+                "{file_type} -> {table_type} must not be re-tagged"
+            ));
+            assert!(
+                err.to_string().contains("cannot be re-tagged"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// The re-tag keeps nulls and a slice's offset: the rebuilt column is the
+    /// same rows of the same buffer, relabelled.
+    #[test]
+    fn test_reconcile_repair_keeps_nulls_and_slice_offset() {
+        use arrow_array::{Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray};
+        use arrow_schema::TimeUnit;
+
+        let values = [Some(1_i64), None, Some(1_577_836_800_001), Some(-1), None];
+        let cases: [(ArrayRef, DataType, ArrayRef); 2] = [
+            (
+                Arc::new(TimestampMicrosecondArray::from(values.to_vec()).with_timezone("UTC")),
+                ts(TimeUnit::Millisecond, Some("UTC")),
+                Arc::new(TimestampMillisecondArray::from(values.to_vec()).with_timezone("UTC")),
+            ),
+            (
+                Arc::new(Int64Array::from(values.to_vec())),
+                ts(TimeUnit::Microsecond, None),
+                Arc::new(TimestampMicrosecondArray::from(values.to_vec())),
+            ),
+        ];
+        for (src, table_type, expected) in cases {
+            let src_type = src.data_type().clone();
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("ts", src_type.clone(), true)])),
+                vec![src],
+            )
+            .unwrap()
+            .slice(1, 3);
+            let target: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                table_type.clone(),
+                true,
+            )]));
+            let out = reconcile_batch_to_schema(&batch, &target).unwrap();
+            assert_eq!(
+                out.column(0).as_ref(),
+                expected.slice(1, 3).as_ref(),
+                "{src_type} -> {table_type}"
+            );
+            assert_eq!(out.column(0).null_count(), 1);
+        }
+    }
+
+    /// The repair applies to a list element and a map value, together with the
+    /// arrow-avro vs parquet child name differences reconcile already handles.
+    #[test]
+    fn test_reconcile_repairs_list_element_and_map_value_timestamps() {
+        use arrow_array::builder::{
+            Int64Builder, ListBuilder, MapBuilder, MapFieldNames, StringBuilder,
+            TimestampMicrosecondBuilder,
+        };
+        use arrow_array::{Array, ListArray, MapArray, TimestampMillisecondArray};
+        use arrow_schema::{Fields, TimeUnit};
+
+        const A: i64 = 1_577_836_800_001;
+        const B: i64 = 1_577_836_799_999;
+
+        // List<ts micros UTC>, element field "item" (arrow-avro spelling).
+        let mut lb = ListBuilder::new(TimestampMicrosecondBuilder::new().with_timezone("UTC"));
+        lb.values().append_value(A);
+        lb.values().append_null();
+        lb.values().append_value(B);
+        lb.append(true);
+        let list = lb.finish();
+
+        // Map<string, long>, entries named "entries" (arrow-avro spelling).
+        let names = MapFieldNames {
+            entry: "entries".to_string(),
+            key: "key".to_string(),
+            value: "value".to_string(),
+        };
+        let mut mb = MapBuilder::new(Some(names), StringBuilder::new(), Int64Builder::new());
+        mb.keys().append_value("a");
+        mb.values().append_value(A);
+        mb.keys().append_value("b");
+        mb.values().append_null();
+        mb.append(true).unwrap();
+        let map = mb.finish();
+
+        let src = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("l", list.data_type().clone(), true),
+                Field::new("m", map.data_type().clone(), true),
+            ])),
+            vec![Arc::new(list) as ArrayRef, Arc::new(map) as ArrayRef],
+        )
+        .unwrap();
+
+        // Parquet spelling ("element", "key_value") and the table's types.
+        let element = Field::new("element", ts(TimeUnit::Millisecond, Some("UTC")), true);
+        let entries = Field::new(
+            "key_value",
+            DataType::Struct(Fields::from(vec![
+                Field::new("key", DataType::Utf8, false),
+                Field::new("value", ts(TimeUnit::Millisecond, None), true),
+            ])),
+            false,
+        );
+        let target: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("l", DataType::List(Arc::new(element)), true),
+            Field::new("m", DataType::Map(Arc::new(entries), false), true),
+        ]));
+
+        let out = reconcile_batch_to_schema(&src, &target).unwrap();
+        assert_eq!(out.schema(), target);
+
+        let l = out.column(0).as_any().downcast_ref::<ListArray>().unwrap();
+        let l = l.value(0);
+        let l = l
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(l.iter().collect::<Vec<_>>(), vec![Some(A), None, Some(B)]);
+
+        let m = out.column(1).as_any().downcast_ref::<MapArray>().unwrap();
+        let v = m
+            .values()
+            .as_any()
+            .downcast_ref::<TimestampMillisecondArray>()
+            .unwrap();
+        assert_eq!(v.iter().collect::<Vec<_>>(), vec![Some(A), None]);
     }
 }
