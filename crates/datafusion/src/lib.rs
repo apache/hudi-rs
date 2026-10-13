@@ -18,6 +18,7 @@
  */
 
 pub(crate) mod hudi_exec;
+pub mod lookup;
 pub(crate) mod util;
 
 use std::collections::HashMap;

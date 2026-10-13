@@ -22,6 +22,7 @@
 //! This module provides methods for interacting with Hudi's metadata table,
 //! which stores file listings and other metadata for efficient table operations.
 
+pub mod record_index;
 pub mod records;
 
 // The reader the metadata read used before `v2_reader` replaced it. Kept, and kept
@@ -131,8 +132,6 @@ impl Table {
 
     /// Create a metadata table instance for this data table.
     ///
-    /// TODO: support more partitions. Only "files" is used currently.
-    ///
     /// # Errors
     ///
     /// Returns an error if the metadata table cannot be created or if there are
@@ -157,7 +156,10 @@ impl Table {
         let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
         Table::new_with_options(
             mdt_url.as_str(),
-            [(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)],
+            self.storage_options().into_iter().chain([(
+                PartitionFields.as_ref().to_string(),
+                METADATA_TABLE_PARTITION_FIELD.to_string(),
+            )]),
         )
         .await
     }
@@ -327,10 +329,7 @@ impl Table {
     /// `None` when the metadata table has no commits, which both callers treat as
     /// an empty result rather than an error.
     ///
-    /// A thin wrapper over [`Self::partition_reader`]: `files` is the only
-    /// partition with a decoded record type and a caller today. The others are
-    /// reachable through `partition_reader` for tests, which is what lets shard
-    /// routing be checked against real file ids rather than synthetic ones.
+    /// A thin wrapper over [`Self::partition_reader`] for file listing callers.
     async fn files_partition_reader(
         &self,
     ) -> Result<
@@ -349,7 +348,7 @@ impl Table {
     /// shard -- record index, secondary index -- differ from it only in how many
     /// slices come back and how their records decode. Slice discovery does not
     /// care which partition it is listing.
-    async fn partition_reader(
+    pub(crate) async fn partition_reader(
         &self,
         partition: &str,
     ) -> Result<
@@ -1219,9 +1218,7 @@ mod tests {
     /// that recovers shard order has to work on names like
     /// `record-index-0003-0` rather than ones a test chose.
     ///
-    /// What this does *not* do is read the records: `record_index` has no decoded
-    /// type yet, so the keys each shard holds are unknown here. It pins
-    /// discovery and selection, and says so.
+    /// This test pins shard discovery and selection independently of payload decoding.
     #[tokio::test]
     async fn routing_selects_one_of_the_record_index_s_real_shards() -> Result<()> {
         let data_table = get_data_table().await;

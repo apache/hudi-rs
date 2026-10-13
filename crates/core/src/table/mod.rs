@@ -92,6 +92,7 @@ pub mod builder;
 pub mod file_pruner;
 pub(crate) mod fs_view;
 mod listing;
+pub mod lookup;
 pub mod partition;
 mod validation;
 

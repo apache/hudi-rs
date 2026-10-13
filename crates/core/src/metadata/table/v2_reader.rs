@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reads the metadata table's `files` partition through the version two file
+//! Reads metadata-table partitions through the version two file
 //! group reader.
 //!
 //! Every metadata-table concern lives here and none of it reaches `reader_v2`,
@@ -118,6 +118,16 @@ impl MetadataTableV2Reader {
         file_slice: &FileSlice,
         keys: &[&str],
     ) -> Result<RecordBatch> {
+        self.read_partition_batch(file_slice, keys, FilesPartitionRecord::PARTITION_NAME)
+            .await
+    }
+
+    pub(crate) async fn read_partition_batch(
+        &self,
+        file_slice: &FileSlice,
+        keys: &[&str],
+        partition: &str,
+    ) -> Result<RecordBatch> {
         let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths = if file_slice.has_log_file() {
             file_slice
@@ -137,7 +147,7 @@ impl MetadataTableV2Reader {
         // The metadata table sets `hoodie.populate.meta.fields=false`, so the record
         // key is its own `key` column rather than `_hoodie_record_key`. Without this
         // the merge keys every record on an empty string and collapses them into one.
-        reader_context.rebuild_record_context(FilesPartitionRecord::PARTITION_NAME.to_string());
+        reader_context.rebuild_record_context(partition.to_string());
 
         // A named-key read is a point lookup, which is the normal shape for the
         // metadata table; an empty key list is the full scan the `files` partition
@@ -165,7 +175,7 @@ impl MetadataTableV2Reader {
                 base_file_path,
                 base_file_commit_time,
                 log_file_paths,
-                FilesPartitionRecord::PARTITION_NAME.to_string(),
+                partition.to_string(),
             ),
             ReaderParameters::default(),
             None,
@@ -175,7 +185,7 @@ impl MetadataTableV2Reader {
         let batch = reader.read().await?;
         log::debug!(
             "metadata read of '{}' with {} named key(s): merge map peaked at {} entries",
-            FilesPartitionRecord::PARTITION_NAME,
+            partition,
             keys.len(),
             reader.read_stats().merge_map_peak_entries
         );
