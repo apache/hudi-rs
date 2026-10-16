@@ -194,7 +194,7 @@ enum Commands {
         #[arg(long)]
         memory_limit: Option<String>,
     },
-    /// Parse Spark benchmark JSON output into a timing table
+    /// Parse Spark or DuckDB benchmark JSON output into a timing table
     ParseSparkOutput {
         /// Input file (reads from stdin if omitted)
         #[arg(long)]
@@ -951,7 +951,7 @@ fn run_parse_spark_output(
     if results.is_empty() {
         println!("No benchmark data found in input.");
     } else {
-        print_single_table("Spark", &results);
+        print_single_table(display_name.or(engine_label).unwrap_or("Spark"), &results);
         if let Some(dir) = output_dir {
             let engine = engine_label.unwrap_or("spark");
             let fmt = format_label.unwrap_or("hudi");
