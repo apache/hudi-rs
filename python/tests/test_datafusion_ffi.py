@@ -63,6 +63,19 @@ def test_datafusion_ffi_pushes_the_filter_into_the_provider(v6_table):
     assert batch.to_pydict()["n"] == [2]
 
 
+def test_datafusion_ffi_strings_are_utf8_unless_view_types_are_requested(v6_table):
+    pa = pytest.importorskip("pyarrow")
+
+    def name_type(options=None):
+        ctx = datafusion.SessionContext()
+        ctx.register_table("hudi_t", HudiDataFusionDataSource(v6_table, options))
+        return ctx.sql("SELECT name FROM hudi_t").collect()[0].schema.field("name").type
+
+    assert name_type() == pa.string()
+    view_types = [("datafusion.execution.parquet.schema_force_view_types", "true")]
+    assert name_type(view_types) == pa.string_view()
+
+
 def test_datafusion_ffi_plan_goes_through_the_ffi_boundary(v6_table):
     ctx = datafusion.SessionContext()
     ctx.register_table("hudi_t", HudiDataFusionDataSource(v6_table))

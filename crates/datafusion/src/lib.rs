@@ -25,7 +25,7 @@ use std::error::Error;
 use std::fmt::Debug;
 use std::sync::Arc;
 
-use arrow_schema::{Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::datasource::TableProvider;
@@ -59,6 +59,31 @@ use hudi_core::config::{ConfigParser, HudiConfigs};
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
+
+/// DataFusion's switch for reading strings and binaries as view types. The
+/// table factory forwards it from the session; otherwise it comes from the
+/// options the provider is built with, defaulting to on as in DataFusion.
+const SCHEMA_FORCE_VIEW_TYPES: &str = "datafusion.execution.parquet.schema_force_view_types";
+
+/// The schema with every top-level string and binary column as its view type,
+/// which is what `datafusion.execution.parquet.schema_force_view_types` does
+/// to an inferred parquet schema.
+fn schema_with_view_types(schema: &Schema) -> Schema {
+    let fields: Vec<arrow_schema::FieldRef> = schema
+        .fields()
+        .iter()
+        .map(|field| match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                Arc::new(field.as_ref().clone().with_data_type(DataType::Utf8View))
+            }
+            DataType::Binary | DataType::LargeBinary => {
+                Arc::new(field.as_ref().clone().with_data_type(DataType::BinaryView))
+            }
+            _ => field.clone(),
+        })
+        .collect();
+    Schema::new_with_metadata(fields, schema.metadata().clone())
+}
 
 fn default_file_slice_read_concurrency() -> usize {
     match FileSliceReadConcurrency.default_value() {
@@ -231,6 +256,17 @@ impl HudiDataSource {
             }
             None => default_file_slice_read_concurrency(),
         };
+        let view_types = match all_options
+            .iter()
+            .find(|(k, _)| k == SCHEMA_FORCE_VIEW_TYPES)
+        {
+            Some((_, v)) => v.to_ascii_lowercase().parse().map_err(|e| {
+                Execution(format!(
+                    "Invalid value '{v}' for {SCHEMA_FORCE_VIEW_TYPES}: {e}"
+                ))
+            })?,
+            None => true,
+        };
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| external_error("Failed to create Hudi table", e))?;
@@ -261,6 +297,11 @@ impl HudiDataSource {
                 warn!("Failed to get table schema, using empty schema: {e}");
                 SchemaRef::from(Schema::empty())
             });
+        let schema = if view_types {
+            Arc::new(schema_with_view_types(&schema))
+        } else {
+            schema
+        };
 
         // Cache partition schema at construction for use in supports_filters_pushdown
         let partition_schema = match table.get_partition_schema().await {
@@ -1515,5 +1556,179 @@ mod tests {
 
         assert_scan_filter(&filters, "region", "=", &["us"]);
         assert_scan_filter(&filters, "txn_id", "=", &["TXN-001"]);
+    }
+
+    /// Strings are view types by default and stay `Utf8` when the option or the
+    /// session turns view types off.
+    #[tokio::test]
+    async fn string_columns_follow_the_sessions_view_type_setting() {
+        let path = V6Nonpartitioned.path_to_cow();
+        let by_default = HudiDataSource::new(&path).await.unwrap();
+        assert_eq!(
+            by_default
+                .schema()
+                .field_with_name("name")
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8View
+        );
+        assert_eq!(
+            by_default
+                .schema()
+                .field_with_name("_hoodie_record_key")
+                .unwrap()
+                .data_type(),
+            &DataType::Utf8View
+        );
+
+        let off = HudiDataSource::new_with_options(&path, [(SCHEMA_FORCE_VIEW_TYPES, "false")])
+            .await
+            .unwrap();
+        assert_eq!(
+            off.schema().field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8
+        );
+        let upper = HudiDataSource::new_with_options(&path, [(SCHEMA_FORCE_VIEW_TYPES, "TRUE")])
+            .await
+            .unwrap();
+        assert_eq!(
+            upper.schema().field_with_name("name").unwrap().data_type(),
+            &DataType::Utf8View
+        );
+        let invalid =
+            HudiDataSource::new_with_options(&path, [(SCHEMA_FORCE_VIEW_TYPES, "maybe")]).await;
+        assert!(invalid.is_err());
+
+        for (setting, expected) in [("true", DataType::Utf8View), ("false", DataType::Utf8)] {
+            let factory: Arc<dyn TableProviderFactory> = Arc::new(HudiTableFactory::new());
+            let state = datafusion::execution::session_state::SessionStateBuilder::new()
+                .with_default_features()
+                .with_table_factories(HashMap::from([("HUDI".to_string(), factory)]))
+                .build();
+            let ctx = SessionContext::new_with_state(state);
+            ctx.sql(&format!("SET {SCHEMA_FORCE_VIEW_TYPES} = {setting}"))
+                .await
+                .unwrap();
+            ctx.sql(&format!(
+                "CREATE EXTERNAL TABLE t STORED AS HUDI LOCATION '{path}'"
+            ))
+            .await
+            .unwrap();
+            let df = ctx.sql("SELECT name FROM t").await.unwrap();
+            assert_eq!(
+                df.schema().field(0).data_type(),
+                &expected,
+                "session setting {setting}"
+            );
+        }
+    }
+
+    /// The merge-on-read scan goes through `HudiScanExec`, whose batches come
+    /// from the reader in storage types; they must arrive in the declared view
+    /// types with the same values the `Utf8` configuration returns.
+    #[tokio::test]
+    async fn merge_on_read_scan_returns_the_declared_view_types() {
+        use hudi_test::SampleTable::V6SimplekeygenNonhivestyle;
+        async fn names(view: bool) -> (DataType, Vec<String>) {
+            let path = V6SimplekeygenNonhivestyle.path_to_mor_parquet();
+            let ctx = SessionContext::new();
+            let ds = HudiDataSource::new_with_options(
+                &path,
+                [(SCHEMA_FORCE_VIEW_TYPES, if view { "true" } else { "false" })],
+            )
+            .await
+            .unwrap();
+            ctx.register_table("t", Arc::new(ds)).unwrap();
+            let batches = ctx
+                .sql("SELECT name FROM t ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let data_type = batches[0].schema().field(0).data_type().clone();
+            let values = batches
+                .iter()
+                .flat_map(|b| {
+                    hudi_test::util::get_str_column(b, "name")
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            (data_type, values)
+        }
+        let (view_type, view_values) = names(true).await;
+        let (utf8_type, utf8_values) = names(false).await;
+        assert_eq!(view_type, DataType::Utf8View);
+        assert_eq!(utf8_type, DataType::Utf8);
+        assert!(!view_values.is_empty());
+        assert_eq!(view_values, utf8_values);
+
+        let ds = HudiDataSource::new(&V6SimplekeygenNonhivestyle.path_to_mor_parquet())
+            .await
+            .unwrap();
+        let declared = ds.schema();
+        assert_eq!(
+            declared.field_with_name("binaryField").unwrap().data_type(),
+            &DataType::BinaryView
+        );
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::new(ds)).unwrap();
+        let batches = ctx
+            .sql("SELECT * FROM t")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert!(!batches.is_empty());
+        for batch in &batches {
+            let types: Vec<_> = batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.data_type().clone())
+                .collect();
+            let expected: Vec<_> = declared
+                .fields()
+                .iter()
+                .map(|f| f.data_type().clone())
+                .collect();
+            assert_eq!(types, expected);
+        }
+    }
+
+    /// The version-1 reader yields batches in the base file's types rather than
+    /// the table schema's; reads through it work with view types on or off.
+    #[tokio::test]
+    async fn merge_on_read_scan_with_reader_v1_reads_under_either_view_setting() {
+        use hudi_test::SampleTable::V6SimplekeygenNonhivestyle;
+        for view in ["true", "false"] {
+            let ds = HudiDataSource::new_with_options(
+                &V6SimplekeygenNonhivestyle.path_to_mor_parquet(),
+                [
+                    ("hoodie.read.file.group.reader.version", "1"),
+                    (SCHEMA_FORCE_VIEW_TYPES, view),
+                ],
+            )
+            .await
+            .unwrap();
+            let ctx = SessionContext::new();
+            ctx.register_table("t", Arc::new(ds)).unwrap();
+            let batches = ctx
+                .sql("SELECT * FROM t ORDER BY id")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            let names: Vec<String> = batches
+                .iter()
+                .flat_map(|b| hudi_test::util::get_str_column(b, "name"))
+                .map(str::to_string)
+                .collect();
+            assert!(!names.is_empty(), "view types {view}");
+        }
     }
 }

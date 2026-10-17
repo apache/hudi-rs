@@ -24,8 +24,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use arrow_array::RecordBatch;
-use arrow_schema::SchemaRef;
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
@@ -160,6 +160,89 @@ impl HudiScanExec {
     pub(crate) fn read_options(&self) -> &ReadOptions {
         &self.read_options
     }
+}
+
+/// Cast the string and binary columns of `batch` to the view types `schema`
+/// declares for them; every other column passes through as the reader made it.
+///
+/// Columns are matched by position, since the reader produced this batch for
+/// this projection, so a column is cast only when its name matches the declared
+/// one: casting across a misaligned position would hide the misalignment. Each
+/// field keeps the batch's nullability, because a meta field the table does not
+/// populate is declared non-nullable yet read back as nulls.
+fn cast_batch_to_schema(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
+    let to_view = |from: &DataType, to: &DataType| {
+        matches!(
+            (from, to),
+            (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
+                | (
+                    DataType::Binary | DataType::LargeBinary,
+                    DataType::BinaryView
+                )
+        )
+    };
+    let needs_cast = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .any(|(col, declared)| to_view(col.data_type(), declared.data_type()));
+    if !needs_cast {
+        return Ok(batch);
+    }
+    let batch_schema = batch.schema();
+    let mut fields: Vec<FieldRef> = Vec::with_capacity(batch.num_columns());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (i, (actual, col)) in batch_schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .enumerate()
+    {
+        let Some(declared) = schema
+            .fields()
+            .get(i)
+            .filter(|declared| to_view(col.data_type(), declared.data_type()))
+        else {
+            fields.push(actual.clone());
+            columns.push(col.clone());
+            continue;
+        };
+        if actual.name() != declared.name() {
+            return Err(Execution(format!(
+                "Batch column '{}' does not match the declared column '{}' at the same position",
+                actual.name(),
+                declared.name()
+            )));
+        }
+        let cast = arrow::compute::cast(col, declared.data_type()).map_err(|e| {
+            Execution(format!(
+                "Failed to cast column '{}' from {} to {}: {e}",
+                actual.name(),
+                col.data_type(),
+                declared.data_type()
+            ))
+        })?;
+        fields.push(Arc::new(
+            actual
+                .as_ref()
+                .clone()
+                .with_data_type(declared.data_type().clone()),
+        ));
+        columns.push(cast);
+    }
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new_with_metadata(
+            fields,
+            batch_schema.metadata().clone(),
+        )),
+        columns,
+        &arrow_array::RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+    )
+    .map_err(|e| {
+        Execution(format!(
+            "Failed to rebuild batch in the declared schema: {e}"
+        ))
+    })
 }
 
 struct LimitBatchStream {
@@ -327,6 +410,9 @@ impl ExecutionPlan for HudiScanExec {
 
         let reader = self.file_group_reader.clone();
         let options = self.read_options.clone();
+        // The reader yields string and binary columns in their storage types
+        // while the plan may declare view types for them.
+        let declared = projected_schema.clone();
         // The plan-time budget cannot see what else is running. Registering with
         // the pool lets this scan account for what it is about to hold and, when
         // the pool is already under pressure, read fewer slices at once instead
@@ -351,6 +437,7 @@ impl ExecutionPlan for HudiScanExec {
                 let file_slice = file_slices[idx].clone();
                 let reader = reader.clone();
                 let options = options.clone();
+                let declared = declared.clone();
                 async move {
                     let inner_stream =
                         reader
@@ -358,7 +445,11 @@ impl ExecutionPlan for HudiScanExec {
                             .await
                             .map_err(|e| external_error("Failed to read file slice", e))?;
                     Ok::<_, DataFusionError>(
-                        inner_stream.map_err(|e| external_error("Failed to read batch", e)),
+                        inner_stream
+                            .map_err(|e| external_error("Failed to read batch", e))
+                            .and_then(move |batch| {
+                                futures::future::ready(cast_batch_to_schema(batch, &declared))
+                            }),
                     )
                 }
             })
@@ -695,6 +786,109 @@ mod tests {
 
         assert!(matches!(stats.num_rows, Precision::Absent));
         assert_eq!(stats.total_byte_size, Precision::Inexact(500));
+    }
+
+    /// Only a string or binary column declared as a view type is cast, and only
+    /// under its own name; any other difference passes through as the reader
+    /// made it.
+    #[test]
+    fn cast_batch_to_schema_casts_only_same_named_string_columns_to_views() {
+        use arrow_array::{Int32Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+
+        let declared = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8View, true),
+        ]));
+        let cast = cast_batch_to_schema(batch.clone(), &declared).unwrap();
+        assert_eq!(cast.schema(), declared);
+        assert_eq!(
+            cast.column(1)
+                .as_any()
+                .downcast_ref::<arrow_array::StringViewArray>()
+                .unwrap()
+                .value(1),
+            "b"
+        );
+
+        let misaligned = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("title", DataType::Utf8View, true),
+        ]));
+        let err = cast_batch_to_schema(batch.clone(), &misaligned)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not match the declared column"), "{err}");
+
+        let widened = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8View, true),
+        ]));
+        let cast = cast_batch_to_schema(batch.clone(), &widened).unwrap();
+        assert_eq!(cast.schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(cast.schema().field(1).data_type(), &DataType::Utf8View);
+
+        let no_views = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let untouched = cast_batch_to_schema(batch.clone(), &no_views).unwrap();
+        assert_eq!(untouched.schema(), batch.schema());
+
+        let id_as_view = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8View, false),
+            Field::new("name", DataType::Utf8View, true),
+        ]));
+        let cast = cast_batch_to_schema(batch.clone(), &id_as_view).unwrap();
+        assert_eq!(cast.schema().field(0).data_type(), &DataType::Int32);
+        assert_eq!(cast.schema().field(1).data_type(), &DataType::Utf8View);
+
+        let wider = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8View, true),
+            Field::new("extra", DataType::Utf8View, true),
+        ]));
+        let cast = cast_batch_to_schema(batch, &wider).unwrap();
+        assert_eq!(cast.num_columns(), 2);
+        assert_eq!(cast.schema().field(1).data_type(), &DataType::Utf8View);
+    }
+
+    /// A meta field the table does not populate is declared non-nullable but
+    /// read back with nulls; only its type may change, not its nullability.
+    #[test]
+    fn cast_batch_to_schema_keeps_the_batch_nullability() {
+        use arrow_array::StringArray;
+        use arrow_schema::{DataType, Field, Schema};
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "_hoodie_commit_time",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![None::<&str>, Some("1")]))],
+        )
+        .unwrap();
+        let declared = Arc::new(Schema::new(vec![Field::new(
+            "_hoodie_commit_time",
+            DataType::Utf8View,
+            false,
+        )]));
+
+        let cast = cast_batch_to_schema(batch, &declared).unwrap();
+        assert_eq!(cast.schema().field(0).data_type(), &DataType::Utf8View);
+        assert!(cast.schema().field(0).is_nullable());
+        assert_eq!(cast.column(0).null_count(), 1);
     }
 
     #[tokio::test]
