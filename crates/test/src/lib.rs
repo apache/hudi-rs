@@ -17,7 +17,7 @@
  * under the License.
  */
 
-use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch, StringArray};
+use arrow_array::{BooleanArray, Float64Array, Int32Array, RecordBatch};
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -464,18 +464,8 @@ pub enum QuickstartTripsTable {
 
 impl QuickstartTripsTable {
     pub fn uuid_rider_and_fare(record_batch: &RecordBatch) -> Vec<(String, String, f64)> {
-        let uuids = record_batch
-            .column_by_name("uuid")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let riders = record_batch
-            .column_by_name("rider")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let uuids = util::str_values(record_batch.column_by_name("uuid").unwrap().as_ref());
+        let riders = util::str_values(record_batch.column_by_name("rider").unwrap().as_ref());
         let fares = record_batch
             .column_by_name("fare")
             .unwrap()
@@ -484,16 +474,10 @@ impl QuickstartTripsTable {
             .unwrap();
 
         uuids
-            .iter()
-            .zip(riders.iter())
+            .into_iter()
+            .zip(riders)
             .zip(fares.iter())
-            .map(|((uuid, rider), fare)| {
-                (
-                    uuid.unwrap().to_string(),
-                    rider.unwrap().to_string(),
-                    fare.unwrap(),
-                )
-            })
+            .map(|((uuid, rider), fare)| (uuid.to_string(), rider.to_string(), fare.unwrap()))
             .collect()
     }
     fn zip_path(&self, table_type: &str, log_format: Option<&str>) -> Box<Path> {
@@ -631,12 +615,7 @@ impl SampleTable {
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
-        let names = record_batch
-            .column_by_name("name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let names = util::str_values(record_batch.column_by_name("name").unwrap().as_ref());
         let is_actives = record_batch
             .column_by_name("isActive")
             .unwrap()
@@ -646,9 +625,9 @@ impl SampleTable {
 
         let mut data: Vec<(i32, &str, bool)> = ids
             .iter()
-            .zip(names.iter())
+            .zip(names)
             .zip(is_actives.iter())
-            .map(|((id, name), is_active)| (id.unwrap(), name.unwrap(), is_active.unwrap()))
+            .map(|((id, name), is_active)| (id.unwrap(), name, is_active.unwrap()))
             .collect();
         data.sort_unstable_by_key(|(id, _, _)| *id);
         data
