@@ -807,15 +807,16 @@ impl FileGroupReader {
             .as_ref()
             .and_then(|f| f.file_metadata.as_ref())
             .map(|metadata| metadata.size);
-        let layout = self
+        let spans = self
             .reader_for_path(&base_file_path)?
-            .row_group_layout(&base_file_path, known_size)
+            .row_group_spans(&base_file_path, known_size)
             .await
             .map_err(|e| {
                 ReadFileSliceError(format!(
                     "Failed to read the row groups of base file '{base_file_path}': {e:?}"
                 ))
             })?;
+        let layout: Vec<(u64, u64)> = spans.iter().map(|span| (span.rows, span.bytes)).collect();
         Ok(BaseFileRange::split(&layout, parts))
     }
 
@@ -856,11 +857,7 @@ impl FileGroupReader {
                     .read_file_slice_from_paths(base_file_path, log_file_paths, options)
                     .await;
             }
-            ByteSplit::Nothing => {
-                return Ok(RecordBatch::new_empty(
-                    self.resolved_data_schema(base_file_path).await?,
-                ));
-            }
+            ByteSplit::Nothing => return self.empty_split_batch(base_file_path, options).await,
             ByteSplit::RowGroups(range) => range,
         };
         let mut stream = self
@@ -878,10 +875,20 @@ impl FileGroupReader {
         }
         match batches.first() {
             Some(first) => Ok(arrow::compute::concat_batches(&first.schema(), &batches)?),
-            None => Ok(RecordBatch::new_empty(
-                self.resolved_data_schema(base_file_path).await?,
-            )),
+            None => self.empty_split_batch(base_file_path, options).await,
         }
+    }
+
+    /// The batch a split that selects no rows returns: the slice's data schema,
+    /// narrowed to the read's projection like a split with rows would be.
+    async fn empty_split_batch(
+        &self,
+        base_file_path: &str,
+        options: &ReadOptions,
+    ) -> Result<RecordBatch> {
+        let options = self.resolve_read_options(options)?;
+        let empty = RecordBatch::new_empty(self.resolved_data_schema(base_file_path).await?);
+        project_batch_by_names(empty, options.projection.as_deref())
     }
 
     /// Streaming version of [`FileGroupReader::read_file_slice_from_paths_split`].
@@ -3214,6 +3221,16 @@ mod range_read_tests {
         start: u64,
         length: u64,
     ) -> Result<RecordBatch> {
+        split_read_with(reader, slice, &ReadOptions::new(), start, length).await
+    }
+
+    async fn split_read_with(
+        reader: &FileGroupReader,
+        slice: &FileSlice,
+        options: &ReadOptions,
+        start: u64,
+        length: u64,
+    ) -> Result<RecordBatch> {
         let base = slice.base_file_relative_path().unwrap().unwrap_or_default();
         let logs: Vec<String> = slice
             .log_files
@@ -3221,7 +3238,7 @@ mod range_read_tests {
             .map(|log| slice.log_file_relative_path(log).unwrap())
             .collect();
         reader
-            .read_file_slice_from_paths_split(&base, logs, &ReadOptions::new(), start, length)
+            .read_file_slice_from_paths_split(&base, logs, options, start, length)
             .await
     }
 
@@ -3281,6 +3298,17 @@ mod range_read_tests {
             whole.schema().fields().len(),
             "an empty split still carries the slice's columns"
         );
+
+        // A projected read narrows the empty split like it narrows a split with rows.
+        let projected = ReadOptions::new().with_projection(["fare"]);
+        let empty = split_read_with(&reader, &slice, &projected, size - 8, 8)
+            .await
+            .unwrap();
+        let half = split_read_with(&reader, &slice, &projected, 0, size / 2)
+            .await
+            .unwrap();
+        assert_eq!(empty.schema().fields().len(), 1);
+        assert_eq!(empty.schema(), half.schema());
     }
 
     #[tokio::test]

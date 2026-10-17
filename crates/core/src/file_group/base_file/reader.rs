@@ -308,24 +308,14 @@ pub trait BaseFileReader: Send + Sync {
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>>;
 
     /// The file's row groups with their byte offsets, in file order, for a reader
-    /// handed a byte-range split of the file. Empty for a format that has no such
-    /// unit, which leaves the file read whole.
+    /// that splits one file across several readers or is handed a byte-range
+    /// split of it. Empty for a format that has no such unit, which leaves the
+    /// file read whole.
     fn row_group_spans<'a>(
         &'a self,
         _relative_path: &'a str,
         _known_file_size: Option<u64>,
     ) -> BoxFuture<'a, Result<Vec<RowGroupSpan>>> {
-        Box::pin(async { Ok(Vec::new()) })
-    }
-
-    /// The file's row groups as `(rows, bytes)` in file order, for a reader that
-    /// splits one file across several readers. Empty for a format that has no
-    /// such unit, which leaves the file read whole.
-    fn row_group_layout<'a>(
-        &'a self,
-        _relative_path: &'a str,
-        _known_file_size: Option<u64>,
-    ) -> BoxFuture<'a, Result<Vec<(u64, u64)>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
 }

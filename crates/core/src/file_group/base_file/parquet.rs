@@ -345,39 +345,16 @@ impl BaseFileReader for ParquetBaseFileReader {
                     start: group
                         .columns()
                         .iter()
-                        .map(|column| column.byte_range().0)
+                        .map(|column| {
+                            column
+                                .dictionary_page_offset()
+                                .unwrap_or_else(|| column.data_page_offset())
+                                .max(0) as u64
+                        })
                         .min()
                         .unwrap_or(0),
                     bytes: group.compressed_size().max(0) as u64,
                     rows: group.num_rows().max(0) as u64,
-                })
-                .collect())
-        })
-    }
-
-    fn row_group_layout<'a>(
-        &'a self,
-        relative_path: &'a str,
-        known_file_size: Option<u64>,
-    ) -> BoxFuture<'a, Result<Vec<(u64, u64)>>> {
-        Box::pin(async move {
-            let builder = match known_file_size {
-                Some(size) => {
-                    let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
-                    let obj_path = ObjPath::from_url_path(obj_url.path())?;
-                    self.open_builder_with_size(obj_path, size, None).await?
-                }
-                None => self.open_builder(relative_path, None).await?,
-            };
-            Ok(builder
-                .metadata()
-                .row_groups()
-                .iter()
-                .map(|group| {
-                    (
-                        group.num_rows().max(0) as u64,
-                        group.compressed_size().max(0) as u64,
-                    )
                 })
                 .collect())
         })

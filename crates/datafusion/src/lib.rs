@@ -62,8 +62,9 @@ use hudi_core::file_group::reader::FileGroupReader;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
 
-/// The session's file repartitioning settings, which the merge-on-read scan
-/// honours the way DataFusion's parquet scan does.
+/// The session's file repartitioning settings, read by the merge-on-read scan:
+/// `enabled` turns slice cutting off, and the size is a floor on each range's
+/// bytes (DataFusion applies it to the whole scan instead).
 #[derive(Debug, Clone, Copy, Default)]
 struct FileRepartition {
     enabled: bool,
@@ -804,14 +805,12 @@ impl HudiDataSource {
         )))
     }
 
-    /// The scan's memory budget, when the table or read set one.
-    ///
-    /// Absent means the concurrency knob stands on its own, which is the
-    /// behaviour every existing table keeps.
     /// Spread file slices over the scan's partitions when there are fewer slices
-    /// than partitions, the way DataFusion's parquet scan splits a file by byte
+    /// than partitions, much as DataFusion's parquet scan splits a file by byte
     /// range. A slice is cut along its base file's row groups, into about its
-    /// share of the partitions by size. A slice with log files can only be cut
+    /// share of the partitions by size; the session's `repartition_file_scans`
+    /// turns this off, and `repartition_file_min_size` is applied as a floor on
+    /// each range's bytes rather than, as DataFusion does, on the whole scan. A slice with log files can only be cut
     /// when the merge matches log records to base rows by position
     /// (`hoodie.merge.use.record.positions`) or when the read leaves the logs out.
     async fn scan_units(
@@ -888,6 +887,10 @@ impl HudiDataSource {
         Ok(units.into_iter().flatten().collect())
     }
 
+    /// The scan's memory budget, when the table or read set one.
+    ///
+    /// Absent means the concurrency knob stands on its own, which is the
+    /// behaviour every existing table keeps.
     fn scan_max_memory_size(&self) -> Option<u64> {
         self.table
             .hudi_configs

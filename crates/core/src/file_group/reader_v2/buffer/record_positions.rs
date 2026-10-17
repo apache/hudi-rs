@@ -53,13 +53,8 @@ use crate::error::CoreError;
 /// stripped before the merged output — it never appears in the reader's output.
 pub const ROW_INDEX_TEMPORARY_COLUMN_NAME: &str = "_tmp_metadata_row_index";
 
-/// Decode the Base64 + portable-Roaring64 `RECORD_POSITIONS` header value into
-/// its record positions, in ascending order (the bitmap iteration order).
-///
-/// # Errors
-///
-/// Returns [`CoreError::LogBlockError`] if the value is not valid Base64 or not
-/// a valid portable Roaring64 bitmap.
+/// Encode record positions as the Base64 + portable-Roaring64 `RECORD_POSITIONS`
+/// header value, the inverse of [`decode_record_positions`].
 pub fn encode_record_positions<I: IntoIterator<Item = u64>>(positions: I) -> String {
     let bitmap: RoaringTreemap = positions.into_iter().collect();
     let mut bytes = Vec::new();
@@ -69,6 +64,13 @@ pub fn encode_record_positions<I: IntoIterator<Item = u64>>(positions: I) -> Str
     STANDARD.encode(bytes)
 }
 
+/// Decode the Base64 + portable-Roaring64 `RECORD_POSITIONS` header value into
+/// its record positions, in ascending order (the bitmap iteration order).
+///
+/// # Errors
+///
+/// Returns [`CoreError::LogBlockError`] if the value is not valid Base64 or not
+/// a valid portable Roaring64 bitmap.
 pub fn decode_record_positions(encoded: &str) -> Result<Vec<u64>> {
     let bytes = STANDARD.decode(encoded.trim()).map_err(|e| {
         CoreError::LogBlockError(format!("RECORD_POSITIONS header is not valid base64: {e}"))

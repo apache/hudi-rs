@@ -78,6 +78,7 @@ pub(crate) async fn read_file_slice(
 /// Same merge as [`read_file_slice`], but the base file is decoded one row group
 /// at a time instead of whole, so peak memory tracks a row group rather than the
 /// file. Arguments carry the same meaning.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_file_slice_stream(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,

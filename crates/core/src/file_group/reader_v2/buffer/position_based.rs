@@ -389,7 +389,7 @@ impl PositionBasedFileGroupRecordBuffer {
     }
 }
 
-/// Read the base row's physical position from the row-index column.
+/// Records a block holds, data and delete rows alike.
 fn block_record_count(block: &LogBlock) -> usize {
     match &block.content {
         LogBlockContent::Records(batches) => batches.num_data_rows() + batches.num_delete_rows(),
@@ -398,6 +398,7 @@ fn block_record_count(block: &LogBlock) -> usize {
     }
 }
 
+/// Read the base row's physical position from the row-index column.
 fn position_at(base_batch: &RecordBatch, row_idx: usize) -> Result<u64> {
     let arr = base_row_position_array(base_batch)?;
     let raw = arr.value(row_idx);
