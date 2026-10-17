@@ -396,14 +396,14 @@ Each hudi-rs release targets one DataFusion major, and with it one arrow major. 
 crate's `TableProvider` and the Python `hudi[datafusion]` extra both have to match the DataFusion
 version of the application they plug into, so pick the hudi-rs release that pairs with yours.
 Readers that take Arrow data out through the C data interface (Python `read()`, the C++ and JVM
-bindings) are not tied to these versions.
+bindings) are not tied to these versions. The `hudi[datafusion]` extra first shipped in 0.5.
 
 | hudi-rs | DataFusion | arrow | Python `datafusion` package |
 |---------|------------|-------|-----------------------------|
 | 0.6 (unreleased) | 55 | 59 | `>=55.0.0,<56` |
 | 0.5 | 54 | 58 | `>=54.0.0,<55` |
-| 0.4 | 46 | 54 | `>=46.0.0,<47` |
-| 0.3 | 43 | 53 | `>=43.0.0,<44` |
+| 0.4 | 46 | 54 | not available |
+| 0.3 | 43 | 53 | not available |
 
 On macOS arm64, a debug build of an application that links `hudi` with the `datafusion` feature
 can fail with `ld: B/BL out of range ... (max +/-128MB)`: unoptimized dependencies push the

@@ -420,7 +420,7 @@ impl HudiDataSource {
             Some(format) => matches!(format, BaseFileFormatValue::Parquet),
             None => Self::file_slices_are_parquet(file_slices)?,
         };
-        if !parquet_base_files {
+        if !parquet_base_files || !Self::file_slices_have_sizes(file_slices) {
             return Ok(false);
         }
         if !self.table.is_mor() {
@@ -429,6 +429,19 @@ impl HudiDataSource {
         read_options
             .is_read_optimized()
             .map_err(|e| external_error("Invalid read-optimized option", e))
+    }
+
+    /// Whether every base file carries its size. The parquet source needs it:
+    /// DataFusion reads the footer at the size it is given, and its file-group
+    /// repartitioner assigns a zero-length file to no partition at all, so a
+    /// slice without one goes through `HudiScanExec`, which looks the size up.
+    fn file_slices_have_sizes(file_slices: &[FileSlice]) -> bool {
+        file_slices.iter().all(|slice| {
+            slice
+                .base_file
+                .as_ref()
+                .is_none_or(|base_file| base_file.file_metadata.is_some())
+        })
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -1099,6 +1112,30 @@ mod tests {
     #[test]
     fn test_file_slices_are_parquet_empty_is_false() {
         assert!(!HudiDataSource::file_slices_are_parquet(&[]).unwrap());
+    }
+
+    #[test]
+    fn test_file_slices_have_sizes_requires_metadata_on_every_base_file() {
+        use hudi_core::file_group::base_file::BaseFile;
+        use hudi_core::storage::file_metadata::FileMetadata;
+        use std::str::FromStr;
+
+        let name = "0832997e-30d8-4a42-a52d-e2c540816593-0_0-43-78_20261016221427272.parquet";
+        let sized = {
+            let mut base_file = BaseFile::from_str(name).unwrap();
+            base_file.file_metadata = Some(FileMetadata::new(name.to_string(), 4096));
+            FileSlice::new(base_file, "city=sf".to_string())
+        };
+        let without_size = FileSlice::new(BaseFile::from_str(name).unwrap(), "city=sf".to_string());
+
+        assert!(HudiDataSource::file_slices_have_sizes(&[]));
+        assert!(HudiDataSource::file_slices_have_sizes(
+            std::slice::from_ref(&sized)
+        ));
+        assert!(!HudiDataSource::file_slices_have_sizes(&[
+            sized,
+            without_size
+        ]));
     }
 
     #[tokio::test]
