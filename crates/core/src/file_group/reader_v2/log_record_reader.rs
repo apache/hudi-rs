@@ -454,6 +454,15 @@ pub struct BaseHoodieLogRecordReader {
     /// in which case Gate 3 is a no-op. Populated by `Table` from the active timeline
     /// (completed + pending instant sets + the first active instant).
     pub completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
+    /// The part of the base file this reader merges, when the slice is read in
+    /// ranges, with the base file's instant. See [`Self::positions_within`].
+    pub base_file_range: Option<crate::file_group::reader_v2::input_split::BaseFileRange>,
+    pub base_file_instant: Option<String>,
+    /// Set once the scan has seen every block's header: the positions whose
+    /// records this reader decodes, when every data and delete block carries
+    /// positions relative to the base file. Otherwise every block is decoded
+    /// whole and the merge buffer sorts out the fallback.
+    pub positions_within: Option<std::ops::Range<u64>>,
 
     // ── Stats / state (mirrors Java's AtomicLong counters + progress) ──
     pub valid_block_instants: Vec<String>,
@@ -582,6 +591,7 @@ impl BaseHoodieLogRecordReader {
             while let Some(block) = pass2.current_instant_log_blocks.pop_back() {
                 ordered.push(block);
             }
+            self.positions_within = self.positions_to_decode(&ordered);
             profile_once!(
                 self.merge_insert_us,
                 self.fetch_and_merge_windows(&hudi_configs, &mut ordered)
@@ -849,6 +859,36 @@ impl BaseHoodieLogRecordReader {
         }
     }
 
+    /// The positions this reader decodes records at, when it reads a base file
+    /// range and every block the merge will consume carries positions relative
+    /// to the base file. One block without them means the merge will be by key,
+    /// which needs every record, so nothing is skipped. An HFile data block is
+    /// never narrowed, since its records are not length-prefixed, so one in the
+    /// log turns skipping off as well.
+    pub(super) fn positions_to_decode(&self, ordered: &[LogBlock]) -> Option<std::ops::Range<u64>> {
+        let range = self.base_file_range.as_ref()?;
+        let base_instant = self.base_file_instant.as_deref()?;
+        let complete = ordered
+            .iter()
+            .filter(|block| {
+                matches!(
+                    block.block_type,
+                    BlockType::AvroData
+                        | BlockType::ParquetData
+                        | BlockType::HfileData
+                        | BlockType::Delete
+                )
+            })
+            .all(|block| {
+                block.block_type != BlockType::HfileData
+                    && block.base_file_instant_time_of_positions() == Some(base_instant)
+                    && block
+                        .record_positions_header()
+                        .is_some_and(|header| !header.is_empty())
+            });
+        complete.then(|| range.positions.clone())
+    }
+
     /// The decoder Pass 3 inflates a window's blocks with.
     ///
     /// The same settings the sweep would have decoded with, so an inflated block
@@ -859,6 +899,10 @@ impl BaseHoodieLogRecordReader {
         crate::file_group::log_file::content::Decoder::new(Arc::new(
             crate::config::HudiConfigs::new(self.reader_context.table_config.clone()),
         ))
+        .with_positions_within(
+            self.positions_within.clone(),
+            self.base_file_instant.clone(),
+        )
         // The merge buffer takes Arrow and nothing else, so an HFile block's
         // records are decoded rather than handed over as key-value pairs.
         .with_hfile_as_records(true)

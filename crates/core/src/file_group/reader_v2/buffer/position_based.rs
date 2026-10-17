@@ -63,9 +63,11 @@ use crate::file_group::reader_v2::buffer::row_extraction::records_to_batch;
 use crate::file_group::reader_v2::buffer::spillable_map::{SpillConfig, SpillableRecordMap};
 use crate::file_group::reader_v2::buffer::{BufferType, HoodieFileGroupRecordBuffer};
 use crate::file_group::reader_v2::buffered_record::{BufferedRecord, DeleteRecord};
+use crate::file_group::reader_v2::input_split::BaseFileRange;
 use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::update_processor::UpdateStats;
+use roaring::RoaringTreemap;
 
 /// A merge buffer that matches base rows to log records by base-file row
 /// position. See the module docs. Wraps a [`KeyBasedFileGroupRecordBuffer`] and
@@ -92,6 +94,19 @@ pub struct PositionBasedFileGroupRecordBuffer {
     /// Position-only deletes retained across a fallback (see
     /// [`needs_hybrid_strategy`](Self::needs_hybrid_strategy)).
     hybrid_deletes: HashMap<u64, BufferedRecord>,
+    /// The base rows this reader covers, when the slice is read in ranges.
+    ///
+    /// Ranges after the first keep only the log records addressed at their
+    /// rows. The first range keeps every record so that it can take over the
+    /// whole slice when a block without positions forces a key-based merge,
+    /// and drops the records addressed elsewhere once the merge begins.
+    range: Option<BaseFileRange>,
+    /// Positions the first range ingested on behalf of the other ranges, to be
+    /// removed before the log-only inserts are drained.
+    foreign_positions: RoaringTreemap,
+    /// Set when this range reader fell back to a key-based merge and the first
+    /// range owns the whole slice; the rest of the log scan is skipped.
+    deferred: bool,
 }
 
 impl PositionBasedFileGroupRecordBuffer {
@@ -104,6 +119,7 @@ impl PositionBasedFileGroupRecordBuffer {
         merge_mode: String,
         emit_delete: bool,
         base_file_instant_time: String,
+        range: Option<BaseFileRange>,
     ) -> Result<Self> {
         let inner = KeyBasedFileGroupRecordBuffer::new(reader_context, merge_mode, emit_delete)?;
         Ok(Self {
@@ -112,7 +128,41 @@ impl PositionBasedFileGroupRecordBuffer {
             should_use_position: true,
             needs_hybrid_strategy: false,
             hybrid_deletes: HashMap::new(),
+            range,
+            foreign_positions: RoaringTreemap::new(),
+            deferred: false,
         })
+    }
+
+    /// Whether a log record at `position` is ingested by this reader. Ranges
+    /// after the first take only their own rows; the first takes every row and
+    /// remembers the ones it holds for the others. See [`Self::range`].
+    fn ingests_position(&mut self, position: u64) -> bool {
+        match &self.range {
+            None => true,
+            Some(range) if range.owns_position(position) => true,
+            Some(range) if range.is_first() => {
+                self.foreign_positions.insert(position);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Drop the records the first range ingested for rows that other ranges
+    /// merge, so they are not drained as log-only inserts here.
+    fn prune_records_outside_range(&mut self) -> Result<()> {
+        if !self.should_use_position {
+            return Ok(());
+        }
+        let foreign = std::mem::take(&mut self.foreign_positions);
+        for position in foreign.iter() {
+            self.inner
+                .base
+                .records
+                .remove(&Self::position_key(position))?;
+        }
+        Ok(())
     }
 
     /// The map key for a base-file position: its decimal string. Positions and
@@ -151,7 +201,9 @@ impl PositionBasedFileGroupRecordBuffer {
                 // because the Hudi writer emits records within a block in
                 // ascending base-position order.
                 let positions = decode_record_positions(encoded)?;
-                if positions.is_empty() {
+                // A block narrowed to a base file range can be left with no
+                // records at all; it still merges by position, with nothing to do.
+                if positions.is_empty() && block_record_count(block) > 0 {
                     Ok(None)
                 } else {
                     Ok(Some(positions))
@@ -169,6 +221,17 @@ impl PositionBasedFileGroupRecordBuffer {
             return Ok(());
         }
         self.should_use_position = false;
+
+        if matches!(&self.range, Some(range) if !range.is_first()) {
+            // Only part of the log was kept, so this reader cannot merge by key;
+            // the first range reads the whole slice. Release what was buffered.
+            self.deferred = true;
+            self.inner.base.records = SpillableRecordMap::with_config(SpillConfig::from_config(
+                &self.inner.reader_context.hoodie_reader_config,
+            )?);
+            return Ok(());
+        }
+        self.foreign_positions.clear();
 
         // Rebuild the (possibly-spilled) position-keyed map as a record-key-keyed
         // map. `drain_iter` yields values; the position keys are dropped.
@@ -270,6 +333,7 @@ impl PositionBasedFileGroupRecordBuffer {
                 return Ok(true);
             }
         }
+        self.prune_records_outside_range()?;
         self.inner.base.has_next_log_record()
     }
 
@@ -325,6 +389,15 @@ impl PositionBasedFileGroupRecordBuffer {
     }
 }
 
+/// Records a block holds, data and delete rows alike.
+fn block_record_count(block: &LogBlock) -> usize {
+    match &block.content {
+        LogBlockContent::Records(batches) => batches.num_data_rows() + batches.num_delete_rows(),
+        LogBlockContent::HFileRecords(records) => records.len(),
+        LogBlockContent::Empty => 0,
+    }
+}
+
 /// Read the base row's physical position from the row-index column.
 fn position_at(base_batch: &RecordBatch, row_idx: usize) -> Result<u64> {
     let arr = base_row_position_array(base_batch)?;
@@ -346,6 +419,9 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn process_data_block(&mut self, block: &mut LogBlock) -> Result<()> {
+        if self.deferred {
+            return Ok(());
+        }
         if !self.should_use_position {
             return self.inner.process_data_block(block);
         }
@@ -384,6 +460,9 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                         ))
                     })?;
                     pos_idx += 1;
+                    if !self.ingests_position(position) {
+                        continue;
+                    }
                     self.inner
                         .process_next_data_record(record, &Self::position_key(position))?;
                 }
@@ -403,6 +482,9 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn process_delete_block(&mut self, block: &mut LogBlock) -> Result<()> {
+        if self.deferred {
+            return Ok(());
+        }
         if !self.should_use_position {
             return self.inner.process_delete_block(block);
         }
@@ -432,6 +514,9 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                         ))
                     })?;
                     pos_idx += 1;
+                    if !self.ingests_position(position) {
+                        continue;
+                    }
                     // Java sets the record key on the delete so a later fallback
                     // can re-key it; `DeleteRecord` carries it, and
                     // `process_next_deleted_record` keys the map by position.
@@ -605,6 +690,9 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        if self.inner.base.log_drain_iter.is_none() {
+            self.prune_records_outside_range()?;
+        }
         self.inner.drain_log_only_inserts(target_schema)
     }
 }
@@ -829,6 +917,7 @@ mod tests {
             merge_mode.to_string(),
             false,
             BASE_INSTANT.to_string(),
+            None,
         )
         .unwrap()
     }

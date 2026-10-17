@@ -168,6 +168,11 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
             .map(|v| v.eq_ignore_ascii_case("skip_merge"))
             .unwrap_or(false);
 
+        let merges_by_position = reader_parameters.use_record_position
+            && input_split.base_file_path.is_some()
+            && input_split.base_file_commit_time.is_some()
+            && base_file_is_parquet(&reader_context.base_file_format);
+
         let record_buffer: Box<dyn HoodieFileGroupRecordBuffer> = if is_skip_merge {
             return Err(crate::error::CoreError::Unsupported(
                 "UnmergedFileGroupRecordBuffer (skip_merge mode) is not yet implemented"
@@ -178,11 +183,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
                 "SortedKeyBasedFileGroupRecordBuffer (sort_output mode) is not yet implemented"
                     .to_string(),
             ));
-        } else if reader_parameters.use_record_position
-            && input_split.base_file_path.is_some()
-            && input_split.base_file_commit_time.is_some()
-            && base_file_is_parquet(&reader_context.base_file_format)
-        {
+        } else if merges_by_position {
             // Position-based merge: match base rows to log records by base-file
             // row position (Java PositionBasedFileGroupRecordBuffer). This gate
             // MUST match HoodieFileGroupReader::use_record_position() (which
@@ -212,6 +213,7 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
                 merge_mode,
                 reader_parameters.emit_delete,
                 base_file_instant_time,
+                input_split.base_file_range.clone(),
             )?)
         } else if reader_parameters.emit_delete {
             // Java's emitDeletes path synthesizes a delete row
@@ -234,12 +236,20 @@ impl FileGroupRecordBufferLoader for DefaultFileGroupRecordBufferLoader {
         };
 
         // STEP: scanLogFiles — build and run HoodieMergedLogRecordReader
+        // Only a merge by position can leave out the log records addressed at
+        // other ranges of the base file; a merge by key needs them all.
+        let range_for_positions = if merges_by_position {
+            input_split.base_file_range.clone()
+        } else {
+            None
+        };
         let (mut populated_buffer, valid_block_instants, stats) = scan_log_files(
             reader_context,
             storage,
             input_split,
             record_buffer,
             reader_parameters,
+            range_for_positions,
         )
         .await?;
 
@@ -289,6 +299,7 @@ async fn scan_log_files(
     input_split: &InputSplit,
     record_buffer: Box<dyn HoodieFileGroupRecordBuffer>,
     reader_parameters: &ReaderParameters,
+    range_for_positions: Option<crate::file_group::reader_v2::input_split::BaseFileRange>,
 ) -> Result<(
     Box<dyn HoodieFileGroupRecordBuffer>,
     Vec<String>,
@@ -332,6 +343,10 @@ async fn scan_log_files(
         .with_record_buffer(record_buffer)
         .with_allow_inflight_instants(reader_parameters.allow_inflight_instants)
         .with_completion_gate_inputs(completion_gate_inputs)
+        .with_base_file_range(
+            range_for_positions,
+            input_split.base_file_commit_time.clone(),
+        )
         .with_force_full_scan(true)
         .build()
         .await?;
