@@ -120,6 +120,7 @@ fn filter_field_matches_partition_column(filter_field: &str, partition_column: &
 #[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
+    options: HashMap<String, String>,
     /// Cached table schema (with meta fields) for synchronous access in `TableProvider::schema()`.
     /// This provider is a construction-time metadata snapshot; create a new
     /// provider to observe schema/stat changes from later commits.
@@ -230,6 +231,7 @@ impl HudiDataSource {
             }
             None => default_file_slice_read_concurrency(),
         };
+        let options = all_options.iter().cloned().collect();
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| external_error("Failed to create Hudi table", e))?;
@@ -291,6 +293,7 @@ impl HudiDataSource {
 
         Ok(Self {
             table: Arc::new(table),
+            options,
             schema,
             partition_schema,
             cached_stats,
@@ -299,6 +302,16 @@ impl HudiDataSource {
             file_slice_read_concurrency,
             base_file_format,
         })
+    }
+
+    /// Returns the table location needed to reconstruct this provider.
+    pub fn base_uri(&self) -> String {
+        self.table.base_url().to_string()
+    }
+
+    /// Returns the caller-supplied options needed to reconstruct this provider.
+    pub fn options(&self) -> &HashMap<String, String> {
+        &self.options
     }
 
     fn get_input_partitions(&self) -> usize {
