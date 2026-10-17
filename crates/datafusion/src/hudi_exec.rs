@@ -42,8 +42,33 @@ use futures::{Stream, StreamExt};
 
 use crate::{external_error, inexact_usize_from_u64};
 use hudi_core::file_group::file_slice::FileSlice;
-use hudi_core::file_group::reader::FileGroupReader;
+use hudi_core::file_group::reader::{BaseFileRange, FileGroupReader};
 use hudi_core::table::ReadOptions;
+
+/// One unit of work in a scan partition: a whole file slice, or one range of
+/// its base file when a slice is spread across partitions.
+#[derive(Debug, Clone)]
+pub struct ScanUnit {
+    pub file_slice: FileSlice,
+    pub base_file_range: Option<BaseFileRange>,
+}
+
+impl ScanUnit {
+    pub fn whole(file_slice: FileSlice) -> Self {
+        Self {
+            file_slice,
+            base_file_range: None,
+        }
+    }
+
+    /// Whether this unit stands for its slice in counts and statistics, so a
+    /// slice read in ranges is counted once.
+    fn stands_for_slice(&self) -> bool {
+        self.base_file_range
+            .as_ref()
+            .is_none_or(BaseFileRange::is_first)
+    }
+}
 
 /// DataFusion execution plan that reads Hudi file slices through
 /// [`FileGroupReader`].
@@ -54,7 +79,7 @@ use hudi_core::table::ReadOptions;
 /// native `ParquetSource` path for row-group/page-level pruning.
 #[derive(Debug)]
 pub struct HudiScanExec {
-    file_slice_partitions: Vec<Arc<Vec<FileSlice>>>,
+    file_slice_partitions: Vec<Arc<Vec<ScanUnit>>>,
     file_group_reader: Arc<FileGroupReader>,
     read_options: ReadOptions,
     input_partitions: usize,
@@ -82,8 +107,11 @@ impl HudiScanExec {
     /// pool — and it would contradict `slices_in_flight`, which admits one slice
     /// in the same situation. The rule is the same in both places so that an
     /// unmeasured slice means one thing throughout the scan.
-    fn planned_slices(configured: usize, file_slices: &[FileSlice]) -> usize {
-        if file_slices.iter().any(|s| s.log_size_bytes().is_none()) {
+    fn planned_slices(configured: usize, file_slices: &[ScanUnit]) -> usize {
+        if file_slices
+            .iter()
+            .any(|u| u.file_slice.log_size_bytes().is_none())
+        {
             return 1;
         }
         configured.min(file_slices.len()).max(1)
@@ -107,7 +135,7 @@ impl HudiScanExec {
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        file_slice_partitions: Vec<Vec<FileSlice>>,
+        file_slice_partitions: Vec<Vec<ScanUnit>>,
         file_group_reader: Arc<FileGroupReader>,
         read_options: ReadOptions,
         input_partitions: usize,
@@ -128,7 +156,7 @@ impl HudiScanExec {
         // (DataFusion's planners typically expect at least one partition; some
         // operators panic on zero). `execute(0)` then returns an empty stream
         // via the `if file_slices.is_empty()` short-circuit below.
-        let partitions: Vec<Arc<Vec<FileSlice>>> = if file_slice_partitions.is_empty() {
+        let partitions: Vec<Arc<Vec<ScanUnit>>> = if file_slice_partitions.is_empty() {
             vec![Arc::new(vec![])]
         } else {
             file_slice_partitions.into_iter().map(Arc::new).collect()
@@ -235,7 +263,12 @@ impl Stream for BaselineMetricStream {
 
 impl DisplayAs for HudiScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let total_slices: usize = self.file_slice_partitions.iter().map(|p| p.len()).sum();
+        let total_slices: usize = self
+            .file_slice_partitions
+            .iter()
+            .flat_map(|p| p.iter())
+            .filter(|u| u.stands_for_slice())
+            .count();
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
@@ -337,9 +370,9 @@ impl ExecutionPlan for HudiScanExec {
         let planned = Self::planned_slices(self.file_slice_read_concurrency, &file_slices);
         let per_slice = file_slices
             .iter()
-            .map(|s| {
+            .map(|u| {
                 hudi_core::file_group::admission::estimated_slice_bytes(
-                    s.log_size_bytes().unwrap_or(0),
+                    u.file_slice.log_size_bytes().unwrap_or(0),
                 )
             })
             .max()
@@ -348,15 +381,23 @@ impl ExecutionPlan for HudiScanExec {
 
         let stream = stream::iter(0..file_slices.len())
             .map(move |idx| {
-                let file_slice = file_slices[idx].clone();
+                let unit = file_slices[idx].clone();
                 let reader = reader.clone();
                 let options = options.clone();
                 async move {
-                    let inner_stream =
-                        reader
-                            .read_file_slice_stream(&file_slice, &options)
-                            .await
-                            .map_err(|e| external_error("Failed to read file slice", e))?;
+                    let inner_stream = match &unit.base_file_range {
+                        Some(range) => {
+                            reader
+                                .read_file_slice_range_stream(&unit.file_slice, &options, range)
+                                .await
+                        }
+                        None => {
+                            reader
+                                .read_file_slice_stream(&unit.file_slice, &options)
+                                .await
+                        }
+                    }
+                    .map_err(|e| external_error("Failed to read file slice", e))?;
                     Ok::<_, DataFusionError>(
                         inner_stream.map_err(|e| external_error("Failed to read batch", e)),
                     )
@@ -393,7 +434,7 @@ impl ExecutionPlan for HudiScanExec {
         let column_statistics =
             vec![ColumnStatistics::new_unknown(); self.projected_schema.fields().len()];
 
-        let partitions: Box<dyn Iterator<Item = &[FileSlice]> + '_> = match partition {
+        let partitions: Box<dyn Iterator<Item = &[ScanUnit]> + '_> = match partition {
             None => Box::new(
                 self.file_slice_partitions
                     .iter()
@@ -439,15 +480,16 @@ impl HudiScanExec {
         column_statistics: Vec<ColumnStatistics>,
     ) -> Statistics
     where
-        I: IntoIterator<Item = &'a [FileSlice]>,
+        I: IntoIterator<Item = &'a [ScanUnit]>,
     {
         let mut total_rows: u64 = 0;
         let mut total_byte_size: u64 = 0;
         let mut have_row_estimate = false;
         let mut have_byte_estimate = false;
 
-        for slices in partitions {
-            for file_slice in slices {
+        for units in partitions {
+            for unit in units.iter().filter(|u| u.stands_for_slice()) {
+                let file_slice = &unit.file_slice;
                 if let Some(meta) = file_slice
                     .base_file
                     .as_ref()
@@ -569,7 +611,10 @@ mod memory_pool_tests {
             slice
         };
 
-        let measured = vec![slice_with(true), slice_with(true)];
+        let measured = vec![
+            ScanUnit::whole(slice_with(true)),
+            ScanUnit::whole(slice_with(true)),
+        ];
         assert_eq!(
             HudiScanExec::planned_slices(4, &measured),
             2,
@@ -577,7 +622,7 @@ mod memory_pool_tests {
         );
 
         let mut mixed = measured.clone();
-        mixed.push(slice_with(false));
+        mixed.push(ScanUnit::whole(slice_with(false)));
         assert_eq!(
             HudiScanExec::planned_slices(4, &mixed),
             1,
@@ -652,6 +697,10 @@ mod tests {
             )],
         ];
 
+        let partitions: Vec<Vec<ScanUnit>> = partitions
+            .into_iter()
+            .map(|slices| slices.into_iter().map(ScanUnit::whole).collect())
+            .collect();
         let stats = HudiScanExec::aggregate_partitions(
             partitions.iter().map(Vec::as_slice),
             vec![ColumnStatistics::new_unknown(); 2],
@@ -668,6 +717,10 @@ mod tests {
         bf.file_metadata = None;
         let slices = [vec![FileSlice::new(bf, String::new())]];
 
+        let slices: Vec<Vec<ScanUnit>> = slices
+            .into_iter()
+            .map(|slices| slices.into_iter().map(ScanUnit::whole).collect())
+            .collect();
         let stats = HudiScanExec::aggregate_partitions(
             slices.iter().map(Vec::as_slice),
             vec![ColumnStatistics::new_unknown()],
@@ -688,6 +741,10 @@ mod tests {
             0,
         )]];
 
+        let slices: Vec<Vec<ScanUnit>> = slices
+            .into_iter()
+            .map(|slices| slices.into_iter().map(ScanUnit::whole).collect())
+            .collect();
         let stats = HudiScanExec::aggregate_partitions(
             slices.iter().map(Vec::as_slice),
             vec![ColumnStatistics::new_unknown()],

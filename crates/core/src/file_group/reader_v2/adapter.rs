@@ -35,7 +35,7 @@ use crate::config::read::HudiReadConfig;
 use crate::error::CoreError;
 use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
-use crate::file_group::reader_v2::input_split::InputSplit;
+use crate::file_group::reader_v2::input_split::{BaseFileRange, InputSplit};
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use crate::file_group::reader_v2::resolver::resolve_reader_context;
@@ -67,6 +67,7 @@ pub(crate) async fn read_file_slice(
         partition_path,
         data_schema,
         completion_gate_inputs,
+        None,
     )?;
 
     reader.read().await
@@ -85,6 +86,7 @@ pub(crate) async fn read_file_slice_stream(
     partition_path: String,
     data_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
+    base_file_range: Option<BaseFileRange>,
 ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
     let mut reader = build_reader(
         hudi_configs,
@@ -94,6 +96,7 @@ pub(crate) async fn read_file_slice_stream(
         partition_path,
         data_schema,
         completion_gate_inputs,
+        base_file_range,
     )?;
 
     reader.open_stream().await
@@ -101,7 +104,8 @@ pub(crate) async fn read_file_slice_stream(
 
 /// Assemble the reader both entry points use, so the eager and streaming reads
 /// cannot resolve their context, split or parameters differently.
-fn build_reader(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_reader(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
@@ -109,6 +113,7 @@ fn build_reader(
     partition_path: String,
     data_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
+    base_file_range: Option<BaseFileRange>,
 ) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
     let hudi_configs = with_unbounded_end_timestamp(hudi_configs);
@@ -131,7 +136,8 @@ fn build_reader(
         base_file_commit_time,
         log_file_paths,
         partition_path,
-    );
+    )
+    .with_base_file_range(base_file_range);
 
     // Defaults chosen to match what the existing reader returns: deletes are
     // applied but never emitted, output keeps merge order, and only completed

@@ -28,6 +28,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 
 use crate::config::table::BaseFileFormatValue;
+use crate::file_group::reader_v2::input_split::RowGroupSpan;
 use crate::statistics::StatisticsContainer;
 use crate::storage::error::Result;
 use crate::storage::file_metadata::FileMetadata;
@@ -305,6 +306,28 @@ pub trait BaseFileReader: Send + Sync {
         relative_path: &'a str,
         table_schema: &'a arrow_schema::Schema,
     ) -> BoxFuture<'a, Result<(FileMetadata, StatisticsContainer)>>;
+
+    /// The file's row groups with their byte offsets, in file order, for a reader
+    /// handed a byte-range split of the file. Empty for a format that has no such
+    /// unit, which leaves the file read whole.
+    fn row_group_spans<'a>(
+        &'a self,
+        _relative_path: &'a str,
+        _known_file_size: Option<u64>,
+    ) -> BoxFuture<'a, Result<Vec<RowGroupSpan>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    /// The file's row groups as `(rows, bytes)` in file order, for a reader that
+    /// splits one file across several readers. Empty for a format that has no
+    /// such unit, which leaves the file read whole.
+    fn row_group_layout<'a>(
+        &'a self,
+        _relative_path: &'a str,
+        _known_file_size: Option<u64>,
+    ) -> BoxFuture<'a, Result<Vec<(u64, u64)>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 /// Create a [`BaseFileReader`] for a regular table base-file format.

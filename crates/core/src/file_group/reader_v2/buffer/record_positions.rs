@@ -60,6 +60,15 @@ pub const ROW_INDEX_TEMPORARY_COLUMN_NAME: &str = "_tmp_metadata_row_index";
 ///
 /// Returns [`CoreError::LogBlockError`] if the value is not valid Base64 or not
 /// a valid portable Roaring64 bitmap.
+pub fn encode_record_positions<I: IntoIterator<Item = u64>>(positions: I) -> String {
+    let bitmap: RoaringTreemap = positions.into_iter().collect();
+    let mut bytes = Vec::new();
+    bitmap
+        .serialize_into(&mut bytes)
+        .expect("a roaring bitmap serializes into a vector");
+    STANDARD.encode(bytes)
+}
+
 pub fn decode_record_positions(encoded: &str) -> Result<Vec<u64>> {
     let bytes = STANDARD.decode(encoded.trim()).map_err(|e| {
         CoreError::LogBlockError(format!("RECORD_POSITIONS header is not valid base64: {e}"))
