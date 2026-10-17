@@ -431,6 +431,22 @@ impl HudiDataSource {
             .map_err(|e| external_error("Invalid read-optimized option", e))
     }
 
+    /// The scan's routing once the file slices are known: a table whose
+    /// persisted format already settled on parquet still needs every base file
+    /// sized, and a table without a persisted format decides from the slices.
+    fn scan_uses_parquet_source(
+        &self,
+        format_decision: Option<bool>,
+        read_options: &ReadOptions,
+        file_slices: &[FileSlice],
+    ) -> Result<bool> {
+        match format_decision {
+            Some(false) => Ok(false),
+            Some(true) => Ok(Self::file_slices_have_sizes(file_slices)),
+            None => self.use_parquet_source(read_options, file_slices),
+        }
+    }
+
     /// Whether every base file carries its size. The parquet source needs it:
     /// DataFusion reads the footer at the size it is given, and its file-group
     /// repartitioner assigns a zero-length file to no partition at all, so a
@@ -879,16 +895,9 @@ impl TableProvider for HudiDataSource {
             self.scan_read_options(all_pushdown_filters, read_optimized)?
         };
 
-        match self.use_parquet_source_without_file_slices(&partition_read_options)? {
-            Some(true) => {
-                let flat_slices = self
-                    .table
-                    .get_file_slices(&partition_read_options)
-                    .await
-                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
-                self.scan_parquet(state, projection, filters, limit, flat_slices)
-                    .await
-            }
+        let format_decision =
+            self.use_parquet_source_without_file_slices(&partition_read_options)?;
+        match format_decision {
             Some(false) => {
                 let flat_slices = self
                     .table
@@ -904,14 +913,18 @@ impl TableProvider for HudiDataSource {
                 )
                 .await
             }
-            None => {
+            _ => {
                 let partition_flat_slices = self
                     .table
                     .get_file_slices(&partition_read_options)
                     .await
                     .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
 
-                if self.use_parquet_source(&partition_read_options, &partition_flat_slices)? {
+                if self.scan_uses_parquet_source(
+                    format_decision,
+                    &partition_read_options,
+                    &partition_flat_slices,
+                )? {
                     self.scan_parquet(state, projection, filters, limit, partition_flat_slices)
                         .await
                 } else {
@@ -1062,6 +1075,7 @@ mod tests {
 
     use datafusion::logical_expr::BinaryExpr;
     use datafusion::prelude::SessionContext;
+    use hudi_test::QuickstartTripsTable;
     use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle, V9LanceTxnsSimple};
 
     use crate::HudiDataSource;
@@ -1136,6 +1150,41 @@ mod tests {
             sized,
             without_size
         ]));
+    }
+
+    #[tokio::test]
+    async fn test_scan_routing_requires_sizes_even_when_the_table_persists_parquet() {
+        // This fixture persists `hoodie.table.base.file.format=PARQUET`, so a
+        // read-optimized read settles on the parquet source before any slice is
+        // read.
+        let base_uri = QuickstartTripsTable::MorDeleteOrdInt.path_to_mor_avro();
+        let hudi = HudiDataSource::new_with_options(base_uri.as_str(), empty_options())
+            .await
+            .unwrap();
+        let read_options = hudi.scan_read_options(Vec::new(), true).unwrap();
+        let decision = hudi
+            .use_parquet_source_without_file_slices(&read_options)
+            .unwrap();
+        assert_eq!(
+            decision,
+            Some(true),
+            "the persisted format settles on parquet"
+        );
+
+        let mut slices = hudi.table.get_file_slices(&read_options).await.unwrap();
+        assert!(!slices.is_empty());
+        assert!(
+            hudi.scan_uses_parquet_source(decision, &read_options, &slices)
+                .unwrap()
+        );
+
+        slices[0].base_file.as_mut().unwrap().file_metadata = None;
+        assert!(
+            !hudi
+                .scan_uses_parquet_source(decision, &read_options, &slices)
+                .unwrap(),
+            "a base file without a size must leave the parquet source"
+        );
     }
 
     #[tokio::test]
