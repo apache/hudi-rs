@@ -45,7 +45,6 @@ use datafusion_common::stats::Precision;
 use datafusion_common::{DataFusionError, Statistics};
 use datafusion_expr::utils::split_conjunction;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
-use datafusion_physical_expr::create_physical_expr;
 use log::warn;
 
 use crate::hudi_exec::HudiScanExec;
@@ -121,6 +120,7 @@ fn filter_field_matches_partition_column(filter_field: &str, partition_column: &
 #[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
+    options: HashMap<String, String>,
     /// Cached table schema (with meta fields) for synchronous access in `TableProvider::schema()`.
     /// This provider is a construction-time metadata snapshot; create a new
     /// provider to observe schema/stat changes from later commits.
@@ -231,6 +231,7 @@ impl HudiDataSource {
             }
             None => default_file_slice_read_concurrency(),
         };
+        let options = all_options.iter().cloned().collect();
         let table = HudiTable::new_with_options(base_uri, all_options)
             .await
             .map_err(|e| external_error("Failed to create Hudi table", e))?;
@@ -292,6 +293,7 @@ impl HudiDataSource {
 
         Ok(Self {
             table: Arc::new(table),
+            options,
             schema,
             partition_schema,
             cached_stats,
@@ -300,6 +302,16 @@ impl HudiDataSource {
             file_slice_read_concurrency,
             base_file_format,
         })
+    }
+
+    /// Returns the table location needed to reconstruct this provider.
+    pub fn base_uri(&self) -> String {
+        self.table.base_url().to_string()
+    }
+
+    /// Returns the caller-supplied options needed to reconstruct this provider.
+    pub fn options(&self) -> &HashMap<String, String> {
+        &self.options
     }
 
     fn get_input_partitions(&self) -> usize {
@@ -408,7 +420,7 @@ impl HudiDataSource {
             Some(format) => matches!(format, BaseFileFormatValue::Parquet),
             None => Self::file_slices_are_parquet(file_slices)?,
         };
-        if !parquet_base_files {
+        if !parquet_base_files || !Self::file_slices_have_sizes(file_slices) {
             return Ok(false);
         }
         if !self.table.is_mor() {
@@ -417,6 +429,19 @@ impl HudiDataSource {
         read_options
             .is_read_optimized()
             .map_err(|e| external_error("Invalid read-optimized option", e))
+    }
+
+    /// Whether every base file carries its size. The parquet source needs it:
+    /// DataFusion reads the footer at the size it is given, and its file-group
+    /// repartitioner assigns a zero-length file to no partition at all, so a
+    /// slice without one goes through `HudiScanExec`, which looks the size up.
+    fn file_slices_have_sizes(file_slices: &[FileSlice]) -> bool {
+        file_slices.iter().all(|slice| {
+            slice
+                .base_file
+                .as_ref()
+                .is_none_or(|base_file| base_file.file_metadata.is_some())
+        })
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -682,7 +707,7 @@ impl HudiDataSource {
         let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
         if let Some(expr) = filter {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
-            let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
+            let predicate = state.create_physical_expr(expr, &df_schema)?;
             parquet_source = parquet_source.with_predicate(predicate)
         }
 
@@ -1010,7 +1035,15 @@ impl TableProviderFactory for HudiTableFactory {
         cmd: &CreateExternalTable,
     ) -> Result<Arc<dyn TableProvider>> {
         let options = HudiTableFactory::resolve_options(state, cmd)?;
-        let base_uri = cmd.location.as_str();
+        let base_uri = match cmd.locations.as_slice() {
+            [location] => location.as_str(),
+            locations => {
+                return Err(DataFusionError::Plan(format!(
+                    "A Hudi table has exactly one location, got {}",
+                    locations.len()
+                )));
+            }
+        };
         let table_provider = HudiDataSource::new_with_options(base_uri, options).await?;
         Ok(Arc::new(table_provider))
     }
@@ -1079,6 +1112,30 @@ mod tests {
     #[test]
     fn test_file_slices_are_parquet_empty_is_false() {
         assert!(!HudiDataSource::file_slices_are_parquet(&[]).unwrap());
+    }
+
+    #[test]
+    fn test_file_slices_have_sizes_requires_metadata_on_every_base_file() {
+        use hudi_core::file_group::base_file::BaseFile;
+        use hudi_core::storage::file_metadata::FileMetadata;
+        use std::str::FromStr;
+
+        let name = "0832997e-30d8-4a42-a52d-e2c540816593-0_0-43-78_20261016221427272.parquet";
+        let sized = {
+            let mut base_file = BaseFile::from_str(name).unwrap();
+            base_file.file_metadata = Some(FileMetadata::new(name.to_string(), 4096));
+            FileSlice::new(base_file, "city=sf".to_string())
+        };
+        let without_size = FileSlice::new(BaseFile::from_str(name).unwrap(), "city=sf".to_string());
+
+        assert!(HudiDataSource::file_slices_have_sizes(&[]));
+        assert!(HudiDataSource::file_slices_have_sizes(
+            std::slice::from_ref(&sized)
+        ));
+        assert!(!HudiDataSource::file_slices_have_sizes(&[
+            sized,
+            without_size
+        ]));
     }
 
     #[tokio::test]

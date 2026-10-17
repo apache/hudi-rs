@@ -392,12 +392,35 @@ Create a Hudi file group reader instance using its constructor or the Hudi table
 Enabling the `hudi` crate with `datafusion` feature will provide a [DataFusion](https://datafusion.apache.org/)
 extension to query Hudi tables.
 
+Each hudi-rs release targets one DataFusion major, and with it one arrow major. The Rust `hudi`
+crate's `TableProvider` and the Python `hudi[datafusion]` extra both have to match the DataFusion
+version of the application they plug into, so pick the hudi-rs release that pairs with yours.
+Readers that take Arrow data out through the C data interface (Python `read()`, the C++ and JVM
+bindings) are not tied to these versions. The `hudi[datafusion]` extra first shipped in 0.5.
+
+| hudi-rs | DataFusion | arrow | Python `datafusion` package |
+|---------|------------|-------|-----------------------------|
+| 0.6 (unreleased) | 55 | 59 | `>=55.0.0,<56` |
+| 0.5 | 54 | 58 | `>=54.0.0,<55` |
+| 0.4 | 46 | 54 | not available |
+| 0.3 | 43 | 53 | not available |
+
+On macOS arm64, a debug build of an application that links `hudi` with the `datafusion` feature
+can fail with `ld: B/BL out of range ... (max +/-128MB)`: unoptimized dependencies push the
+binary's code section past the arm64 branch range. Optimize dependencies in the dev profile, as
+this workspace does:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 1
+```
+
 <details>
 <summary>Add crate hudi with datafusion feature to your application to query a Hudi table.</summary>
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@54
+cargo add tokio@1 datafusion@55
 cargo add hudi --features datafusion
 ```
 
