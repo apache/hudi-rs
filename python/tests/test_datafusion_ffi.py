@@ -27,8 +27,8 @@ import pytest
 
 datafusion = pytest.importorskip("datafusion")
 
-from hudi._internal import HudiDataFusionDataSource, get_test_table_path  # noqa: E402
 from hudi import HudiTable  # noqa: E402
+from hudi._internal import HudiDataFusionDataSource, get_test_table_path  # noqa: E402
 
 
 @pytest.fixture
