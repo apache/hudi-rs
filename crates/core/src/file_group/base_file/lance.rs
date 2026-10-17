@@ -41,6 +41,7 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use tokio::sync::OnceCell;
 
+use super::lance_arrow;
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
 use crate::statistics::{ColumnStatistics, StatisticsContainer, StatsGranularity};
 use crate::storage::Storage;
@@ -232,7 +233,13 @@ impl LanceBaseFileReader {
         let (reader, _) = self
             .open_file_reader_with_metadata(relative_path, None, None)
             .await?;
-        Ok(arrow_schema::Schema::from(reader.schema().as_ref()))
+        Self::file_schema(&reader)
+    }
+
+    /// The Lance file's schema in the workspace's arrow.
+    fn file_schema(reader: &FileReader) -> Result<arrow_schema::Schema> {
+        let lance_schema = arrow_schema_lance::Schema::from(reader.schema().as_ref());
+        lance_arrow::schema_to_host(&lance_schema)
     }
 
     /// Build a single zero-column [`RecordBatch`] with the Lance file's
@@ -320,10 +327,11 @@ impl BaseFileReader for LanceBaseFileReader {
                     ))
                 })?;
 
-            let arrow_schema = lance_stream.schema().clone();
+            let arrow_schema: SchemaRef =
+                Arc::new(lance_arrow::schema_to_host(lance_stream.schema().as_ref())?);
 
             let mapped_stream = lance_stream
-                .map(|result| result.map_err(StorageError::from))
+                .map(|result| lance_arrow::batch_to_host(result?))
                 .boxed();
 
             Ok(BaseFileStream::new(arrow_schema, mapped_stream))
@@ -368,12 +376,12 @@ impl BaseFileReader for LanceBaseFileReader {
             // pruning falls back to "include".
             let mut col_stats = StatisticsContainer::new(StatsGranularity::File);
             col_stats.num_rows = Some(num_rows);
-            let file_schema = reader.schema();
-            for field in &file_schema.fields {
-                let field_name = field.name.clone();
+            let file_schema = Self::file_schema(&reader)?;
+            for field in file_schema.fields() {
+                let field_name = field.name().clone();
                 col_stats.columns.insert(
                     field_name.clone(),
-                    ColumnStatistics::new(field_name, field.data_type()),
+                    ColumnStatistics::new(field_name, field.data_type().clone()),
                 );
             }
 

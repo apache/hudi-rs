@@ -30,8 +30,6 @@ use futures::stream::BoxStream;
 use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
 use crate::storage::error::Result;
-#[cfg(not(feature = "lance"))]
-use crate::storage::error::StorageError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::{RowFilterBuilder, RowGroupSelector, Storage};
 
@@ -324,14 +322,9 @@ pub fn create_base_file_reader(
         BaseFileFormatValue::HFile => Ok(Arc::new(super::hfile::HFileBaseFileReader::new(
             storage.clone(),
         ))),
-        #[cfg(feature = "lance")]
         BaseFileFormatValue::Lance => Ok(Arc::new(super::lance::LanceBaseFileReader::new(
             storage.clone(),
         ))),
-        #[cfg(not(feature = "lance"))]
-        BaseFileFormatValue::Lance => Err(StorageError::UnsupportedBaseFileFormat(
-            "lance support is not enabled".to_string(),
-        )),
     }
 }
 

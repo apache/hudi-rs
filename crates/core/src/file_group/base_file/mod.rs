@@ -17,8 +17,8 @@
  * under the License.
  */
 pub mod hfile;
-#[cfg(feature = "lance")]
 pub mod lance;
+mod lance_arrow;
 pub mod parquet;
 pub mod reader;
 
