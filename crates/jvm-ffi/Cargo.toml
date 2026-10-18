@@ -25,7 +25,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Plain C ABI over hudi-rs, so a JVM can call it through the Arrow C Data Interface."
+description = "Plain C ABI over hudi-rs, so a JVM or a C++ engine can call it through the Arrow C Data Interface."
 homepage.workspace = true
 repository.workspace = true
 
@@ -41,4 +41,8 @@ ffi-test-hooks = []
 [dependencies]
 hudi = { path = "../hudi", version = "0.6.0-dev" }
 arrow = { workspace = true, features = ["ffi"] }
+futures = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+hudi-test = { path = "../test" }
