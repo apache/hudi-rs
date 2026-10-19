@@ -46,6 +46,10 @@
 //! }
 //! ```
 
+// The write-path async fns (e.g. `Table::delete_keys`) nest deeply enough that computing their
+// layout exceeds the default limit of 128 on Linux targets.
+#![recursion_limit = "256"]
+
 mod avro_to_arrow;
 pub mod config;
 pub mod error;
