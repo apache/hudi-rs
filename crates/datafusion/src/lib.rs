@@ -33,6 +33,7 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::physical_plan::FileScanConfigBuilder;
+use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
 use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
@@ -674,16 +675,33 @@ impl HudiDataSource {
             crypto: Default::default(),
         };
         let table_schema = self.schema();
-        let mut parquet_source = ParquetSource::new(table_schema.clone())
-            .with_table_parquet_options(parquet_opts)
-            .with_pushdown_filters(true)
-            .with_reorder_filters(true)
-            .with_enable_page_index(true);
-        let filter = filters.iter().cloned().reduce(|acc, new| acc.and(new));
-        if let Some(expr) = filter {
+        // Row-filter pushdown, filter reordering, and page-index use follow
+        // the session's parquet options, the same knobs a plain parquet
+        // registration of these files obeys.
+        let mut parquet_source =
+            ParquetSource::new(table_schema.clone()).with_table_parquet_options(parquet_opts);
+        // Conjuncts DataFusion's filter-pushdown rule can absorb reach the
+        // scan through that rule exactly once (for stats pruning, and as a row
+        // filter when the session enables pushdown); installing them here too
+        // ANDs a duplicate copy into the merged predicate. Only conjuncts the
+        // rule rejects (e.g. struct-field filters) are installed, which keeps
+        // their footer-stats pruning.
+        if !filters.is_empty() {
             let df_schema = DFSchema::try_from(table_schema.clone())?;
-            let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
-            parquet_source = parquet_source.with_predicate(predicate)
+            let mut residual_conjuncts: Vec<Expr> = Vec::new();
+            for conjunct in filters.iter().flat_map(|expr| split_conjunction(expr)) {
+                let physical = create_physical_expr(conjunct, &df_schema, state.execution_props())?;
+                if !can_expr_be_pushed_down_with_schemas(&physical, table_schema.as_ref()) {
+                    residual_conjuncts.push(conjunct.clone());
+                }
+            }
+            if let Some(expr) = residual_conjuncts
+                .into_iter()
+                .reduce(|acc, new| acc.and(new))
+            {
+                let predicate = create_physical_expr(&expr, &df_schema, state.execution_props())?;
+                parquet_source = parquet_source.with_predicate(predicate)
+            }
         }
 
         let file_groups: Vec<FileGroup> = parquet_file_groups
@@ -1476,6 +1494,63 @@ mod tests {
         assert!(
             bounded.contains("file_slice_read_concurrency=1"),
             "a 1 MiB budget must lower the fan-out to 1: {bounded}"
+        );
+    }
+
+    /// Row-filter pushdown on the parquet scan is governed by the session's
+    /// parquet options: off by default (the filter stays a `FilterExec` above
+    /// the scan), swallowed into the scan when the session enables it, and in
+    /// both modes the scan predicate carries each conjunct once.
+    ///
+    /// `reorder_filters` and `enable_page_index` ride the same
+    /// `TableParquetOptions` and are not plan-visible, so only the pushdown
+    /// flag is pinned here.
+    #[tokio::test]
+    async fn test_scan_parquet_row_filter_pushdown_follows_session_config() {
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::SessionConfig;
+
+        async fn filtered_cow_plan(pushdown_filters: Option<bool>) -> String {
+            let mut config = SessionConfig::new();
+            if let Some(enabled) = pushdown_filters {
+                config.options_mut().execution.parquet.pushdown_filters = enabled;
+                config.options_mut().execution.parquet.reorder_filters = enabled;
+            }
+            let ctx = SessionContext::new_with_config(config);
+            let hudi = HudiDataSource::new(V6Nonpartitioned.path_to_cow().as_str())
+                .await
+                .unwrap();
+            ctx.register_table("t", Arc::new(hudi)).unwrap();
+            let df = ctx.sql("SELECT id FROM t WHERE id > 1").await.unwrap();
+            let plan = df.create_physical_plan().await.unwrap();
+            displayable(plan.as_ref())
+                .set_show_schema(false)
+                .indent(true)
+                .to_string()
+        }
+
+        let default_plan = filtered_cow_plan(None).await;
+        assert!(
+            default_plan.contains("FilterExec"),
+            "with default session config the filter must stay above the scan: {default_plan}"
+        );
+        assert!(
+            !default_plan.contains("id@5 > 1 AND id@5 > 1"),
+            "the scan predicate must carry the conjunct once: {default_plan}"
+        );
+
+        let pushdown_plan = filtered_cow_plan(Some(true)).await;
+        assert!(
+            !pushdown_plan.contains("FilterExec"),
+            "with pushdown_filters=true the filter must move into the scan: {pushdown_plan}"
+        );
+        assert!(
+            pushdown_plan.contains("id@5 > 1"),
+            "the scan predicate must carry the pushed filter: {pushdown_plan}"
+        );
+        assert!(
+            !pushdown_plan.contains("id@5 > 1 AND id@5 > 1"),
+            "the scan predicate must carry the conjunct once: {pushdown_plan}"
         );
     }
 
