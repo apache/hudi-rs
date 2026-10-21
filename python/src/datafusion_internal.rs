@@ -74,10 +74,16 @@ impl HudiDataFusionDataSource {
     #[new]
     #[pyo3(signature = (base_uri, options=None))]
     fn new(base_uri: &str, options: Option<Vec<(String, String)>>) -> PyResult<Self> {
+        let mut options = options.unwrap_or_default();
+        // A Python session's own setting cannot be seen from here, so strings
+        // stay `Utf8` unless the caller passes the option.
+        const VIEW_TYPES: &str = "datafusion.execution.parquet.schema_force_view_types";
+        if !options.iter().any(|(k, _)| k == VIEW_TYPES) {
+            options.push((VIEW_TYPES.to_string(), "false".to_string()));
+        }
         let inner: InternalDataFusionHudiDataSource = rt()
             .block_on(InternalDataFusionHudiDataSource::new_with_options(
-                base_uri,
-                options.unwrap_or_default(),
+                base_uri, options,
             ))
             .map_err(PythonError::from)?;
         Ok(HudiDataFusionDataSource { table: inner })
