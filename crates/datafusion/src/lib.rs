@@ -152,7 +152,24 @@ pub struct HudiDataSource {
     file_slice_read_concurrency: usize,
     /// Explicit base file format from table config, if present.
     base_file_format: Option<BaseFileFormatValue>,
+    /// Resolved file slices per (pushdown filters, read-optimized) pair.
+    ///
+    /// Resolving file slices walks the table's file-system view and metadata
+    /// table on every `scan()`, a fixed planning cost repeated per query on
+    /// object storage. The provider is a construction-time snapshot of the
+    /// timeline (see `schema`), so identical scans resolve identical slices
+    /// and reuse is sound. Clones share the cache, like the snapshot they
+    /// share.
+    ///
+    /// Entries accrete per distinct pushed-down literal set; a long-lived
+    /// provider serving many distinct literals trades that memory for the
+    /// avoided per-scan listing.
+    file_slice_cache: Arc<tokio::sync::Mutex<HashMap<FileSliceCacheKey, Arc<Vec<FileSlice>>>>>,
 }
+
+/// Pushdown filter triples plus the read-optimized flag: the two inputs that
+/// determine which file slices a scan resolves.
+type FileSliceCacheKey = (Vec<(String, String, String)>, bool);
 
 impl std::fmt::Debug for HudiDataSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -299,7 +316,43 @@ impl HudiDataSource {
             read_optimized_mode,
             file_slice_read_concurrency,
             base_file_format,
+            file_slice_cache: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         })
+    }
+
+    /// Resolve file slices through the per-provider cache; see
+    /// [`Self::file_slice_cache`] for why reuse is sound.
+    ///
+    /// The lock is held across the resolution on purpose: the file-system
+    /// view keeps one shared partition map, and two resolutions with
+    /// different pruners interleaving on it can cross-contaminate each
+    /// other's slice sets. Serializing resolution per provider keeps every
+    /// cached entry the product of a single, isolated listing (and resolves
+    /// each key at most once).
+    async fn get_file_slices_cached(
+        &self,
+        pushdown_filters: &[(String, String, String)],
+        read_optimized: bool,
+        read_options: &ReadOptions,
+    ) -> Result<Vec<FileSlice>> {
+        let key = (pushdown_filters.to_vec(), read_optimized);
+        let mut cache = self.file_slice_cache.lock().await;
+        if let Some(slices) = cache.get(&key) {
+            return Ok(slices.as_ref().clone());
+        }
+        let slices = self
+            .table
+            .get_file_slices(read_options)
+            .await
+            .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+        let shared = Arc::new(slices);
+        cache.insert(key, Arc::clone(&shared));
+        Ok(shared.as_ref().clone())
+    }
+
+    #[cfg(test)]
+    async fn file_slice_cache_len(&self) -> usize {
+        self.file_slice_cache.lock().await.len()
     }
 
     fn get_input_partitions(&self) -> usize {
@@ -812,10 +865,9 @@ impl TableProvider for HudiDataSource {
     /// of doing recursive object-store listing, so MDT is strictly cheaper
     /// than the generic `ListingTable` path.
     ///
-    /// Callers that issue many `scan()` calls per session against the same
-    /// table (e.g. ad-hoc SQL across the same dataset) may still benefit from
-    /// caching the resolved file-slice set keyed by
-    /// `(filters, as_of_timestamp)`. Tracked as future work.
+    /// Resolved file slices are cached per (pushdown filters, read-optimized)
+    /// pair, so repeated `scan()` calls against the same provider list once;
+    /// see [`Self::file_slice_cache`].
     ///
     /// We implement the legacy `scan()` rather than `scan_with_args()`. The
     /// default `scan_with_args()` impl delegates to `scan()`, so today's
@@ -851,25 +903,29 @@ impl TableProvider for HudiDataSource {
         let all_read_options = if all_filters_are_partition_filters {
             partition_read_options.clone()
         } else {
-            self.scan_read_options(all_pushdown_filters, read_optimized)?
+            self.scan_read_options(all_pushdown_filters.clone(), read_optimized)?
         };
 
         match self.use_parquet_source_without_file_slices(&partition_read_options)? {
             Some(true) => {
                 let flat_slices = self
-                    .table
-                    .get_file_slices(&partition_read_options)
-                    .await
-                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                    .get_file_slices_cached(
+                        &partition_pushdown_filters,
+                        read_optimized,
+                        &partition_read_options,
+                    )
+                    .await?;
                 self.scan_parquet(state, projection, filters, limit, flat_slices)
                     .await
             }
             Some(false) => {
                 let flat_slices = self
-                    .table
-                    .get_file_slices(&all_read_options)
-                    .await
-                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                    .get_file_slices_cached(
+                        &all_pushdown_filters,
+                        read_optimized,
+                        &all_read_options,
+                    )
+                    .await?;
                 self.scan_hudi(
                     projection,
                     limit,
@@ -881,10 +937,12 @@ impl TableProvider for HudiDataSource {
             }
             None => {
                 let partition_flat_slices = self
-                    .table
-                    .get_file_slices(&partition_read_options)
-                    .await
-                    .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
+                    .get_file_slices_cached(
+                        &partition_pushdown_filters,
+                        read_optimized,
+                        &partition_read_options,
+                    )
+                    .await?;
 
                 if self.use_parquet_source(&partition_read_options, &partition_flat_slices)? {
                     self.scan_parquet(state, projection, filters, limit, partition_flat_slices)
@@ -893,12 +951,12 @@ impl TableProvider for HudiDataSource {
                     let flat_slices = if all_filters_are_partition_filters {
                         partition_flat_slices
                     } else {
-                        self.table
-                            .get_file_slices(&all_read_options)
-                            .await
-                            .map_err(|e| {
-                                external_error("Failed to get file slices from Hudi table", e)
-                            })?
+                        self.get_file_slices_cached(
+                            &all_pushdown_filters,
+                            read_optimized,
+                            &all_read_options,
+                        )
+                        .await?
                     };
                     self.scan_hudi(
                         projection,
@@ -1405,6 +1463,59 @@ mod tests {
         assert_eq!(actual.filters[0].field, "amount");
         assert_eq!(actual.projection, read_options.projection);
         assert_eq!(actual.hudi_options, read_options.hudi_options);
+    }
+
+    /// Repeated scans with the same pushdown filters reuse the resolved file
+    /// slices and produce the same plan; a different filter set resolves and
+    /// caches its own entry.
+    #[tokio::test]
+    async fn test_scan_reuses_cached_file_slices_per_filter_set() {
+        use datafusion::physical_plan::displayable;
+
+        let hudi = HudiDataSource::new(V6SimplekeygenNonhivestyle.url_to_mor_parquet().as_str())
+            .await
+            .unwrap();
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        assert_eq!(hudi.file_slice_cache_len().await, 0);
+        let first = hudi.scan(&state, None, &[], None).await.unwrap();
+        assert_eq!(hudi.file_slice_cache_len().await, 1);
+
+        let second = hudi.scan(&state, None, &[], None).await.unwrap();
+        assert_eq!(
+            hudi.file_slice_cache_len().await,
+            1,
+            "an identical scan must reuse the cached slices"
+        );
+        let first_plan = displayable(first.as_ref()).indent(true).to_string();
+        assert_eq!(
+            first_plan,
+            displayable(second.as_ref()).indent(true).to_string(),
+            "cached slices must produce the same plan as freshly resolved ones"
+        );
+
+        let filter = col_lit("id", Operator::Gt, ScalarValue::Int32(Some(1)));
+        hudi.scan(&state, None, &[filter], None).await.unwrap();
+        assert_eq!(
+            hudi.file_slice_cache_len().await,
+            2,
+            "a different pushdown filter set is its own cache entry"
+        );
+
+        // The scan must actually consume the cached entry, not just insert
+        // under the same key: replace the unfiltered entry with an empty
+        // sentinel and the planned scan must change shape.
+        hudi.file_slice_cache
+            .lock()
+            .await
+            .insert((vec![], false), Arc::new(vec![]));
+        let seeded = hudi.scan(&state, None, &[], None).await.unwrap();
+        assert_ne!(
+            first_plan,
+            displayable(seeded.as_ref()).indent(true).to_string(),
+            "a scan must plan from the cached slices"
+        );
     }
 
     #[tokio::test]
