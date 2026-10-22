@@ -174,6 +174,83 @@ impl PartitionPruner {
         })
     }
 
+    /// Returns `true` if a partition directory prefix should be descended into.
+    ///
+    /// Unlike `should_include`, `partial_path` may resolve fewer segments than
+    /// the schema has fields (we're mid-descent, not at a leaf yet). Any segment
+    /// this can't safely reason about — not enough schema fields to compare
+    /// against, an opaque single-field `_hoodie_partition_path` schema (e.g.
+    /// under a timestamp-based key generator, where that one field's value
+    /// spans multiple physical path segments, so no individual segment carries
+    /// independently meaningful value), a hive-style segment that doesn't parse
+    /// as `key=value`, or a cast/compare error — is treated as unconstrained,
+    /// never as a reason to reject. Only a segment that positively fails an
+    /// already-resolved filter returns `false`.
+    ///
+    /// `is_hive_style && is_url_encoded` is required unconditionally, matching
+    /// Java's `FileSystemBackedTableMetadata` (line 157) — regardless of field
+    /// count. `is_hive_style` is needed because without `key=value` labels
+    /// there's no independent way to verify a split segment lines up with its
+    /// schema field at all. `is_url_encoded` is needed even for a single
+    /// field: without it, a value containing a literal `/` splits across an
+    /// extra physical directory level (e.g. `region=b/c` on disk for a value
+    /// `"b/c"`), and a mid-descent prefix that has only resolved the first
+    /// level (`region=b`) has no way to tell that genuinely-short value apart
+    /// from one truncated by such a stray `/` — the `parts.len()` check below
+    /// can't catch it either, since at that depth there simply aren't more
+    /// parts yet to exceed the field count. Comparing the truncated value
+    /// against a filter for the full value would then wrongly reject a prefix
+    /// that should have been descended into.
+    pub fn should_include_prefix(&self, partial_path: &str) -> bool {
+        // A single-field schema is only unsafe to reason about per-segment when
+        // that field is the opaque `_hoodie_partition_path` metafield, whose one
+        // value spans multiple physical segments. A genuine single partition
+        // field (e.g. `SimpleKeyGenerator`) has no such gap: its one segment
+        // *is* its full value when `is_hive_style && is_url_encoded` hold, so
+        // it can be compared like any other field.
+        let is_opaque_single_field = self.schema.fields().len() == 1
+            && self.schema.field(0).name() == MetaField::PartitionPath.as_ref();
+        if self.and_filters.is_empty() || is_opaque_single_field {
+            return true;
+        }
+        if !(self.is_hive_style && self.is_url_encoded) {
+            return true;
+        }
+
+        let parts = match self.split_segments(partial_path) {
+            Ok(p) => p,
+            Err(_) => return true,
+        };
+        if parts.len() > self.schema.fields().len() {
+            return true;
+        }
+
+        // `is_hive_style` is guaranteed by the gate above, so every segment
+        // is expected to parse as `key=value`.
+        for (field, part) in self.schema.fields().iter().zip(parts.iter()) {
+            let value = match part.split_once('=') {
+                Some((name, v)) if name == field.name() => v,
+                _ => continue,
+            };
+            let scalar = match SchemableFilter::cast_value(&[value], field.data_type()) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            for filter in self
+                .and_filters
+                .iter()
+                .filter(|f| f.field.name() == field.name())
+            {
+                if let Ok(result) = filter.apply_comparison(&scalar)
+                    && !result.value(0)
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Transforms user filters on data columns to filters on partition path columns
     /// based on the configured key generator.
     fn transform_filters_for_keygen(
@@ -210,30 +287,54 @@ impl PartitionPruner {
         Ok(transformed)
     }
 
-    fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
-        let partition_path = if self.is_url_encoded {
-            percent_encoding::percent_decode(partition_path.as_bytes())
-                .decode_utf8()?
-                .into_owned()
-        } else {
-            partition_path.to_string()
-        };
+    /// Splits a partition path into its literal `/`-separated segments,
+    /// decoding each segment independently — rather than decoding the whole
+    /// path and then splitting.
+    ///
+    /// Splitting on the raw path first is required: a value containing a `/`
+    /// is only ever safe to store because it gets percent-encoded to `%2F`
+    /// before being written to disk, so a literal `/` in the raw path is
+    /// always a genuine segment boundary. Decoding first would turn that
+    /// `%2F` back into `/` before splitting, corrupting the boundary and
+    /// silently shifting every field after it. Mirrors Java's
+    /// `AbstractHoodieTableMetadata.extractPartitionValues`.
+    fn split_segments(&self, path: &str) -> Result<Vec<String>> {
+        if path.is_empty() {
+            return Ok(Vec::new());
+        }
+        path.split('/')
+            .map(|segment| {
+                if self.is_url_encoded {
+                    Ok(percent_encoding::percent_decode(segment.as_bytes())
+                        .decode_utf8()?
+                        .into_owned())
+                } else {
+                    Ok(segment.to_string())
+                }
+            })
+            .collect()
+    }
 
-        // Special case: single _hoodie_partition_path field uses the raw path as-is
+    fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
+        // Special case: single _hoodie_partition_path field uses the raw path as-is,
+        // with no segments to split — decode the whole value directly.
         if self.schema.fields().len() == 1
             && self.schema.field(0).name() == MetaField::PartitionPath.as_ref()
         {
-            let scalar = SchemableFilter::cast_value(
-                &[partition_path.as_str()],
-                &arrow_schema::DataType::Utf8,
-            )?;
+            let decoded = if self.is_url_encoded {
+                percent_encoding::percent_decode(partition_path.as_bytes()).decode_utf8()?
+            } else {
+                std::borrow::Cow::Borrowed(partition_path)
+            };
+            let scalar =
+                SchemableFilter::cast_value(&[decoded.as_ref()], &arrow_schema::DataType::Utf8)?;
             return Ok(HashMap::from([(
                 MetaField::PartitionPath.as_ref().to_string(),
                 scalar,
             )]));
         }
 
-        let parts: Vec<&str> = partition_path.split('/').collect();
+        let parts = self.split_segments(partition_path)?;
 
         if parts.len() != self.schema.fields().len() {
             return Err(InvalidPartitionPath(format!(
@@ -261,7 +362,7 @@ impl PartitionPruner {
                     }
                     value
                 } else {
-                    part
+                    part.as_str()
                 };
                 let scalar = SchemableFilter::cast_value(&[value], field.data_type())?;
                 Ok((field.name().to_string(), scalar))
@@ -402,6 +503,242 @@ mod tests {
     }
 
     #[test]
+    fn test_partition_pruner_should_include_prefix() {
+        let schema = create_test_schema();
+        // Descent-time pruning only trusts positional segment-to-field binding
+        // under hive-style + url-encoded partitioning; see the gate in
+        // `should_include_prefix`.
+        let configs = create_hudi_configs(true, true);
+
+        let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let filter_lte_100 = Filter::try_from(("count", "<=", "100")).unwrap();
+
+        let pruner = PartitionPruner::new(
+            &[filter_gt_date, filter_eq_a, filter_lte_100],
+            &schema,
+            &configs,
+        )
+        .unwrap();
+
+        // A resolved segment that already violates its filter is rejected
+        // without needing to resolve the rest of the path.
+        assert!(!pruner.should_include_prefix("date=2022-12-31"));
+        assert!(!pruner.should_include_prefix("date=2023-02-01/category=B"));
+
+        // A resolved segment that satisfies its filter, with later fields not
+        // yet resolved, is not rejected.
+        assert!(pruner.should_include_prefix("date=2023-02-01"));
+        assert!(pruner.should_include_prefix("date=2023-02-01/category=A"));
+        assert!(pruner.should_include_prefix("date=2023-02-01/category=A/count=10"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_no_filters() {
+        let pruner = PartitionPruner::empty();
+        assert!(pruner.should_include_prefix("date=2022-12-31"));
+        assert!(pruner.should_include_prefix(""));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_malformed_segment_fails_open() {
+        let schema = create_test_schema();
+        // hive-style + url-encoded, so the malformed-segment path (rather than
+        // the `is_hive_style && is_url_encoded` gate) is what's under test.
+        let configs = create_hudi_configs(true, true);
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq_a], &schema, &configs).unwrap();
+
+        // A segment that doesn't parse as `key=value` under hive-style
+        // partitioning can't be safely compared, so it must not be rejected.
+        assert!(pruner.should_include_prefix("not-a-kv-pair"));
+    }
+
+    /// Without hive-style labels there's no way to independently verify a
+    /// split segment lines up with its schema field — positional binding is
+    /// only trusted when `is_hive_style && is_url_encoded` both hold (see
+    /// `should_include_prefix`'s doc comment), so a non-hive-style table
+    /// fails open on every prefix, deferring entirely to the full-path
+    /// `should_include` check.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_non_hive_style_fails_open() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(false, false);
+        let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_gt_date], &schema, &configs).unwrap();
+
+        assert!(pruner.should_include_prefix("2022-12-31"));
+        assert!(pruner.should_include_prefix("2023-02-01"));
+    }
+
+    /// Hive-style alone isn't enough either: without url-encoding, a value
+    /// containing a literal `/` fragments across an extra directory level
+    /// that a mid-descent prefix can't distinguish from a genuinely short
+    /// prefix, so pruning must stay disabled until both flags hold.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_hive_style_without_url_encoding_fails_open() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, false);
+        let filter_eq_a = Filter::try_from(("category", "=", "A")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq_a], &schema, &configs).unwrap();
+
+        assert!(pruner.should_include_prefix("date=2023-02-01/category=B"));
+    }
+
+    /// A genuine single-partition-field schema (not the opaque
+    /// `_hoodie_partition_path` metafield) has no descent to speak of — its one
+    /// segment already is the full value — so it must still get pruned like
+    /// any other field once the gate is satisfied, rather than always failing
+    /// open the way `test_partition_pruner_should_include_prefix_single_field_schema_fails_open`
+    /// does for the opaque case.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_single_real_field_is_pruned() {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let filter_eq = Filter::try_from(("region", "=", "us")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        assert!(pruner.should_include_prefix("region=us"));
+        assert!(!pruner.should_include_prefix("region=fr"));
+    }
+
+    /// `is_url_encoded` is required even for a single real partition field —
+    /// without it, a value containing a literal `/` (e.g. `"b/c"`) splits
+    /// across an extra physical directory level (`region=b/c` on disk), so a
+    /// mid-descent prefix that has only resolved the first level
+    /// (`region=b`) can't tell that genuinely-short value apart from one
+    /// truncated by such a stray `/`. Comparing the truncated `"b"` against a
+    /// filter for the full `"b/c"` would wrongly reject a prefix that should
+    /// have been descended into — so pruning must fail open here rather than
+    /// risk that false exclusion. This is the common `dt=2024-01-01`-style
+    /// single-column layout, which defaults to `urlencode=false` in real
+    /// tables: it forgoes the pruning optimization, but never at the cost of
+    /// correctness.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_single_real_field_fails_open_without_url_encoding()
+     {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, false);
+        let filter_eq = Filter::try_from(("region", "=", "b/c")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        // Without url-encoding, "region=b" alone can't be distinguished from
+        // a value truncated ahead of a literal `/`, so it must not be pruned
+        // even though "b" alone doesn't match the full filter value "b/c".
+        assert!(pruner.should_include_prefix("region=b"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_url_encoded() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, true);
+        let filter_eq = Filter::try_from(("category", "=", "A/B")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        // Hudi escapes the value only (`/` -> `%2F`); the `/` between segments
+        // and the `=` in `key=value` stay literal on disk.
+        assert!(!pruner.should_include_prefix("date=2023-02-01/category=B"));
+        assert!(pruner.should_include_prefix("date=2023-02-01/category=A%2FB"));
+    }
+
+    /// A prefix segment whose percent-encoding decodes to invalid UTF-8 can't
+    /// be safely compared, so `split_segments` fails and `should_include_prefix`
+    /// must fail open rather than propagate the error.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_invalid_percent_encoding_fails_open() {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let filter_eq = Filter::try_from(("region", "=", "us")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        // `%ff` decodes to a lone 0xFF byte, which is not valid UTF-8.
+        assert!(pruner.should_include_prefix("region=%ff"));
+    }
+
+    /// A prefix that resolves more segments than the schema has fields can't
+    /// be positionally bound to it, so it must fail open exactly like
+    /// `should_include`'s exact segment-count check on a complete path.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_too_many_segments_fails_open() {
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("dt", DataType::Utf8, false),
+        ]);
+        let configs = create_hudi_configs(true, true);
+        let filter_eq = Filter::try_from(("region", "=", "us")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        assert!(pruner.should_include_prefix("region=us/dt=2024-01-01/extra=1"));
+    }
+
+    /// `is_hive_style` is required unconditionally, matching Java — even a
+    /// single real partition field can't be positionally verified without
+    /// hive-style `key=value` labels, so a non-hive-style table fails open
+    /// regardless of field count.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_single_real_field_non_hive_style_fails_open() {
+        let schema = Schema::new(vec![Field::new("region", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(false, false);
+        let filter_eq = Filter::try_from(("region", "=", "us")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        assert!(pruner.should_include_prefix("fr"));
+    }
+
+    /// A segment whose value fails to cast to its field's data type can't be
+    /// safely compared, so it must be treated as unconstrained (continue to
+    /// the next field) rather than rejected.
+    #[test]
+    fn test_partition_pruner_should_include_prefix_cast_error_is_unconstrained() {
+        let schema = create_test_schema();
+        let configs = create_hudi_configs(true, true);
+        let filter_gt_date = Filter::try_from(("date", ">", "2023-01-01")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_gt_date], &schema, &configs).unwrap();
+
+        // "not-a-date" fails to cast to the `date` field's Date32 type, so the
+        // filter on it can't be evaluated and must not cause a rejection.
+        assert!(pruner.should_include_prefix("date=not-a-date"));
+    }
+
+    #[test]
+    fn test_partition_pruner_should_include_prefix_single_field_schema_fails_open() {
+        // Under a timestamp-based key generator, `get_partition_schema` collapses
+        // the schema to a single opaque `_hoodie_partition_path` field (see
+        // `test_partition_pruner_with_timestamp_keygen`), so no per-segment
+        // prefix can be safely evaluated during descent.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let user_filter = Filter {
+            field: "ts".to_string(),
+            operator: ExprOperator::Gte,
+            values: vec!["2024-01-15T00:00:00Z".to_string()],
+        };
+        let pruner = PartitionPruner::new(&[user_filter], &partition_schema, &configs).unwrap();
+
+        // Even a prefix that would violate the equivalent full-path filter
+        // must fail open, since a single opaque field carries no per-segment
+        // meaning until the whole path is known.
+        assert!(pruner.should_include_prefix("year=2020"));
+    }
+
+    #[test]
     fn test_partition_pruner_parse_segments() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
@@ -422,13 +759,56 @@ mod tests {
         let configs = create_hudi_configs(true, true);
         let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
 
+        // Only the value needs decoding (`%20` -> space); the `/` between
+        // segments and the `=` in `key=value` stay literal on disk.
         let segments = pruner
-            .parse_segments("date%3D2023-02-01%2Fcategory%3DA%2Fcount%3D10")
+            .parse_segments("date=2023-02-01/category=A%20B/count=10")
             .unwrap();
         assert_eq!(segments.len(), 3);
         assert!(segments.contains_key("date"));
         assert!(segments.contains_key("category"));
         assert!(segments.contains_key("count"));
+    }
+
+    /// Regression test: a url-encoded value that itself contains `/` (encoded
+    /// as `%2F` on disk) must not be mistaken for a path separator. Decoding
+    /// the whole path before splitting turns `region=us%2Feast/dt=2024-01-01`
+    /// into 3 raw-looking parts against a 2-field schema; splitting first
+    /// (on the still-encoded path) correctly yields 2.
+    #[test]
+    fn test_partition_pruner_parse_segments_value_contains_encoded_slash() {
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("dt", DataType::Utf8, false),
+        ]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner
+            .parse_segments("region=us%2Feast/dt=2024-01-01")
+            .unwrap();
+        assert_eq!(segments.len(), 2);
+        assert!(segments.contains_key("region"));
+        assert!(segments.contains_key("dt"));
+    }
+
+    /// Same scenario through `should_include`/`should_include_prefix`: a
+    /// filter matching the decoded value (`region = 'us/east'`) must not be
+    /// dropped because of a spurious segment-boundary split.
+    #[test]
+    fn test_partition_pruner_should_include_value_contains_encoded_slash() {
+        let schema = Schema::new(vec![
+            Field::new("region", DataType::Utf8, false),
+            Field::new("dt", DataType::Utf8, false),
+        ]);
+        let configs = create_hudi_configs(true, true);
+        let filter_eq = Filter::try_from(("region", "=", "us/east")).unwrap();
+        let pruner = PartitionPruner::new(&[filter_eq], &schema, &configs).unwrap();
+
+        assert!(pruner.should_include("region=us%2Feast/dt=2024-01-01"));
+        assert!(pruner.should_include_prefix("region=us%2Feast"));
+        assert!(!pruner.should_include("region=us%2Fwest/dt=2024-01-01"));
+        assert!(!pruner.should_include_prefix("region=us%2Fwest"));
     }
 
     #[test]
