@@ -129,6 +129,15 @@ pub struct HudiDataSource {
     /// This is cached at construction since partition schema rarely changes
     /// and is needed synchronously in `supports_filters_pushdown`.
     partition_schema: Schema,
+    /// Columns whose predicates are forwarded to Hudi file listing, so partition pruning
+    /// sees them: the partition schema's fields plus, for a timestamp-based key generator,
+    /// the source column it derives the partition path from. That column is absent from
+    /// the partition schema — the generator rewrites predicates on it into
+    /// `_hoodie_partition_path` predicates — so classifying by the partition schema alone
+    /// never let such a predicate reach listing and every partition was scanned. These
+    /// columns are for listing only; a predicate on a derived column is never exact,
+    /// because a day partition holds every instant of that day.
+    listing_columns: Vec<String>,
     /// Cached table-level statistics for join ordering and broadcast decisions.
     ///
     /// Consumed in two places:
@@ -271,6 +280,8 @@ impl HudiDataSource {
             }
         };
 
+        let listing_columns = Self::listing_columns(&partition_schema, &table.hudi_configs);
+
         // Compute table-level statistics for join ordering and broadcast decisions.
         // Uses MDT files partition for base-file sizes and, for Parquet tables, one
         // sampled footer to infer row counts and byte sizes without loading all file groups.
@@ -294,6 +305,7 @@ impl HudiDataSource {
             table: Arc::new(table),
             schema,
             partition_schema,
+            listing_columns,
             cached_stats,
             input_partitions,
             read_optimized_mode,
@@ -502,6 +514,30 @@ impl HudiDataSource {
             .collect()
     }
 
+    /// Columns whose predicates Hudi file listing can act on. See [`Self::listing_columns`].
+    fn listing_columns(partition_schema: &Schema, hudi_configs: &HudiConfigs) -> Vec<String> {
+        let mut columns: Vec<String> = partition_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        match hudi_core::keygen::is_timestamp_based_keygen(hudi_configs) {
+            Ok(true) => {
+                let source_fields: Vec<String> = hudi_configs
+                    .get_or_default(HudiTableConfig::PartitionFields)
+                    .into();
+                for field in source_fields {
+                    if !columns.contains(&field) {
+                        columns.push(field);
+                    }
+                }
+            }
+            Ok(false) => {}
+            Err(e) => warn!("Failed to read key generator configuration: {e}"),
+        }
+        columns
+    }
+
     /// Checks if expression filters only on a partition column.
     ///
     /// Partition filters are safe to push into Hudi file listing for every
@@ -582,8 +618,11 @@ impl HudiDataSource {
 
     /// Returns `(partition_pushdown_exprs, all_pushdown_exprs)`.
     fn split_scan_pushdown_exprs(&self, filters: &[Expr]) -> (Vec<Expr>, Vec<Expr>) {
-        let partition_cols = self.get_partition_columns();
-        Self::split_scan_pushdown_exprs_for_schema(self.schema.as_ref(), &partition_cols, filters)
+        Self::split_scan_pushdown_exprs_for_schema(
+            self.schema.as_ref(),
+            &self.listing_columns,
+            filters,
+        )
     }
 
     fn split_scan_pushdown_exprs_for_schema(

@@ -600,6 +600,9 @@ pub enum SampleTable {
     V6SimplekeygenNonhivestyle,
     V6SimplekeygenNonhivestyleOverwritetable,
     V6TimebasedkeygenNonhivestyle,
+    V6TimebasedkeygenHivestyleDay,
+    V6TimebasedkeygenHivestyleHour,
+    V6CustomkeygenHivestyle,
     V8ComplexkeygenHivestyle,
     V8Empty,
     V8Nonpartitioned,
@@ -607,8 +610,10 @@ pub enum SampleTable {
     V8SimplekeygenNonhivestyle,
     V9NonpartitionedRollback,
     V9TimebasedkeygenEpochmillis,
+    V9TimebasedkeygenHivestyleEpochmicros,
     V9TimebasedkeygenNonhivestyle,
     V9TimebasedkeygenUnixtimestamp,
+    V9CustomkeygenHivestyle,
     V9TxnsComplexMeta,
     V9TxnsComplexNometa,
     V9TxnsNonpartMeta,
@@ -671,12 +676,17 @@ impl SampleTable {
     pub fn available_formats(&self) -> &'static [TableFormat] {
         match self {
             Self::V6TimebasedkeygenNonhivestyle
+            | Self::V6TimebasedkeygenHivestyleDay
+            | Self::V6TimebasedkeygenHivestyleHour
+            | Self::V6CustomkeygenHivestyle
+            | Self::V9CustomkeygenHivestyle
             | Self::V8ComplexkeygenHivestyle
             | Self::V8Empty
             | Self::V8Nonpartitioned
             | Self::V8SimplekeygenHivestyleNoMetafields
             | Self::V8SimplekeygenNonhivestyle
             | Self::V9TimebasedkeygenEpochmillis
+            | Self::V9TimebasedkeygenHivestyleEpochmicros
             | Self::V9TimebasedkeygenUnixtimestamp
             | Self::V9LanceNonpartitioned
             | Self::V9LanceTxnsNonpart
