@@ -91,7 +91,7 @@ jobs:
   rust-tests-no-spill-backend:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
@@ -281,7 +281,8 @@ jobs:
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
       - name: Pre-pull base images
         run: |
-          docker pull quay.io/minio/minio:latest
+          docker pull cgr.dev/chainguard/minio:latest
+          docker pull cgr.dev/chainguard/minio-client:latest-dev
       - name: Prepare cache directories with correct permissions
         run: |
           mkdir -p .cargo/registry .cargo/git target python/target .uv-cache
@@ -320,7 +321,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
       # Builds the wheel in the same container, running the same dependency
