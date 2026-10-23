@@ -31,7 +31,7 @@ arrow-array = { workspace = true }
 arrow-cast = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
-comfy-table = "7"
+comfy-table = "8"
 datafusion = { workspace = true }
 hudi = { path = "../../crates/hudi", features = ["datafusion"] }
 object_store = { workspace = true }
