@@ -95,7 +95,9 @@ jobs:
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: no-spill-backend
+          # The image is part of the key: a target cache built on another Ubuntu
+          # release carries that image's system-library link decisions.
+          key: no-spill-backend-ubuntu-24.04
       # Deliberately no clang/libclang: if a change makes the default-off build
       # pull rocksdb back in, this job fails to compile rather than quietly
       # reintroducing the native dependency.
@@ -174,7 +176,9 @@ jobs:
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: msrv
+          # The image is part of the key: a target cache built on another Ubuntu
+          # release carries that image's system-library link decisions.
+          key: msrv-ubuntu-24.04
       - name: Check the workspace on the MSRV
         run: cargo +"$MSRV" check --workspace --all-targets --all-features
 
