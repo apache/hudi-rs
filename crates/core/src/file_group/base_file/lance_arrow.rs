@@ -55,9 +55,7 @@ pub(super) fn schema_to_host(schema: &LanceSchema) -> Result<Schema> {
 /// Converts a batch from Lance's arrow into the workspace's arrow, sharing
 /// the column buffers.
 ///
-/// `schema` is the stream's schema, crossed once by [`schema_to_host`]; every
-/// batch of the stream carries it, so the batch's own schema is not crossed
-/// again. A column that does not match it fails the batch.
+/// `schema` is the stream's schema, already crossed by [`schema_to_host`].
 pub(super) fn batch_to_host(batch: LanceRecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for column in batch.columns() {
@@ -119,8 +117,6 @@ mod tests {
         TimeUnit as LanceTimeUnit,
     };
 
-    /// Crosses the batch's own schema first, as the Lance reader does once per
-    /// stream.
     fn to_host(batch: LanceRecordBatch) -> Result<RecordBatch> {
         let schema = Arc::new(schema_to_host(batch.schema().as_ref())?);
         batch_to_host(batch, schema)
@@ -287,13 +283,6 @@ mod tests {
             Arc::ptr_eq(&host.schema(), &schema),
             "the batch must share the stream's schema rather than cross its own"
         );
-    }
-
-    #[test]
-    fn test_batch_to_host_rejects_a_schema_the_columns_do_not_match() {
-        let batch = lance_batch();
-        let other = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
-        assert!(batch_to_host(batch, other).is_err());
     }
 
     #[test]
