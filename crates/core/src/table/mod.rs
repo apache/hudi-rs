@@ -100,6 +100,7 @@ pub use crate::config::read_options::{QueryType, ReadOptions};
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig;
+use crate::config::plan::HudiPlanConfig::ListingParallelism;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
@@ -124,6 +125,7 @@ use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
+use futures::{StreamExt, TryStreamExt, stream};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -517,6 +519,52 @@ impl Table {
                     .await
             }
         }
+    }
+
+    /// Fills in the size of every base file in `file_slices` that the file
+    /// system view did not record one for, with one `HEAD` request per such
+    /// file, issued at `hoodie.plan.listing.parallelism`.
+    ///
+    /// A view built from the timeline knows a base file's size only when the
+    /// write stat that named the file also measured it. A delta commit that
+    /// appends to the file group measures its log file instead, so a base
+    /// file whose creating commit is archived carries no size. The file group
+    /// reader looks the size up itself; a reader that takes it from the slice,
+    /// such as DataFusion's parquet source, needs it filled in first.
+    pub async fn populate_base_file_sizes(&self, file_slices: &mut [FileSlice]) -> Result<()> {
+        let mut lookups = Vec::new();
+        for (index, file_slice) in file_slices.iter().enumerate() {
+            let sizeless = file_slice
+                .base_file
+                .as_ref()
+                .is_some_and(|base_file| base_file.file_metadata.is_none());
+            if !sizeless {
+                continue;
+            }
+            if let Some(relative_path) = file_slice.base_file_relative_path()? {
+                lookups.push((index, relative_path));
+            }
+        }
+        if lookups.is_empty() {
+            return Ok(());
+        }
+
+        let storage = &self.file_system_view.storage;
+        let parallelism = self.hudi_configs.get_or_default(ListingParallelism).into();
+        let sized: Vec<_> = stream::iter(lookups)
+            .map(|(index, relative_path)| async move {
+                let metadata = storage.get_file_metadata(&relative_path).await?;
+                Ok::<_, CoreError>((index, metadata))
+            })
+            .buffer_unordered(parallelism)
+            .try_collect()
+            .await?;
+        for (index, metadata) in sized {
+            if let Some(base_file) = file_slices[index].base_file.as_mut() {
+                base_file.file_metadata = Some(metadata);
+            }
+        }
+        Ok(())
     }
 
     async fn get_file_slices_inner(
@@ -3267,5 +3315,59 @@ mod tests {
 
         let file_slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
         assert!(!file_slices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn populate_base_file_sizes_measures_only_the_sizeless_base_files() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await.unwrap();
+        let mut file_slices = hudi_table
+            .get_file_slices(&ReadOptions::new())
+            .await
+            .unwrap();
+        assert!(!file_slices.is_empty());
+        let listed_sizes: Vec<u64> = file_slices
+            .iter()
+            .map(|s| {
+                s.base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .as_ref()
+                    .unwrap()
+                    .size
+            })
+            .collect();
+        assert!(listed_sizes.iter().all(|&size| size > 0));
+
+        // A sizeless base file is measured; the others keep what the listing recorded.
+        file_slices[0].base_file.as_mut().unwrap().file_metadata = None;
+        hudi_table
+            .populate_base_file_sizes(&mut file_slices)
+            .await
+            .unwrap();
+        let sizes: Vec<u64> = file_slices
+            .iter()
+            .map(|s| {
+                s.base_file
+                    .as_ref()
+                    .unwrap()
+                    .file_metadata
+                    .as_ref()
+                    .unwrap()
+                    .size
+            })
+            .collect();
+        assert_eq!(sizes, listed_sizes);
+
+        // A base file that does not exist cannot be measured.
+        let base_file = file_slices[0].base_file.as_mut().unwrap();
+        base_file.file_metadata = None;
+        base_file.file_id = "00000000-0000-0000-0000-000000000000-0".to_string();
+        let err = hudi_table
+            .populate_base_file_sizes(&mut file_slices)
+            .await
+            .expect_err("a missing base file must fail the lookup");
+        assert!(matches!(err, CoreError::Storage(_)), "{err:?}");
     }
 }

@@ -330,8 +330,9 @@ impl BaseFileReader for LanceBaseFileReader {
             let arrow_schema: SchemaRef =
                 Arc::new(lance_arrow::schema_to_host(lance_stream.schema().as_ref())?);
 
+            let batch_schema = arrow_schema.clone();
             let mapped_stream = lance_stream
-                .map(|result| lance_arrow::batch_to_host(result?))
+                .map(move |result| lance_arrow::batch_to_host(result?, batch_schema.clone()))
                 .boxed();
 
             Ok(BaseFileStream::new(arrow_schema, mapped_stream))

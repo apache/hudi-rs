@@ -30,10 +30,9 @@
 //! `release` callback when the host batch drops.
 
 use std::mem::transmute;
-use std::sync::Arc;
 
 use arrow::array::{RecordBatch, RecordBatchOptions, make_array};
-use arrow::datatypes::Schema;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::ArrowError;
 use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema, from_ffi};
 use arrow_array_lance::RecordBatch as LanceRecordBatch;
@@ -55,8 +54,11 @@ pub(super) fn schema_to_host(schema: &LanceSchema) -> Result<Schema> {
 
 /// Converts a batch from Lance's arrow into the workspace's arrow, sharing
 /// the column buffers.
-pub(super) fn batch_to_host(batch: LanceRecordBatch) -> Result<RecordBatch> {
-    let schema = Arc::new(schema_to_host(batch.schema().as_ref())?);
+///
+/// `schema` is the stream's schema, crossed once by [`schema_to_host`]; every
+/// batch of the stream carries it, so the batch's own schema is not crossed
+/// again. A column that does not match it fails the batch.
+pub(super) fn batch_to_host(batch: LanceRecordBatch, schema: SchemaRef) -> Result<RecordBatch> {
     let mut columns = Vec::with_capacity(batch.num_columns());
     for column in batch.columns() {
         let (array, array_schema) = to_ffi(&column.to_data()).map_err(export_error)?;
@@ -101,6 +103,7 @@ mod tests {
     use super::*;
 
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     use arrow::array::{Array, AsArray};
     use arrow::datatypes::{DataType, Field, Int32Type, TimeUnit};
@@ -115,6 +118,13 @@ mod tests {
         DataType as LanceDataType, Field as LanceField, Fields as LanceFields,
         TimeUnit as LanceTimeUnit,
     };
+
+    /// Crosses the batch's own schema first, as the Lance reader does once per
+    /// stream.
+    fn to_host(batch: LanceRecordBatch) -> Result<RecordBatch> {
+        let schema = Arc::new(schema_to_host(batch.schema().as_ref())?);
+        batch_to_host(batch, schema)
+    }
 
     /// A batch with the type shapes that take different paths through the C
     /// data interface: a primitive with nulls, a variable-width string, a
@@ -232,7 +242,7 @@ mod tests {
 
     #[test]
     fn test_batch_to_host_preserves_values_and_nulls() {
-        let host = batch_to_host(lance_batch()).unwrap();
+        let host = to_host(lance_batch()).unwrap();
         assert_eq!(host.num_rows(), 3);
         assert_eq!(host.num_columns(), 5);
         assert_eq!(host.schema().field(0).name(), "id");
@@ -269,10 +279,28 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_to_host_carries_the_given_schema() {
+        let batch = lance_batch();
+        let schema = Arc::new(schema_to_host(batch.schema().as_ref()).unwrap());
+        let host = batch_to_host(batch, schema.clone()).unwrap();
+        assert!(
+            Arc::ptr_eq(&host.schema(), &schema),
+            "the batch must share the stream's schema rather than cross its own"
+        );
+    }
+
+    #[test]
+    fn test_batch_to_host_rejects_a_schema_the_columns_do_not_match() {
+        let batch = lance_batch();
+        let other = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        assert!(batch_to_host(batch, other).is_err());
+    }
+
+    #[test]
     fn test_batch_to_host_shares_column_buffers() {
         let batch = lance_batch();
         let source_ptr = batch.column(0).to_data().buffers()[0].as_ptr();
-        let host = batch_to_host(batch).unwrap();
+        let host = to_host(batch).unwrap();
         let host_ptr = host.column(0).to_data().buffers()[0].as_ptr();
         assert_eq!(
             source_ptr, host_ptr,
@@ -282,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_batch_to_host_keeps_buffers_alive_after_source_drops() {
-        let host = batch_to_host(lance_batch()).unwrap();
+        let host = to_host(lance_batch()).unwrap();
         // The source batch is gone; the imported arrays hold its buffers
         // through the exporter's `release` callback.
         let name = host.column(1).as_string::<i32>();
@@ -302,7 +330,7 @@ mod tests {
             vec![Arc::new(LanceInt32Array::from(Vec::<i32>::new()))],
         )
         .unwrap();
-        let host = batch_to_host(no_rows).unwrap();
+        let host = to_host(no_rows).unwrap();
         assert_eq!(host.num_rows(), 0);
         assert_eq!(host.num_columns(), 1);
 
@@ -312,7 +340,7 @@ mod tests {
             &arrow_array_lance::RecordBatchOptions::new().with_row_count(Some(7)),
         )
         .unwrap();
-        let host = batch_to_host(no_columns).unwrap();
+        let host = to_host(no_columns).unwrap();
         assert_eq!(host.num_rows(), 7);
         assert_eq!(host.num_columns(), 0);
     }
@@ -371,7 +399,7 @@ mod tests {
         )
         .unwrap();
 
-        let host = batch_to_host(batch).unwrap();
+        let host = to_host(batch).unwrap();
         assert_eq!(host.num_rows(), 3);
 
         let sliced = host.column(0).as_primitive::<Int32Type>();
@@ -422,7 +450,7 @@ mod tests {
     fn test_host_field_type_round_trips_through_the_workspace_arrow() {
         // A field built in the workspace arrow equals the crossed field, so the
         // two arrows agree on the type encoding the C interface carries.
-        let host = batch_to_host(lance_batch()).unwrap();
+        let host = to_host(lance_batch()).unwrap();
         let expected = Field::new(
             "ts",
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),

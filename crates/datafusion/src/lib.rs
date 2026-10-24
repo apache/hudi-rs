@@ -420,7 +420,7 @@ impl HudiDataSource {
             Some(format) => matches!(format, BaseFileFormatValue::Parquet),
             None => Self::file_slices_are_parquet(file_slices)?,
         };
-        if !parquet_base_files || !Self::file_slices_have_sizes(file_slices) {
+        if !parquet_base_files {
             return Ok(false);
         }
         if !self.table.is_mor() {
@@ -429,35 +429,6 @@ impl HudiDataSource {
         read_options
             .is_read_optimized()
             .map_err(|e| external_error("Invalid read-optimized option", e))
-    }
-
-    /// The scan's routing once the file slices are known: a table whose
-    /// persisted format already settled on parquet still needs every base file
-    /// sized, and a table without a persisted format decides from the slices.
-    fn scan_uses_parquet_source(
-        &self,
-        format_decision: Option<bool>,
-        read_options: &ReadOptions,
-        file_slices: &[FileSlice],
-    ) -> Result<bool> {
-        match format_decision {
-            Some(false) => Ok(false),
-            Some(true) => Ok(Self::file_slices_have_sizes(file_slices)),
-            None => self.use_parquet_source(read_options, file_slices),
-        }
-    }
-
-    /// Whether every base file carries its size. The parquet source needs it:
-    /// DataFusion reads the footer at the size it is given, and its file-group
-    /// repartitioner assigns a zero-length file to no partition at all, so a
-    /// slice without one goes through `HudiScanExec`, which looks the size up.
-    fn file_slices_have_sizes(file_slices: &[FileSlice]) -> bool {
-        file_slices.iter().all(|slice| {
-            slice
-                .base_file
-                .as_ref()
-                .is_none_or(|base_file| base_file.file_metadata.is_some())
-        })
     }
 
     /// Check if the given expression can be pushed down to the Hudi table.
@@ -696,11 +667,20 @@ impl HudiDataSource {
                 };
                 let url = join_url_segments(&base_url, &[relative_path.as_str()])
                     .map_err(|e| external_error("Failed to join URL segments", e))?;
+                // DataFusion reads the footer at this size, and its file-group
+                // repartitioner assigns a zero-length file to no partition at
+                // all, so a missing size is an error rather than a zero.
                 let size = f
                     .base_file
                     .as_ref()
                     .and_then(|b| b.file_metadata.as_ref())
-                    .map_or(0, |m| m.size);
+                    .map(|m| m.size)
+                    .ok_or_else(|| {
+                        DataFusionError::Internal(format!(
+                            "Base file {relative_path} has no known size; \
+                             populate_base_file_sizes must run before scan_parquet"
+                        ))
+                    })?;
                 let partitioned_file = PartitionedFile::new(url.path(), size);
                 parquet_file_group_vec.push(partitioned_file);
             }
@@ -914,17 +894,26 @@ impl TableProvider for HudiDataSource {
                 .await
             }
             _ => {
-                let partition_flat_slices = self
+                let mut partition_flat_slices = self
                     .table
                     .get_file_slices(&partition_read_options)
                     .await
                     .map_err(|e| external_error("Failed to get file slices from Hudi table", e))?;
 
-                if self.scan_uses_parquet_source(
-                    format_decision,
-                    &partition_read_options,
-                    &partition_flat_slices,
-                )? {
+                let use_parquet_source = match format_decision {
+                    Some(decided) => decided,
+                    None => {
+                        self.use_parquet_source(&partition_read_options, &partition_flat_slices)?
+                    }
+                };
+                if use_parquet_source {
+                    // The parquet source reads each footer at the size the slice
+                    // carries, so a base file the view did not size is measured
+                    // here rather than handed over as zero bytes.
+                    self.table
+                        .populate_base_file_sizes(&mut partition_flat_slices)
+                        .await
+                        .map_err(|e| external_error("Failed to look up base file sizes", e))?;
                     self.scan_parquet(state, projection, filters, limit, partition_flat_slices)
                         .await
                 } else {
@@ -1075,7 +1064,6 @@ mod tests {
 
     use datafusion::logical_expr::BinaryExpr;
     use datafusion::prelude::SessionContext;
-    use hudi_test::QuickstartTripsTable;
     use hudi_test::SampleTable::{V6Nonpartitioned, V6SimplekeygenNonhivestyle, V9LanceTxnsSimple};
 
     use crate::HudiDataSource;
@@ -1128,63 +1116,24 @@ mod tests {
         assert!(!HudiDataSource::file_slices_are_parquet(&[]).unwrap());
     }
 
-    #[test]
-    fn test_file_slices_have_sizes_requires_metadata_on_every_base_file() {
-        use hudi_core::file_group::base_file::BaseFile;
-        use hudi_core::storage::file_metadata::FileMetadata;
-        use std::str::FromStr;
-
-        let name = "0832997e-30d8-4a42-a52d-e2c540816593-0_0-43-78_20261016221427272.parquet";
-        let sized = {
-            let mut base_file = BaseFile::from_str(name).unwrap();
-            base_file.file_metadata = Some(FileMetadata::new(name.to_string(), 4096));
-            FileSlice::new(base_file, "city=sf".to_string())
-        };
-        let without_size = FileSlice::new(BaseFile::from_str(name).unwrap(), "city=sf".to_string());
-
-        assert!(HudiDataSource::file_slices_have_sizes(&[]));
-        assert!(HudiDataSource::file_slices_have_sizes(
-            std::slice::from_ref(&sized)
-        ));
-        assert!(!HudiDataSource::file_slices_have_sizes(&[
-            sized,
-            without_size
-        ]));
-    }
-
     #[tokio::test]
-    async fn test_scan_routing_requires_sizes_even_when_the_table_persists_parquet() {
-        // This fixture persists `hoodie.table.base.file.format=PARQUET`, so a
-        // read-optimized read settles on the parquet source before any slice is
-        // read.
-        let base_uri = QuickstartTripsTable::MorDeleteOrdInt.path_to_mor_avro();
+    async fn test_scan_parquet_rejects_a_base_file_without_size() {
+        let base_uri = V6Nonpartitioned.path_to_cow();
         let hudi = HudiDataSource::new_with_options(base_uri.as_str(), empty_options())
             .await
             .unwrap();
-        let read_options = hudi.scan_read_options(Vec::new(), true).unwrap();
-        let decision = hudi
-            .use_parquet_source_without_file_slices(&read_options)
-            .unwrap();
-        assert_eq!(
-            decision,
-            Some(true),
-            "the persisted format settles on parquet"
-        );
-
+        let read_options = hudi.scan_read_options(Vec::new(), false).unwrap();
         let mut slices = hudi.table.get_file_slices(&read_options).await.unwrap();
         assert!(!slices.is_empty());
-        assert!(
-            hudi.scan_uses_parquet_source(decision, &read_options, &slices)
-                .unwrap()
-        );
-
         slices[0].base_file.as_mut().unwrap().file_metadata = None;
-        assert!(
-            !hudi
-                .scan_uses_parquet_source(decision, &read_options, &slices)
-                .unwrap(),
-            "a base file without a size must leave the parquet source"
-        );
+
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+        let err = hudi
+            .scan_parquet(&state, None, &[], None, slices)
+            .await
+            .expect_err("a sizeless base file must not reach DataFusion as zero bytes");
+        assert!(err.to_string().contains("has no known size"), "{err}");
     }
 
     #[tokio::test]

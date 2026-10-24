@@ -298,9 +298,8 @@ impl Storage {
         runtime_env.register_object_store(self.base_url.as_ref(), self.object_store.clone());
     }
 
-    #[cfg(test)]
     /// Get basic file metadata (name, size) without loading the file content.
-    async fn get_file_metadata_not_populated(&self, relative_path: &str) -> Result<FileMetadata> {
+    pub async fn get_file_metadata(&self, relative_path: &str) -> Result<FileMetadata> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let meta = self.object_store.head(&obj_path).await?;
@@ -595,10 +594,7 @@ mod tests {
         let base_url =
             Url::from_directory_path(canonicalize(Path::new("tests/data")).unwrap()).unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
-        let file_metadata = storage
-            .get_file_metadata_not_populated("a.parquet")
-            .await
-            .unwrap();
+        let file_metadata = storage.get_file_metadata("a.parquet").await.unwrap();
         assert_eq!(file_metadata.name, "a.parquet");
         assert_eq!(file_metadata.size, 866);
     }
