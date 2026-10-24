@@ -30,6 +30,9 @@ pub mod log_block;
 pub mod log_format;
 pub mod reader;
 pub mod scanner;
+pub mod writer;
+
+pub use log_block::{BlockMetadataKey, BlockType};
 
 /// Represents a Hudi log file (delta log).
 ///
