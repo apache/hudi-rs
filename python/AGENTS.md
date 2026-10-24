@@ -55,10 +55,12 @@ Tests in `python/tests/`.
 import pytest
 from hudi import HudiReadOptions, HudiTableBuilder
 
+
 def test_read_snapshot_with_filters():
     table = HudiTableBuilder.from_base_uri("/tmp/test").build()
     batches = table.read(HudiReadOptions(filters=[("city", "=", "test")]))
     assert len(batches) > 0
+
 
 def test_invalid_path_raises():
     with pytest.raises(RuntimeError, match="Failed to"):
