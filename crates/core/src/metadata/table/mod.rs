@@ -210,6 +210,36 @@ impl Table {
             .await
     }
 
+    /// Read one metadata-table partition as an Arrow batch, undecoded.
+    ///
+    /// The generalisation of [`Self::read_metadata_table_files_partition_arrow`]:
+    /// `partition` is the metadata table partition to read — one of `files`,
+    /// `column_stats`, `partition_stats`, `bloom_filters`, `record_index`, or a
+    /// `secondary_index_<name>` value (see
+    /// [`Self::get_metadata_table_partitions`]). `files` is the only partition
+    /// with a decoded record type; the others come back as raw Arrow in their
+    /// stored schema, so callers that want them should consume the batch
+    /// directly.
+    ///
+    /// `keys` empty reads every record; otherwise only those keys, matched
+    /// **as stored**.
+    ///
+    /// An empty batch when the partition is not enabled or has no commits.
+    ///
+    /// # Note
+    /// Must be called on a DATA table, not a METADATA table.
+    pub async fn read_metadata_table_partition_arrow(
+        &self,
+        partition: &str,
+        keys: &[&str],
+    ) -> Result<arrow_array::RecordBatch> {
+        let metadata_table = self.get_or_init_metadata_table().await?;
+        let valid = self.valid_instant_timestamps(metadata_table).await?;
+        metadata_table
+            .read_metadata_table_partition_batch(partition, keys, &valid)
+            .await
+    }
+
     /// Fetch records from the `files` partition with optional partition pruning.
     ///
     /// For non-partitioned tables, directly fetches the "." record.
@@ -306,7 +336,28 @@ impl Table {
         keys: &[&str],
         valid_instants: &HashSet<String>,
     ) -> Result<arrow_array::RecordBatch> {
-        let Some((reader, file_slices)) = self.files_partition_reader().await? else {
+        self.read_metadata_table_partition_batch(
+            FilesPartitionRecord::PARTITION_NAME,
+            keys,
+            valid_instants,
+        )
+        .await
+    }
+
+    /// The merged batch of one metadata partition, for a caller that wants Arrow.
+    ///
+    /// An empty batch when the partition is not enabled or has no commits,
+    /// matching the empty map the decoded form returns in that case.
+    ///
+    /// # Note
+    /// Must be called on a METADATA table instance.
+    pub(crate) async fn read_metadata_table_partition_batch(
+        &self,
+        partition: &str,
+        keys: &[&str],
+        valid_instants: &HashSet<String>,
+    ) -> Result<arrow_array::RecordBatch> {
+        let Some((reader, file_slices)) = self.partition_reader(partition).await? else {
             return Ok(arrow_array::RecordBatch::new_empty(std::sync::Arc::new(
                 Schema::empty(),
             )));
@@ -316,7 +367,7 @@ impl Table {
         let batches = crate::util::concurrency::bounded_in_order(
             &targets,
             self.bounded_read_concurrency_for(&targets),
-            |file_slice| reader.read_files_partition_batch(file_slice, keys),
+            |file_slice| reader.read_partition_batch(file_slice, keys, partition),
         )
         .await?;
         concat_metadata_batches(batches)
