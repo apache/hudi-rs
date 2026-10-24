@@ -89,13 +89,15 @@ jobs:
   # Python wheel) has a configuration to use. Nothing else in CI compiles it, so
   # without this job it would break silently.
   rust-tests-no-spill-backend:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: no-spill-backend
+          # The image is part of the key: a target cache built on another Ubuntu
+          # release carries that image's system-library link decisions.
+          key: no-spill-backend-ubuntu-24.04
       # Deliberately no clang/libclang: if a change makes the default-off build
       # pull rocksdb back in, this job fails to compile rather than quietly
       # reintroducing the native dependency.
@@ -157,7 +159,7 @@ jobs:
   # compiles with the MSRV that Cargo.toml declares (read at run time so it
   # follows bumps), keeping the declared floor buildable once the two diverge.
   msrv-check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Install system dependencies
@@ -174,7 +176,9 @@ jobs:
       - name: Cache dependencies
         uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: msrv
+          # The image is part of the key: a target cache built on another Ubuntu
+          # release carries that image's system-library link decisions.
+          key: msrv-ubuntu-24.04
       - name: Check the workspace on the MSRV
         run: cargo +"$MSRV" check --workspace --all-targets --all-features
 
@@ -274,7 +278,7 @@ jobs:
         fail-fast: false
         matrix:
           app-path: [ 'datafusion', 'hudi-file-group-api/cpp', 'hudi-table-api/rust' , 'hudi-table-api/python' ]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - name: Set up Docker Buildx
@@ -314,14 +318,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
           - runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
       # Builds the wheel in the same container, running the same dependency
@@ -353,7 +357,7 @@ jobs:
 
   publish-coverage:
     name: Publish coverage reports to codecov.io
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [ rust-tests, python-tests ]
     if: github.event.pull_request.user.login != 'dependabot[bot]'
     steps:
