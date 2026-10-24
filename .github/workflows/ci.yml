@@ -67,7 +67,7 @@ jobs:
           apt-get update
           apt-get install -y protobuf-compiler clang libclang-dev
       - name: Cache dependencies
-        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Only cache cargo registry and git, not target directory
           # Tarpaulin needs clean builds for accurate coverage
@@ -93,7 +93,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Cache dependencies
-        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The image is part of the key: a target cache built on another Ubuntu
           # release carries that image's system-library link decisions.
@@ -174,7 +174,7 @@ jobs:
           rustup toolchain install "$msrv" --profile minimal
           echo "MSRV=$msrv" >> "$GITHUB_ENV"
       - name: Cache dependencies
-        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The image is part of the key: a target cache built on another Ubuntu
           # release carries that image's system-library link decisions.
@@ -221,7 +221,7 @@ jobs:
 
       # Cache Rust dependencies and build artifacts
       - name: Cache Rust dependencies
-        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Cache based on Python version and OS for better hit rate
           shared-key: "python-binding-${{ matrix.os }}-py${{ matrix.python-version }}"
