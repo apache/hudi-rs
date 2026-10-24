@@ -58,11 +58,14 @@ apache-avro = { version = "0.21", features = ["derive"] }
 apache-avro-derive = { version = "0.21" }
 
 # datafusion
-datafusion = { version = "55" }
-datafusion-expr = { version = "55" }
-datafusion-common = { version = "55" }
-datafusion-physical-expr = { version = "55" }
-datafusion-ffi = { version = "55" }
+# The floor is 55.2 rather than 55: 55.1 made `FFI_TableProvider::new_with_ffi_codec`
+# honor its codec and runtime arguments for an already-foreign provider, which the
+# Python binding relies on, and 55.2 picks up the rustls fix for RUSTSEC-2026-0285.
+datafusion = { version = "55.2" }
+datafusion-expr = { version = "55.2" }
+datafusion-common = { version = "55.2" }
+datafusion-physical-expr = { version = "55.2" }
+datafusion-ffi = { version = "55.2" }
 
 # serde
 percent-encoding = { version = "2" }

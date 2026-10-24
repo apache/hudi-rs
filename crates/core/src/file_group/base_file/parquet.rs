@@ -26,10 +26,10 @@ use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 // `ParquetObjectReader` is deprecated as of parquet 59 in favour of hand-rolling
-// an `AsyncFileReader` over `object_store`. Replacing it is its own change — it
-// has to carry the counting wrapper and the metadata normalization below — so
-// the deprecated reader is kept, allowed at each use site rather than for the
-// whole file.
+// an `AsyncFileReader` over `object_store`. Replacing it is its own change
+// (apache/hudi-rs#843): it has to carry the counting wrapper and the metadata
+// normalization below, so the deprecated reader is kept, allowed at each use
+// site rather than for the whole file.
 #[allow(deprecated)]
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber, parquet_to_arrow_schema};
