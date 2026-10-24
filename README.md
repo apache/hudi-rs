@@ -364,7 +364,7 @@ silently redirect every later read.
 | `hoodie.read.stream.batch_size`                                 | `1024`        | table or read | Rows per batch for streaming reads.                                                                                      |
 | `hoodie.read.file.slice.read.concurrency`                       | `4`           | table or read | File slices read concurrently.                                                                                           |
 | `hoodie.read.scan.max.memory.size`                              | unset         | table or read | Total bytes a whole scan may use for concurrent slice reads; when set, the concurrency is derived from it. Reaching the limit lowers throughput, it never fails the read. |
-| `hoodie.read.input.partitions`                                  | `0`           | table or read | How many partitions the DataFusion table provider buckets the file slices into. `0` defers to DataFusion's `target_partitions`. |
+| `hoodie.read.input.partitions`                                  | `0`           | table or read | How many partitions the DataFusion table provider buckets the file slices into. `0` defers to DataFusion's `target_partitions`. On the parquet-source path (copy-on-write, read-optimized merge-on-read) DataFusion may split a bucket further once it exceeds `datafusion.optimizer.repartition_file_min_size`, unless `datafusion.optimizer.repartition_file_scans` is off. |
 | `hoodie.merge.use.record.positions`                             | `false`       | table or read | Match a log record to the base row it updates by position rather than by record key. Honored by reader version 2 only; a log block written without positions is merged by key regardless. |
 
 A table whose `hoodie.record.merge.mode` is `CUSTOM` needs a merger for its payload class. When
@@ -392,12 +392,38 @@ Create a Hudi file group reader instance using its constructor or the Hudi table
 Enabling the `hudi` crate with `datafusion` feature will provide a [DataFusion](https://datafusion.apache.org/)
 extension to query Hudi tables.
 
+Each hudi-rs release targets one DataFusion major, and with it one arrow major. The Rust `hudi`
+crate's `TableProvider` and the Python `hudi[datafusion]` extra both have to match the DataFusion
+version of the application they plug into, so pick the hudi-rs release that pairs with yours.
+Readers that take Arrow data out through the C data interface (Python `read()`, the C++ and JVM
+bindings) are not tied to these versions. The `hudi[datafusion]` extra first shipped in 0.5.
+
+| hudi-rs | DataFusion | arrow | Python `datafusion` package |
+|---------|------------|-------|-----------------------------|
+| 0.6 (unreleased) | 55 | 59 | `>=55.0.0,<56` |
+| 0.5 | 54 | 58 | `>=54.0.0,<55` |
+| 0.4 | 46 | 54 | not available |
+| 0.3 | 43 | 53 | not available |
+
+On macOS arm64, a debug build of an application that links `hudi` with the `datafusion` feature
+can fail with `ld: B/BL out of range ... (max +/-128MB)`: unoptimized dependencies push the
+binary's code section past the arm64 branch range. Optimize dependencies in the dev profile:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 1
+```
+
+This workspace applies the same setting from `build-wrapper.sh` on macOS arm64 only, since it
+slows compilation noticeably. It goes away once a Lance release shares the workspace's arrow major
+([#844](https://github.com/apache/hudi-rs/issues/844)).
+
 <details>
 <summary>Add crate hudi with datafusion feature to your application to query a Hudi table.</summary>
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@54
+cargo add tokio@1 datafusion@55
 cargo add hudi --features datafusion
 ```
 
