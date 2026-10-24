@@ -77,6 +77,7 @@ url = { workspace = true }
 
 # runtime / async
 async-recursion = { workspace = true }
+async-trait = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 tokio = { workspace = true }
@@ -92,17 +93,22 @@ flate2 = { workspace = true }
 # prost-build at compile time, which shells out to `protoc`. Any build of
 # hudi-core (CI, Docker, local dev, downstream consumers) must therefore
 # have `protoc` available on PATH — there is no opt-out.
-lance-core = { version = "11.0.0" }
-lance-encoding = { version = "11.0.0" }
-lance-file = { version = "11.0.0" }
-lance-io = { version = "11.0.0" }
-# Lance 11 is built on arrow 58 while the workspace is on 59. These are the
+lance-core = { version = "13.0.0" }
+lance-encoding = { version = "13.0.0" }
+lance-file = { version = "13.0.0" }
+lance-io = { version = "13.0.0" }
+# Lance 13 is built on arrow 58 while the workspace is on 59. These are the
 # arrow crates Lance's API speaks, renamed so the Lance reader can export its
 # batches through the Arrow C data interface and import them as the
 # workspace's arrow; see `file_group::base_file::lance_arrow`. Drop them once a
 # Lance release shares the workspace's arrow major.
 arrow-array-lance = { package = "arrow-array", version = "58", features = ["ffi"] }
 arrow-schema-lance = { package = "arrow-schema", version = "58", features = ["ffi"] }
+# Lance 13 is built on object_store 0.14 while the workspace is on 0.13; the
+# Lance reader wraps the workspace's store in Lance's `ObjectStore` trait; see
+# `file_group::base_file::lance_object_store`. Drop it with the arrow crates
+# above once the majors line up.
+object_store-lance = { package = "object_store", version = "0.14.1", default-features = false }
 
 # datafusion
 datafusion = { workspace = true, optional = true }
@@ -112,9 +118,6 @@ datafusion-physical-expr = { workspace = true, optional = true }
 percent-encoding = { workspace = true }
 
 [dev-dependencies]
-# Needed only to implement `object_store::ObjectStore` for the test-only counting
-# wrapper: that trait is declared with `#[async_trait]`, so an impl must be too.
-async-trait = { workspace = true }
 hudi-test = { path = "../test" }
 serial_test = { workspace = true }
 # Also a regular dependency, but only an optional one behind `spill-rocksdb`.

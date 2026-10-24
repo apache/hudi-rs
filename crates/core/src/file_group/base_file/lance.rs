@@ -39,9 +39,11 @@ use lance_io::scheduler::{FileScheduler, ScanScheduler, SchedulerConfig};
 use lance_io::utils::CachedFileSize;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
+use object_store_lance::path::Path as LancePath;
 use tokio::sync::OnceCell;
 
 use super::lance_arrow;
+use super::lance_object_store::LanceObjectStoreAdapter;
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
 use crate::statistics::{ColumnStatistics, StatisticsContainer, StatsGranularity};
 use crate::storage::Storage;
@@ -84,14 +86,16 @@ impl LanceBaseFileReader {
                     ),
                 );
                 // `ObjectStoreParams::object_store` is marked deprecated in lance-io
-                // 11.x in favor of implementing `ObjectStoreProvider`. We still set
+                // in favor of implementing `ObjectStoreProvider`. We still set
                 // it here so Lance reuses the ObjectStore we already built (with
                 // hudi-rs's storage options applied) and skips re-resolving
                 // credentials. `storage_options_accessor` itself is current API.
                 #[allow(deprecated)]
                 let params = lance_io::object_store::ObjectStoreParams {
                     object_store: Some((
-                        self.storage.object_store.clone(),
+                        Arc::new(LanceObjectStoreAdapter::new(
+                            self.storage.object_store.clone(),
+                        )),
                         (*self.storage.base_url).clone(),
                     )),
                     storage_options_accessor: Some(storage_accessor),
@@ -128,7 +132,8 @@ impl LanceBaseFileReader {
     ) -> Result<FileScheduler> {
         let scheduler = self.scheduler().await?;
         let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
-        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_path = LancePath::from_url_path(obj_url.path())
+            .map_err(|e| StorageError::InvalidPath(e.to_string()))?;
         let cached_size = match known_size {
             Some(size) => CachedFileSize::new(size),
             None => CachedFileSize::unknown(),
@@ -394,6 +399,8 @@ impl BaseFileReader for LanceBaseFileReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::HudiConfigs;
+    use crate::storage::counting::CountingObjectStore;
     use hudi_test::SampleTable;
     use std::io::Write;
     use tempfile::TempDir;
@@ -431,6 +438,39 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_lance_reader_reads_data_through_a_non_local_store() {
+        // Lance reads a file:// URL straight from disk and uses the given store
+        // only for size lookups, so only a non-local store carries the data reads.
+        let file_name = lance_base_file_name();
+        let table_path = SampleTable::V9LanceNonpartitioned.path_to_cow();
+        let bytes = std::fs::read(std::path::Path::new(&table_path).join(&file_name)).unwrap();
+        let memory = object_store::memory::InMemory::new();
+        memory
+            .put(&ObjPath::from(format!("table/{file_name}")), bytes.into())
+            .await
+            .unwrap();
+        let (store, counts) = CountingObjectStore::new(Arc::new(memory));
+        let storage = Storage::new_with_object_store(
+            Url::parse("memory:///table/").unwrap(),
+            store,
+            Arc::new(HudiConfigs::empty()),
+        );
+
+        let from_memory = LanceBaseFileReader::new(storage)
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .unwrap();
+        let from_disk = LanceBaseFileReader::new(lance_test_storage())
+            .read_data(&file_name, BaseFileReadOptions::new())
+            .await
+            .unwrap();
+
+        assert!(from_memory.num_rows() > 0);
+        assert_eq!(from_memory, from_disk);
+        assert!(counts.gets() > 0);
     }
 
     #[tokio::test]
