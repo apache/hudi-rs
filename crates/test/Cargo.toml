@@ -38,6 +38,11 @@ arrow-schema = { workspace = true }
 arrow-select = { workspace = true }
 parquet = { workspace = true }
 
+# synthetic merge-on-read tables (Avro log blocks with record positions)
+apache-avro = { workspace = true }
+base64 = { workspace = true }
+roaring = { workspace = true }
+
 # datafusion (optional, for verification helpers)
 datafusion = { workspace = true, optional = true }
 hudi-datafusion = { path = "../datafusion", optional = true }

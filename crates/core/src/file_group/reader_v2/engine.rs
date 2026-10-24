@@ -35,7 +35,7 @@ use crate::file_group::reader_v2::buffer::loader::{
 };
 use crate::file_group::reader_v2::buffer::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME;
 use crate::file_group::reader_v2::buffered_record_converter::BufferedRecordConverter;
-use crate::file_group::reader_v2::input_split::InputSplit;
+use crate::file_group::reader_v2::input_split::{BaseFileRange, InputSplit};
 use crate::file_group::reader_v2::iterator_mode::IteratorMode;
 use crate::file_group::reader_v2::merge_iterator::{
     FileGroupMergeStream, StreamStatsHandle, new_stream_stats_handle,
@@ -183,6 +183,30 @@ fn base_read_options(
         options = options.with_row_index_column(ROW_INDEX_TEMPORARY_COLUMN_NAME);
     }
     options
+}
+
+/// Narrow a row-group selection to the row groups of `range`: the selector's
+/// own pruning still applies inside the range, and a file with fewer row groups
+/// than the range expects yields what it has.
+fn restrict_to_range(
+    selector: Option<RowGroupSelector>,
+    range: Option<&BaseFileRange>,
+) -> Option<RowGroupSelector> {
+    let Some(range) = range.cloned() else {
+        return selector;
+    };
+    Some(Arc::new(
+        move |metadata: &parquet::file::metadata::ParquetMetaData| {
+            let total = metadata.num_row_groups();
+            let within = range.row_groups.start.min(total)..range.row_groups.end.min(total);
+            Some(
+                match selector.as_ref().and_then(|select| select(metadata)) {
+                    Some(kept) => kept.into_iter().filter(|i| within.contains(i)).collect(),
+                    None => within.collect(),
+                },
+            )
+        },
+    ))
 }
 
 /// A base file as the merge consumes it: batches, plus the schema they carry.
@@ -448,8 +472,7 @@ impl HoodieFileGroupReader {
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         // Stage timing (perf harness): opening the base file. Only the open —
         // the per-row-group decode is paid lazily, inside the merge.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
-        Ok(self.init_record_iterators(base).await?.into_stream())
+        Ok(self.init_record_iterators().await?.into_stream())
     }
 
     /// Read the file group and return the merged output as a single
@@ -463,9 +486,8 @@ impl HoodieFileGroupReader {
         // Stage timing (perf harness): only the open, same as `open_stream` —
         // the decode happens lazily while `collect_into_one_batch` drives the
         // stream, so it lands in the merge loop rather than in `base_read_us`.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
         let batch = self
-            .init_record_iterators(base)
+            .init_record_iterators()
             .await?
             .collect_into_one_batch()
             .await?;
@@ -505,7 +527,7 @@ impl HoodieFileGroupReader {
     ///   └─ recordBufferLoader.getRecordBuffer(...)
     ///        → FileGroupMergeStream::new_buffered(...)
     /// ```
-    async fn init_record_iterators(&mut self, base: BaseSource) -> Result<FileGroupMergeStream> {
+    async fn init_record_iterators(&mut self) -> Result<FileGroupMergeStream> {
         log::debug!(
             "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
             self.input_split.partition_path,
@@ -514,15 +536,6 @@ impl HoodieFileGroupReader {
                 .as_deref()
                 .unwrap_or("<none>"),
             self.input_split.log_file_paths.len(),
-        );
-
-        let BaseSource {
-            schema: base_source_schema,
-            batches: base_source,
-        } = base;
-        log::debug!(
-            "[HoodieFileGroupReader] base file source: schema_cols={}",
-            base_source_schema.fields().len(),
         );
 
         // The post-projection output schema is the same regardless of
@@ -534,6 +547,10 @@ impl HoodieFileGroupReader {
         // iterator that yields the base file batches directly.
         if self.input_split.is_base_only() {
             log::debug!("[HoodieFileGroupReader] no log files → Eager iterator");
+            let BaseSource {
+                schema: base_source_schema,
+                batches: base_source,
+            } = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
 
             // The schema travels with the source, so it is known without
             // forcing a row-group decode. A log-only file group's source is
@@ -559,6 +576,14 @@ impl HoodieFileGroupReader {
 
         // Step 3: MOR path — load record buffer (scan log files + create buffer).
         // Mirrors Java: this.recordBuffer = recordBufferLoader.getRecordBuffer(...).getLeft();
+        // A range reader whose log records cannot be matched to its rows by
+        // position has nothing to contribute; the first range reads the whole
+        // slice instead. Known before the scan when positions are off, and after
+        // it when a block turns out to carry none.
+        if self.defers_to_first_range(self.use_record_position()) {
+            return self.nothing_to_read(post_projection_schema, output_converter);
+        }
+
         log::debug!(
             "[HoodieFileGroupReader] scanning {} log file(s) with latest_commit_time={}",
             self.input_split.log_file_paths.len(),
@@ -578,6 +603,25 @@ impl HoodieFileGroupReader {
         let record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
 
+        let merges_by_position = record_buffer.get_buffer_type() == BufferType::PositionBasedMerge;
+        if self.defers_to_first_range(merges_by_position) {
+            return self.nothing_to_read(post_projection_schema, output_converter);
+        }
+        // The base file is opened after the log scan so that the row groups it
+        // reads can depend on how the scan went.
+        let range = self.base_file_range_to_read(merges_by_position);
+        let BaseSource {
+            schema: base_source_schema,
+            batches: base_source,
+        } = profile_once!(
+            self.read_stats.base_read_us,
+            self.base_file_source_reading(range).await
+        )?;
+        log::debug!(
+            "[HoodieFileGroupReader] base file source: schema_cols={}",
+            base_source_schema.fields().len(),
+        );
+
         // Anything this read expects that is quietly not done, said once, before
         // the rows come back looking unremarkable. Reported here rather than on
         // entry for two reasons: the scan has finished, so a position merge that
@@ -589,7 +633,7 @@ impl HoodieFileGroupReader {
             &self.reader_context,
             &self.reader_parameters,
             self.use_record_position(),
-            record_buffer.get_buffer_type() == BufferType::PositionBasedMerge,
+            merges_by_position,
         );
 
         log::debug!(
@@ -761,6 +805,43 @@ impl HoodieFileGroupReader {
         )
     }
 
+    /// The part of the base file this reader decodes, once it is known whether
+    /// log records can be matched to base rows by position. A range is honoured
+    /// for a slice without log files, or one whose blocks all carry positions;
+    /// otherwise the first range reads the whole file.
+    fn base_file_range_to_read(&self, merges_by_position: bool) -> Option<BaseFileRange> {
+        let range = self.input_split.base_file_range.as_ref()?;
+        (!self.input_split.has_log_files() || merges_by_position).then(|| range.clone())
+    }
+
+    /// Whether this range reader leaves the whole slice to the first range.
+    fn defers_to_first_range(&self, merges_by_position: bool) -> bool {
+        match &self.input_split.base_file_range {
+            Some(range) => {
+                self.input_split.has_log_files() && !merges_by_position && !range.is_first()
+            }
+            None => false,
+        }
+    }
+
+    fn nothing_to_read(
+        &self,
+        post_projection_schema: Option<SchemaRef>,
+        output_converter: Option<Box<dyn OutputConverter>>,
+    ) -> Result<FileGroupMergeStream> {
+        let schema = self.schema_handler.required_schema.clone().ok_or_else(|| {
+            CoreError::ReadFileSliceError(
+                "a base file range read needs a requested schema".to_string(),
+            )
+        })?;
+        Ok(FileGroupMergeStream::new_eager(
+            BaseSource::empty(schema.clone()).batches,
+            post_projection_schema.unwrap_or(schema),
+            output_converter,
+            self.stream_stats.clone(),
+        ))
+    }
+
     /// Open the base file as a stream of batches, with the schema they carry.
     ///
     /// One shape for every caller: the base file is read asynchronously, one
@@ -776,6 +857,14 @@ impl HoodieFileGroupReader {
     ///
     /// Mirrors Java's `HoodieFileGroupReader.makeBaseFileIterator()`.
     async fn base_file_source(&mut self) -> Result<BaseSource> {
+        let range = self.base_file_range_to_read(self.use_record_position());
+        self.base_file_source_reading(range).await
+    }
+
+    async fn base_file_source_reading(
+        &mut self,
+        range: Option<BaseFileRange>,
+    ) -> Result<BaseSource> {
         let Some(path) = self.input_split.base_file_path.clone() else {
             // Log-only file group — empty base. Use the required_schema
             // as the reported schema when available; otherwise an empty
@@ -870,7 +959,7 @@ impl HoodieFileGroupReader {
                     &path,
                     base_read_options(
                         row_filter.clone(),
-                        row_group_selector.clone(),
+                        restrict_to_range(row_group_selector.clone(), range.as_ref()),
                         key_predicate.clone(),
                         use_position,
                     ),
@@ -1021,7 +1110,7 @@ impl HoodieFileGroupReader {
                 &path,
                 base_read_options(
                     row_filter.clone(),
-                    row_group_selector.clone(),
+                    restrict_to_range(row_group_selector.clone(), range.as_ref()),
                     key_predicate.clone(),
                     use_position,
                 )

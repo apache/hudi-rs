@@ -36,6 +36,7 @@ use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber, parquet_to_arro
 use parquet::file::metadata::ParquetMetaData;
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
+use crate::file_group::reader_v2::input_split::RowGroupSpan;
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use crate::statistics::StatisticsContainer;
 use crate::storage::ReadVolume;
@@ -328,6 +329,45 @@ impl ParquetBaseFileReader {
 }
 
 impl BaseFileReader for ParquetBaseFileReader {
+    fn row_group_spans<'a>(
+        &'a self,
+        relative_path: &'a str,
+        known_file_size: Option<u64>,
+    ) -> BoxFuture<'a, Result<Vec<RowGroupSpan>>> {
+        Box::pin(async move {
+            let builder = match known_file_size {
+                Some(size) => {
+                    let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+                    let obj_path = ObjPath::from_url_path(obj_url.path())?;
+                    self.open_builder_with_size(obj_path, size, None).await?
+                }
+                None => self.open_builder(relative_path, None).await?,
+            };
+            Ok(builder
+                .metadata()
+                .row_groups()
+                .iter()
+                .map(|group| RowGroupSpan {
+                    // The group starts at its earliest page; a dictionary page
+                    // precedes the data pages when a column has one.
+                    start: group
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            column
+                                .dictionary_page_offset()
+                                .unwrap_or_else(|| column.data_page_offset())
+                                .max(0) as u64
+                        })
+                        .min()
+                        .unwrap_or(0),
+                    bytes: group.compressed_size().max(0) as u64,
+                    rows: group.num_rows().max(0) as u64,
+                })
+                .collect())
+        })
+    }
+
     fn read_stream<'a>(
         &'a self,
         relative_path: &'a str,

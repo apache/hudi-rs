@@ -281,6 +281,8 @@ pub struct Builder {
     /// Inputs for the Gate-3 completed/inflight check; `Some` only for
     /// table version < 8. `None` (default) leaves Gate 3 a no-op.
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
+    base_file_range: Option<crate::file_group::reader_v2::input_split::BaseFileRange>,
+    base_file_instant: Option<String>,
 }
 
 impl Default for Builder {
@@ -296,6 +298,8 @@ impl Default for Builder {
             force_full_scan: true,
             allow_inflight_instants: false,
             completion_gate_inputs: None,
+            base_file_range: None,
+            base_file_instant: None,
         }
     }
 }
@@ -361,6 +365,18 @@ impl Builder {
         self
     }
 
+    /// Read only the log records addressed at `range` of the base file written
+    /// at `base_instant`, when every block carries record positions.
+    pub fn with_base_file_range(
+        mut self,
+        range: Option<crate::file_group::reader_v2::input_split::BaseFileRange>,
+        base_instant: Option<String>,
+    ) -> Self {
+        self.base_file_range = range;
+        self.base_file_instant = base_instant;
+        self
+    }
+
     /// Build and optionally perform scan.
     ///
     /// Mirrors Java's `build()` which calls the constructor, and the
@@ -399,6 +415,9 @@ impl Builder {
             record_buffer,
             allow_inflight_instants: self.allow_inflight_instants,
             completion_gate_inputs: self.completion_gate_inputs,
+            base_file_range: self.base_file_range,
+            base_file_instant: self.base_file_instant,
+            positions_within: None,
             valid_block_instants: Vec::new(),
             total_log_files: 0,
             total_log_blocks: 0,
@@ -549,6 +568,84 @@ mod tests {
             .with_force_full_scan(true)
             .build()
             .await
+    }
+
+    /// Records of other ranges are skipped at decode only when every block to
+    /// merge carries positions relative to this base file; one block without
+    /// them means a merge by key, which needs every record.
+    #[tokio::test]
+    async fn records_are_skipped_at_decode_only_when_every_block_carries_positions() {
+        use crate::file_group::log_file::log_block::{
+            BlockMetadataKey, BlockType, LogBlock, LogBlockContent,
+        };
+        use crate::file_group::log_file::log_format::LogFormatVersion;
+        use crate::file_group::reader_v2::buffer::record_positions::encode_record_positions;
+        use crate::file_group::reader_v2::input_split::BaseFileRange;
+        use std::collections::HashMap;
+
+        let (dir, file_name) = fixture_copy();
+        let mut reader = HoodieMergedLogRecordReader::new_builder()
+            .with_reader_context(make_test_reader_context())
+            .with_storage(storage_over(&dir))
+            .with_log_files(vec![file_name])
+            .with_record_buffer(make_test_buffer())
+            .with_base_file_range(
+                Some(BaseFileRange {
+                    row_groups: 1..2,
+                    positions: 100..200,
+                }),
+                Some("20250101".to_string()),
+            )
+            .with_force_full_scan(false)
+            .build()
+            .await
+            .unwrap();
+
+        let block = |block_type: BlockType, positions_for: Option<&str>| {
+            let mut header = HashMap::from([(BlockMetadataKey::InstantTime, "20250102".into())]);
+            if let Some(base) = positions_for {
+                header.insert(
+                    BlockMetadataKey::RecordPositions,
+                    encode_record_positions([1u64, 150]),
+                );
+                header.insert(
+                    BlockMetadataKey::BaseFileInstantTimeOfRecordPositions,
+                    base.to_string(),
+                );
+            }
+            LogBlock::new(
+                LogFormatVersion::V1,
+                block_type,
+                header,
+                LogBlockContent::Empty,
+                HashMap::new(),
+            )
+        };
+
+        let complete = [
+            block(BlockType::AvroData, Some("20250101")),
+            block(BlockType::Delete, Some("20250101")),
+            block(BlockType::Command, None),
+        ];
+        assert_eq!(reader.base.positions_to_decode(&complete), Some(100..200));
+
+        let one_without = [
+            block(BlockType::AvroData, Some("20250101")),
+            block(BlockType::AvroData, None),
+        ];
+        assert_eq!(reader.base.positions_to_decode(&one_without), None);
+
+        let other_base = [block(BlockType::AvroData, Some("20250103"))];
+        assert_eq!(reader.base.positions_to_decode(&other_base), None);
+
+        let with_hfile = [
+            block(BlockType::AvroData, Some("20250101")),
+            block(BlockType::HfileData, Some("20250101")),
+        ];
+        assert_eq!(reader.base.positions_to_decode(&with_hfile), None);
+
+        reader.base.base_file_range = None;
+        assert_eq!(reader.base.positions_to_decode(&complete), None);
     }
 
     /// The undecodable payload is genuinely fatal when a gate admits its instant.

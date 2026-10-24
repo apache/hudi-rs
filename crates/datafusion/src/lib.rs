@@ -47,8 +47,9 @@ use datafusion_expr::utils::split_conjunction;
 use datafusion_expr::{CreateExternalTable, Expr, TableProviderFilterPushDown, TableType};
 use log::warn;
 
-use crate::hudi_exec::HudiScanExec;
+use crate::hudi_exec::{HudiScanExec, ScanUnit};
 use crate::util::expr::exprs_to_filters;
+use futures::{StreamExt, TryStreamExt};
 use hudi_core::config::read::HudiReadConfig::{
     FileSliceReadConcurrency, InputPartitions, UseReadOptimizedMode,
 };
@@ -56,8 +57,40 @@ use hudi_core::config::table::{BaseFileFormatValue, HudiTableConfig};
 use hudi_core::config::util::empty_options;
 use hudi_core::config::{ConfigParser, HudiConfigs};
 use hudi_core::file_group::file_slice::FileSlice;
+use hudi_core::file_group::reader::FileGroupReader;
 use hudi_core::storage::util::{get_scheme_authority, join_url_segments};
 use hudi_core::table::{ReadOptions, Table as HudiTable};
+
+/// The session's file repartitioning settings, read by the merge-on-read scan:
+/// `enabled` turns slice cutting off, and the size is a floor on each range's
+/// bytes (DataFusion applies it to the whole scan instead).
+#[derive(Debug, Clone, Copy, Default)]
+struct FileRepartition {
+    enabled: bool,
+    /// Bytes below which a slice is not cut further; zero means no floor.
+    min_size: u64,
+}
+
+impl FileRepartition {
+    fn from_session(state: &dyn Session) -> Self {
+        let optimizer = &state.config_options().optimizer;
+        Self {
+            enabled: optimizer.repartition_file_scans,
+            min_size: optimizer.repartition_file_min_size as u64,
+        }
+    }
+}
+
+/// Deal scan units over `partitions` in turn, so that `n` units fill `n`
+/// partitions and the ranges of one slice land on different partitions.
+fn spread_over_partitions(units: Vec<ScanUnit>, partitions: usize) -> Vec<Vec<ScanUnit>> {
+    let count = partitions.clamp(1, units.len().max(1));
+    let mut spread: Vec<Vec<ScanUnit>> = (0..count).map(|_| Vec::new()).collect();
+    for (index, unit) in units.into_iter().enumerate() {
+        spread[index % count].push(unit);
+    }
+    spread
+}
 
 fn default_file_slice_read_concurrency() -> usize {
     match FileSliceReadConcurrency.default_value() {
@@ -759,6 +792,7 @@ impl HudiDataSource {
         input_partitions: usize,
         flat_slices: Vec<FileSlice>,
         read_options: ReadOptions,
+        repartition: FileRepartition,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Derive the fan-out from the scan's memory budget when one is set. The
         // concurrency knob alone cannot express the peak: it multiplies by the
@@ -772,8 +806,6 @@ impl HudiDataSource {
             &slice_log_bytes,
             self.file_slice_read_concurrency,
         );
-        let file_slices =
-            hudi_core::util::collection::split_into_chunks(flat_slices, input_partitions);
 
         // The reader is built with the caller's full options so table-level
         // setup sees the same query context. Dropped partition filters are only
@@ -785,6 +817,17 @@ impl HudiDataSource {
                 .await
                 .map_err(|e| external_error("Failed to create FileGroupReader", e))?,
         );
+
+        let units = self
+            .scan_units(
+                &file_group_reader,
+                flat_slices,
+                input_partitions,
+                &read_options,
+                repartition,
+            )
+            .await?;
+        let file_slices = spread_over_partitions(units, input_partitions);
 
         let mut hudi_read_options =
             Self::read_options_for_hudi_exec(&self.table.hudi_configs, &read_options);
@@ -806,6 +849,88 @@ impl HudiDataSource {
             projection.cloned(),
             limit,
         )))
+    }
+
+    /// Spread file slices over the scan's partitions when there are fewer slices
+    /// than partitions, much as DataFusion's parquet scan splits a file by byte
+    /// range. A slice is cut along its base file's row groups, into about its
+    /// share of the partitions by size; the session's `repartition_file_scans`
+    /// turns this off, and `repartition_file_min_size` is applied as a floor on
+    /// each range's bytes rather than, as DataFusion does, on the whole scan. A slice with log files can only be cut
+    /// when the merge matches log records to base rows by position
+    /// (`hoodie.merge.use.record.positions`) or when the read leaves the logs out.
+    async fn scan_units(
+        &self,
+        reader: &FileGroupReader,
+        slices: Vec<FileSlice>,
+        partitions: usize,
+        read_options: &ReadOptions,
+        repartition: FileRepartition,
+    ) -> Result<Vec<ScanUnit>> {
+        if !repartition.enabled || slices.is_empty() || slices.len() >= partitions {
+            return Ok(slices.into_iter().map(ScanUnit::whole).collect());
+        }
+        let by_position: bool = self
+            .table
+            .hudi_configs
+            .get_or_default(hudi_core::config::read::HudiReadConfig::MergeUseRecordPositions)
+            .into();
+        let base_only = read_options.is_read_optimized().unwrap_or(false);
+        // Only the base file is divided, and every range still walks the whole
+        // log, so shares and the size floor go by base bytes alone.
+        let bytes_of = |slice: &FileSlice| -> u64 {
+            slice
+                .base_file
+                .as_ref()
+                .and_then(|b| b.file_metadata.as_ref())
+                .map_or(0, |m| m.size)
+        };
+        let total_bytes: u64 = slices.iter().map(bytes_of).sum();
+        let parts_for = |slice: &FileSlice| -> usize {
+            let cuttable =
+                slice.base_file.is_some() && (base_only || !slice.has_log_file() || by_position);
+            if !cuttable || total_bytes == 0 {
+                return 1;
+            }
+            let bytes = bytes_of(slice);
+            // Rounded down so a slice takes no more than its share of the
+            // partitions; a slice too small for a share still stays whole.
+            let share = (bytes as u128 * partitions as u128 / total_bytes as u128) as usize;
+            let within_min_size = match repartition.min_size {
+                0 => usize::MAX,
+                min => (bytes / min) as usize,
+            };
+            share.min(within_min_size).max(1)
+        };
+
+        let units: Vec<Vec<ScanUnit>> = futures::stream::iter(slices.into_iter().map(|slice| {
+            let parts = parts_for(&slice);
+            async move {
+                let ranges = if parts > 1 {
+                    reader
+                        .base_file_ranges(&slice, parts)
+                        .await
+                        .map_err(|e| external_error("Failed to split a file slice", e))?
+                } else {
+                    Vec::new()
+                };
+                Ok::<_, DataFusionError>(if ranges.len() > 1 {
+                    ranges
+                        .into_iter()
+                        .map(|range| ScanUnit {
+                            file_slice: slice.clone(),
+                            base_file_range: Some(range),
+                        })
+                        .collect()
+                } else {
+                    vec![ScanUnit::whole(slice)]
+                })
+            }
+        }))
+        .buffered(partitions.max(1))
+        .try_collect()
+        .await?;
+        Ok(units.into_iter().flatten().collect())
     }
 
     /// The scan's memory budget, when the table or read set one.
@@ -915,6 +1040,7 @@ impl TableProvider for HudiDataSource {
                     input_partitions,
                     flat_slices,
                     all_read_options,
+                    FileRepartition::from_session(state),
                 )
                 .await
             }
@@ -949,6 +1075,7 @@ impl TableProvider for HudiDataSource {
                         input_partitions,
                         flat_slices,
                         all_read_options,
+                        FileRepartition::from_session(state),
                     )
                     .await
                 }
@@ -1552,7 +1679,14 @@ mod tests {
         let flat_slices = hudi.table.get_file_slices(&read_options).await.unwrap();
 
         let plan = hudi
-            .scan_hudi(None, None, 1, flat_slices, read_options)
+            .scan_hudi(
+                None,
+                None,
+                1,
+                flat_slices,
+                read_options,
+                FileRepartition::default(),
+            )
             .await
             .unwrap();
         let exec = plan
@@ -1607,6 +1741,98 @@ mod tests {
         assert!(
             bounded.contains("file_slice_read_concurrency=1"),
             "a 1 MiB budget must lower the fan-out to 1: {bounded}"
+        );
+    }
+
+    #[test]
+    fn units_are_dealt_over_partitions_in_turn() {
+        use std::str::FromStr;
+        let slice = |n: usize| {
+            let base = hudi_core::file_group::base_file::BaseFile::from_str(&format!(
+                "5a226868-2934-4f84-a16f-55124630c68{n}-0_0-7-24_20240402144910683.parquet"
+            ))
+            .unwrap();
+            ScanUnit::whole(FileSlice::new(base, String::new()))
+        };
+        let spread = spread_over_partitions((0..5).map(slice).collect(), 3);
+        assert_eq!(
+            spread.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 2, 1]
+        );
+        let spread = spread_over_partitions((0..2).map(slice).collect(), 8);
+        assert_eq!(spread.len(), 2, "no empty partitions");
+        assert_eq!(spread_over_partitions(Vec::new(), 4).len(), 1);
+    }
+
+    /// One merge-on-read slice on a session with more partitions than slices is
+    /// read in base-file ranges, one per partition, with the same rows as the
+    /// single-partition read; the session's file repartitioning switch turns it
+    /// off.
+    #[tokio::test]
+    async fn a_merge_on_read_slice_is_spread_over_idle_partitions() {
+        use arrow_array::RecordBatch;
+        use datafusion::physical_plan::displayable;
+        use datafusion::prelude::SessionConfig;
+        use hudi_test::synthetic::{LogFileSpec, MorTableSpec, write_temp_mor_table};
+
+        let written = write_temp_mor_table(&MorTableSpec {
+            rows: 1_000,
+            row_group_rows: 100,
+            log_files: vec![LogFileSpec {
+                updates: (0..1_000).step_by(7).collect(),
+                deletes: (0..1_000).step_by(100).collect(),
+                with_positions: true,
+            }],
+        });
+
+        async fn run(
+            url: &str,
+            partitions: usize,
+            repartition: bool,
+        ) -> (String, Vec<RecordBatch>) {
+            let mut config = SessionConfig::new();
+            config.options_mut().execution.target_partitions = partitions;
+            config.options_mut().optimizer.repartition_file_scans = repartition;
+            config.options_mut().optimizer.repartition_file_min_size = 0;
+            let ctx = SessionContext::new_with_config(config);
+            let hudi = HudiDataSource::new_with_options(
+                url,
+                [("hoodie.merge.use.record.positions", "true")],
+            )
+            .await
+            .unwrap();
+            ctx.register_table("t", Arc::new(hudi)).unwrap();
+            let df = ctx
+                .sql("SELECT uuid, fare FROM t ORDER BY uuid")
+                .await
+                .unwrap();
+            let plan = df.clone().create_physical_plan().await.unwrap();
+            let shown = displayable(plan.as_ref()).indent(true).to_string();
+            (shown, df.collect().await.unwrap())
+        }
+
+        let url = written.table.base_url();
+        let (single_plan, single) = run(url.as_str(), 1, true).await;
+        assert!(
+            single_plan.contains("partitions=1, file_slices=1"),
+            "{single_plan}"
+        );
+        let (split_plan, split) = run(url.as_str(), 4, true).await;
+        assert!(
+            split_plan.contains("partitions=4, file_slices=1"),
+            "the one slice is spread over four partitions: {split_plan}"
+        );
+        let rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+        assert_eq!(rows(&split), 990);
+        assert_eq!(
+            arrow::compute::concat_batches(&split[0].schema(), &split).unwrap(),
+            arrow::compute::concat_batches(&single[0].schema(), &single).unwrap()
+        );
+
+        let (unsplit_plan, _) = run(url.as_str(), 4, false).await;
+        assert!(
+            unsplit_plan.contains("partitions=1, file_slices=1"),
+            "repartitioning off leaves the slice whole: {unsplit_plan}"
         );
     }
 
