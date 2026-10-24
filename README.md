@@ -407,13 +407,16 @@ bindings) are not tied to these versions. The `hudi[datafusion]` extra first shi
 
 On macOS arm64, a debug build of an application that links `hudi` with the `datafusion` feature
 can fail with `ld: B/BL out of range ... (max +/-128MB)`: unoptimized dependencies push the
-binary's code section past the arm64 branch range. Optimize dependencies in the dev profile, as
-this workspace does:
+binary's code section past the arm64 branch range. Optimize dependencies in the dev profile:
 
 ```toml
 [profile.dev.package."*"]
 opt-level = 1
 ```
+
+This workspace applies the same setting from `build-wrapper.sh` on macOS arm64 only, since it
+slows compilation noticeably. It goes away once a Lance release shares the workspace's arrow major
+([#844](https://github.com/apache/hudi-rs/issues/844)).
 
 <details>
 <summary>Add crate hudi with datafusion feature to your application to query a Hudi table.</summary>

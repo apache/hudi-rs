@@ -113,12 +113,3 @@ flate2 = { version = "1" }
 serial_test = { version = "4" }
 tempfile = { version = "3" }
 zip = { version = "8", default-features = false, features = ["deflate"] }
-
-# Dependencies are optimized in dev builds. hudi-core links two arrow majors
-# while Lance stays on its own, and at opt-level 0 that puts the
-# hudi-datafusion test binaries' `__text` past the arm64 +/-128MB branch range
-# on macOS, where the linker cannot reach `ctor`'s startup section (pulled in
-# through lance-io -> opendal). Workspace crates stay at opt-level 0 for
-# debugging.
-[profile.dev.package."*"]
-opt-level = 1
