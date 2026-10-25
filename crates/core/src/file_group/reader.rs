@@ -40,6 +40,7 @@ use crate::storage::Storage;
 
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
+use crate::table::validation::validate_configs;
 use crate::timeline::selector::InstantRange;
 use crate::util::arrow::project_batch_by_names;
 use arrow::compute::and;
@@ -63,8 +64,9 @@ pub struct FileGroupReader {
     ///
     /// The base file's own schema is stale whenever a later writer widened a
     /// column or added one: its values would be forced back into the narrower
-    /// base types. A caller holding the timeline knows better; one reading from
-    /// paths alone (the cxx bridge) does not, and falls back to the base file.
+    /// base types. A caller holding the timeline knows better, and so does one
+    /// handed the schema with its paths ([`Self::with_data_schema`]); one
+    /// reading from paths alone (the cxx bridge) falls back to the base file.
     data_schema_override: Option<arrow_schema::SchemaRef>,
     /// The committed/inflight sets the log-block scan gates on.
     ///
@@ -73,7 +75,8 @@ pub struct FileGroupReader {
     /// committed. Without these the scan merges such a block, because it sorts
     /// below the latest instant and passes every other gate. Only a caller
     /// holding the timeline can supply them; one reading from paths alone (the
-    /// cxx bridge) leaves the gate off, as it always was.
+    /// cxx bridge, [`Self::new_with_resolved_options`]) leaves the gate off, as
+    /// it always was.
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 }
 
@@ -179,6 +182,72 @@ impl FileGroupReader {
         })
     }
 
+    /// Creates a reader from table configuration the caller already holds,
+    /// without reading anything from storage.
+    ///
+    /// `hudi_options` is the table's `hoodie.properties` plus the `hoodie.read.*`
+    /// options for this read, and `storage_options` is the full storage option
+    /// set: nothing is read from environment variables or `hudi-defaults.conf`
+    /// here. The options are validated the way [`Self::new_with_options`]
+    /// validates what it loads, but nothing is loaded: an engine that planned a
+    /// read on its driver already holds the table properties and schema, and a
+    /// task that fetched them again would pay a round trip per task for data the
+    /// plan can carry. Pair it with [`Self::with_data_schema`] so an evolved
+    /// table reads against its current schema rather than each base file's.
+    ///
+    /// Every `hoodie.read.*` option that steers the merge (the reader version,
+    /// `hoodie.read.start.timestamp`, `hoodie.read.end.timestamp`) goes in
+    /// `hudi_options`; the [`ReadOptions`] of a later read call contribute only
+    /// the projection, filters, batch size and read-optimized mode. A read
+    /// pinned to an instant passes it as `hoodie.read.end.timestamp`:
+    /// `hoodie.read.as.of.timestamp` is resolved against the timeline by
+    /// [`Table`](crate::table::Table) and is rejected here, since nothing on
+    /// this path would honour it.
+    ///
+    /// Below table version 8 the log-block scan of a reader built here admits
+    /// blocks of a delta commit that never completed, because the committed
+    /// instant set that gates them comes from the timeline. From version 8 the
+    /// file slice itself excludes such log files, so a caller that builds slices
+    /// from a version 8 or later timeline loses nothing.
+    pub fn new_with_resolved_options<I, K, V, S, SK, SV>(
+        base_uri: &str,
+        hudi_options: I,
+        storage_options: S,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+        S: IntoIterator<Item = (SK, SV)>,
+        SK: AsRef<str>,
+        SV: Into<String>,
+    {
+        let mut hudi_options: HashMap<String, String> = hudi_options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+            .collect();
+        hudi_options.insert(
+            HudiTableConfig::BasePath.as_ref().to_string(),
+            base_uri.to_string(),
+        );
+        let hudi_configs = Arc::new(HudiConfigs::new(hudi_options));
+        validate_configs(&hudi_configs)?;
+        Self::reject_scan_budget(&hudi_configs)?;
+        let as_of = HudiReadConfig::AsOfTimestamp.as_ref();
+        if hudi_configs.as_options().contains_key(as_of) {
+            return Err(CoreError::InvalidValue(format!(
+                "{as_of} is resolved against the timeline, which this reader does not \
+                 hold. Pass the instant as {} instead.",
+                HudiReadConfig::EndTimestamp.as_ref()
+            )));
+        }
+        let storage_options = storage_options
+            .into_iter()
+            .map(|(k, v)| (k.as_ref().to_string(), v.into()))
+            .collect();
+        Self::new_with_overrides(hudi_configs, HashMap::new(), storage_options)
+    }
+
     fn resolve_read_options(&self, options: &ReadOptions) -> Result<ReadOptions> {
         options.with_defaults_from(&self.hudi_configs)
     }
@@ -267,6 +336,23 @@ impl FileGroupReader {
         self.data_schema_override = Some(schema);
     }
 
+    /// Reads slices with `schema`, the table's current one, rather than whatever
+    /// each base file carries: a column added after a base file was written is
+    /// null-filled and a widened one is read at its current width. A reader from
+    /// [`Table`](crate::table::Table) already carries it; one built with
+    /// [`Self::new_with_resolved_options`] supplies it here.
+    ///
+    /// `schema` is the schema the slice's records carry: with the `_hoodie_*`
+    /// meta fields in front when `hoodie.populate.meta.fields` is on (the
+    /// default, and what [`Table::get_schema_with_meta_fields`](crate::table::Table::get_schema_with_meta_fields)
+    /// returns), without them otherwise. The merge keys records on
+    /// `_hoodie_record_key` in the first case and on the record key fields in
+    /// the second, so a schema with the wrong shape fails the read.
+    pub fn with_data_schema(mut self, schema: arrow_schema::SchemaRef) -> Self {
+        self.set_data_schema(schema);
+        self
+    }
+
     /// The schema the merge-on-read reader needs up front.
     ///
     /// The table's own, whenever the caller could supply one — which is every
@@ -276,7 +362,8 @@ impl FileGroupReader {
     /// with it forces the newer records back into the older shape: an i64 read as
     /// i32, an f64 as f32, an added column dropped. Wrong values, not an error.
     ///
-    /// Only a caller reading from paths with no timeline at all — the cxx bridge —
+    /// Only a caller reading from paths with no schema at all — the cxx bridge, or
+    /// [`Self::new_with_resolved_options`] without [`Self::with_data_schema`] —
     /// falls back to the base file. Reading its footer costs one request; the
     /// engine reads it again when it opens the file, and collapsing the two
     /// into one request is not yet done.
@@ -299,7 +386,8 @@ impl FileGroupReader {
     /// The schema a streamed base-file batch must be reconciled to, or `None`
     /// when there is nothing to reconcile.
     ///
-    /// `None` for a caller that supplied no table schema (the cxx bridge), and
+    /// `None` for a caller that supplied no table schema (the cxx bridge, a
+    /// paths-only reader without [`Self::with_data_schema`]), and
     /// for a base file whose columns already match it — the overwhelmingly common
     /// case, where reconciliation would be a per-batch no-op.
     ///
@@ -1281,6 +1369,172 @@ mod tests {
                 .storage
                 .hudi_configs
                 .contains(HudiTableConfig::BasePath)
+        );
+    }
+
+    fn table_properties_of(base_uri: &str) -> HashMap<String, String> {
+        let path = Url::parse(base_uri)
+            .unwrap()
+            .to_file_path()
+            .unwrap()
+            .join(".hoodie")
+            .join("hoodie.properties");
+        let bytes = bytes::Bytes::from(std::fs::read(path).unwrap());
+        crate::config::util::parse_data_for_options(&bytes, "=").unwrap()
+    }
+
+    #[test]
+    fn test_new_with_resolved_options_reads_nothing_from_storage() {
+        let props = table_properties_of(&get_base_uri_with_valid_props_minimum());
+        // Nothing exists under this URI, so a constructor that looked would fail.
+        let base_uri = get_non_existent_base_uri();
+        let reader =
+            FileGroupReader::new_with_resolved_options(&base_uri, props.iter(), empty_options())
+                .unwrap();
+        let base_path: String = reader
+            .hudi_configs
+            .get(HudiTableConfig::BasePath)
+            .unwrap()
+            .into();
+        assert_eq!(base_path, base_uri);
+        let table_type: String = reader
+            .hudi_configs
+            .get(HudiTableConfig::TableType)
+            .unwrap()
+            .into();
+        assert_eq!(
+            table_type.to_lowercase(),
+            props[HudiTableConfig::TableType.as_ref()].to_lowercase()
+        );
+    }
+
+    #[test]
+    fn test_new_with_resolved_options_validates_the_given_properties() {
+        let mut props = table_properties_of(&get_base_uri_with_valid_props_minimum());
+        props.insert(
+            HudiTableConfig::TableVersion.as_ref().to_string(),
+            "7".to_string(),
+        );
+        let err = FileGroupReader::new_with_resolved_options(
+            &get_non_existent_base_uri(),
+            props,
+            empty_options(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::Unsupported(_)), "{err:?}");
+    }
+
+    /// A reader built from shipped properties reads an evolved table the way a
+    /// table-built one does once it is handed the table's schema: a column added
+    /// after the base file is null-filled for rows from the base file and present
+    /// for rows from the log that wrote it. Without the schema the projection
+    /// names a column the base file lacks, and the read fails rather than
+    /// inventing a value.
+    #[tokio::test]
+    async fn test_with_data_schema_null_fills_a_column_added_after_the_base_file() -> Result<()> {
+        use crate::table::Table;
+        use arrow::array::Array as _;
+        use futures::TryStreamExt;
+        use hudi_test::QuickstartTripsTable;
+
+        let base_uri = QuickstartTripsTable::MorEvoAddCol
+            .url_to_mor_avro()
+            .to_string();
+        let table = Table::new(&base_uri).await?;
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        assert_eq!(slices.len(), 1, "the fixture holds one file slice");
+        let base_file = slices[0].base_file_relative_path()?.unwrap();
+        let log_files = slices[0]
+            .log_files
+            .iter()
+            .map(|log_file| slices[0].log_file_relative_path(log_file))
+            .collect::<Result<Vec<_>>>()?;
+        let schema = Arc::new(table.get_schema_with_meta_fields().await?);
+        let options = ReadOptions::new().with_projection(["key", "extra"]);
+        // The reader version steers the merge, so it travels with the table
+        // properties rather than the per-read options.
+        let mut props = table_properties_of(&base_uri);
+        props.insert(
+            HudiReadConfig::FileGroupReaderVersion.as_ref().to_string(),
+            "2".to_string(),
+        );
+
+        let reader =
+            FileGroupReader::new_with_resolved_options(&base_uri, props.iter(), empty_options())?
+                .with_data_schema(schema);
+        let batches: Vec<RecordBatch> = reader
+            .read_file_slice_from_paths_stream(&base_file, &log_files, &options)
+            .await?
+            .try_collect()
+            .await?;
+        let mut rows: Vec<(String, Option<String>)> = Vec::new();
+        for batch in &batches {
+            let keys = batch
+                .column_by_name("key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let extras = batch
+                .column_by_name("extra")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let extra = (!extras.is_null(i)).then(|| extras.value(i).to_string());
+                rows.push((keys.value(i).to_string(), extra));
+            }
+        }
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("k1".to_string(), None),
+                ("k2".to_string(), Some("x2".to_string())),
+                ("k3".to_string(), None),
+                ("k4".to_string(), None),
+            ]
+        );
+
+        let reader =
+            FileGroupReader::new_with_resolved_options(&base_uri, props.iter(), empty_options())?;
+        let read = async {
+            reader
+                .read_file_slice_from_paths_stream(&base_file, &log_files, &options)
+                .await?
+                .try_collect::<Vec<RecordBatch>>()
+                .await
+        }
+        .await;
+        let err = read.expect_err(
+            "without the table schema the projection names a column the base file lacks",
+        );
+        assert!(
+            err.to_string().contains("extra"),
+            "the error must name the missing column, got: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_new_with_resolved_options_rejects_as_of_timestamp() {
+        let mut props = table_properties_of(&get_base_uri_with_valid_props_minimum());
+        props.insert(
+            HudiReadConfig::AsOfTimestamp.as_ref().to_string(),
+            "20240418173551906".to_string(),
+        );
+        let err = FileGroupReader::new_with_resolved_options(
+            &get_non_existent_base_uri(),
+            props,
+            empty_options(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, CoreError::InvalidValue(_)), "{err:?}");
+        assert!(
+            err.to_string()
+                .contains(HudiReadConfig::EndTimestamp.as_ref()),
+            "the error must point at the option this path honours, got: {err}"
         );
     }
 
