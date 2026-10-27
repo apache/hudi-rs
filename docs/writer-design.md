@@ -173,6 +173,11 @@ implemented natively.
 - **SimpleIndex** (scan-based) is the fallback when RLI is unavailable.
 - Locations found by the index are validated against the live file-system
   view, so records moved by clustering land in their new file groups.
+- An upsert whose partition value differs from the indexed location moves
+  the record: it is deleted from the old partition and inserted into the new
+  one, with either index. Java's RLI keeps the record in its old partition by
+  default (`hoodie.record.index.update.partition.path=false`), so the same
+  upserts can leave a different layout than a Spark writer would.
 
 ### 4.3 Small-file packing and sizing
 
