@@ -21,7 +21,7 @@
 //! # The [config] module is responsible for managing configurations.
 //!
 
-//! A plain C ABI over hudi-rs, so a JVM can read a file slice.
+//! A plain C ABI over hudi-rs, so a JVM or a C++ engine can read a file slice.
 //!
 //! The `cpp` crate already exposes the same reads, but `cxx` generates
 //! C++-mangled symbols and `CxxString`/`CxxVector` arguments, neither of which a
@@ -41,7 +41,7 @@
 //! A failing call returns null and leaves a message retrievable with
 //! [`hudi_ffi_last_error`] until the next call on the same thread. Panics are
 //! caught at every boundary and turned into that same null-plus-message, because
-//! a panic unwinding into the JVM aborts the process.
+//! a panic unwinding into the caller aborts the process.
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char};
