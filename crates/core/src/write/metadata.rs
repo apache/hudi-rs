@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::Result;
-use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::file_group::log_file::writer::LogFileWriter;
 use crate::file_group::log_file::{BlockMetadataKey, BlockType};
 use crate::hfile::{HFileReader, HFileWriter};
@@ -1116,18 +1116,8 @@ pub(crate) async fn load_column_stats_records(
         // (Java getValidInstantTimestamps); orphan MDT commits are skipped.
         let scanner = LogFileScanner::new(hudi_configs, storage);
         let range = InstantRange::exact_match(valid_instants.iter().cloned(), "UTC");
-        match scanner.scan(log_paths, &range).await? {
-            ScanResult::HFileRecords(records) => {
-                for record in &records {
-                    apply_column_stats_record(&mut merged, wanted, record)?;
-                }
-            }
-            ScanResult::Empty => {}
-            ScanResult::RecordBatches(_) => {
-                return Err(crate::error::CoreError::MetadataTable(
-                    "column_stats logs must contain HFile data blocks".to_string(),
-                ));
-            }
+        for record in &scanner.scan_hfile_records(log_paths, &range).await? {
+            apply_column_stats_record(&mut merged, wanted, record)?;
         }
     }
     Ok(merged)
@@ -1574,5 +1564,110 @@ mod tests {
             .await
             .unwrap();
         assert!(slices.is_empty());
+    }
+
+    fn id_value_batch(rows: &[(&str, i64)]) -> arrow_array::RecordBatch {
+        use arrow_array::{Int64Array, StringArray};
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Utf8, false),
+            arrow_schema::Field::new("value", arrow_schema::DataType::Int64, false),
+        ]));
+        arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                std::sync::Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_record_index_with_delete_only_log_after_compaction() {
+        use crate::config::table::TableTypeValue;
+        use crate::index::{HoodieIndex, HoodieKey, RecordIndex};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(TableTypeValue::MergeOnRead)
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([id_value_batch(&[("a", 1), ("b", 2)])])
+            .await
+            .unwrap();
+        let key = |k: &str| HoodieKey {
+            record_key: k.to_string(),
+            partition_path: String::new(),
+        };
+
+        // Compact the record index the way a Spark MDT compaction does: every
+        // shard gets a committed base holding its entries, so the delete below
+        // is the only live log in the partition.
+        let compaction_instant = crate::write::append::generate_instant_time().await;
+        let mdt = dir.path().join(METADATA_BASE);
+        let schema_json = record_index_metadata_avro_schema_json()
+            .unwrap()
+            .to_string();
+        let locations = RecordIndex
+            .tag_location(&table, &[key("a"), key("b")])
+            .await
+            .unwrap();
+        for record_key in ["a", "b"] {
+            let location = locations[&key(record_key)].clone().unwrap();
+            let entry = RecordIndexEntry {
+                record_key: record_key.to_string(),
+                partition_path: location.partition_path,
+                file_id: location.file_id,
+                instant_time_millis: instant_to_epoch_millis(&location.instant_time),
+                is_deleted: false,
+            };
+            let base = HFileWriter::write(
+                &[(
+                    record_key.to_string(),
+                    encode_record_index_entry(&entry).unwrap(),
+                )],
+                BTreeMap::from([("schema".to_string(), schema_json.clone().into_bytes())]),
+            )
+            .unwrap();
+            let shard = map_record_key_to_file_group_index(record_key, DEFAULT_RLI_NUM_FILE_GROUPS);
+            std::fs::write(
+                mdt.join(format!(
+                    "record_index/{}_0-0-0_{compaction_instant}.hfile",
+                    record_index_file_id(shard)
+                )),
+                base,
+            )
+            .unwrap();
+        }
+        let timeline = mdt.join(".hoodie/timeline");
+        let latest_deltacommit = std::fs::read_dir(&timeline)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".deltacommit"))
+            .max()
+            .unwrap();
+        std::fs::copy(
+            latest_deltacommit,
+            timeline.join(format!("{compaction_instant}_{compaction_instant}.commit")),
+        )
+        .unwrap();
+
+        table.delete_keys([key("a")]).await.unwrap();
+        table.upsert([id_value_batch(&[("b", 20)])]).await.unwrap();
+
+        let tagged = RecordIndex
+            .tag_location(&table, &[key("a"), key("b")])
+            .await
+            .unwrap();
+        assert!(tagged[&key("a")].is_none(), "deleted key must stay deleted");
+        assert!(tagged[&key("b")].is_some());
     }
 }

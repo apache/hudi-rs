@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::error::CoreError;
-use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
 use crate::metadata::table::encode::decode_record_index_entry;
@@ -108,15 +108,8 @@ async fn load_record_index_map(
         let valid = table.valid_metadata_instants().await?;
         let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage);
         let range = InstantRange::exact_match(valid, "UTC");
-        match scanner.scan(log_paths, &range).await? {
-            ScanResult::HFileRecords(records) => apply_hfile_records(&mut merged, &records)?,
-            ScanResult::Empty => {}
-            ScanResult::RecordBatches(_) => {
-                return Err(CoreError::MetadataTable(
-                    "record_index logs must contain HFile data blocks".to_string(),
-                ));
-            }
-        }
+        let records = scanner.scan_hfile_records(log_paths, &range).await?;
+        apply_hfile_records(&mut merged, &records)?;
     }
 
     Ok(merged

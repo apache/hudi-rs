@@ -251,7 +251,7 @@ impl LogFileScanner {
     ///
     /// Delete blocks may appear alongside HFile data (MDT RLI tombstones). Apply them
     /// as empty-value records so callers treat the key as deleted.
-    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<ScanResult> {
+    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<Vec<HFileRecord>> {
         // Pre-count records for capacity
         let mut total_records = 0;
         for blocks in &collected.all_blocks {
@@ -294,7 +294,32 @@ impl LogFileScanner {
             }
         }
 
-        Ok(ScanResult::HFileRecords(records))
+        Ok(records)
+    }
+
+    /// Scan metadata-table log files, whose data blocks are HFile blocks.
+    ///
+    /// Delete blocks become tombstones even when no HFile block is in range: after an
+    /// MDT compaction, a write that only deletes leaves delete-only logs, which the
+    /// content detection of [`Self::scan`] would classify as Arrow records.
+    pub async fn scan_hfile_records(
+        &self,
+        relative_paths: Vec<String>,
+        instant_range: &InstantRange,
+    ) -> Result<Vec<HFileRecord>> {
+        let collected = self.collect_blocks(relative_paths, instant_range).await?;
+        if collected.all_blocks.iter().flatten().any(|block| {
+            matches!(
+                block.block_type,
+                BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData
+            )
+        }) {
+            return Err(crate::error::CoreError::LogBlockError(
+                "metadata table log files must not contain Avro, Parquet, or CDC data blocks"
+                    .into(),
+            ));
+        }
+        self.collect_hfile_records(collected)
     }
 
     /// Scan log files and return the appropriate content type.
@@ -320,7 +345,9 @@ impl LogFileScanner {
 
         match content_type {
             ContentType::Records => self.collect_record_batches(collected),
-            ContentType::HFile => self.collect_hfile_records(collected),
+            ContentType::HFile => self
+                .collect_hfile_records(collected)
+                .map(ScanResult::HFileRecords),
             ContentType::Empty => Ok(ScanResult::Empty),
         }
     }
