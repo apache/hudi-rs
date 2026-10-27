@@ -176,9 +176,19 @@ impl AvroBlockDecoder {
     ///
     /// Taken from the decoder rather than converted from the Avro JSON, because
     /// `avro_to_arrow` does not handle named-type references and the metadata
-    /// table's schema uses them.
+    /// table's schema uses them. Dictionaries are unpacked to match what
+    /// [`flush`](Self::flush) emits.
     pub fn schema(&self) -> SchemaRef {
-        self.decoder.schema()
+        let schema = self.decoder.schema();
+        if !schema
+            .fields()
+            .iter()
+            .any(|f| has_dictionary(f.data_type()))
+        {
+            return schema;
+        }
+        let fields: Vec<Field> = schema.fields().iter().map(|f| unpacked_field(f)).collect();
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
     }
 
     /// Project each decoded batch to `schema` instead of resolving during the
@@ -234,7 +244,11 @@ impl AvroBlockDecoder {
         let batch = self.decoder.flush().map_err(|e| {
             CoreError::LogBlockError(format!("Failed to flush decoded records: {e}"))
         })?;
-        let batch = batch.map(normalize_utc_timestamps).transpose()?;
+        let batch = batch
+            .map(normalize_utc_timestamps)
+            .transpose()?
+            .map(unpack_dictionaries)
+            .transpose()?;
         match (batch, self.rewrite_to.as_ref()) {
             (Some(batch), Some(target)) => {
                 crate::schema::batch_evolution::project_batch_to_schema(&batch, target).map(Some)
@@ -298,6 +312,71 @@ fn normalize_utc_timestamps(batch: RecordBatch) -> Result<RecordBatch> {
         }
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(CoreError::ArrowError)
+}
+
+/// Unpack every dictionary column, at any depth, to its value type.
+///
+/// `arrow-avro` decodes an Avro `enum` as `Dictionary(Int32, Utf8)`, while the
+/// table schema (`avro_to_arrow::schema`) and a parquet base file both hold the
+/// same column as `Utf8`. The merge reconciles log rows to the table schema,
+/// which refuses a dictionary leaf, so the log batch is unpacked here.
+fn unpack_dictionaries(batch: RecordBatch) -> Result<RecordBatch> {
+    let schema = batch.schema();
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| has_dictionary(f.data_type()))
+    {
+        return Ok(batch);
+    }
+
+    let mut fields: Vec<Field> = Vec::with_capacity(batch.num_columns());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if has_dictionary(field.data_type()) {
+            let target = unpacked_field(field);
+            columns.push(cast(column, target.data_type()).map_err(CoreError::ArrowError)?);
+            fields.push(target);
+        } else {
+            fields.push(field.as_ref().clone());
+            columns.push(column.clone());
+        }
+    }
+    RecordBatch::try_new(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+    )
+    .map_err(CoreError::ArrowError)
+}
+
+fn has_dictionary(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, _) => true,
+        DataType::Struct(fields) => fields.iter().any(|f| has_dictionary(f.data_type())),
+        DataType::List(f)
+        | DataType::LargeList(f)
+        | DataType::FixedSizeList(f, _)
+        | DataType::Map(f, _) => has_dictionary(f.data_type()),
+        _ => false,
+    }
+}
+
+fn unpacked_field(field: &Field) -> Field {
+    field.clone().with_data_type(unpacked(field.data_type()))
+}
+
+fn unpacked(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::Dictionary(_, value_type) => unpacked(value_type),
+        DataType::Struct(fields) => {
+            DataType::Struct(fields.iter().map(|f| unpacked_field(f)).collect())
+        }
+        DataType::List(f) => DataType::List(Arc::new(unpacked_field(f))),
+        DataType::LargeList(f) => DataType::LargeList(Arc::new(unpacked_field(f))),
+        DataType::FixedSizeList(f, n) => DataType::FixedSizeList(Arc::new(unpacked_field(f)), *n),
+        DataType::Map(f, sorted) => DataType::Map(Arc::new(unpacked_field(f)), *sorted),
+        other => other.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +571,52 @@ mod tests {
             batch.schema().field(0).data_type(),
             &arrow_schema::DataType::Int64
         );
+    }
+
+    /// An Avro enum decodes as a string dictionary; it leaves the decoder as
+    /// plain strings at every depth, matching the table schema's `Utf8`.
+    #[test]
+    fn test_enum_decodes_to_utf8_at_every_depth() {
+        use apache_avro::types::Value;
+        use arrow_array::cast::AsArray;
+        use arrow_schema::DataType;
+
+        let schema = r#"{"type":"record","name":"r","fields":[
+            {"name":"e","type":{"type":"enum","name":"Kind","symbols":["A","B"]}},
+            {"name":"n","type":["null","Kind"],"default":null},
+            {"name":"s","type":{"type":"record","name":"s","fields":[{"name":"k","type":"Kind"}]}},
+            {"name":"a","type":{"type":"array","items":"Kind"}},
+            {"name":"m","type":{"type":"map","values":"Kind"}}]}"#;
+        let avro_schema = apache_avro::Schema::parse_str(schema).unwrap();
+        let kind = |i: u32| Value::Enum(i, ["A", "B"][i as usize].to_string());
+        let record = Value::Record(vec![
+            ("e".into(), kind(1)),
+            ("n".into(), Value::Union(0, Box::new(Value::Null))),
+            ("s".into(), Value::Record(vec![("k".into(), kind(0))])),
+            ("a".into(), Value::Array(vec![kind(0), kind(1)])),
+            ("m".into(), Value::Map([("x".to_string(), kind(1))].into())),
+        ]);
+        let body = apache_avro::to_avro_datum(&avro_schema, record).unwrap();
+
+        let mut decoder =
+            AvroBlockDecoder::try_new_with_reader(schema, Some(schema), 1024).unwrap();
+        decoder.decode(&body).unwrap();
+        let declared = decoder.schema();
+        let batch = decoder.flush().unwrap().expect("a batch");
+        assert_eq!(declared.fields(), batch.schema().fields());
+
+        // `as_string` panics on a dictionary column, so each read below also
+        // pins the type.
+        assert_eq!(batch.column(0).as_string::<i32>().value(0), "B");
+        assert_eq!(batch.column(1).data_type(), &DataType::Utf8);
+        assert!(batch.column(1).is_null(0));
+        let s = batch.column(2).as_struct();
+        assert_eq!(s.column(0).as_string::<i32>().value(0), "A");
+        let a = batch.column(3).as_list::<i32>().value(0);
+        let a = a.as_string::<i32>();
+        assert_eq!((a.value(0), a.value(1)), ("A", "B"));
+        let m = batch.column(4).as_map();
+        assert_eq!(m.values().as_string::<i32>().value(0), "B");
     }
 
     /// Without a reader schema the block reads at the schema it was written

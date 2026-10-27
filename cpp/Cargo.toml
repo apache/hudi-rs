@@ -33,11 +33,13 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 hudi = { path = "../crates/hudi", version = "0.6.0-dev" }
-hudi-test = { path = "../crates/test", version = "0.6.0-dev" }
 cxx = { version = "1.0" }
 arrow = { workspace = true , features = ["ffi"]}
 arrow-array = { workspace = true , features = ["ffi"]}
 tokio = { workspace = true }
+
+[dev-dependencies]
+hudi-test = { path = "../crates/test", version = "0.6.0-dev" }
 
 [build-dependencies]
 cxx-build = { version = "1.0" }
