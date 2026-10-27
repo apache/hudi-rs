@@ -23,8 +23,9 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use md5::{Digest, Md5};
 use xxhash_rust::xxh64::xxh64;
 
-/// Java `HashID.HASH_SEED`.
-const HASH_SEED: u64 = 0xdabadaba;
+/// Java `HashID.HASH_SEED`. It is the `int` `0xdabadaba`, which Java
+/// sign-extends when passing it to `XXHash64.hash(..., long seed)`.
+const HASH_SEED: u64 = 0xdabadaba_u32 as i32 as i64 as u64;
 
 /// Empty data-table partition path maps to MDT files-partition key `"."`.
 pub fn partition_identifier(partition_path: &str) -> &str {
@@ -35,7 +36,7 @@ pub fn partition_identifier(partition_path: &str) -> &str {
     }
 }
 
-/// XXHash64 (seed `0xdabadaba`) as big-endian bytes — Java `HashID` BITS_64.
+/// XXHash64 (seed [`HASH_SEED`]) as big-endian bytes, Java `HashID` BITS_64.
 pub fn xxhash64_bytes(message: &str) -> [u8; 8] {
     xxh64(message.as_bytes(), HASH_SEED).to_be_bytes()
 }
@@ -95,11 +96,33 @@ mod tests {
     }
 
     #[test]
-    fn xxhash64_matches_java_golden_hex() {
-        // From Java TestHashID.testHashValues BITS_64.
-        assert_eq!(hex_upper(&xxhash64_bytes("Hudi")), "F7727B9A28379071");
-        assert_eq!(hex_upper(&xxhash64_bytes("Data lake")), "52BC72D592EBCAE5");
-        assert_eq!(hex_upper(&xxhash64_bytes("Col1")), "22FB1DD2F4784D31");
+    fn xxhash64_matches_java_runtime() {
+        // HashID.hash(_, BITS_64) as computed by the Hudi 1.1.1 Spark bundle.
+        assert_eq!(hex_upper(&xxhash64_bytes("Hudi")), "B9A47174FD473C0E");
+        assert_eq!(hex_upper(&xxhash64_bytes("cnt")), "B22F51D19144F1D5");
+        assert_eq!(hex_upper(&xxhash64_bytes("part=p1")), "B6CB202E0F44EE9D");
+    }
+
+    #[test]
+    fn stats_keys_match_spark_written_mdt() {
+        // Keys read back from a column_stats / partition_stats MDT written by
+        // Spark with the Hudi 1.1.1 bundle.
+        assert_eq!(column_index_id_b64("cnt"), "si9R0ZFE8dU=");
+        assert_eq!(column_index_id_b64("_hoodie_record_key"), "uSJGdDiVr/k=");
+        assert_eq!(partition_index_id_b64("part=p1"), "tssgLg9E7p0=");
+        assert_eq!(partition_index_id_b64("part=p2"), "tFBD22Dgg24=");
+        assert_eq!(
+            partition_stats_index_key("part=p1", "cnt"),
+            "si9R0ZFE8dU=tssgLg9E7p0="
+        );
+        assert_eq!(
+            column_stats_index_key(
+                "part=p1",
+                "9c313941-89ac-46f5-9346-b14cd8e6e19d-0_0-21-22_20261027125934360.parquet",
+                "cnt"
+            ),
+            "si9R0ZFE8dU=tssgLg9E7p0=fMkQyotsskcUseEa7+Im8A=="
+        );
     }
 
     #[test]
