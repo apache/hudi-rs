@@ -495,7 +495,8 @@ mod tests {
 
     #[test]
     fn test_key_generator_resolution() {
-        let cases: &[(&[(&str, &str)], Option<bool>)] = &[
+        type Case<'a> = (&'a [(&'a str, &'a str)], Option<bool>);
+        let cases: &[Case] = &[
             (&[("hoodie.table.keygenerator.type", "SIMPLE")], Some(false)),
             (
                 &[("hoodie.table.keygenerator.type", "NON_PARTITION")],

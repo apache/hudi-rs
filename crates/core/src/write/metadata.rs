@@ -1441,7 +1441,11 @@ mod tests {
             .unwrap();
         assert_eq!(slices.len(), 1);
         let (_, base, logs) = &slices[0];
-        assert!(base.ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile"));
+        assert!(
+            base.as_ref()
+                .unwrap()
+                .ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile")
+        );
         assert_eq!(logs.len(), 1);
     }
 
