@@ -233,6 +233,7 @@ impl Table {
     /// Reload the active timeline and drop listing caches before a write plans.
     pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
         crate::write::ensure_writable_table_version(self)?;
+        crate::write::ensure_supported_key_generator(&self.hudi_configs)?;
         // Instants must be minted in the table's declared timeline timezone
         // (Spark writers default to LOCAL); set before any instant is minted.
         crate::write::set_commit_timezone(&self.timezone());

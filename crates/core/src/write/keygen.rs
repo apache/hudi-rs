@@ -24,7 +24,8 @@ use arrow::record_batch::RecordBatch;
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig::{
-    IsHiveStylePartitioning, PartitionFields, RecordKeyFields,
+    IsHiveStylePartitioning, IsPartitionPathUrlencoded, KeyGeneratorClass, KeyGeneratorType,
+    PartitionFields, RecordKeyFields, TableVersion,
 };
 use crate::error::CoreError;
 use crate::index::HoodieKey;
@@ -40,14 +41,95 @@ use crate::index::HoodieKey;
 ///
 /// Partition paths use hive-style (`field=value/...`) when
 /// `hoodie.datasource.write.hive_style_partitioning` is true; otherwise value-only
-/// segments. Null partition values are rejected. Partition columns are not stripped
-/// from the batch — callers must leave them in the written Parquet.
+/// segments. Null or empty partition values map to [`DEFAULT_PARTITION_PATH`].
+/// Partition columns are not stripped from the batch — callers must leave them in
+/// the written Parquet.
 /// Placeholder instant for pre-fence validation passes: [`hoodie_keys_for_batch`]
 /// uses the instant only to FORMAT auto-generated keys, never to decide errors,
 /// so deriving keys with this dummy value surfaces every deterministic input
 /// error (missing/null/wrong-type key or partition columns) before an instant
 /// is requested.
 pub(crate) const VALIDATION_INSTANT: &str = "00000000000000000";
+
+/// Java `PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH`.
+const DEFAULT_PARTITION_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
+
+/// Java `HoodieWriteConfig.COMPLEX_KEYGEN_NEW_ENCODING`.
+const COMPLEX_KEYGEN_NEW_ENCODING: &str = "hoodie.write.complex.keygen.new.encoding";
+
+/// Whether the table's key generator stores a single-field record key as
+/// `field:value` (Java `ComplexKeyGenerator`) rather than the bare value
+/// (`SimpleKeyGenerator`, `NonpartitionedKeyGenerator`).
+///
+/// The generator resolves like Java `KeyGeneratorType.getKeyGeneratorClassName`:
+/// the class wins over the type, and with neither it is inferred from the field
+/// lists (`KeyGenUtils.inferKeyGeneratorType`). Generators whose keys or partition
+/// paths the writer does not reproduce are rejected, since writing with a
+/// different encoding would split a key across two index entries.
+fn encodes_single_key_field_name(hudi_configs: &HudiConfigs) -> Result<bool> {
+    let complex = if let Some(class) = hudi_configs
+        .get_raw(KeyGeneratorClass.as_ref())
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
+        match class {
+            "org.apache.hudi.keygen.SimpleKeyGenerator"
+            | "org.apache.hudi.keygen.SimpleAvroKeyGenerator"
+            | "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
+            | "org.apache.hudi.keygen.NonpartitionedAvroKeyGenerator" => false,
+            // Spark SQL's wrapper delegates to ComplexKeyGenerator when the table
+            // config names the wrapper itself rather than an origin class.
+            "org.apache.hudi.keygen.ComplexKeyGenerator"
+            | "org.apache.hudi.keygen.ComplexAvroKeyGenerator"
+            | "org.apache.spark.sql.hudi.command.SqlKeyGenerator" => true,
+            other => {
+                return Err(unsupported_key_generator(KeyGeneratorClass.as_ref(), other));
+            }
+        }
+    } else if let Some(key_generator_type) = hudi_configs
+        .get_raw(KeyGeneratorType.as_ref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        match key_generator_type {
+            "SIMPLE" | "SIMPLE_AVRO" | "NON_PARTITION" | "NON_PARTITION_AVRO" => false,
+            "COMPLEX" | "COMPLEX_AVRO" | "SPARK_SQL" => true,
+            other => {
+                return Err(unsupported_key_generator(KeyGeneratorType.as_ref(), other));
+            }
+        }
+    } else {
+        let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
+        if partition_fields.first().is_some_and(|f| f.contains(':')) {
+            return Err(unsupported_key_generator(
+                PartitionFields.as_ref(),
+                &partition_fields.join(","),
+            ));
+        }
+        partition_fields.len() > 1
+    };
+    if !complex {
+        return Ok(false);
+    }
+    // Java `KeyGenUtils.encodeSingleKeyFieldNameForComplexKeyGen`.
+    let table_version: Option<isize> = hudi_configs.try_get(TableVersion)?.map(Into::into);
+    let new_encoding = hudi_configs
+        .get_raw(COMPLEX_KEYGEN_NEW_ENCODING)
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    Ok(table_version.is_some_and(|v| v >= 9) || !new_encoding)
+}
+
+/// Fail a write on a table whose key generator the writer cannot reproduce.
+pub(crate) fn ensure_supported_key_generator(hudi_configs: &HudiConfigs) -> Result<()> {
+    encodes_single_key_field_name(hudi_configs).map(|_| ())
+}
+
+fn unsupported_key_generator(config: &str, value: &str) -> CoreError {
+    CoreError::Unsupported(format!(
+        "writes do not support {config}={value}; supported key generators are SIMPLE, \
+         COMPLEX, NON_PARTITION, and SPARK_SQL"
+    ))
+}
 
 /// Run key/partition derivation for its error side only — call before fencing
 /// an instant so invalid input leaves no timeline trace.
@@ -84,8 +166,12 @@ pub fn hoodie_keys_for_batch_with_offset(
         .map(|f| f.is_empty() || (f.len() == 1 && f[0].is_empty()))
         .unwrap_or(true);
 
+    let encode_field_name = encodes_single_key_field_name(hudi_configs)?;
     let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
     let hive_style: bool = hudi_configs.get_or_default(IsHiveStylePartitioning).into();
+    let url_encode: bool = hudi_configs
+        .get_or_default(IsPartitionPathUrlencoded)
+        .into();
 
     if auto_keys {
         let instant = instant.ok_or_else(|| {
@@ -97,7 +183,8 @@ pub fn hoodie_keys_for_batch_with_offset(
         for row in 0..batch.num_rows() {
             // Match Java HoodieRecord.generateSequenceId(instant, partitionId, rowId).
             let record_key = format!("{instant}_{partition_id}_{}", row_id_offset + row);
-            let partition_path = partition_path_for_row(batch, row, &partition_fields, hive_style)?;
+            let partition_path =
+                partition_path_for_row(batch, row, &partition_fields, hive_style, url_encode)?;
             keys.push(HoodieKey {
                 record_key,
                 partition_path,
@@ -137,13 +224,19 @@ pub fn hoodie_keys_for_batch_with_offset(
 
     let mut keys = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        if key_array.is_null(row) {
-            return Err(CoreError::Write(
-                "record key values must be non-null".to_string(),
-            ));
+        if key_array.is_null(row) || key_array.value(row).is_empty() {
+            return Err(CoreError::Write(format!(
+                "record key field '{key_name}' must be non-null and non-empty"
+            )));
         }
-        let record_key = key_array.value(row).to_string();
-        let partition_path = partition_path_for_row(batch, row, &partition_fields, hive_style)?;
+        let value = key_array.value(row);
+        let record_key = if encode_field_name {
+            format!("{key_name}:{value}")
+        } else {
+            value.to_string()
+        };
+        let partition_path =
+            partition_path_for_row(batch, row, &partition_fields, hive_style, url_encode)?;
         keys.push(HoodieKey {
             record_key,
             partition_path,
@@ -157,6 +250,7 @@ fn partition_path_for_row(
     row: usize,
     partition_fields: &[String],
     hive_style: bool,
+    url_encode: bool,
 ) -> Result<String> {
     if partition_fields.is_empty() {
         return Ok(String::new());
@@ -168,12 +262,15 @@ fn partition_path_for_row(
                 "partition field '{field}' is missing from write batch"
             ))
         })?;
-        if column.is_null(row) {
-            return Err(CoreError::Write(format!(
-                "partition field '{field}' must be non-null"
-            )));
-        }
-        let value = array_value_as_string(column.as_ref(), row)?;
+        let value = if column.is_null(row) {
+            DEFAULT_PARTITION_PATH.to_string()
+        } else {
+            match array_value_as_string(column.as_ref(), row)? {
+                value if value.is_empty() => DEFAULT_PARTITION_PATH.to_string(),
+                value if url_encode => escape_path_name(&value),
+                value => value,
+            }
+        };
         if hive_style {
             segments.push(format!("{field}={value}"));
         } else {
@@ -181,6 +278,39 @@ fn partition_path_for_row(
         }
     }
     Ok(segments.join("/"))
+}
+
+/// Java `PartitionPathEncodeUtils.escapePathName` (Hive `FileUtils`): percent-encode
+/// ASCII control characters and `"#%'*/:=?\{[]^` plus DEL; other characters,
+/// including non-ASCII, pass through.
+fn escape_path_name(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for c in value.chars() {
+        let needs_escape = c < ' '
+            || matches!(
+                c,
+                '"' | '#'
+                    | '%'
+                    | '\''
+                    | '*'
+                    | '/'
+                    | ':'
+                    | '='
+                    | '?'
+                    | '\\'
+                    | '\u{7F}'
+                    | '{'
+                    | '['
+                    | ']'
+                    | '^'
+            );
+        if needs_escape {
+            escaped.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 fn array_value_as_string(array: &dyn Array, row: usize) -> Result<String> {
@@ -314,18 +444,20 @@ mod tests {
             "p=9"
         );
 
-        // Null partition value: error.
+        // Null and empty partition values: Java's default partition.
         let b = batch(
             vec![
                 Field::new("id", DataType::Utf8, false),
                 Field::new("p", DataType::Utf8, true),
             ],
             vec![
-                Arc::new(StringArray::from(vec!["k"])),
-                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(StringArray::from(vec!["k", "l"])),
+                Arc::new(StringArray::from(vec![None, Some("")])),
             ],
         );
-        assert!(hoodie_keys_for_batch(&cfg, &b, None).is_err());
+        let keys = hoodie_keys_for_batch(&cfg, &b, None).unwrap();
+        assert_eq!(keys[0].partition_path, "p=__HIVE_DEFAULT_PARTITION__");
+        assert_eq!(keys[1].partition_path, "p=__HIVE_DEFAULT_PARTITION__");
 
         // Missing partition column: error.
         let b = batch(
@@ -347,5 +479,110 @@ mod tests {
             ],
         );
         assert!(hoodie_keys_for_batch(&cfg, &b, None).is_err());
+    }
+
+    #[test]
+    fn test_escape_path_name_matches_java() {
+        assert_eq!(escape_path_name("2024/01/02"), "2024%2F01%2F02");
+        assert_eq!(
+            escape_path_name("a b:c=d%e#f?g*h'i\"j\\k{l[m]n^o"),
+            "a b%3Ac%3Dd%25e%23f%3Fg%2Ah%27i%22j%5Ck%7Bl%5Bm%5Dn%5Eo"
+        );
+        assert_eq!(escape_path_name("\u{0}\t\u{1F}\u{7F}"), "%00%09%1F%7F");
+        // Java leaves `-`, `_`, `}`, `.` and non-ASCII characters alone.
+        assert_eq!(escape_path_name("a-b_c}d.e\u{e9}"), "a-b_c}d.e\u{e9}");
+    }
+
+    #[test]
+    fn test_key_generator_resolution() {
+        let cases: &[(&[(&str, &str)], Option<bool>)] = &[
+            (&[("hoodie.table.keygenerator.type", "SIMPLE")], Some(false)),
+            (
+                &[("hoodie.table.keygenerator.type", "NON_PARTITION")],
+                Some(false),
+            ),
+            (&[("hoodie.table.keygenerator.type", "COMPLEX")], Some(true)),
+            (
+                &[("hoodie.table.keygenerator.type", "SPARK_SQL")],
+                Some(true),
+            ),
+            (&[("hoodie.table.keygenerator.type", "TIMESTAMP")], None),
+            (&[("hoodie.table.keygenerator.type", "GLOBAL_DELETE")], None),
+            // The class wins over the type.
+            (
+                &[
+                    ("hoodie.table.keygenerator.type", "COMPLEX"),
+                    (
+                        "hoodie.table.keygenerator.class",
+                        "org.apache.hudi.keygen.SimpleKeyGenerator",
+                    ),
+                ],
+                Some(false),
+            ),
+            (
+                &[(
+                    "hoodie.table.keygenerator.class",
+                    "org.apache.hudi.keygen.ComplexAvroKeyGenerator",
+                )],
+                Some(true),
+            ),
+            (
+                &[(
+                    "hoodie.table.keygenerator.class",
+                    "org.apache.hudi.keygen.TimestampBasedAvroKeyGenerator",
+                )],
+                None,
+            ),
+            // Inferred like Java: one partition field is SIMPLE, more is COMPLEX,
+            // a `field:type` partition spec is CUSTOM.
+            (&[("hoodie.table.partition.fields", "p")], Some(false)),
+            (&[("hoodie.table.partition.fields", "p,q")], Some(true)),
+            (&[("hoodie.table.partition.fields", "p:SIMPLE")], None),
+            // Table version 8 encodes unless the new encoding is opted into.
+            (
+                &[
+                    ("hoodie.table.keygenerator.type", "COMPLEX"),
+                    ("hoodie.table.version", "8"),
+                ],
+                Some(true),
+            ),
+            (
+                &[
+                    ("hoodie.table.keygenerator.type", "COMPLEX"),
+                    ("hoodie.table.version", "8"),
+                    ("hoodie.write.complex.keygen.new.encoding", "true"),
+                ],
+                Some(false),
+            ),
+            (
+                &[
+                    ("hoodie.table.keygenerator.type", "COMPLEX"),
+                    ("hoodie.table.version", "9"),
+                    ("hoodie.write.complex.keygen.new.encoding", "true"),
+                ],
+                Some(true),
+            ),
+        ];
+        for (pairs, expected) in cases {
+            let result = encodes_single_key_field_name(&configs(pairs));
+            match expected {
+                Some(encode) => assert_eq!(result.unwrap(), *encode, "{pairs:?}"),
+                None => assert!(
+                    matches!(result, Err(CoreError::Unsupported(_))),
+                    "{pairs:?}: {result:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_empty_record_key_errors() {
+        let cfg = configs(&[("hoodie.table.recordkey.fields", "id")]);
+        let b = batch(
+            vec![Field::new("id", DataType::Utf8, false)],
+            vec![Arc::new(StringArray::from(vec![""]))],
+        );
+        let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
+        assert!(err.to_string().contains("non-empty"), "{err}");
     }
 }

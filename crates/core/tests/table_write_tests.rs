@@ -537,22 +537,22 @@ async fn test_invalid_input_leaves_no_pending_instant() {
         names
     };
 
-    // Null partition value on a fresh table exercises the keygen validation
+    // An empty record key on a fresh table exercises the keygen validation
     // pass in append (no table schema yet to catch it earlier).
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("city", DataType::Utf8, true),
     ]));
-    let null_partition = RecordBatch::try_new(
+    let empty_key = RecordBatch::try_new(
         schema,
         vec![
-            Arc::new(StringArray::from(vec![Some("a")])),
-            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(StringArray::from(vec![Some("")])),
+            Arc::new(StringArray::from(vec![Some("sf")])),
         ],
     )
     .unwrap();
     let before = timeline_files();
-    table.append([null_partition]).await.unwrap_err();
+    table.append([empty_key]).await.unwrap_err();
     assert_eq!(
         timeline_files(),
         before,
@@ -2402,4 +2402,320 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
             .collect();
         assert_eq!(indexed, vec!["b", "e"], "{table_type:?}");
     }
+}
+
+/// Rewrite `hoodie.properties` the way another writer would have left it.
+fn rewrite_table_props(base: &std::path::Path, remove: &[&str], set: &[(&str, &str)]) {
+    let path = base.join(".hoodie/hoodie.properties");
+    let existing = std::fs::read_to_string(&path).unwrap();
+    let mut rewritten: String = existing
+        .lines()
+        .filter(|line| {
+            let key = line.split_once('=').map(|(k, _)| k).unwrap_or(line);
+            !remove.contains(&key) && !set.iter().any(|(k, _)| *k == key)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    for (key, value) in set {
+        rewritten.push_str(&format!("{key}={value}\n"));
+    }
+    std::fs::write(&path, rewritten).unwrap();
+}
+
+/// `(_hoodie_record_key, _hoodie_partition_path)` of every row, sorted.
+fn meta_keys(batches: &[RecordBatch]) -> Vec<(String, String)> {
+    let mut keys = batches
+        .iter()
+        .flat_map(|batch| {
+            let record_keys = batch
+                .column_by_name("_hoodie_record_key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let partitions = batch
+                .column_by_name("_hoodie_partition_path")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|i| {
+                    (
+                        record_keys.value(i).to_string(),
+                        partitions.value(i).to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys
+}
+
+fn nullable_city_batch(rows: Vec<(&str, Option<&str>, i64)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|(_, city, _)| *city).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|(_, _, value)| *value).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_write_rejects_unsupported_key_generators() {
+    let cases = [
+        ("hoodie.table.keygenerator.type", "TIMESTAMP"),
+        ("hoodie.table.keygenerator.type", "CUSTOM"),
+        (
+            "hoodie.table.keygenerator.class",
+            "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+        ),
+        (
+            "hoodie.table.keygenerator.class",
+            "org.apache.hudi.keygen.CustomKeyGenerator",
+        ),
+        (
+            "hoodie.table.keygenerator.class",
+            "com.example.UserKeyGenerator",
+        ),
+    ];
+    for (key, value) in cases {
+        let dir = tempdir().unwrap();
+        Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        rewrite_table_props(
+            dir.path(),
+            &["hoodie.table.keygenerator.type"],
+            &[(key, value)],
+        );
+        let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let err = table
+            .upsert([city_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::Unsupported(msg) if msg.contains(key) && msg.contains(value)),
+            "{key}={value}: {err}"
+        );
+        let err = table
+            .delete_keys([HoodieKey {
+                record_key: "a".to_string(),
+                partition_path: "sf".to_string(),
+            }])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::Unsupported(_)),
+            "{key}={value}: {err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_complex_key_generator_encodes_single_key_field() {
+    // Spark records the key generator by class; SqlKeyGenerator with no origin
+    // class in the table config delegates to ComplexKeyGenerator.
+    let cases = [
+        ("hoodie.table.keygenerator.type", "COMPLEX"),
+        (
+            "hoodie.table.keygenerator.class",
+            "org.apache.hudi.keygen.ComplexKeyGenerator",
+        ),
+        (
+            "hoodie.table.keygenerator.class",
+            "org.apache.spark.sql.hudi.command.SqlKeyGenerator",
+        ),
+    ];
+    for (key, value) in cases {
+        let dir = tempdir().unwrap();
+        Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        rewrite_table_props(
+            dir.path(),
+            &["hoodie.table.keygenerator.type"],
+            &[(key, value)],
+        );
+        let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        table
+            .append([city_batch(vec![("a", "sf", 1), ("b", "sf", 2)])])
+            .await
+            .unwrap();
+        table
+            .upsert([city_batch(vec![("a", "sf", 10)])])
+            .await
+            .unwrap();
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(
+            meta_keys(&batches),
+            vec![
+                ("id:a".to_string(), "city=sf".to_string()),
+                ("id:b".to_string(), "city=sf".to_string()),
+            ],
+            "{key}={value}"
+        );
+        assert_eq!(
+            rows_by_id(&batches),
+            vec![("a".to_string(), 10), ("b".to_string(), 2)],
+            "{key}={value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_urlencoded_partition_path_matches_java_escaping() {
+    let dir = tempdir().unwrap();
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_hive_style_partitioning(true)
+        .create()
+        .await
+        .unwrap();
+    rewrite_table_props(
+        dir.path(),
+        &[],
+        &[("hoodie.datasource.write.partitionpath.urlencode", "true")],
+    );
+    let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    table
+        .append([city_batch(vec![("a", "2024/01/02", 1), ("b", "a b:c", 2)])])
+        .await
+        .unwrap();
+    table
+        .upsert([city_batch(vec![("a", "2024/01/02", 10)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(
+        meta_keys(&batches),
+        vec![
+            ("a".to_string(), "city=2024%2F01%2F02".to_string()),
+            ("b".to_string(), "city=a b%3Ac".to_string()),
+        ]
+    );
+    assert_eq!(
+        rows_by_id(&batches),
+        vec![("a".to_string(), 10), ("b".to_string(), 2)]
+    );
+    assert!(dir.path().join("city=2024%2F01%2F02").is_dir());
+    assert!(!dir.path().join("city=2024").exists());
+}
+
+#[tokio::test]
+async fn test_empty_and_null_partition_values_use_default_partition() {
+    for hive_style in [true, false] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_hive_style_partitioning(hive_style)
+            .create()
+            .await
+            .unwrap();
+        let default_partition = if hive_style {
+            "city=__HIVE_DEFAULT_PARTITION__"
+        } else {
+            "__HIVE_DEFAULT_PARTITION__"
+        };
+        let sf = if hive_style { "city=sf" } else { "sf" };
+
+        table
+            .append([nullable_city_batch(vec![
+                ("a", Some(""), 1),
+                ("c", Some("sf"), 3),
+            ])])
+            .await
+            .unwrap();
+        assert_eq!(
+            meta_keys(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![
+                ("a".to_string(), default_partition.to_string()),
+                ("c".to_string(), sf.to_string()),
+            ],
+            "hive_style={hive_style}"
+        );
+
+        table
+            .upsert([nullable_city_batch(vec![
+                ("a", Some(""), 10),
+                ("b", None, 2),
+            ])])
+            .await
+            .unwrap();
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(
+            meta_keys(&batches),
+            vec![
+                ("a".to_string(), default_partition.to_string()),
+                ("b".to_string(), default_partition.to_string()),
+                ("c".to_string(), sf.to_string()),
+            ],
+            "hive_style={hive_style}"
+        );
+        assert_eq!(
+            rows_by_id(&batches),
+            vec![
+                ("a".to_string(), 10),
+                ("b".to_string(), 2),
+                ("c".to_string(), 3)
+            ],
+            "hive_style={hive_style}"
+        );
+        assert!(dir.path().join(default_partition).is_dir());
+    }
+}
+
+#[tokio::test]
+async fn test_empty_record_key_rejected() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let err = table
+        .append([batch(vec![("a", 1), ("", 2)])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Write(msg) if msg.contains("empty")),
+        "{err}"
+    );
+    let err = table.upsert([batch(vec![("", 2)])]).await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Write(msg) if msg.contains("empty")),
+        "{err}"
+    );
+    assert!(
+        table.timeline.get_latest_commit_timestamp().is_err(),
+        "a rejected key must not leave a commit"
+    );
 }
