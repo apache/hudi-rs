@@ -231,3 +231,132 @@ async fn test_rollback_without_markers_is_clean_noop() {
         .count();
     assert_eq!(rollbacks, 1, "rollback instant still recorded");
 }
+
+/// Makes `dir` read-only so unlinking files inside it fails, returning false
+/// when the platform still allows the delete (e.g. running as root).
+#[cfg(unix)]
+fn deny_deletes_in(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let probe = dir.join("delete-probe");
+    std::fs::write(&probe, b"").unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::remove_file(&probe).is_ok() {
+        allow_deletes_in(dir);
+        return false;
+    }
+    true
+}
+
+#[cfg(unix)]
+fn allow_deletes_in(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_file(dir.join("delete-probe"));
+}
+
+fn completed_rollbacks(timeline: &Path) -> Vec<String> {
+    std::fs::read_dir(timeline)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".rollback"))
+        .collect()
+}
+
+/// A data file the rollback cannot delete must fail the rollback: completing
+/// it removes the failed instant's fencing files, after which archival would
+/// make the surviving file read as committed. The rollback is retried by the
+/// next write once the delete succeeds.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rollback_fails_when_data_file_delete_fails() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000002";
+    let partial_file = fabricate_crashed_write(dir.path(), crashed_ts, false);
+    let partition = dir.path().join("city=sf");
+    if !deny_deletes_in(&partition) {
+        eprintln!("skipping: directory permissions do not block deletes here");
+        return;
+    }
+
+    let result = table.append([batch(vec![("b", "la", 2)])]).await;
+    allow_deletes_in(&partition);
+    assert!(
+        result.is_err(),
+        "rollback must fail when a marker-listed file cannot be deleted"
+    );
+    assert!(partition.join(&partial_file).exists());
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert!(
+        timeline.join(format!("{crashed_ts}.inflight")).exists()
+            && timeline
+                .join(format!("{crashed_ts}.commit.requested"))
+                .exists(),
+        "the failed instant must stay pending so the rollback is retried"
+    );
+    assert!(
+        completed_rollbacks(&timeline).is_empty(),
+        "no rollback may complete while the file survives"
+    );
+
+    // Once the delete can succeed, the next write finishes the rollback.
+    table.append([batch(vec![("b", "la", 2)])]).await.unwrap();
+    assert!(!partition.join(&partial_file).exists());
+    assert!(!timeline.join(format!("{crashed_ts}.inflight")).exists());
+    assert_eq!(completed_rollbacks(&timeline).len(), 1);
+    let rows = table
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+/// The same holds for the orphan MDT deltacommit's log files: a surviving
+/// orphan becomes trusted once the failed data instant is no longer pending.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rollback_fails_when_orphan_mdt_delete_fails() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000003";
+    fabricate_crashed_write(dir.path(), crashed_ts, true);
+    let mdt_files = dir.path().join(".hoodie/metadata/files");
+    if !deny_deletes_in(&mdt_files) {
+        eprintln!("skipping: directory permissions do not block deletes here");
+        return;
+    }
+
+    let result = table.append([batch(vec![("b", "la", 2)])]).await;
+    allow_deletes_in(&mdt_files);
+    assert!(
+        result.is_err(),
+        "rollback must fail when the orphan MDT log file cannot be deleted"
+    );
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert!(timeline.join(format!("{crashed_ts}.inflight")).exists());
+    assert!(completed_rollbacks(&timeline).is_empty());
+
+    table.append([batch(vec![("b", "la", 2)])]).await.unwrap();
+    let mdt_timeline = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+    assert!(
+        !mdt_timeline
+            .join(format!("{crashed_ts}_{crashed_ts}.deltacommit"))
+            .exists()
+    );
+    assert!(
+        !mdt_files
+            .join(format!(".files-0000-0_{crashed_ts}.log.1_0-0-0"))
+            .exists()
+    );
+    assert!(!timeline.join(format!("{crashed_ts}.inflight")).exists());
+    let rows = table
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}

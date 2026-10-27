@@ -180,19 +180,22 @@ async fn rollback_instant(
         } else {
             request.files_to_be_deleted.push(file_path.clone());
         }
-        let deleted = storage.delete_file(&file_path).await.is_ok();
+        // A surviving file must fail the rollback (Java `RollbackHelper.deleteFiles`):
+        // completing it unfences the instant, and once archival passes the
+        // instant the file reads as committed.
+        if let Err(error) = storage.delete_file(&file_path).await
+            && storage.exists(&file_path).await.unwrap_or(true)
+        {
+            return Err(error.into());
+        }
         let meta = partition_meta.entry(partition.clone()).or_insert_with(|| {
             HoodieRollbackPartitionMetadata {
                 partition_path: partition.clone(),
                 ..Default::default()
             }
         });
-        if deleted {
-            total_deleted += 1;
-            meta.success_delete_files.push(file_path);
-        } else {
-            meta.failed_delete_files.push(file_path);
-        }
+        total_deleted += 1;
+        meta.success_delete_files.push(file_path);
     }
 
     // Rollback plan + lifecycle on its own (new) instant.
@@ -313,13 +316,15 @@ async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Resul
             for file in files {
                 // MDT log files embed the data instant: `.{fileId}_{ts}.log.N_...`.
                 if file.name.contains(&format!("_{failed_ts}.log.")) {
-                    let _ = storage.delete_file(&format!("{dir}/{}", file.name)).await;
+                    storage.delete_file(&format!("{dir}/{}", file.name)).await?;
                 }
             }
         }
     }
     for name in mdt_instant_files {
-        let _ = storage.delete_file(&format!("{mdt_timeline}/{name}")).await;
+        storage
+            .delete_file(&format!("{mdt_timeline}/{name}"))
+            .await?;
     }
     Ok(())
 }
