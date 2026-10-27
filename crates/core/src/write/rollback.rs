@@ -125,16 +125,20 @@ async fn load_pending_rollback(
         .fencing_files
         .iter()
         .any(|n| n.ends_with(".inflight"));
-    let bytes = storage
+    let plan = match storage
         .get_file_data(&format!("{timeline_dir}/{requested}"))
-        .await?;
-    match HoodieRollbackPlan::from_avro_bytes(&bytes) {
-        Ok(plan) => Ok(Some(PendingRollback {
+        .await
+    {
+        Ok(bytes) => HoodieRollbackPlan::from_avro_bytes(&bytes).ok(),
+        Err(_) => None,
+    };
+    match plan {
+        Some(plan) => Ok(Some(PendingRollback {
             timestamp: rollback.timestamp,
             plan,
             inflight,
         })),
-        Err(_) => {
+        None => {
             if !inflight {
                 storage
                     .delete_file(&format!("{timeline_dir}/{requested}"))

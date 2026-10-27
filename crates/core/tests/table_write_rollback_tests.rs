@@ -688,6 +688,44 @@ async fn test_unreadable_requested_rollback_plan_is_discarded() {
     assert!(!dir.path().join("city=sf").join(&partial).exists());
 }
 
+/// An inflight rollback whose plan cannot be read is skipped, as Java does,
+/// rather than failing every write; the failed write gets a new rollback.
+#[tokio::test]
+async fn test_inflight_rollback_without_readable_plan_is_skipped() {
+    for plan in [None, Some(b"not avro".as_slice())] {
+        let dir = tempdir().unwrap();
+        let mut table = create_partitioned(dir.path()).await;
+        table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+        let crashed_ts = "30000101000000015";
+        let partial = fabricate_crashed_write(dir.path(), crashed_ts, false);
+        let timeline = dir.path().join(".hoodie/timeline");
+        let rollback_ts = "30000101000000016";
+        if let Some(plan) = plan {
+            std::fs::write(
+                timeline.join(format!("{rollback_ts}.rollback.requested")),
+                plan,
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            timeline.join(format!("{rollback_ts}.rollback.inflight")),
+            b"",
+        )
+        .unwrap();
+
+        table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+        assert!(
+            timeline
+                .join(format!("{rollback_ts}.rollback.inflight"))
+                .exists()
+        );
+        assert_eq!(completed_rollbacks(&timeline).len(), 1, "{plan:?}");
+        assert!(!dir.path().join("city=sf").join(&partial).exists());
+    }
+}
+
 /// A pending rollback of a compaction belongs to the table service that owns
 /// the compaction; the writer leaves it alone.
 #[tokio::test]
