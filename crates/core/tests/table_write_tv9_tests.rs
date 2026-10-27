@@ -503,3 +503,56 @@ async fn test_tv8_stats_remain_v1() {
         "tv8 records must not carry valueType"
     );
 }
+
+/// A table upgraded from version 8 keeps its V1 `column_stats` definition, and
+/// its stats stay V1 (Java `existingIndexVersionOrDefault`): V1 records, V1
+/// column eligibility, and the definition's version left as is.
+#[tokio::test]
+async fn test_tv9_stats_follow_v1_index_definition() {
+    let dir = tempdir().unwrap();
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_version(9)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    let def_path = dir.path().join(".hoodie/.index_defs/index.json");
+    let text = std::fs::read_to_string(&def_path).unwrap();
+    let mut json: serde_json::Value = serde_json::from_str(&text).unwrap();
+    json["indexDefinitions"]["column_stats"]["version"] = serde_json::json!("V1");
+    std::fs::write(&def_path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+    let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    table
+        .append([typed_batch(&[
+            ("a", 10_100, &[1, 1], 5),
+            ("b", 10_300, &[3, 1], 7),
+        ])])
+        .await
+        .unwrap();
+
+    let col_stats = read_stats_records(&table, dir.path(), "column_stats").await;
+    let first = &base_file_names(dir.path(), "city=sf")[0];
+    let amount = col_stats
+        .get(&column_stats_index_key("city=sf", first, "amount"))
+        .expect("column_stats for amount");
+    assert_eq!(amount.decoded_value_type_ordinal, None);
+    assert_eq!(
+        amount.min_value,
+        Some(ColumnStatValue::Decimal {
+            unscaled: 10_100 * 10_i128.pow(13),
+            precision: 30,
+            scale: 15,
+        })
+    );
+    assert!(!col_stats.contains_key(&column_stats_index_key("city=sf", first, "wide")));
+    let part_stats = read_stats_records(&table, dir.path(), "partition_stats").await;
+    let sf_amount = part_stats
+        .get(&partition_stats_index_key("city=sf", "amount"))
+        .expect("partition_stats for amount");
+    assert_eq!(sf_amount.decoded_value_type_ordinal, None);
+    let (fields, index_version) = column_stats_index_definition(dir.path());
+    assert!(!fields.contains(&"wide".to_string()), "{fields:?}");
+    assert_eq!(index_version, "V1");
+}

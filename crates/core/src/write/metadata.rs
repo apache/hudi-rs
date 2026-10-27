@@ -612,23 +612,53 @@ fn mdt_partition_enabled(table: &Table, partition: MetadataPartitionType) -> boo
         .any(|p| p.trim() == partition.partition_name())
 }
 
-/// Java `HoodieIndexVersion.getCurrentVersion`: column/partition stats are V2
-/// from table version 9 (primitive wrappers + `valueType`).
-fn stats_index_version(table: &Table) -> StatsIndexVersion {
+/// Java `HoodieTableMetadataUtil.existingIndexVersionOrDefault`: stats keep
+/// the version the column_stats (else partition_stats) index definition
+/// records, so a table upgraded from version 8 stays V1; Java requires both
+/// definitions to agree (`HoodieIndexMetadata.validateIndexMetadata`). Without
+/// either, stats are V2 from table version 9 (`HoodieIndexVersion.getCurrentVersion`).
+fn stats_index_version(
+    table: &Table,
+    definitions: Option<&serde_json::Value>,
+) -> Result<StatsIndexVersion> {
+    for partition in [
+        MetadataPartitionType::ColumnStats,
+        MetadataPartitionType::PartitionStats,
+    ] {
+        let name = partition.partition_name();
+        match definitions
+            .and_then(|root| root.pointer(&format!("/indexDefinitions/{name}/version")))
+        {
+            None | Some(serde_json::Value::Null) => {}
+            Some(version) => {
+                return match version.as_str() {
+                    Some("V1") => Ok(StatsIndexVersion::V1),
+                    Some("V2") => Ok(StatsIndexVersion::V2),
+                    _ => Err(crate::error::CoreError::MetadataTable(format!(
+                        "unsupported {name} index version {version}"
+                    ))),
+                };
+            }
+        }
+    }
     let table_version: isize = table
         .hudi_configs
         .get_or_default(crate::config::table::HudiTableConfig::TableVersion)
         .into();
-    if table_version >= 9 {
+    Ok(if table_version >= 9 {
         StatsIndexVersion::V2
     } else {
         StatsIndexVersion::V1
-    }
+    })
 }
 
 /// Columns indexed by `column_stats` / `partition_stats` for this table,
 /// honoring the column list and max-columns write configs.
-fn table_columns_to_index(table: &Table, schema: &Schema) -> Vec<String> {
+fn table_columns_to_index(
+    table: &Table,
+    schema: &Schema,
+    version: StatsIndexVersion,
+) -> Vec<String> {
     let options = table.hudi_configs.as_options();
     let column_list: Vec<String> = options
         .get(COLUMN_STATS_COLUMN_LIST_KEY)
@@ -644,12 +674,7 @@ fn table_columns_to_index(table: &Table, schema: &Schema) -> Vec<String> {
         .get(COLUMN_STATS_MAX_COLUMNS_KEY)
         .and_then(|max| max.trim().parse().ok())
         .unwrap_or(MAX_COLUMNS_TO_INDEX);
-    columns_to_index(
-        schema,
-        stats_index_version(table),
-        &column_list,
-        max_columns,
-    )
+    columns_to_index(schema, version, &column_list, max_columns)
 }
 
 /// Java `HoodieTableConfig.RELATIVE_INDEX_DEFINITION_PATH`.
@@ -717,10 +742,9 @@ pub(crate) fn column_stats_index_definition_json(
         .map_err(|e| crate::error::CoreError::MetadataTable(e.to_string()))
 }
 
-/// Keep the table's `column_stats` index definition in step with the indexed
-/// columns, as Java does on every commit. Spark only uses column_stats and
-/// partition_stats for data skipping on the columns this definition lists.
-async fn write_column_stats_index_definition(table: &Table, columns: &[String]) -> Result<()> {
+/// The table's configured index definitions path and the file's contents, if
+/// it exists.
+async fn read_index_definitions(table: &Table) -> Result<Option<(String, Option<bytes::Bytes>)>> {
     let Some(path) = table
         .hudi_configs
         .as_options()
@@ -728,7 +752,7 @@ async fn write_column_stats_index_definition(table: &Table, columns: &[String]) 
         .filter(|path| !path.trim().is_empty())
         .cloned()
     else {
-        return Ok(());
+        return Ok(None);
     };
     let storage = table.file_system_view.storage.clone();
     let existing = if storage.exists(&path).await? {
@@ -736,12 +760,23 @@ async fn write_column_stats_index_definition(table: &Table, columns: &[String]) 
     } else {
         None
     };
-    if let Some(json) = column_stats_index_definition_json(
-        existing.as_deref(),
-        columns,
-        stats_index_version(table),
-    )? {
-        storage.put_file(&path, json).await?;
+    Ok(Some((path, existing)))
+}
+
+/// Keep the table's `column_stats` index definition in step with the indexed
+/// columns, as Java does on every commit. Spark only uses column_stats and
+/// partition_stats for data skipping on the columns this definition lists.
+async fn write_column_stats_index_definition(
+    table: &Table,
+    definitions: Option<&(String, Option<bytes::Bytes>)>,
+    columns: &[String],
+    version: StatsIndexVersion,
+) -> Result<()> {
+    let Some((path, existing)) = definitions else {
+        return Ok(());
+    };
+    if let Some(json) = column_stats_index_definition_json(existing.as_deref(), columns, version)? {
+        table.file_system_view.storage.put_file(path, json).await?;
     }
     Ok(())
 }
@@ -774,8 +809,25 @@ pub async fn update_column_stats_partitions(
     // aggregate would collapse onto this commit's files (Java indexes the
     // three meta columns unconditionally).
     let full_schema = crate::write::append::schema_with_meta_fields(schema);
-    let indexed_columns = table_columns_to_index(table, &full_schema);
-    write_column_stats_index_definition(table, &indexed_columns).await?;
+    let index_definitions = read_index_definitions(table).await?;
+    let parsed_definitions: Option<serde_json::Value> = index_definitions
+        .as_ref()
+        .and_then(|(_, existing)| existing.as_deref())
+        .filter(|bytes| !bytes.is_empty())
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|e| {
+            crate::error::CoreError::MetadataTable(format!("invalid index definitions: {e}"))
+        })?;
+    let stats_version = stats_index_version(table, parsed_definitions.as_ref())?;
+    let indexed_columns = table_columns_to_index(table, &full_schema, stats_version);
+    write_column_stats_index_definition(
+        table,
+        index_definitions.as_ref(),
+        &indexed_columns,
+        stats_version,
+    )
+    .await?;
     // Footers carry every supported column; only the indexed ones are written.
     let updates: Vec<StatsFileUpdate> = updates
         .iter()
@@ -816,7 +868,7 @@ pub async fn update_column_stats_partitions(
             &column_stats_file_id,
             &column_records,
             true,
-            stats_index_version(table),
+            stats_version,
         )
         .await?;
         out.insert(
@@ -846,7 +898,7 @@ pub async fn update_column_stats_partitions(
                 &partition_stats_file_id,
                 &partition_records,
                 false,
-                stats_index_version(table),
+                stats_version,
             )
             .await?;
             out.insert(
