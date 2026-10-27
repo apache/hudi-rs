@@ -181,7 +181,7 @@ impl Table {
         let metadata_table = self.get_or_init_metadata_table().await?;
         // Built here because it needs both timelines: the data table's completed
         // and pending instants, and the metadata table's own.
-        let valid = self.valid_instant_timestamps(&metadata_table).await?;
+        let valid = self.valid_instant_timestamps(metadata_table).await?;
         metadata_table
             .fetch_files_partition_records(partition_pruner, &valid)
             .await
@@ -207,7 +207,7 @@ impl Table {
         keys: &[&str],
     ) -> Result<arrow_array::RecordBatch> {
         let metadata_table = self.get_or_init_metadata_table().await?;
-        let valid = self.valid_instant_timestamps(&metadata_table).await?;
+        let valid = self.valid_instant_timestamps(metadata_table).await?;
         metadata_table
             .read_files_partition_batch(keys, &valid)
             .await
@@ -510,13 +510,10 @@ const SOLO_COMMIT_TIMESTAMP: &str = "00000000000000";
 const ROLLBACK_READ_CONCURRENCY: usize = 8;
 
 impl Table {
-    /// The valid-instant set for reading this data table's metadata partitions,
-    /// built against a freshly opened metadata-table handle. Writers call this
-    /// between their own commits, so the handle must see the delta commit the
-    /// previous write just added; a cached one would fence those blocks out.
+    /// The valid-instant set for reading this data table's metadata partitions.
     pub(crate) async fn valid_metadata_instants(&self) -> Result<HashSet<String>> {
         let mdt = self.get_or_init_metadata_table().await?;
-        self.valid_instant_timestamps(&mdt).await
+        self.valid_instant_timestamps(mdt).await
     }
 
     /// The instants whose metadata log blocks may be read.
@@ -1262,13 +1259,13 @@ mod tests {
         let baseline_table = Table::new(&one).await?;
         let baseline_mdt = baseline_table.get_or_init_metadata_table().await?;
         let baseline_valid = baseline_table
-            .valid_instant_timestamps(&baseline_mdt)
+            .valid_instant_timestamps(baseline_mdt)
             .await?;
         let baseline = baseline_mdt
             .read_files_partition_batch(&[], &baseline_valid)
             .await?;
 
-        let doubled_valid = table.valid_instant_timestamps(&metadata).await?;
+        let doubled_valid = table.valid_instant_timestamps(metadata).await?;
         let doubled = metadata
             .read_files_partition_batch(&[], &doubled_valid)
             .await?;
@@ -1373,7 +1370,7 @@ mod tests {
 
         // Source 5 — exactly the sentinel-prefixed metadata commits, and every
         // one of them really carries the prefix.
-        let from_sentinel = Table::valid_from_sentinel_commits(&mdt);
+        let from_sentinel = Table::valid_from_sentinel_commits(mdt);
         assert!(
             !from_sentinel.is_empty(),
             "the fixture must have sentinel-prefixed metadata commits"
@@ -1388,7 +1385,7 @@ mod tests {
         // Source 2 — every metadata delta commit whose data instant is not
         // pending, and none whose data instant is.
         let data_pending = data_table.timeline.all_pending_instant_times().await?;
-        let from_mdt = data_table.valid_from_mdt_delta_commits(&mdt, &data_pending);
+        let from_mdt = data_table.valid_from_mdt_delta_commits(mdt, &data_pending);
         for instant in &mdt.timeline.completed_commits {
             let pending = data_pending.contains(&instant.timestamp);
             let is_delta = instant.action == Action::DeltaCommit;
@@ -1479,7 +1476,7 @@ mod tests {
         // this the exclusion below could be passing for any other reason.
         assert!(
             table
-                .valid_instant_timestamps(&mdt)
+                .valid_instant_timestamps(mdt)
                 .await?
                 .contains(COMPACTION_TS),
             "{COMPACTION_TS} must start out valid, or the assertion below proves nothing"
@@ -1510,7 +1507,7 @@ mod tests {
         );
         assert!(
             !table
-                .valid_instant_timestamps(&mdt)
+                .valid_instant_timestamps(mdt)
                 .await?
                 .contains(COMPACTION_TS),
             "{COMPACTION_TS} has a pending data compaction and must be excluded"
@@ -1571,14 +1568,14 @@ mod tests {
             assert!(
                 !table.valid_from_completed_data_instants().contains(ts)
                     && !table
-                        .valid_from_mdt_delta_commits(&mdt, &data_pending)
+                        .valid_from_mdt_delta_commits(mdt, &data_pending)
                         .contains(ts)
-                    && !Table::valid_from_sentinel_commits(&mdt).contains(ts),
+                    && !Table::valid_from_sentinel_commits(mdt).contains(ts),
                 "{ts} must not be reachable from sources 1, 2 or 5, or this test proves nothing"
             );
         }
 
-        let valid = table.valid_instant_timestamps(&mdt).await?;
+        let valid = table.valid_instant_timestamps(mdt).await?;
         assert!(
             valid.contains(ROLLED_BACK),
             "source 3: a commit rolled back by a data-table rollback must be valid"
@@ -1623,7 +1620,7 @@ mod tests {
         let mdt = table.get_or_init_metadata_table().await?;
 
         let err = table
-            .valid_instant_timestamps(&mdt)
+            .valid_instant_timestamps(mdt)
             .await
             .expect_err("an unreadable rollback must fail the read");
         assert!(

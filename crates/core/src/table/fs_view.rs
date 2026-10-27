@@ -1175,7 +1175,7 @@ mod tests {
         // meant "admit no metadata log blocks", so this test could pass while
         // reading a metadata table it had filtered down to nothing.
         let valid_instants = hudi_table
-            .valid_instant_timestamps(&metadata_table)
+            .valid_instant_timestamps(metadata_table)
             .await
             .unwrap();
         assert!(
@@ -1191,7 +1191,7 @@ mod tests {
                 &table_schema,
                 &timeline_view,
                 Some(MetadataListing {
-                    table: &metadata_table,
+                    table: metadata_table,
                     valid_instants: &valid_instants,
                 }),
                 None,

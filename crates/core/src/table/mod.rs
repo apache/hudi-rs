@@ -143,6 +143,12 @@ pub struct Table {
     pub storage_options: Arc<HashMap<String, String>>,
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
+    /// Cached metadata table instance, lazily initialized on first use.
+    /// Shared across clones via `Arc`; [`Table::clear_read_caches`] gives this
+    /// handle a fresh cell, so a handle that writes reopens the metadata table
+    /// and sees its own delta commits while clones keep the one that matches
+    /// their timeline.
+    cached_metadata_table: Arc<OnceCell<Table>>,
     /// Cached file stats estimator. Materialized on first successful call to
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
     /// populate the cache, allowing later calls with newer timestamps to retry.
@@ -156,6 +162,7 @@ impl Clone for Table {
             storage_options: self.storage_options.clone(),
             timeline: self.timeline.clone(),
             file_system_view: self.file_system_view.clone(),
+            cached_metadata_table: self.cached_metadata_table.clone(),
             cached_estimator: self.cached_estimator.clone(),
         }
     }
@@ -203,13 +210,24 @@ fn instant_time_minus_one(instant_time: &str) -> String {
 }
 
 impl Table {
-    /// Open a fresh metadata-table handle from storage (no instance cache).
+    /// Get or initialize the cached metadata table instance.
     ///
-    /// Writers and readers reload the data timeline first, then open MDT relative
-    /// to that view. Commit locking / conflict checks are deferred to a later
-    /// concurrency-control project.
-    pub(crate) async fn get_or_init_metadata_table(&self) -> Result<Table> {
-        self.new_metadata_table().await
+    /// Returns `Ok(&Table)` if metadata table is successfully created or was already cached.
+    /// The instance is created once and reused until [`Self::clear_read_caches`].
+    pub(crate) async fn get_or_init_metadata_table(&self) -> Result<&Table> {
+        self.cached_metadata_table
+            .get_or_try_init(|| async {
+                log::debug!("Initializing cached metadata table instance");
+                self.new_metadata_table().await
+            })
+            .await
+    }
+
+    /// Drop the listing cache and the metadata-table handle, after the
+    /// timeline has been reloaded around a write.
+    pub(crate) fn clear_read_caches(&mut self) {
+        self.file_system_view.clear_cache();
+        self.cached_metadata_table = Arc::new(OnceCell::new());
     }
 
     /// Reload the active timeline and drop listing caches before a write plans.
@@ -222,7 +240,7 @@ impl Table {
         // any new instant is minted.
         crate::write::rollback::rollback_failed_writes(self).await?;
         self.timeline.reload_completed_commits().await?;
-        self.file_system_view.clear_cache();
+        self.clear_read_caches();
         Ok(())
     }
 
@@ -697,13 +715,11 @@ impl Table {
         // Built here rather than inside the view: it needs the data table's
         // timeline as well as the metadata table's, and only this scope holds
         // both.
-        // The metadata handle is opened fresh (never cached), so it is owned
-        // here and the listing borrows it for the duration of this call.
-        let valid_instants = match metadata_table.as_ref() {
+        let valid_instants = match metadata_table {
             Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
             None => None,
         };
-        let metadata_listing = match (metadata_table.as_ref(), valid_instants.as_ref()) {
+        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
             (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
                 table,
                 valid_instants,
@@ -1455,7 +1471,7 @@ impl Table {
         let hudi_configs = self.hudi_configs.as_ref();
         let partition_pruner = PartitionPruner::new(&[], &partition_schema, hudi_configs).ok()?;
         let mdt = self.get_or_init_metadata_table().await.ok()?;
-        let valid = self.valid_instant_timestamps(&mdt).await.ok()?;
+        let valid = self.valid_instant_timestamps(mdt).await.ok()?;
         let records = mdt
             .fetch_files_partition_records(&partition_pruner, &valid)
             .await
@@ -3534,7 +3550,7 @@ mod tests {
         let partition_pruner =
             PartitionPruner::new(&[], &partition_schema, table.hudi_configs.as_ref()).unwrap();
         let valid = table
-            .valid_instant_timestamps(&metadata_table)
+            .valid_instant_timestamps(metadata_table)
             .await
             .unwrap();
         let records = metadata_table

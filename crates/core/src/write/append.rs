@@ -455,7 +455,7 @@ async fn append_batches_inner(
     drop(cs2);
 
     let _ = table.timeline.reload_completed_commits().await;
-    table.file_system_view.clear_cache();
+    table.clear_read_caches();
 
     Ok(AppendResult {
         instant: request_instant,

@@ -1678,7 +1678,7 @@ async fn mor_upsert_batches(
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
     let _ = table.timeline.reload_completed_commits().await;
-    table.file_system_view.clear_cache();
+    table.clear_read_caches();
     Ok(WriteResult {
         instant,
         num_writes: incoming.num_rows(),
@@ -1890,7 +1890,7 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
     let _ = table.timeline.reload_completed_commits().await;
-    table.file_system_view.clear_cache();
+    table.clear_read_caches();
     Ok(WriteResult {
         instant,
         num_writes: 0,
@@ -2928,7 +2928,7 @@ async fn finalize_rewrite_commit(
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await;
     drop(cs2);
     let _ = table.timeline.reload_completed_commits().await;
-    table.file_system_view.clear_cache();
+    table.clear_read_caches();
     Ok(WriteResult {
         instant: instant.to_string(),
         num_writes,

@@ -340,3 +340,76 @@ async fn test_mdt_commit_without_any_data_instant_is_read_like_java() {
     assert!(listed.iter().any(|name| name.contains(&commits[0].0)));
     assert!(listed.iter().any(|name| name.contains(&orphan_instant)));
 }
+
+fn sf_files(
+    records: &std::collections::HashMap<
+        String,
+        hudi_core::metadata::table::records::FilesPartitionRecord,
+    >,
+) -> usize {
+    records["city=sf"].active_file_names().len()
+}
+
+/// A reader handle opens the metadata table once and serves every later read
+/// from that handle: once the first read has opened it, the metadata table's
+/// own `hoodie.properties` is not read again.
+#[tokio::test]
+async fn test_reader_handle_opens_metadata_table_once() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path(), TableTypeValue::CopyOnWrite).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    let reader = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    let partition_schema = reader.get_partition_schema().await.unwrap();
+    let pruner =
+        PartitionPruner::new(&[], &partition_schema, reader.hudi_configs.as_ref()).unwrap();
+    let options = hudi_core::table::ReadOptions::new();
+    assert_eq!(reader.get_file_slices(&options).await.unwrap().len(), 2);
+
+    let mdt_properties = dir
+        .path()
+        .join(".hoodie/metadata/.hoodie/hoodie.properties");
+    std::fs::rename(&mdt_properties, dir.path().join("mdt.properties.moved")).unwrap();
+
+    for _ in 0..2 {
+        assert_eq!(reader.get_file_slices(&options).await.unwrap().len(), 2);
+        let records = reader
+            .read_metadata_table_files_partition(&pruner)
+            .await
+            .unwrap();
+        assert_eq!(sf_files(&records), 2);
+    }
+}
+
+/// A handle that reads, writes, and reads again sees its own write through the
+/// metadata table: the write drops the metadata-table handle the first read
+/// opened.
+#[tokio::test]
+async fn test_writing_handle_reads_its_own_writes_through_metadata_table() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path(), TableTypeValue::CopyOnWrite).await;
+    let options = hudi_core::table::ReadOptions::new();
+
+    for (i, id) in ["a", "b", "c"].into_iter().enumerate() {
+        table
+            .append([batch(vec![(id, "sf", i as i64)])])
+            .await
+            .unwrap();
+        let partition_schema = table.get_partition_schema().await.unwrap();
+        let pruner =
+            PartitionPruner::new(&[], &partition_schema, table.hudi_configs.as_ref()).unwrap();
+        let records = table
+            .read_metadata_table_files_partition(&pruner)
+            .await
+            .unwrap();
+        assert_eq!(sf_files(&records), i + 1);
+        assert_eq!(table.get_file_slices(&options).await.unwrap().len(), i + 1);
+    }
+
+    let result = table.upsert([batch(vec![("c", "sf", 30)])]).await.unwrap();
+    assert_eq!(result.num_updates, 1);
+    assert_eq!(result.num_inserts, 0);
+    let rows = table.read(&options).await.unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+}
