@@ -224,7 +224,17 @@ impl Table {
     /// `keys` empty reads every record; otherwise only those keys, matched
     /// **as stored**.
     ///
-    /// An empty batch when the partition is not enabled or has no commits.
+    /// An empty batch when the partition has no commits yet.
+    ///
+    /// # Errors
+    /// [`CoreError::MetadataTable`] when `partition` is not one the table
+    /// declares in `hoodie.table.metadata.partitions`. An empty batch there
+    /// would be indistinguishable from a declared partition that holds no
+    /// records, and an undeclared name is most likely a typo.
+    ///
+    /// A file group that is log-only and holds nothing but tombstones fails in
+    /// the merge with "No schema available for merge output", since no record
+    /// survives to lend the output its schema. Not yet handled.
     ///
     /// # Note
     /// Must be called on a DATA table, not a METADATA table.
@@ -233,6 +243,13 @@ impl Table {
         partition: &str,
         keys: &[&str],
     ) -> Result<arrow_array::RecordBatch> {
+        let declared = self.get_metadata_table_partitions();
+        if !declared.iter().any(|p| p == partition) {
+            return Err(CoreError::MetadataTable(format!(
+                "Metadata table partition '{partition}' is not declared on this table; \
+                 declared partitions: {declared:?}"
+            )));
+        }
         let metadata_table = self.get_or_init_metadata_table().await?;
         let valid = self.valid_instant_timestamps(metadata_table).await?;
         metadata_table
@@ -1597,6 +1614,69 @@ mod tests {
         assert!(
             err.to_string().contains(ROLLBACK_TS),
             "the error must name the instant that could not be read, got {err}"
+        );
+        Ok(())
+    }
+
+    /// The record index through the public Arrow API, on a table whose index is
+    /// sharded across file groups. A keyed read opens one shard and comes back
+    /// keyed as stored; an unknown key is empty rather than an error; a full
+    /// scan holds one entry per live record.
+    #[tokio::test]
+    async fn read_metadata_table_partition_arrow_reads_the_record_index() -> Result<()> {
+        use arrow_array::{Array, StringArray};
+
+        let table = Table::new(&SampleTable::V9TxnsSimpleMeta.path_to_cow()).await?;
+
+        let batch = table
+            .read_metadata_table_partition_arrow("record_index", &["TXN-011"])
+            .await?;
+        assert_eq!(batch.num_rows(), 1, "one live key is one index entry");
+        let keys = batch
+            .column_by_name("key")
+            .expect("the record index keys on a `key` column")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("`key` is a string column");
+        assert_eq!(keys.value(0), "TXN-011");
+
+        let batch = table
+            .read_metadata_table_partition_arrow("record_index", &["no-such-key"])
+            .await?;
+        assert_eq!(
+            batch.num_rows(),
+            0,
+            "a missing key is an empty batch, not an error"
+        );
+
+        let live_rows: usize = table
+            .read(&crate::table::ReadOptions::new())
+            .await?
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        let batch = table
+            .read_metadata_table_partition_arrow("record_index", &[])
+            .await?;
+        assert_eq!(
+            batch.num_rows(),
+            live_rows,
+            "a full scan holds one entry per live record"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_metadata_table_partition_arrow_rejects_an_undeclared_partition() -> Result<()> {
+        let table = Table::new(&SampleTable::V9TxnsSimpleMeta.path_to_cow()).await?;
+        let err = table
+            .read_metadata_table_partition_arrow("secondary_idx_merchant", &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CoreError::MetadataTable(_)), "got {err}");
+        assert!(
+            err.to_string().contains("secondary_idx_merchant"),
+            "the error must name the partition, got {err}"
         );
         Ok(())
     }
