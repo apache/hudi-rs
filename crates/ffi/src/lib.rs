@@ -16,16 +16,12 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Crate `hudi-core`.
-//!
-//! # The [config] module is responsible for managing configurations.
-//!
-
 //! A plain C ABI over hudi-rs, so a JVM or a C++ engine can read a file slice.
 //!
 //! The `cpp` crate already exposes the same reads, but `cxx` generates
-//! C++-mangled symbols and `CxxString`/`CxxVector` arguments, neither of which a
-//! JVM can bind to. This crate restates those calls in C: null-terminated
+//! C++-mangled symbols and `CxxString`/`CxxVector` arguments, which a JVM cannot
+//! bind to and which tie a C++ caller to the bridge's generated code and
+//! toolchain. This crate restates those calls in C: null-terminated
 //! strings in, opaque handles and an `ArrowArrayStream` out. It holds no reading
 //! logic of its own.
 //!
@@ -69,7 +65,7 @@ fn set_error(message: impl Into<String>) {
 ///
 /// Every exported function goes through this. A panic that unwinds across the C
 /// ABI aborts the process, so catching it here is what keeps a Rust bug from
-/// killing the JVM that called us.
+/// killing the process that called us.
 fn guard<T>(what: &str, body: impl FnOnce() -> Result<*mut T, String>) -> *mut T {
     // The previous call's message dies here, so `hudi_ffi_last_error` means
     // "the last call failed", not "some call once failed" — a binding that
@@ -381,7 +377,7 @@ mod tests {
     /// A successful call clears the previous failure's message.
     ///
     /// `hudi_ffi_last_error` documents "null if the last call succeeded", and a
-    /// JVM binding that checks the message rather than the return value relies
+    /// binding that checks the message rather than the return value relies
     /// on it: without the clear, one failure makes every later success look
     /// like that same failure.
     #[test]
@@ -403,9 +399,9 @@ mod tests {
 
     /// Freeing null is a no-op, on every free.
     ///
-    /// A JVM caller's `finally` runs whether or not the call succeeded, so it
-    /// will free a null handle on the failure path. That has to be safe or the
-    /// error path becomes a crash.
+    /// A caller's cleanup (a JVM `finally`, a C++ destructor) runs whether or
+    /// not the call succeeded, so it will free a null handle on the failure path.
+    /// That has to be safe or the error path becomes a crash.
     #[test]
     fn freeing_null_is_a_no_op() {
         unsafe {
