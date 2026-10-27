@@ -173,6 +173,7 @@ pub async fn upsert_batches(
     let key_name = record_key_name(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
     let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
+    let delete_markers = delete_marker_rows(&incoming);
     let locations = crate::index::for_table_checked(table)
         .await
         .tag_location(table, &incoming_hoodie_keys)
@@ -190,7 +191,7 @@ pub async fn upsert_batches(
     let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
     let mut insert_rows_by_partition: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
-        if locations.get(hoodie_key).and_then(Option::as_ref).is_none() {
+        if !delete_markers[index] && locations.get(hoodie_key).and_then(Option::as_ref).is_none() {
             insert_rows_by_partition
                 .entry(hoodie_key.partition_path.clone())
                 .or_default()
@@ -270,6 +271,7 @@ pub async fn upsert_batches(
     let rejected_moves =
         moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices)
             .await?;
+    let mut moved_deletes = Vec::new();
     for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
         // A location whose file group has no live slice is a stale index
         // entry (its group was replaced); the row no longer exists, so the
@@ -278,6 +280,28 @@ pub async fn upsert_batches(
             .get(hoodie_key)
             .and_then(Option::as_ref)
             .filter(|location| slice_by_file_id.contains_key(&location.file_id));
+        // A delete marker that would land as a new row writes nothing (Java's
+        // create handle skips it); on a partition move it only evicts the
+        // stored row. In-place markers are resolved by the group merge.
+        if delete_markers[index]
+            && !located.is_some_and(|location| {
+                location.partition_path == hoodie_key.partition_path
+                    || rejected_moves.contains(&hoodie_key.record_key)
+            })
+        {
+            if let Some(location) = located {
+                evictions_by_group
+                    .entry(location.file_id.clone())
+                    .or_default()
+                    .insert(hoodie_key.record_key.clone());
+                moved_deletes.push((
+                    hoodie_key.record_key.clone(),
+                    location.partition_path.clone(),
+                ));
+            }
+            row_target.push(None);
+            continue;
+        }
         let target = match located {
             Some(location) if location.partition_path == hoodie_key.partition_path => {
                 updates += 1;
@@ -416,6 +440,17 @@ pub async fn upsert_batches(
                 is_deleted: false,
             })
         })
+        .chain(
+            moved_deletes
+                .into_iter()
+                .map(|(record_key, partition_path)| RecordIndexEntry {
+                    record_key,
+                    partition_path,
+                    file_id: String::new(),
+                    instant_time_millis: instant_to_epoch_millis(&instant),
+                    is_deleted: true,
+                }),
+        )
         .collect();
 
     let schema = incoming.schema();
@@ -1205,40 +1240,55 @@ async fn mor_upsert_batches(
         &mor_slice_by_file_id,
     )
     .await?;
+    // Delete markers follow Java's append handle: one that would land as a
+    // new row writes nothing, a partition move only tombstones the stored
+    // row, and an in-place marker is logged for the reader to merge. The
+    // record index forgets every key whose stored row the marker removes.
+    let delete_markers = delete_marker_rows(&incoming);
+    let mut index_deletes: Vec<HoodieKey> = Vec::new();
+    let mut in_place_deletes: HashMap<String, Vec<String>> = HashMap::new();
     for (index, key) in incoming_keys.iter().enumerate() {
         let incoming_partition = tagged_keys
             .get(index)
             .map(|k| k.partition_path.clone())
             .unwrap_or_default();
         match locations.get(key) {
-            Some(location) if location.partition_path == incoming_partition => {
+            Some(location)
+                if location.partition_path == incoming_partition
+                    || rejected_moves.contains(key) =>
+            {
                 update_indices
                     .entry((location.partition_path.clone(), location.file_id.clone()))
                     .or_default()
                     .push(index as u32);
                 updates += 1;
-            }
-            Some(location) if rejected_moves.contains(key) => {
-                update_indices
-                    .entry((location.partition_path.clone(), location.file_id.clone()))
-                    .or_default()
-                    .push(index as u32);
-                updates += 1;
+                if delete_markers[index] {
+                    in_place_deletes
+                        .entry(location.file_id.clone())
+                        .or_default()
+                        .push(key.clone());
+                }
             }
             Some(location) => {
+                let doomed = HoodieKey {
+                    record_key: key.clone(),
+                    partition_path: location.partition_path.clone(),
+                };
+                if delete_markers[index] {
+                    index_deletes.push(doomed.clone());
+                } else {
+                    insert_indices_by_partition
+                        .entry(incoming_partition)
+                        .or_default()
+                        .push(index as u32);
+                }
                 moved_tombstones
                     .entry((location.partition_path.clone(), location.file_id.clone()))
                     .or_default()
-                    .push(HoodieKey {
-                        record_key: key.clone(),
-                        partition_path: location.partition_path.clone(),
-                    });
-                insert_indices_by_partition
-                    .entry(incoming_partition)
-                    .or_default()
-                    .push(index as u32);
+                    .push(doomed);
                 updates += 1;
             }
+            None if delete_markers[index] => {}
             None => {
                 insert_indices_by_partition
                     .entry(incoming_partition)
@@ -1247,6 +1297,26 @@ async fn mor_upsert_batches(
                 inserts += 1;
             }
         }
+    }
+    // A stale in-place marker loses the reader's event-time merge and leaves
+    // the stored row, and its index entry, in place.
+    let stale_deletes = moved_keys_rejected_by_event_time(
+        table,
+        &incoming,
+        &in_place_deletes,
+        &mor_slice_by_file_id,
+    )
+    .await?;
+    for (key, location) in in_place_deletes
+        .into_values()
+        .flatten()
+        .filter(|key| !stale_deletes.contains(key))
+        .filter_map(|key| locations.get(&key).map(|location| (key, location)))
+    {
+        index_deletes.push(HoodieKey {
+            record_key: key,
+            partition_path: location.partition_path.clone(),
+        });
     }
 
     let storage = table.file_system_view.storage.clone();
@@ -1355,7 +1425,16 @@ async fn mor_upsert_batches(
     let mut stats = Vec::new();
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
-    let mut rli_entries = Vec::new();
+    let mut rli_entries: Vec<RecordIndexEntry> = index_deletes
+        .into_iter()
+        .map(|key| RecordIndexEntry {
+            record_key: key.record_key,
+            partition_path: key.partition_path,
+            file_id: String::new(),
+            instant_time_millis: instant_to_epoch_millis(&instant),
+            is_deleted: true,
+        })
+        .collect();
     let mut stats_updates = Vec::new();
     // Delete log blocks for keys that moved partitions.
     for ((partition_path, file_id), moved) in &moved_tombstones {
@@ -2222,6 +2301,20 @@ fn partition_paths_for_batch(batch: &RecordBatch) -> Vec<String> {
             .unwrap_or_else(|| vec![String::new(); batch.num_rows()]),
         None => vec![String::new(); batch.num_rows()],
     }
+}
+
+/// Rows carrying a true `_hoodie_is_deleted` delete marker, read as the file
+/// group reader reads it (a null or non-boolean marker is not a delete).
+fn delete_marker_rows(batch: &RecordBatch) -> Vec<bool> {
+    batch
+        .column_by_name("_hoodie_is_deleted")
+        .and_then(|column| column.as_any().downcast_ref::<BooleanArray>())
+        .map(|markers| {
+            (0..batch.num_rows())
+                .map(|row| markers.is_valid(row) && markers.value(row))
+                .collect()
+        })
+        .unwrap_or_else(|| vec![false; batch.num_rows()])
 }
 
 fn strip_meta_columns(batch: &RecordBatch) -> Result<RecordBatch> {
@@ -3119,6 +3212,27 @@ fn merge_file_group_task(
                 } else {
                     take_batch(&combined, &selected)?
                 };
+                // A winning incoming delete marker removes the row (Java
+                // merge handle: `combineRecord.isDelete`); stored rows are
+                // written as they are.
+                let delete_markers = delete_marker_rows(&merged);
+                let merged = if delete_markers.contains(&true) {
+                    let merged_keys = keys(&merged, key_field)?;
+                    let merged_partitions =
+                        string_values(&merged, MetaField::PartitionPath.as_ref())?;
+                    let mut survivors = Vec::with_capacity(merged.num_rows());
+                    for (row, source) in selected.iter().enumerate() {
+                        if delete_markers[row] && *source as usize >= old.num_rows() {
+                            rli_deletes
+                                .push((merged_keys[row].clone(), merged_partitions[row].clone()));
+                        } else {
+                            survivors.push(row as u32);
+                        }
+                    }
+                    take_batch(&merged, &survivors)?
+                } else {
+                    merged
+                };
                 (merged, matched)
             }
             GroupOp::DeleteKeys { exact, keys_only } => {
@@ -3467,8 +3581,14 @@ async fn commit_merge_plans(
         return Ok(WriteResult::default());
     }
 
-    // RLI tombstones from the workers (deleted rows' actual key/partition).
+    // RLI tombstones from the workers (deleted rows' actual key/partition),
+    // replacing the driver's entry for a key an upsert delete marker removed.
     if rli_enabled {
+        let removed: HashSet<&str> = outputs
+            .iter()
+            .flat_map(|output| output.rli_deletes.iter().map(|(key, _)| key.as_str()))
+            .collect();
+        rli_entries.retain(|entry| !removed.contains(entry.record_key.as_str()));
         for output in &outputs {
             for (record_key, partition_path) in &output.rli_deletes {
                 rli_entries.push(RecordIndexEntry {

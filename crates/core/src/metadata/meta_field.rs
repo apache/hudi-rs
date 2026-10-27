@@ -88,9 +88,11 @@ lazy_static! {
 }
 
 impl MetaField {
-    /// Whether `name` is a reserved `_hoodie_*` meta field.
+    /// Whether `name` is a writer-managed meta field (Java
+    /// `HoodieSchemaUtils.isMetadataField`). Other `_hoodie_` names, such as the
+    /// `_hoodie_is_deleted` delete marker, are data columns.
     pub fn is_meta_field(name: &str) -> bool {
-        name.starts_with("_hoodie_")
+        Self::from_str(name).is_ok()
     }
 
     #[inline]

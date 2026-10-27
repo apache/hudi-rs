@@ -841,7 +841,7 @@ pub(crate) fn strip_meta_fields_from_schema(schema: &arrow_schema::Schema) -> ar
     let fields: Vec<_> = schema
         .fields()
         .iter()
-        .filter(|f| !f.name().starts_with("_hoodie_"))
+        .filter(|f| !crate::metadata::meta_field::MetaField::is_meta_field(f.name()))
         .cloned()
         .collect();
     arrow_schema::Schema::new(fields)
@@ -1134,7 +1134,9 @@ mod tests {
         let schema = Schema::new(vec![
             Field::new("_hoodie_commit_time", DataType::Utf8, true),
             Field::new("_hoodie_record_key", DataType::Utf8, true),
+            Field::new("_hoodie_operation", DataType::Utf8, true),
             Field::new("id", DataType::Utf8, false),
+            Field::new("_hoodie_is_deleted", DataType::Boolean, true),
         ]);
         let stripped = strip_meta_fields_from_schema(&schema);
         assert_eq!(
@@ -1143,7 +1145,7 @@ mod tests {
                 .iter()
                 .map(|f| f.name().clone())
                 .collect::<Vec<_>>(),
-            vec!["id"]
+            vec!["id", "_hoodie_is_deleted"]
         );
     }
 
