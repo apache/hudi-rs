@@ -310,7 +310,7 @@ fn relative_to_base(base: &url::Url, path: &str) -> Result<String> {
             match rest.strip_prefix("//") {
                 Some(rest) => {
                     let (authority, raw_path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
-                    if authority != base.authority() {
+                    if bucket_of(authority) != bucket_of(base.authority()) {
                         return Err(not_under_base());
                     }
                     raw_path
@@ -329,6 +329,19 @@ fn relative_to_base(base: &url::Url, path: &str) -> Result<String> {
         .and_then(|rest| rest.strip_prefix('/'))
         .map(str::to_string)
         .ok_or_else(not_under_base)
+}
+
+/// The bucket or container an authority names, so spellings of one store
+/// compare equal: `abfss://container@account...` and `az://container` share a
+/// container, and `hdfs://nn` and `hdfs://nn:8020` share a namenode.
+fn bucket_of(authority: &str) -> &str {
+    if let Some((container, _)) = authority.split_once('@') {
+        return container;
+    }
+    authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map_or(authority, |(host, _)| host)
 }
 
 async fn rollback_instant(
@@ -554,6 +567,31 @@ mod tests {
             relative_to_base(&s3, "s3a://bucket/t/f.parquet").unwrap(),
             "f.parquet"
         );
+        for (base, path) in [
+            (
+                "az://container/t",
+                "abfss://container@acct.dfs.core.windows.net/t/f.parquet",
+            ),
+            (
+                "abfss://container@acct.dfs.core.windows.net/t",
+                "az://container/t/f.parquet",
+            ),
+            ("hdfs://nn/t", "hdfs://nn:8020/t/f.parquet"),
+            ("hdfs://nn:8020/t", "hdfs://nn/t/f.parquet"),
+        ] {
+            let base = url::Url::parse(base).unwrap();
+            assert_eq!(
+                relative_to_base(&base, path).unwrap(),
+                "f.parquet",
+                "{path}"
+            );
+        }
+        let az = url::Url::parse("az://container/t").unwrap();
+        assert!(
+            relative_to_base(&az, "abfss://other@acct.dfs.core.windows.net/t/f.parquet").is_err()
+        );
+        let hdfs = url::Url::parse("hdfs://nn/t").unwrap();
+        assert!(relative_to_base(&hdfs, "hdfs://nn2:8020/t/f.parquet").is_err());
         assert!(relative_to_base(&base, "file:///tmp/other/f.parquet").is_err());
         assert!(relative_to_base(&base, "file:///tmp/t2/f.parquet").is_err());
     }
