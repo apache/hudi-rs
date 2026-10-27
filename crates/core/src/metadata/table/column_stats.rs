@@ -28,7 +28,10 @@ use parquet::file::statistics::Statistics as ParquetStatistics;
 use crate::Result;
 use crate::error::CoreError;
 use crate::metadata::meta_field::MetaField;
-use crate::metadata::table::encode::{ColumnStatValue, ColumnStatsMetadata};
+use crate::metadata::table::encode::{
+    ColumnStatValue, ColumnStatsMetadata, StatsIndexVersion, V1_DECIMAL_PRECISION,
+    V1_DECIMAL_SCALE, i128_from_be_bytes, rescale_decimal,
+};
 
 /// Per-column range extracted from a written Parquet base file.
 #[derive(Debug, Clone)]
@@ -50,9 +53,8 @@ pub struct ColumnRangeStats {
 
 /// Read file-level column ranges from in-memory Parquet bytes (Java `ParquetUtils`).
 ///
-/// Covers exactly [`columns_to_index`]: the three always-indexed meta fields plus
-/// the first 32 supported data fields. Nested (multi-part path) columns and types
-/// Spark does not index (bytes/fixed/decimal) are omitted rather than mis-encoded.
+/// Covers every top-level column of a type any index version supports; the
+/// metadata writer narrows that to [`columns_to_index`] for the table.
 pub fn column_ranges_from_parquet_bytes(bytes: &[u8]) -> Result<Vec<ColumnRangeStats>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
         .map_err(|e| CoreError::Write(format!("Failed to open Parquet for column stats: {e}")))?;
@@ -73,8 +75,6 @@ fn column_ranges_from_parquet_metadata(
         .iter()
         .map(|f| (f.name().as_str(), f.data_type()))
         .collect();
-    let indexed_columns: std::collections::HashSet<String> =
-        columns_to_index(schema).into_iter().collect();
 
     #[derive(Default)]
     struct Acc {
@@ -103,12 +103,12 @@ fn column_ranges_from_parquet_metadata(
             let Some(col_name) = path.parts().first().map(|s| s.as_str()) else {
                 continue;
             };
-            if !indexed_columns.contains(col_name) {
-                continue;
-            }
             let Some(&data_type) = type_by_name.get(col_name) else {
                 continue;
             };
+            if !is_indexable_type(data_type, StatsIndexVersion::V2) {
+                continue;
+            }
 
             let acc = by_col.entry(col_name.to_string()).or_default();
             acc.data_type = Some(data_type.clone());
@@ -345,6 +345,16 @@ pub(crate) fn coerce_stat_value(
             timestamp(v, tz)
         }
         (V::Long(v), DataType::Timestamp(unit, tz)) => timestamp(to_micros(v, *unit)?, tz),
+        (
+            V::Decimal {
+                unscaled, scale, ..
+            },
+            DataType::Decimal128(precision, to_scale),
+        ) => decimal(
+            rescale_decimal(unscaled, scale, *to_scale)?,
+            *precision,
+            *to_scale,
+        ),
         _ => return None,
     })
 }
@@ -353,36 +363,78 @@ pub(crate) fn coerce_stat_value(
 /// first 32 supported data fields (schema order) are indexed.
 pub const MAX_COLUMNS_TO_INDEX: usize = 32;
 
+/// Java `HoodieMetadataConfig.COLUMN_STATS_INDEX_FOR_COLUMNS`.
+pub const COLUMN_STATS_COLUMN_LIST_KEY: &str = "hoodie.metadata.index.column.stats.column.list";
+
+/// Java `HoodieMetadataConfig.COLUMN_STATS_INDEX_MAX_COLUMNS`.
+pub const COLUMN_STATS_MAX_COLUMNS_KEY: &str =
+    "hoodie.metadata.index.column.stats.max.columns.to.index";
+
 /// Columns eligible for MDT indexing from a table/data schema.
 ///
 /// Java `HoodieTableMetadataUtil.getColumnsToIndex`: the three always-indexed
-/// meta fields (when present, i.e. `populateMetaFields`) plus the first
-/// [`MAX_COLUMNS_TO_INDEX`] supported non-meta fields in schema order.
-pub fn columns_to_index(schema: &Schema) -> Vec<String> {
+/// meta fields (when present, i.e. `populateMetaFields`), then either the
+/// supported columns of `column_list` in list order, or, when the list is
+/// empty, the first `max_columns` supported non-meta fields in schema order.
+/// Only top-level columns are indexed; nested names in the list are skipped.
+pub fn columns_to_index(
+    schema: &Schema,
+    version: StatsIndexVersion,
+    column_list: &[String],
+    max_columns: usize,
+) -> Vec<String> {
     // Java META_COLS_TO_ALWAYS_INDEX_SCHEMA_MAP is a TreeMap: alphabetical order.
-    let mut cols: Vec<String> = [
+    let always: Vec<String> = [
         MetaField::CommitTime,
         MetaField::PartitionPath,
         MetaField::RecordKey,
     ]
     .iter()
     .map(|m| m.as_ref().to_string())
-    .filter(|name| schema.fields().iter().any(|f| f.name() == name))
     .collect();
-    cols.extend(
-        schema
-            .fields()
-            .iter()
-            .filter(|f| !MetaField::is_meta_field(f.name()) && is_indexable_type(f.data_type()))
-            .take(MAX_COLUMNS_TO_INDEX)
-            .map(|f| f.name().clone()),
-    );
+    let mut cols: Vec<String> = always
+        .iter()
+        .filter(|name| schema.fields().iter().any(|f| f.name() == *name))
+        .cloned()
+        .collect();
+    if column_list.is_empty() {
+        cols.extend(
+            schema
+                .fields()
+                .iter()
+                .filter(|f| {
+                    !MetaField::is_meta_field(f.name()) && is_indexable_type(f.data_type(), version)
+                })
+                .take(max_columns)
+                .map(|f| f.name().clone()),
+        );
+    } else {
+        for name in column_list {
+            if always.contains(name) || cols.contains(name) {
+                continue;
+            }
+            if let Ok(field) = schema.field_with_name(name)
+                && is_indexable_type(field.data_type(), version)
+            {
+                cols.push(name.clone());
+            }
+        }
+    }
     cols
 }
 
-/// Java `isColumnTypeSupported` for the SPARK record type: nested types, enums,
-/// raw bytes/fixed — and hence decimals, stored as bytes/fixed — are not indexed.
-fn is_indexable_type(data_type: &DataType) -> bool {
+/// Java `HoodieTableMetadataUtil.isColumnTypeSupported` for the AVRO record
+/// type, which Spark datasource writes use: nested types are never indexed;
+/// V1 (table version 8) also skips decimals whose value would not fit the
+/// `decimal(30,15)` V1 wrapper.
+pub(crate) fn is_indexable_type(data_type: &DataType, version: StatsIndexVersion) -> bool {
+    if let DataType::Decimal128(precision, scale) = data_type {
+        return *scale >= 0
+            && (version == StatsIndexVersion::V2
+                || (*scale <= V1_DECIMAL_SCALE
+                    && i32::from(*precision) + i32::from(V1_DECIMAL_SCALE - *scale)
+                        <= i32::from(V1_DECIMAL_PRECISION)));
+    }
     matches!(
         data_type,
         DataType::Boolean
@@ -398,6 +450,8 @@ fn is_indexable_type(data_type: &DataType) -> bool {
             | DataType::Float64
             | DataType::Utf8
             | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
             | DataType::Date32
             | DataType::Time64(TimeUnit::Microsecond)
             | DataType::Timestamp(_, _)
@@ -412,6 +466,24 @@ fn parquet_min_max_to_stat_values(
         (ParquetStatistics::Boolean(s), DataType::Boolean) => Some((
             ColumnStatValue::Boolean(*s.min_opt()?),
             ColumnStatValue::Boolean(*s.max_opt()?),
+        )),
+        (ParquetStatistics::Int32(s), DataType::Decimal128(precision, scale)) => Some((
+            decimal(i128::from(*s.min_opt()?), *precision, *scale),
+            decimal(i128::from(*s.max_opt()?), *precision, *scale),
+        )),
+        (ParquetStatistics::Int64(s), DataType::Decimal128(precision, scale)) => Some((
+            decimal(i128::from(*s.min_opt()?), *precision, *scale),
+            decimal(i128::from(*s.max_opt()?), *precision, *scale),
+        )),
+        (ParquetStatistics::FixedLenByteArray(s), DataType::Decimal128(precision, scale)) => {
+            Some((
+                decimal(i128_from_be_bytes(s.min_opt()?.data())?, *precision, *scale),
+                decimal(i128_from_be_bytes(s.max_opt()?.data())?, *precision, *scale),
+            ))
+        }
+        (ParquetStatistics::ByteArray(s), DataType::Decimal128(precision, scale)) => Some((
+            decimal(i128_from_be_bytes(s.min_opt()?.data())?, *precision, *scale),
+            decimal(i128_from_be_bytes(s.max_opt()?.data())?, *precision, *scale),
         )),
         (ParquetStatistics::Int32(s), DataType::Date32) => Some((
             ColumnStatValue::Date(*s.min_opt()?),
@@ -467,6 +539,14 @@ fn parquet_min_max_to_stat_values(
             ColumnStatValue::Bytes(s.max_opt()?.data().to_vec()),
         )),
         _ => None,
+    }
+}
+
+fn decimal(unscaled: i128, precision: u8, scale: i8) -> ColumnStatValue {
+    ColumnStatValue::Decimal {
+        unscaled,
+        precision,
+        scale,
     }
 }
 
@@ -526,6 +606,15 @@ pub(crate) fn stat_value_to_array(
         ColumnStatValue::LocalTimestampMicros(v) => {
             Arc::new(arrow_array::TimestampMicrosecondArray::from(vec![*v]))
         }
+        ColumnStatValue::Decimal {
+            unscaled,
+            precision,
+            scale,
+        } => Arc::new(
+            arrow_array::Decimal128Array::from(vec![*unscaled])
+                .with_precision_and_scale(*precision, *scale)
+                .ok()?,
+        ),
     };
     if natural.data_type() == target {
         return Some(natural);
@@ -537,6 +626,7 @@ pub(crate) fn stat_value_to_array(
 mod tests {
     use super::*;
     use arrow_schema::Field;
+    use std::sync::Arc;
 
     #[test]
     fn test_columns_to_index_meta_fields_and_first_32_cap() {
@@ -551,7 +641,7 @@ mod tests {
             fields.push(Field::new(format!("col{i:02}"), DataType::Int64, false));
         }
         let schema = Schema::new(fields);
-        let cols = columns_to_index(&schema);
+        let cols = columns_to_index(&schema, StatsIndexVersion::V2, &[], MAX_COLUMNS_TO_INDEX);
 
         // Three always-indexed meta fields in Java's TreeMap order, then the
         // first 32 data fields in schema order.
@@ -571,20 +661,126 @@ mod tests {
         assert!(!cols.iter().any(|c| c == "_hoodie_file_name"));
     }
 
+    /// Java `isColumnTypeSupported` for the AVRO record type: V2 indexes every
+    /// non-nested column; V1 also skips decimals outside `decimal(30,15)`.
     #[test]
-    fn test_columns_to_index_skips_unsupported_types() {
+    fn test_columns_to_index_type_support_per_index_version() {
         let schema = Schema::new(vec![
             Field::new("s", DataType::Utf8, false),
-            // Spark record type never indexes bytes/fixed/decimal columns.
             Field::new("b", DataType::Binary, false),
             Field::new("d", DataType::Decimal128(10, 2), false),
+            Field::new("wide", DataType::Decimal128(38, 10), false),
+            Field::new("fine", DataType::Decimal128(20, 16), false),
             Field::new(
                 "nested",
                 DataType::Struct(vec![Field::new("x", DataType::Int64, false)].into()),
                 false,
             ),
+            Field::new(
+                "list",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                false,
+            ),
         ]);
-        assert_eq!(columns_to_index(&schema), vec!["s".to_string()]);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            columns_to_index(&schema, StatsIndexVersion::V1, &[], MAX_COLUMNS_TO_INDEX),
+            names(&["s", "b", "d"])
+        );
+        assert_eq!(
+            columns_to_index(&schema, StatsIndexVersion::V2, &[], MAX_COLUMNS_TO_INDEX),
+            names(&["s", "b", "d", "wide", "fine"])
+        );
+    }
+
+    /// `hoodie.metadata.index.column.stats.column.list` picks the supported
+    /// listed columns in list order after the always-indexed meta fields;
+    /// without it, `max.columns.to.index` caps the schema-order prefix.
+    #[test]
+    fn test_columns_to_index_column_list_and_max_columns() {
+        let schema = Schema::new(vec![
+            Field::new("_hoodie_commit_time", DataType::Utf8, false),
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("_hoodie_partition_path", DataType::Utf8, false),
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Utf8, false),
+            Field::new(
+                "nested",
+                DataType::Struct(vec![Field::new("x", DataType::Int64, false)].into()),
+                false,
+            ),
+            Field::new("c", DataType::Decimal128(38, 10), false),
+        ]);
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let meta = [
+            "_hoodie_commit_time",
+            "_hoodie_partition_path",
+            "_hoodie_record_key",
+        ];
+        let list = names(&["c", "missing", "nested", "_hoodie_record_key", "b", "c"]);
+        let mut expected = names(&meta);
+        expected.extend(names(&["c", "b"]));
+        assert_eq!(
+            columns_to_index(&schema, StatsIndexVersion::V2, &list, 1),
+            expected
+        );
+        let mut expected = names(&meta);
+        expected.push("b".to_string());
+        assert_eq!(
+            columns_to_index(&schema, StatsIndexVersion::V1, &list, 1),
+            expected
+        );
+        let mut expected = names(&meta);
+        expected.extend(names(&["a", "b"]));
+        assert_eq!(
+            columns_to_index(&schema, StatsIndexVersion::V2, &[], 2),
+            expected
+        );
+    }
+
+    /// Decimal footer ranges come back as the column's decimal for every
+    /// physical parquet encoding arrow-rs picks by precision.
+    #[test]
+    fn test_column_ranges_from_parquet_decimals() {
+        use arrow_array::{ArrayRef, Decimal128Array, RecordBatch};
+        let columns = [("d9", 9u8), ("d18", 18), ("d38", 38)];
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|(name, p)| Field::new(*name, DataType::Decimal128(*p, 2), false))
+                .collect::<Vec<_>>(),
+        ));
+        let arrays: Vec<ArrayRef> = columns
+            .iter()
+            .map(|(_, p)| {
+                Arc::new(
+                    Decimal128Array::from(vec![10_100_i128, -250, 10_300])
+                        .with_precision_and_scale(*p, 2)
+                        .unwrap(),
+                ) as ArrayRef
+            })
+            .collect();
+        let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+        let ranges = column_ranges_from_parquet_bytes(&bytes).unwrap();
+        for (name, precision) in columns {
+            let range = ranges.iter().find(|r| r.column_name == name).unwrap();
+            let expected = |unscaled| {
+                Some(ColumnStatValue::Decimal {
+                    unscaled,
+                    precision,
+                    scale: 2,
+                })
+            };
+            assert_eq!(range.min_value, expected(-250), "{name}");
+            assert_eq!(range.max_value, expected(10_300), "{name}");
+        }
     }
 
     /// A V2 stats record shaped like Spark writes it: a primitive `LongWrapper`
@@ -731,7 +927,30 @@ mod tests {
                 Some(V::String("s".into())),
             ),
             (V::Bytes(vec![1]), DataType::Binary, Some(V::Bytes(vec![1]))),
+            // A V1 decimal(30,15) value rescales to the column's scale.
+            (
+                V::Decimal {
+                    unscaled: 101_000_000_000_000_000,
+                    precision: 30,
+                    scale: 15,
+                },
+                DataType::Decimal128(10, 2),
+                Some(V::Decimal {
+                    unscaled: 10_100,
+                    precision: 10,
+                    scale: 2,
+                }),
+            ),
             // No conversion exists.
+            (
+                V::Decimal {
+                    unscaled: 10_123,
+                    precision: 10,
+                    scale: 3,
+                },
+                DataType::Decimal128(10, 2),
+                None,
+            ),
             (V::String("s".into()), DataType::Int64, None),
             (V::Long(7), DataType::Int32, None),
             (V::Double(1.0), DataType::Int64, None),

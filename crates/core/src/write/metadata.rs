@@ -27,7 +27,8 @@ use crate::file_group::log_file::{BlockMetadataKey, BlockType};
 use crate::hfile::{HFileReader, HFileWriter};
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::table::column_stats::{
-    ColumnRangeStats, aggregate_partition_stats, coerce_stat_value, column_stats_for_file,
+    COLUMN_STATS_COLUMN_LIST_KEY, COLUMN_STATS_MAX_COLUMNS_KEY, ColumnRangeStats,
+    MAX_COLUMNS_TO_INDEX, aggregate_partition_stats, coerce_stat_value, column_stats_for_file,
     column_stats_tombstones, columns_to_index,
 };
 use crate::metadata::table::encode::{
@@ -550,6 +551,126 @@ fn stats_index_version(table: &Table) -> StatsIndexVersion {
     }
 }
 
+/// Columns indexed by `column_stats` / `partition_stats` for this table,
+/// honoring the column list and max-columns write configs.
+fn table_columns_to_index(table: &Table, schema: &Schema) -> Vec<String> {
+    let options = table.hudi_configs.as_options();
+    let column_list: Vec<String> = options
+        .get(COLUMN_STATS_COLUMN_LIST_KEY)
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let max_columns = options
+        .get(COLUMN_STATS_MAX_COLUMNS_KEY)
+        .and_then(|max| max.trim().parse().ok())
+        .unwrap_or(MAX_COLUMNS_TO_INDEX);
+    columns_to_index(
+        schema,
+        stats_index_version(table),
+        &column_list,
+        max_columns,
+    )
+}
+
+/// Java `HoodieTableConfig.RELATIVE_INDEX_DEFINITION_PATH`.
+pub(crate) const INDEX_DEFINITION_PATH_KEY: &str = "hoodie.table.index.defs.path";
+
+/// Java's default index definition location, relative to the base path.
+pub(crate) const DEFAULT_INDEX_DEFINITION_PATH: &str = ".hoodie/.index_defs/index.json";
+
+/// The index definitions JSON with the `column_stats` definition set to
+/// `columns` (Java `HoodieSparkIndexClient.createOrUpdateColumnStatsIndexDefinition`),
+/// keeping every other definition. `None` when `existing` already matches.
+pub(crate) fn column_stats_index_definition_json(
+    existing: Option<&[u8]>,
+    columns: &[String],
+    version: StatsIndexVersion,
+) -> Result<Option<Vec<u8>>> {
+    use serde_json::{Value, json};
+    let mut root: Value = match existing {
+        Some(bytes) if !bytes.is_empty() => serde_json::from_slice(bytes).map_err(|e| {
+            crate::error::CoreError::MetadataTable(format!("invalid index definitions: {e}"))
+        })?,
+        _ => json!({}),
+    };
+    let name = MetadataPartitionType::ColumnStats.partition_name();
+    let current = root.pointer(&format!("/indexDefinitions/{name}"));
+    if current
+        .and_then(|def| def.get("sourceFields"))
+        .is_some_and(|fields| *fields == json!(columns))
+    {
+        return Ok(None);
+    }
+    // An existing definition keeps its version (Java existingIndexVersionOrDefault).
+    let version = current
+        .and_then(|def| def.get("version").cloned())
+        .unwrap_or_else(|| {
+            json!(match version {
+                StatsIndexVersion::V1 => "V1",
+                StatsIndexVersion::V2 => "V2",
+            })
+        });
+    let definition = json!({
+        "indexName": name,
+        "indexType": name,
+        "indexFunction": name,
+        "sourceFields": columns,
+        "indexOptions": {},
+        "version": version,
+    });
+    let Some(root_object) = root.as_object_mut() else {
+        return Err(crate::error::CoreError::MetadataTable(
+            "index definitions must be a JSON object".to_string(),
+        ));
+    };
+    let definitions = root_object
+        .entry("indexDefinitions")
+        .or_insert_with(|| json!({}));
+    let Some(definitions) = definitions.as_object_mut() else {
+        return Err(crate::error::CoreError::MetadataTable(
+            "indexDefinitions must be a JSON object".to_string(),
+        ));
+    };
+    definitions.insert(name.to_string(), definition);
+    serde_json::to_vec_pretty(&root)
+        .map(Some)
+        .map_err(|e| crate::error::CoreError::MetadataTable(e.to_string()))
+}
+
+/// Keep the table's `column_stats` index definition in step with the indexed
+/// columns, as Java does on every commit. Spark only uses column_stats and
+/// partition_stats for data skipping on the columns this definition lists.
+async fn write_column_stats_index_definition(table: &Table, columns: &[String]) -> Result<()> {
+    let Some(path) = table
+        .hudi_configs
+        .as_options()
+        .get(INDEX_DEFINITION_PATH_KEY)
+        .filter(|path| !path.trim().is_empty())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let storage = table.file_system_view.storage.clone();
+    let existing = if storage.exists(&path).await? {
+        Some(storage.get_file_data(&path).await?)
+    } else {
+        None
+    };
+    if let Some(json) = column_stats_index_definition_json(
+        existing.as_deref(),
+        columns,
+        stats_index_version(table),
+    )? {
+        storage.put_file(&path, json).await?;
+    }
+    Ok(())
+}
+
 /// Update MDT `column_stats` and `partition_stats` for written files.
 ///
 /// Partition stats follow Java `convertMetadataToPartitionStatRecords`: for each
@@ -578,7 +699,20 @@ pub async fn update_column_stats_partitions(
     // aggregate would collapse onto this commit's files (Java indexes the
     // three meta columns unconditionally).
     let full_schema = crate::write::append::schema_with_meta_fields(schema);
-    let indexed_columns = columns_to_index(&full_schema);
+    let indexed_columns = table_columns_to_index(table, &full_schema);
+    write_column_stats_index_definition(table, &indexed_columns).await?;
+    // Footers carry every supported column; only the indexed ones are written.
+    let updates: Vec<StatsFileUpdate> = updates
+        .iter()
+        .map(|update| {
+            let mut update = update.clone();
+            update
+                .ranges
+                .retain(|r| indexed_columns.contains(&r.column_name));
+            update
+        })
+        .collect();
+    let updates = updates.as_slice();
     let mut column_records: Vec<(String, ColumnStatsMetadata)> = Vec::new();
 
     for update in updates {

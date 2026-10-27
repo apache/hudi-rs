@@ -147,6 +147,12 @@ pub enum ColumnStatValue {
     TimestampMicros(i64),
     /// Timezone-less timestamp micros (Java `LOCAL_TIMESTAMP_MICROS`).
     LocalTimestampMicros(i64),
+    /// Decimal as its unscaled value (Java `BigDecimal`).
+    Decimal {
+        unscaled: i128,
+        precision: u8,
+        scale: i8,
+    },
 }
 
 /// MDT stats index version: V1 (tv8, logical wrappers, no `valueType`) vs V2
@@ -178,6 +184,7 @@ impl ColumnStatValue {
             ColumnStatValue::TimeMicros(_) => 14,
             ColumnStatValue::TimestampMicros(_) => 16,
             ColumnStatValue::LocalTimestampMicros(_) => 19,
+            ColumnStatValue::Decimal { .. } => 10,
         }
     }
 }
@@ -503,6 +510,7 @@ pub fn decode_column_stats_entry(
                     decoded_value_type_ordinal: None,
                 };
                 let mut value_type_ordinal: Option<i32> = None;
+                let mut value_type_info: Option<String> = None;
                 for (fname, fval) in stat_fields {
                     match (fname.as_str(), fval) {
                         ("fileName", Value::Union(1, v)) => {
@@ -513,10 +521,16 @@ pub fn decode_column_stats_entry(
                         ("valueType", Value::Union(1, v)) => {
                             if let Value::Record(info) = *v {
                                 for (iname, ival) in info {
-                                    if iname == "typeOrdinal"
-                                        && let Value::Int(ordinal) = ival
-                                    {
-                                        value_type_ordinal = Some(ordinal);
+                                    match (iname.as_str(), ival) {
+                                        ("typeOrdinal", Value::Int(ordinal)) => {
+                                            value_type_ordinal = Some(ordinal);
+                                        }
+                                        ("additionalInfo", Value::Union(1, info)) => {
+                                            if let Value::String(info) = *info {
+                                                value_type_info = Some(info);
+                                            }
+                                        }
+                                        _ => {}
                                     }
                                 }
                             }
@@ -556,8 +570,9 @@ pub fn decode_column_stats_entry(
                 // V2 records carry logical types in valueType over primitive
                 // wrappers — lift them back to typed stat values.
                 if let Some(ordinal) = value_type_ordinal {
-                    out.min_value = out.min_value.map(|v| lift_stat_value(v, ordinal));
-                    out.max_value = out.max_value.map(|v| lift_stat_value(v, ordinal));
+                    let info = value_type_info.as_deref();
+                    out.min_value = out.min_value.map(|v| lift_stat_value(v, ordinal, info));
+                    out.max_value = out.max_value.map(|v| lift_stat_value(v, ordinal, info));
                     out.decoded_value_type_ordinal = Some(ordinal);
                 }
                 return Ok(Some(out));
@@ -574,9 +589,21 @@ pub fn decode_column_stats_entry(
 /// Millisecond types (Spark writes them for `*-millis` Avro columns) are
 /// lifted to the micros variants footer extraction produces, so stats of one
 /// column compare by value whichever writer produced them.
-fn lift_stat_value(value: ColumnStatValue, ordinal: i32) -> ColumnStatValue {
+fn lift_stat_value(value: ColumnStatValue, ordinal: i32, info: Option<&str>) -> ColumnStatValue {
     let millis_to_micros = |v: i64| v.checked_mul(1_000);
     match (value, ordinal) {
+        // DECIMAL carries "precision,scale" in additionalInfo.
+        (ColumnStatValue::Bytes(bytes), 10) => {
+            let decimal = info.and_then(|info| {
+                let (precision, scale) = info.split_once(',')?;
+                Some(ColumnStatValue::Decimal {
+                    unscaled: i128_from_be_bytes(&bytes)?,
+                    precision: precision.trim().parse().ok()?,
+                    scale: scale.trim().parse().ok()?,
+                })
+            });
+            decimal.unwrap_or(ColumnStatValue::Bytes(bytes))
+        }
         (ColumnStatValue::Int(v), 12) => ColumnStatValue::Date(v),
         (ColumnStatValue::Int(v), 13) => ColumnStatValue::TimeMicros(i64::from(v) * 1_000),
         (ColumnStatValue::Long(v), 14) => ColumnStatValue::TimeMicros(v),
@@ -617,7 +644,59 @@ fn unwrap_stat_value(value: Value) -> Option<ColumnStatValue> {
         (11, Value::Long(v) | Value::TimestampMicros(v)) => {
             Some(ColumnStatValue::TimestampMicros(v))
         }
+        (9, Value::Decimal(v)) => Some(ColumnStatValue::Decimal {
+            unscaled: i128_from_be_bytes(&Vec::<u8>::try_from(&v).ok()?)?,
+            precision: V1_DECIMAL_PRECISION,
+            scale: V1_DECIMAL_SCALE,
+        }),
+        (9, Value::Bytes(v)) => Some(ColumnStatValue::Decimal {
+            unscaled: i128_from_be_bytes(&v)?,
+            precision: V1_DECIMAL_PRECISION,
+            scale: V1_DECIMAL_SCALE,
+        }),
         _ => None,
+    }
+}
+
+/// Precision and scale of the V1 `DecimalWrapper` value (`decimal(30,15)`).
+pub(crate) const V1_DECIMAL_PRECISION: u8 = 30;
+pub(crate) const V1_DECIMAL_SCALE: i8 = 15;
+
+/// Java `BigInteger.toByteArray`: minimal big-endian two's complement.
+pub(crate) fn i128_to_be_bytes(value: i128) -> Vec<u8> {
+    let bytes = value.to_be_bytes();
+    let mut start = 0;
+    while start < bytes.len() - 1 {
+        let (lead, next) = (bytes[start], bytes[start + 1]);
+        if (lead == 0x00 && next & 0x80 == 0) || (lead == 0xff && next & 0x80 != 0) {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    bytes[start..].to_vec()
+}
+
+/// Big-endian two's complement bytes as an `i128`; `None` beyond 16 bytes.
+pub(crate) fn i128_from_be_bytes(bytes: &[u8]) -> Option<i128> {
+    if bytes.is_empty() || bytes.len() > 16 {
+        return None;
+    }
+    let fill = if bytes[0] & 0x80 != 0 { 0xff } else { 0x00 };
+    let mut buf = [fill; 16];
+    buf[16 - bytes.len()..].copy_from_slice(bytes);
+    Some(i128::from_be_bytes(buf))
+}
+
+/// `unscaled * 10^(to - from)`; `None` on overflow or when lowering the scale
+/// would drop non-zero digits.
+pub(crate) fn rescale_decimal(unscaled: i128, from: i8, to: i8) -> Option<i128> {
+    let diff = i32::from(to) - i32::from(from);
+    let factor = 10_i128.checked_pow(diff.unsigned_abs())?;
+    if diff >= 0 {
+        unscaled.checked_mul(factor)
+    } else {
+        (unscaled % factor == 0).then(|| unscaled / factor)
     }
 }
 
@@ -674,11 +753,11 @@ fn encode_column_stats_record(
             ),
             (
                 "minValue".to_string(),
-                wrap_stat_value(metadata.min_value.as_ref(), version),
+                wrap_stat_value(metadata.min_value.as_ref(), version)?,
             ),
             (
                 "maxValue".to_string(),
-                wrap_stat_value(metadata.max_value.as_ref(), version),
+                wrap_stat_value(metadata.max_value.as_ref(), version)?,
             ),
             (
                 "valueCount".to_string(),
@@ -709,17 +788,22 @@ fn encode_column_stats_record(
                 match version {
                     StatsIndexVersion::V1 => null_union(),
                     StatsIndexVersion::V2 => {
-                        let ordinal = metadata
-                            .min_value
-                            .as_ref()
-                            .or(metadata.max_value.as_ref())
-                            .map(ColumnStatValue::value_type_ordinal)
-                            .unwrap_or(1);
+                        let sample = metadata.min_value.as_ref().or(metadata.max_value.as_ref());
+                        let ordinal = sample.map(ColumnStatValue::value_type_ordinal).unwrap_or(1);
+                        let additional_info = match sample {
+                            Some(ColumnStatValue::Decimal {
+                                precision, scale, ..
+                            }) => Value::Union(
+                                1,
+                                Box::new(Value::String(format!("{precision},{scale}"))),
+                            ),
+                            _ => null_union(),
+                        };
                         Value::Union(
                             1,
                             Box::new(Value::Record(vec![
                                 ("typeOrdinal".to_string(), Value::Int(ordinal)),
-                                ("additionalInfo".to_string(), null_union()),
+                                ("additionalInfo".to_string(), additional_info),
                             ])),
                         )
                     }
@@ -745,9 +829,9 @@ fn encode_column_stats_record(
 /// lives in `valueType` instead (Java `ValueType.primitiveWrapperType`):
 /// Date → IntWrapper; TimeMicros / TimestampMicros / LocalTimestampMicros →
 /// LongWrapper.
-fn wrap_stat_value(value: Option<&ColumnStatValue>, version: StatsIndexVersion) -> Value {
+fn wrap_stat_value(value: Option<&ColumnStatValue>, version: StatsIndexVersion) -> Result<Value> {
     let Some(value) = value else {
-        return null_union();
+        return Ok(null_union());
     };
     if version == StatsIndexVersion::V2 {
         let (branch, inner) = match value {
@@ -761,11 +845,14 @@ fn wrap_stat_value(value: Option<&ColumnStatValue>, version: StatsIndexVersion) 
             ColumnStatValue::Double(v) => (5, Value::Double(*v)),
             ColumnStatValue::Bytes(v) => (6, Value::Bytes(v.clone())),
             ColumnStatValue::String(v) => (7, Value::String(v.clone())),
+            ColumnStatValue::Decimal { unscaled, .. } => {
+                (6, Value::Bytes(i128_to_be_bytes(*unscaled)))
+            }
         };
-        return Value::Union(
+        return Ok(Value::Union(
             branch,
             Box::new(Value::Record(vec![("value".to_string(), inner)])),
-        );
+        ));
     }
     let (branch, inner) = match value {
         ColumnStatValue::Boolean(v) => (
@@ -800,8 +887,24 @@ fn wrap_stat_value(value: Option<&ColumnStatValue>, version: StatsIndexVersion) 
             8,
             Value::Record(vec![("value".to_string(), Value::Int(*v))]),
         ),
-        // DecimalWrapper = 9: decimals are not indexed (Spark record type
-        // excludes bytes/fixed columns entirely).
+        // DecimalWrapper holds decimal(30,15): Java upcasts every value to
+        // that scale (HoodieTableMetadataUtil.tryUpcastDecimal).
+        ColumnStatValue::Decimal {
+            unscaled, scale, ..
+        } => {
+            let upcast = rescale_decimal(*unscaled, *scale, V1_DECIMAL_SCALE).ok_or_else(|| {
+                CoreError::MetadataTable(format!(
+                    "decimal {unscaled} at scale {scale} does not fit the V1 DecimalWrapper"
+                ))
+            })?;
+            (
+                9,
+                Value::Record(vec![(
+                    "value".to_string(),
+                    Value::Decimal(apache_avro::Decimal::from(i128_to_be_bytes(upcast))),
+                )]),
+            )
+        }
         ColumnStatValue::TimeMicros(v) => (
             10,
             Value::Record(vec![("value".to_string(), Value::Long(*v))]),
@@ -812,7 +915,7 @@ fn wrap_stat_value(value: Option<&ColumnStatValue>, version: StatsIndexVersion) 
             Value::Record(vec![("value".to_string(), Value::Long(*v))]),
         ),
     };
-    Value::Union(branch, Box::new(inner))
+    Ok(Value::Union(branch, Box::new(inner)))
 }
 
 #[cfg(test)]
@@ -980,6 +1083,11 @@ mod tests {
             ColumnStatValue::TimeMicros(11),
             ColumnStatValue::TimestampMicros(22),
             ColumnStatValue::LocalTimestampMicros(33),
+            ColumnStatValue::Decimal {
+                unscaled: -10_100,
+                precision: 10,
+                scale: 2,
+            },
         ];
         for version in [StatsIndexVersion::V1, StatsIndexVersion::V2] {
             for value in &variants {
@@ -1009,6 +1117,14 @@ mod tests {
                     (StatsIndexVersion::V1, ColumnStatValue::LocalTimestampMicros(v)) => {
                         ColumnStatValue::TimestampMicros(*v)
                     }
+                    // The V1 wrapper is decimal(30,15) whatever the column's type.
+                    (StatsIndexVersion::V1, ColumnStatValue::Decimal { unscaled, .. }) => {
+                        ColumnStatValue::Decimal {
+                            unscaled: unscaled * 10_i128.pow(13),
+                            precision: 30,
+                            scale: 15,
+                        }
+                    }
                     _ => value.clone(),
                 };
                 assert_eq!(decoded.min_value.as_ref(), Some(&expected), "{version:?}");
@@ -1017,6 +1133,121 @@ mod tests {
                 assert_eq!(decoded.null_count, 1);
             }
         }
+    }
+
+    #[test]
+    fn test_i128_be_bytes_match_java_big_integer() {
+        let cases: [(i128, &[u8]); 7] = [
+            (0, &[0x00]),
+            (-1, &[0xff]),
+            (127, &[0x7f]),
+            (128, &[0x00, 0x80]),
+            (-129, &[0xff, 0x7f]),
+            (10_100, &[0x27, 0x74]),
+            (
+                i128::MIN,
+                &[0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ];
+        for (value, bytes) in cases {
+            assert_eq!(i128_to_be_bytes(value), bytes, "{value}");
+            assert_eq!(i128_from_be_bytes(bytes), Some(value), "{value}");
+        }
+    }
+
+    fn column_stats_payload_fields(bytes: &[u8]) -> Vec<(String, Value)> {
+        let value = apache_avro::from_avro_datum(metadata_schema().unwrap(), &mut &bytes[..], None)
+            .unwrap();
+        let Value::Record(fields) = value else {
+            panic!("expected record");
+        };
+        let (_, payload) = fields
+            .into_iter()
+            .find(|(name, _)| name == "ColumnStatsMetadata")
+            .unwrap();
+        let Value::Union(1, payload) = payload else {
+            panic!("expected stats payload");
+        };
+        let Value::Record(payload) = *payload else {
+            panic!("expected stats record");
+        };
+        payload
+    }
+
+    /// Decimal stats are encoded the way Spark writes them: V2 as a
+    /// `BytesWrapper` of the unscaled value with DECIMAL `valueType` and
+    /// "precision,scale"; V1 as a `DecimalWrapper` at scale 15.
+    #[test]
+    fn test_decimal_stats_match_spark_encoding() {
+        let meta = ColumnStatsMetadata {
+            file_name: "f.parquet".to_string(),
+            column_name: "amount".to_string(),
+            // 101.00 as decimal(10,2).
+            min_value: Some(ColumnStatValue::Decimal {
+                unscaled: 10_100,
+                precision: 10,
+                scale: 2,
+            }),
+            max_value: Some(ColumnStatValue::Decimal {
+                unscaled: 10_300,
+                precision: 10,
+                scale: 2,
+            }),
+            value_count: 2,
+            null_count: 0,
+            total_size: 1,
+            total_uncompressed_size: 1,
+            is_deleted: false,
+            is_tight_bound: false,
+            decoded_value_type_ordinal: None,
+        };
+        let v2 = column_stats_payload_fields(
+            &encode_column_stats(&meta, StatsIndexVersion::V2).unwrap(),
+        );
+        let field = |fields: &[(String, Value)], name: &str| {
+            fields.iter().find(|(n, _)| n == name).unwrap().1.clone()
+        };
+        assert_eq!(
+            field(&v2, "minValue"),
+            Value::Union(
+                6,
+                Box::new(Value::Record(vec![(
+                    "value".to_string(),
+                    Value::Bytes(vec![0x27, 0x74])
+                )]))
+            )
+        );
+        assert_eq!(
+            field(&v2, "valueType"),
+            Value::Union(
+                1,
+                Box::new(Value::Record(vec![
+                    ("typeOrdinal".to_string(), Value::Int(10)),
+                    (
+                        "additionalInfo".to_string(),
+                        Value::Union(1, Box::new(Value::String("10,2".to_string())))
+                    ),
+                ]))
+            )
+        );
+
+        let v1 = column_stats_payload_fields(
+            &encode_column_stats(&meta, StatsIndexVersion::V1).unwrap(),
+        );
+        let Value::Union(9, wrapper) = field(&v1, "minValue") else {
+            panic!("V1 decimal must use DecimalWrapper");
+        };
+        let Value::Record(wrapper) = *wrapper else {
+            panic!("expected wrapper record");
+        };
+        let Value::Decimal(decimal) = wrapper[0].1.clone() else {
+            panic!("expected decimal value");
+        };
+        // Spark reads this back as 101.000000000000000.
+        assert_eq!(
+            Vec::<u8>::try_from(&decimal).unwrap(),
+            i128_to_be_bytes(101 * 10_i128.pow(15))
+        );
     }
 
     /// Tombstones round-trip as deletes for both index versions.

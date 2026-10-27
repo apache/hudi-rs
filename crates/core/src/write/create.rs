@@ -360,6 +360,12 @@ impl TableCreateBuilder {
             }
             // Java HoodieTableConfig persists the list alphabetically sorted.
             partitions.sort();
+            if self.column_stats_enabled {
+                props.insert(
+                    crate::write::metadata::INDEX_DEFINITION_PATH_KEY.to_string(),
+                    crate::write::metadata::DEFAULT_INDEX_DEFINITION_PATH.to_string(),
+                );
+            }
             props.insert(
                 HudiTableConfig::MetadataTablePartitions
                     .as_ref()
@@ -497,6 +503,37 @@ impl TableCreateBuilder {
             let marker = format!("{HUDI_METADATA_DIR}/{timeline_path}/.keep");
             storage.put_file(&marker, b"".as_slice()).await?;
         }
+        // No data column is known before the first commit, so the column_stats
+        // definition starts with the always-indexed meta fields; every commit
+        // then sets it to the indexed columns (write::metadata).
+        let index_definition_written = self.metadata_enabled && self.column_stats_enabled;
+        if index_definition_written {
+            let meta_columns = crate::metadata::table::column_stats::columns_to_index(
+                &crate::write::append::schema_with_meta_fields(&arrow_schema::Schema::empty()),
+                crate::metadata::table::encode::StatsIndexVersion::V1,
+                &[],
+                0,
+            );
+            let meta_columns = if self.populates_meta_fields {
+                meta_columns
+            } else {
+                Vec::new()
+            };
+            let version = if self.table_version >= 9 {
+                crate::metadata::table::encode::StatsIndexVersion::V2
+            } else {
+                crate::metadata::table::encode::StatsIndexVersion::V1
+            };
+            if let Some(json) = crate::write::metadata::column_stats_index_definition_json(
+                None,
+                &meta_columns,
+                version,
+            )? {
+                storage
+                    .put_file(crate::write::metadata::DEFAULT_INDEX_DEFINITION_PATH, json)
+                    .await?;
+            }
+        }
         if self.metadata_enabled
             && let Err(error) = bootstrap_metadata_table(
                 &storage,
@@ -516,6 +553,11 @@ impl TableCreateBuilder {
             // deterministic names, so leaving them makes every retry fail.
             // Only files this call created are removed.
             let _ = remove_partial_metadata_table(&storage).await;
+            if index_definition_written {
+                let _ = storage
+                    .delete_file(crate::write::metadata::DEFAULT_INDEX_DEFINITION_PATH)
+                    .await;
+            }
             let _ = storage.delete_file(&properties_path).await;
             return Err(error);
         }

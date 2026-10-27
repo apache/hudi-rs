@@ -216,6 +216,22 @@ fn compare_stat_values(a: &ColumnStatValue, b: &ColumnStatValue) -> Option<std::
         (TimeMicros(x), TimeMicros(y)) => x.partial_cmp(y),
         (TimestampMicros(x), TimestampMicros(y)) => x.partial_cmp(y),
         (LocalTimestampMicros(x), LocalTimestampMicros(y)) => x.partial_cmp(y),
+        (
+            Decimal {
+                unscaled: x,
+                scale: sx,
+                ..
+            },
+            Decimal {
+                unscaled: y,
+                scale: sy,
+                ..
+            },
+        ) => {
+            use crate::metadata::table::encode::rescale_decimal;
+            let scale = (*sx).max(*sy);
+            rescale_decimal(*x, *sx, scale)?.partial_cmp(&rescale_decimal(*y, *sy, scale)?)
+        }
         _ => None,
     }
 }

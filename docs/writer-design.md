@@ -217,7 +217,13 @@ strategy id. Written partitions:
 
 - **files** — per-partition file listings plus `__all_partitions__`.
 - **column_stats** — per file × column, V2 encoding at table version 9
-  (typed primitive wrappers + `valueType`), tight-bound.
+  (typed primitive wrappers + `valueType`), tight-bound. Columns follow Java's
+  AVRO-record-type rules per index version (decimals and binary included; V1
+  skips decimals outside `decimal(30,15)`), honor
+  `hoodie.metadata.index.column.stats.column.list` and
+  `...max.columns.to.index`, and are listed in the `column_stats` definition
+  in `.hoodie/.index_defs/index.json`, which Spark requires before it uses
+  the stats for data skipping.
 - **partition_stats** — per partition × column, recomputed tight-bound on
   each write.
 - **record_index** — record key → file group location, 10 shards.
