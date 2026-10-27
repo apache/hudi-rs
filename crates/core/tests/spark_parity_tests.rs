@@ -656,6 +656,77 @@ async fn parity_d_interleaved_writers() {
 }
 
 // ---------------------------------------------------------------------------
+// Scenario G: Spark data skipping over column_stats / partition_stats that rs
+// wrote, alone and mixed with Spark's own stats in one partition.
+// ---------------------------------------------------------------------------
+fn spark_read_where(env: &SparkEnv, path: &Path, filter: &str) -> Vec<Row> {
+    spark_read_mode(env, path, &["--where", filter])
+}
+
+#[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
+async fn parity_g_data_skipping_on_rs_stats() {
+    if !enabled() {
+        return;
+    }
+    let env = spark_env();
+    for (label, spark_table_version) in [
+        ("spark-created tv9", Some("9")),
+        ("spark-created tv8", Some("8")),
+        ("rs-created", None),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path();
+        let spark_rows = [row("a", Some("sf"), 1, 10), row("b", Some("sf"), 1, 20)];
+        if let Some(version) = spark_table_version {
+            let table_version = format!("hoodie.write.table.version={version}");
+            let options = [
+                "--write-option",
+                "hoodie.metadata.index.column.stats.enable=true",
+                "--write-option",
+                "hoodie.metadata.index.partition.stats.enable=true",
+                "--write-option",
+                table_version.as_str(),
+            ];
+            spark_write_with(&env, path, "insert", "cow", true, &spark_rows, &options);
+        } else {
+            let mut table = rs_create(path, TableTypeValue::CopyOnWrite, true).await;
+            table.append([batch(&spark_rows)]).await.unwrap();
+        }
+        // rs appends values outside the partition's earlier range, so a stale
+        // or unread survivor bound would prune rows that match.
+        let mut table = Table::new(path.to_str().unwrap()).await.unwrap();
+        table
+            .append([batch(&[
+                row("c", Some("sf"), 1, 900),
+                row("d", Some("nyc"), 1, 15),
+            ])])
+            .await
+            .unwrap();
+
+        for (filter, expected) in [
+            ("value = 900", vec![row("c", Some("sf"), 1, 900)]),
+            ("value = 20", vec![row("b", Some("sf"), 1, 20)]),
+            (
+                "value > 12",
+                vec![
+                    row("b", Some("sf"), 1, 20),
+                    row("c", Some("sf"), 1, 900),
+                    row("d", Some("nyc"), 1, 15),
+                ],
+            ),
+            ("value > 1000", vec![]),
+        ] {
+            assert_eq!(
+                spark_read_where(&env, path, filter),
+                expected,
+                "[{label}] spark read where {filter}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scenario E: mixed-operation workload with enough commits for timeline
 // archival, 5 partitions, tens of file groups — verified across snapshot,
 // time-travel, and incremental queries in both engines.

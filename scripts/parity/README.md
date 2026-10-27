@@ -32,6 +32,9 @@ Cross-checks hudi-rs against the Apache Hudi Spark writer/reader:
 - **F** — CDC-enabled Spark table: rs snapshot reads tolerate CDC artifacts;
   Spark CDC read sanity-checked (rs-side CDC-format queries are not yet
   implemented)
+- **G** — Spark data skipping over rs-written column_stats/partition_stats,
+  alone and mixed with Spark's stats in one partition: filtered reads with
+  and without data skipping must agree
 
 Spark snapshot reads always run twice — with and without
 `hoodie.metadata.enable` — and fail on mismatch, so MDT interop bugs surface

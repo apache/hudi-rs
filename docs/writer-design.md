@@ -291,6 +291,10 @@ The acceptance gate for interop lives in
 - **F — CDC-enabled Spark table**: rs snapshot reads tolerate CDC artifacts;
   Spark CDC reads sanity-checked. (CDC-format incremental queries in rs are
   not yet implemented.)
+- **G — data skipping on rs stats**: rs appends out-of-range values to a
+  Spark-created and to an rs-created partitioned table; filtered Spark reads
+  with data skipping (column_stats + partition_stats pruning) must match the
+  same reads without it.
 
 ## 8. Module map
 

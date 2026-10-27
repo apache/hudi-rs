@@ -22,6 +22,11 @@ Modes:
 - timetravel: snapshot as of --as-of instant.
 - incremental: changes in (--begin, --end] (end optional).
 - cdc: incremental with the CDC format; dumps raw CDC rows.
+
+With --where, snapshot mode instead reads the filtered table twice with the
+metadata table, with and without data skipping (column_stats and
+partition_stats pruning), and fails (exit 3) if the two disagree, so pruning
+on stale or unreadable stats surfaces as missing rows.
 """
 import argparse
 import json
@@ -30,7 +35,7 @@ import sys
 from pyspark.sql import SparkSession
 
 
-def read_rows(spark, path, use_metadata, extra_options=None):
+def read_rows(spark, path, use_metadata, extra_options=None, where=None):
     reader = (
         spark.read.format("hudi")
         .option("hoodie.metadata.enable", "true" if use_metadata else "false")
@@ -38,6 +43,8 @@ def read_rows(spark, path, use_metadata, extra_options=None):
     for k, v in (extra_options or {}).items():
         reader = reader.option(k, v)
     df = reader.load(path)
+    if where:
+        df = df.where(where)
     columns = [c for c in ["id", "part", "ts", "value"] if c in df.columns]
     rows = [
         {c: row[c] for c in columns}
@@ -59,6 +66,7 @@ def main() -> int:
     parser.add_argument("--as-of", help="instant for timetravel mode")
     parser.add_argument("--begin", help="begin instant for incremental/cdc mode")
     parser.add_argument("--end", help="optional end instant for incremental/cdc mode")
+    parser.add_argument("--where", help="snapshot filter, checked with and without data skipping")
     args = parser.parse_args()
 
     spark = (
@@ -68,7 +76,26 @@ def main() -> int:
         .getOrCreate()
     )
 
-    if args.mode == "snapshot":
+    if args.mode == "snapshot" and args.where:
+        skipping = {
+            "hoodie.enable.data.skipping": "true",
+            "hoodie.metadata.index.column.stats.enable": "true",
+            "hoodie.metadata.index.partition.stats.enable": "true",
+        }
+        pruned = read_rows(spark, args.path, True, skipping, args.where)
+        unpruned = read_rows(
+            spark, args.path, True, {"hoodie.enable.data.skipping": "false"}, args.where
+        )
+        if pruned != unpruned:
+            print("DATA_SKIPPING_MISMATCH", file=sys.stderr)
+            print(
+                json.dumps({"where": args.where, "skipping": pruned, "no_skipping": unpruned}),
+                file=sys.stderr,
+            )
+            spark.stop()
+            return 3
+        rows = pruned
+    elif args.mode == "snapshot":
         with_mdt = read_rows(spark, args.path, use_metadata=True)
         without_mdt = read_rows(spark, args.path, use_metadata=False)
         if with_mdt != without_mdt:
