@@ -1666,14 +1666,10 @@ async fn mor_upsert_batches(
         }
         return Err(error);
     }
-    if let Err(error) =
-        complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
+    // An errored PUT may still have stored the completed instant, so the
+    // written files stay; the next write's rollback removes them only if the
+    // instant is still pending.
+    complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
@@ -1872,20 +1868,17 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         }
         return Err(error);
     }
-    if let Err(error) = complete_deltacommit(
+    // An errored PUT may still have stored the completed instant, so the
+    // written files stay; the next write's rollback removes them only if the
+    // instant is still pending.
+    complete_deltacommit(
         table,
         &instant,
         "DELETE",
         stats,
         table.get_schema_with_meta_fields().await?.as_ref(),
     )
-    .await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
+    .await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
     drop(cs2);
@@ -2918,12 +2911,10 @@ async fn finalize_rewrite_commit(
     };
     let commit = Instant::new_completed(instant.to_string(), action, completed)?;
     let path = commit.relative_path_with_base(&timeline_dir(table))?;
-    if let Err(error) = storage.put_file_if_absent(&path, bytes).await {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error.into());
-    }
+    // An errored PUT may still have stored the completed instant, so the
+    // written files stay; the next write's rollback removes them only if the
+    // instant is still pending.
+    storage.put_file_if_absent(&path, bytes).await?;
     // Durable from here: best-effort maintenance must not fail the write.
     let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await;
     drop(cs2);
@@ -3920,5 +3911,105 @@ mod lifecycle_tests {
         let result = table.delete("v = 555").await.unwrap();
         assert_eq!(result.num_deletes, 1);
         assert_eq!(rows(&table).await, 1);
+    }
+
+    /// Fail the next completed data-instant PUT of `table` with `fault`.
+    fn arm_completion_put_fault(
+        table: &mut Table,
+        fault: crate::storage::fault::PutFault,
+    ) -> Arc<crate::storage::fault::FaultyPutStore> {
+        let storage = table.file_system_view.storage.clone();
+        let store = crate::storage::fault::FaultyPutStore::new(
+            storage.object_store.clone(),
+            fault,
+            |path| {
+                let path = path.as_ref();
+                !path.contains(".hoodie/metadata/")
+                    && path.contains(".hoodie/timeline/")
+                    && [".commit", ".deltacommit", ".replacecommit"]
+                        .iter()
+                        .any(|action| path.ends_with(action))
+            },
+        );
+        table.file_system_view.storage = crate::storage::Storage::new_with_object_store(
+            storage.base_url.as_ref().clone(),
+            store.clone(),
+            storage.hudi_configs.clone(),
+        );
+        store
+    }
+
+    /// A completion PUT that errors may still have stored the completed
+    /// instant, so the files it references must survive the error; the
+    /// instant is either durable or left pending for the next write's
+    /// rollback.
+    #[tokio::test]
+    async fn test_failed_completion_put_keeps_written_files() {
+        use crate::storage::fault::PutFault;
+        for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+            for fault in [
+                PutFault::LandedThenError,
+                PutFault::LandedThenAlreadyExists,
+                PutFault::NotLanded,
+            ] {
+                for verb in ["append", "upsert", "delete"] {
+                    let ctx = format!("{table_type:?} {fault:?} {verb}");
+                    let dir = tempfile::tempdir().unwrap();
+                    let uri = dir.path().to_str().unwrap();
+                    let mut table = Table::create(uri)
+                        .with_table_name("t")
+                        .with_table_type(table_type.clone())
+                        .with_record_key_fields(["id"])
+                        .with_partition_fields(["city"])
+                        .with_ordering_fields(["ts"])
+                        .create()
+                        .await
+                        .unwrap();
+                    table
+                        .append([batch(&[
+                            ("a", "sf", 1, 10),
+                            ("b", "sf", 1, 20),
+                            ("c", "ny", 1, 30),
+                        ])])
+                        .await
+                        .unwrap();
+
+                    let store = arm_completion_put_fault(&mut table, fault);
+                    let (result, rows_if_committed) = match verb {
+                        "append" => (
+                            table
+                                .append([batch(&[("d", "ny", 2, 40)])])
+                                .await
+                                .map(|_| ()),
+                            4,
+                        ),
+                        "upsert" => (
+                            table
+                                .upsert([batch(&[("a", "sf", 2, 11), ("d", "ny", 2, 40)])])
+                                .await
+                                .map(|_| ()),
+                            4,
+                        ),
+                        _ => (table.delete("id = 'b'").await.map(|_| ()), 2),
+                    };
+                    assert!(result.is_err(), "{ctx}: the faulted PUT must surface");
+                    assert!(!store.is_armed(), "{ctx}: the completion PUT was not hit");
+
+                    let expected = if matches!(fault, PutFault::NotLanded) {
+                        3
+                    } else {
+                        rows_if_committed
+                    };
+                    let mut fresh = Table::new(uri).await.unwrap();
+                    assert_eq!(rows(&fresh).await, expected, "{ctx}");
+
+                    // The next write rolls back only an instant that never
+                    // completed, so a landed commit keeps its rows.
+                    fresh.append([batch(&[("e", "ny", 3, 50)])]).await.unwrap();
+                    let fresh = Table::new(uri).await.unwrap();
+                    assert_eq!(rows(&fresh).await, expected + 1, "{ctx}: after rollback");
+                }
+            }
+        }
     }
 }

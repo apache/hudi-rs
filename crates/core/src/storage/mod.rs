@@ -41,6 +41,8 @@ use crate::storage::util::join_url_segments;
 #[cfg(test)]
 pub(crate) mod counting;
 pub mod error;
+#[cfg(test)]
+pub(crate) mod fault;
 pub mod file_metadata;
 pub mod reader;
 pub mod util;

@@ -438,15 +438,12 @@ async fn append_batches_inner(
     };
     let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
     let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
-    if let Err(error) = storage
+    // An errored PUT may still have stored the completed instant, so the
+    // written files stay; the next write's rollback removes them only if the
+    // instant is still pending.
+    storage
         .put_file_if_absent(&commit_relative_path, commit_bytes)
-        .await
-    {
-        for path in &written_paths {
-            let _ = storage.delete_file(path).await;
-        }
-        return Err(error.into());
-    }
+        .await?;
     // The commit is durable from here: post-commit maintenance (markers,
     // archival) and handle refresh are best-effort — a transient failure must
     // not turn a committed write into an Err the caller would retry.
