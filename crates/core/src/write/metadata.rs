@@ -27,11 +27,11 @@ use crate::file_group::log_file::{BlockMetadataKey, BlockType};
 use crate::hfile::{HFileReader, HFileWriter};
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::table::column_stats::{
-    ColumnRangeStats, aggregate_partition_stats, column_stats_for_file, column_stats_tombstones,
-    columns_to_index,
+    ColumnRangeStats, aggregate_partition_stats, coerce_stat_value, column_stats_for_file,
+    column_stats_tombstones, columns_to_index,
 };
 use crate::metadata::table::encode::{
-    ColumnStatsMetadata, FilesMetadataEntry, RecordIndexEntry, StatsIndexVersion,
+    ColumnStatValue, ColumnStatsMetadata, FilesMetadataEntry, RecordIndexEntry, StatsIndexVersion,
     decode_column_stats_entry, encode_all_partitions, encode_column_stats, encode_files_record,
     encode_partition_stats, encode_record_index_entry, files_metadata_avro_schema_json,
     hoodie_metadata_schema_json, record_index_metadata_avro_schema_json,
@@ -577,7 +577,8 @@ pub async fn update_column_stats_partitions(
     // columns would be missing from the survivor fetch and the partition
     // aggregate would collapse onto this commit's files (Java indexes the
     // three meta columns unconditionally).
-    let indexed_columns = columns_to_index(&crate::write::append::schema_with_meta_fields(schema));
+    let full_schema = crate::write::append::schema_with_meta_fields(schema);
+    let indexed_columns = columns_to_index(&full_schema);
     let mut column_records: Vec<(String, ColumnStatsMetadata)> = Vec::new();
 
     for update in updates {
@@ -618,9 +619,14 @@ pub async fn update_column_stats_partitions(
     }
 
     if is_partition_stats_enabled(table) {
-        let partition_records =
-            compute_partition_stats_records(table, updates, &indexed_columns, replaced_files)
-                .await?;
+        let partition_records = compute_partition_stats_records(
+            table,
+            updates,
+            &full_schema,
+            &indexed_columns,
+            replaced_files,
+        )
+        .await?;
         if !partition_records.is_empty() {
             let stats = write_stats_log_blocks(
                 data_storage.as_ref(),
@@ -658,6 +664,7 @@ fn split_partition_and_name(relative_path: &str) -> (String, String) {
 async fn compute_partition_stats_records(
     table: &Table,
     updates: &[StatsFileUpdate],
+    schema: &Schema,
     indexed_columns: &[String],
     replaced_files: &[String],
 ) -> Result<Vec<(String, ColumnStatsMetadata)>> {
@@ -761,10 +768,33 @@ async fn compute_partition_stats_records(
             });
     }
 
+    // Survivors decoded from the MDT and this commit's footer ranges merge in
+    // the column's own type (Java FileFormatUtils.getColumnRangeInPartition).
+    let coerce =
+        |value: Option<ColumnStatValue>, column: &str| -> Result<Option<ColumnStatValue>> {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            let Ok(field) = schema.field_with_name(column) else {
+                return Ok(Some(value));
+            };
+            coerce_stat_value(value.clone(), field.data_type())
+                .map(Some)
+                .ok_or_else(|| {
+                    crate::error::CoreError::MetadataTable(format!(
+                        "column_stats value {value:?} of column '{column}' does not convert to {}",
+                        field.data_type()
+                    ))
+                })
+        };
     let mut out = Vec::new();
     for (partition, by_file) in ranges {
-        let file_ranges: Vec<Vec<ColumnRangeStats>> = by_file.into_values().collect();
-        for payload in aggregate_partition_stats(&partition, &file_ranges, true) {
+        let mut file_ranges: Vec<Vec<ColumnRangeStats>> = by_file.into_values().collect();
+        for range in file_ranges.iter_mut().flatten() {
+            range.min_value = coerce(range.min_value.take(), &range.column_name)?;
+            range.max_value = coerce(range.max_value.take(), &range.column_name)?;
+        }
+        for payload in aggregate_partition_stats(&partition, &file_ranges, true)? {
             let key = partition_stats_index_key(&partition, &payload.column_name);
             out.push((key, payload));
         }

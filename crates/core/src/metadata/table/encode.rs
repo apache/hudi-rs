@@ -570,11 +570,25 @@ pub fn decode_column_stats_entry(
 
 /// Lift a V2 primitive-wrapped value to its logical type per the Java
 /// `ValueType` ordinal carried in `valueType`.
+///
+/// Millisecond types (Spark writes them for `*-millis` Avro columns) are
+/// lifted to the micros variants footer extraction produces, so stats of one
+/// column compare by value whichever writer produced them.
 fn lift_stat_value(value: ColumnStatValue, ordinal: i32) -> ColumnStatValue {
+    let millis_to_micros = |v: i64| v.checked_mul(1_000);
     match (value, ordinal) {
         (ColumnStatValue::Int(v), 12) => ColumnStatValue::Date(v),
+        (ColumnStatValue::Int(v), 13) => ColumnStatValue::TimeMicros(i64::from(v) * 1_000),
         (ColumnStatValue::Long(v), 14) => ColumnStatValue::TimeMicros(v),
+        (ColumnStatValue::Long(v), 15) => match millis_to_micros(v) {
+            Some(micros) => ColumnStatValue::TimestampMicros(micros),
+            None => ColumnStatValue::Long(v),
+        },
         (ColumnStatValue::Long(v), 16) => ColumnStatValue::TimestampMicros(v),
+        (ColumnStatValue::Long(v), 18) => match millis_to_micros(v) {
+            Some(micros) => ColumnStatValue::LocalTimestampMicros(micros),
+            None => ColumnStatValue::Long(v),
+        },
         (ColumnStatValue::Long(v), 19) => ColumnStatValue::LocalTimestampMicros(v),
         (value, _) => value,
     }

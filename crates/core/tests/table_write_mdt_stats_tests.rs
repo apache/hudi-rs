@@ -599,3 +599,63 @@ async fn test_dynamic_partition_overwrite_defers_deletes_and_tightens_stats() {
         .unwrap();
     assert_eq!(nyc_value.min_value, long_stat(7));
 }
+
+/// Merging a survivor's decoded stats with a new file's footer stats must
+/// compare timestamps by value: on tv8 a tz-less timestamp decodes back from
+/// the MDT as a UTC timestamp while the footer yields a local one.
+#[tokio::test]
+async fn test_partition_stats_local_timestamp_merge_keeps_min_le_max() {
+    use arrow_array::TimestampMicrosecondArray;
+    use arrow_schema::TimeUnit;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+    ]));
+    let ts_batch = |id: &str, ts: i64| {
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![id])),
+                Arc::new(StringArray::from(vec!["sf"])),
+                Arc::new(TimestampMicrosecondArray::from(vec![ts])),
+            ],
+        )
+        .unwrap()
+    };
+    for version in [8, 9] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_version(version)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table.append([ts_batch("a", 100)]).await.unwrap();
+        table.append([ts_batch("b", 10)]).await.unwrap();
+
+        let part_stats = read_stats_records(&table, dir.path(), "partition_stats").await;
+        let sf_ts = part_stats
+            .get(&partition_stats_index_key("city=sf", "ts"))
+            .expect("partition stats for ts");
+        let micros = |v: &Option<ColumnStatValue>| match v {
+            Some(
+                ColumnStatValue::TimestampMicros(m) | ColumnStatValue::LocalTimestampMicros(m),
+            ) => *m,
+            other => panic!("tv{version}: unexpected timestamp stat {other:?}"),
+        };
+        assert_eq!(
+            (micros(&sf_ts.min_value), micros(&sf_ts.max_value)),
+            (10, 100),
+            "tv{version}: {sf_ts:?}"
+        );
+        assert!(sf_ts.is_tight_bound, "tv{version}");
+    }
+}

@@ -220,11 +220,15 @@ pub fn column_stats_tombstones(
 }
 
 /// Aggregate file-level ranges into partition-level stats (same column name).
+///
+/// Ranges must already be expressed in their column's type (see
+/// [`coerce_stat_value`]); values of different types fail the aggregation
+/// rather than producing a bound ordered by type instead of by value.
 pub fn aggregate_partition_stats(
     partition_path: &str,
     ranges_by_file: &[Vec<ColumnRangeStats>],
     is_tight_bound: bool,
-) -> Vec<ColumnStatsMetadata> {
+) -> Result<Vec<ColumnStatsMetadata>> {
     #[derive(Default)]
     struct Acc {
         min: Option<ColumnStatValue>,
@@ -244,6 +248,17 @@ pub fn aggregate_partition_stats(
             // pruning skip a partition whose unknown file may match.
             if !r.range_known && r.null_count != r.value_count {
                 acc.range_incomplete = true;
+            }
+            for value in [&r.min_value, &r.max_value].into_iter().flatten() {
+                if let Some(seen) = acc.min.as_ref().or(acc.max.as_ref())
+                    && std::mem::discriminant(seen) != std::mem::discriminant(value)
+                {
+                    return Err(CoreError::MetadataTable(format!(
+                        "cannot aggregate partition stats for column '{}' in partition '{}': \
+                         {seen:?} and {value:?} are not comparable",
+                        r.column_name, partition_path
+                    )));
+                }
             }
             acc.min = merge_min(acc.min.take(), r.min_value.clone());
             acc.max = merge_max(acc.max.take(), r.max_value.clone());
@@ -283,7 +298,55 @@ pub fn aggregate_partition_stats(
         })
         .collect();
     out.sort_by(|a, b| a.column_name.cmp(&b.column_name));
-    out
+    Ok(out)
+}
+
+/// Express a stat value in the variant footer extraction produces for a
+/// column of `data_type` (Java `ValueMetadata.standardizeJavaTypeAndPromote`),
+/// applying the Avro type promotions. `None` when no conversion exists.
+///
+/// Stats decoded from the MDT do not always come back as that variant: V1
+/// records carry no logical type, so a tz-less timestamp decodes as a UTC one,
+/// and Spark's V1 timestamps are bare longs in the column's own unit.
+pub(crate) fn coerce_stat_value(
+    value: ColumnStatValue,
+    data_type: &DataType,
+) -> Option<ColumnStatValue> {
+    use ColumnStatValue as V;
+    let timestamp = |micros: i64, tz: &Option<std::sync::Arc<str>>| {
+        if tz.is_some() {
+            V::TimestampMicros(micros)
+        } else {
+            V::LocalTimestampMicros(micros)
+        }
+    };
+    Some(match (value, data_type) {
+        (V::Boolean(v), DataType::Boolean) => V::Boolean(v),
+        (V::Int(v) | V::Date(v), DataType::Date32) => V::Date(v),
+        (
+            V::Int(v),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::UInt8 | DataType::UInt16,
+        ) => V::Int(v),
+        (V::Int(v), DataType::Int64) => V::Long(i64::from(v)),
+        (V::Long(v), DataType::Int64) => V::Long(v),
+        (V::Int(v), DataType::Float32) => V::Float(v as f32),
+        (V::Long(v), DataType::Float32) => V::Float(v as f32),
+        (V::Float(v), DataType::Float32) => V::Float(v),
+        (V::Int(v), DataType::Float64) => V::Double(f64::from(v)),
+        (V::Long(v), DataType::Float64) => V::Double(v as f64),
+        (V::Float(v), DataType::Float64) => V::Double(f64::from(v)),
+        (V::Double(v), DataType::Float64) => V::Double(v),
+        (V::String(v), DataType::Utf8 | DataType::LargeUtf8) => V::String(v),
+        (V::Bytes(v), DataType::Binary | DataType::LargeBinary) => V::Bytes(v),
+        (V::TimeMicros(v) | V::Long(v), DataType::Time64(TimeUnit::Microsecond)) => {
+            V::TimeMicros(v)
+        }
+        (V::TimestampMicros(v) | V::LocalTimestampMicros(v), DataType::Timestamp(_, tz)) => {
+            timestamp(v, tz)
+        }
+        (V::Long(v), DataType::Timestamp(unit, tz)) => timestamp(to_micros(v, *unit)?, tz),
+        _ => return None,
+    })
 }
 
 /// Java `HoodieMetadataConfig.COLUMN_STATS_INDEX_MAX_COLUMNS` default: only the
@@ -522,6 +585,164 @@ mod tests {
             ),
         ]);
         assert_eq!(columns_to_index(&schema), vec!["s".to_string()]);
+    }
+
+    /// A V2 stats record shaped like Spark writes it: a primitive `LongWrapper`
+    /// (union branch 3) plus `valueType` carrying the logical type ordinal.
+    fn spark_v2_long_stats_bytes(min: i64, max: i64, type_ordinal: i32) -> Vec<u8> {
+        use apache_avro::types::Value;
+        let wrap = |v: i64| {
+            Value::Union(
+                3,
+                Box::new(Value::Record(vec![("value".to_string(), Value::Long(v))])),
+            )
+        };
+        let some = |v: Value| Value::Union(1, Box::new(v));
+        let null = || Value::Union(0, Box::new(Value::Null));
+        let stats = Value::Record(vec![
+            (
+                "fileName".to_string(),
+                some(Value::String("f.parquet".into())),
+            ),
+            ("columnName".to_string(), some(Value::String("ts".into()))),
+            ("minValue".to_string(), wrap(min)),
+            ("maxValue".to_string(), wrap(max)),
+            ("valueCount".to_string(), some(Value::Long(1))),
+            ("nullCount".to_string(), some(Value::Long(0))),
+            ("totalSize".to_string(), some(Value::Long(1))),
+            ("totalUncompressedSize".to_string(), some(Value::Long(1))),
+            ("isDeleted".to_string(), Value::Boolean(false)),
+            ("isTightBound".to_string(), Value::Boolean(false)),
+            (
+                "valueType".to_string(),
+                some(Value::Record(vec![
+                    ("typeOrdinal".to_string(), Value::Int(type_ordinal)),
+                    ("additionalInfo".to_string(), null()),
+                ])),
+            ),
+        ]);
+        let record = Value::Record(vec![
+            ("key".to_string(), Value::String(String::new())),
+            ("type".to_string(), Value::Int(3)),
+            ("filesystemMetadata".to_string(), null()),
+            ("BloomFilterMetadata".to_string(), null()),
+            ("ColumnStatsMetadata".to_string(), some(stats)),
+            ("recordIndexMetadata".to_string(), null()),
+            ("SecondaryIndexMetadata".to_string(), null()),
+        ]);
+        let schema = crate::schema::avsc::hoodie_metadata_schema().unwrap();
+        apache_avro::to_avro_datum(schema, record).unwrap()
+    }
+
+    /// A Spark-written TIMESTAMP_MILLIS survivor merged with a footer range of
+    /// the same column must compare by instant, so min <= max.
+    #[test]
+    fn test_partition_stats_merge_spark_timestamp_millis_survivor() {
+        use crate::metadata::table::encode::decode_column_stats_entry;
+
+        // Survivor spans [5s, 6s] in millis; the new file holds 1s in micros.
+        let bytes = spark_v2_long_stats_bytes(5_000, 6_000, 15);
+        let survivor = decode_column_stats_entry(&bytes, None).unwrap().unwrap();
+        let survivor = ColumnRangeStats {
+            column_name: "ts".to_string(),
+            min_value: survivor.min_value,
+            max_value: survivor.max_value,
+            range_known: true,
+            value_count: 1,
+            null_count: 0,
+            total_size: 1,
+            total_uncompressed_size: 1,
+        };
+        let footer = ColumnRangeStats {
+            min_value: Some(ColumnStatValue::TimestampMicros(1_000_000)),
+            max_value: Some(ColumnStatValue::TimestampMicros(1_000_000)),
+            ..survivor.clone()
+        };
+        let merged = aggregate_partition_stats("p", &[vec![survivor], vec![footer]], true).unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            (merged[0].min_value.clone(), merged[0].max_value.clone()),
+            (
+                Some(ColumnStatValue::TimestampMicros(1_000_000)),
+                Some(ColumnStatValue::TimestampMicros(6_000_000))
+            )
+        );
+        assert!(merged[0].is_tight_bound);
+    }
+
+    /// Values of different types are never merged into a bound.
+    #[test]
+    fn test_partition_stats_merge_rejects_incomparable_values() {
+        let range = |v: ColumnStatValue| ColumnRangeStats {
+            column_name: "c".to_string(),
+            min_value: Some(v.clone()),
+            max_value: Some(v),
+            range_known: true,
+            value_count: 1,
+            null_count: 0,
+            total_size: 1,
+            total_uncompressed_size: 1,
+        };
+        let result = aggregate_partition_stats(
+            "p",
+            &[
+                vec![range(ColumnStatValue::String("a".into()))],
+                vec![range(ColumnStatValue::Long(1))],
+            ],
+            true,
+        );
+        assert!(result.is_err(), "{result:?}");
+    }
+
+    #[test]
+    fn test_coerce_stat_value_to_column_type() {
+        use crate::metadata::table::encode::ColumnStatValue as V;
+        let ts_utc = DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()));
+        let ts_local = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let ts_millis = DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()));
+        let time_micros = DataType::Time64(TimeUnit::Microsecond);
+        let cases: Vec<(V, DataType, Option<V>)> = vec![
+            // V1 decodes every timestamp wrapper as UTC.
+            (
+                V::TimestampMicros(7),
+                ts_local.clone(),
+                Some(V::LocalTimestampMicros(7)),
+            ),
+            (
+                V::LocalTimestampMicros(7),
+                ts_utc.clone(),
+                Some(V::TimestampMicros(7)),
+            ),
+            // A bare long is in the column's own unit (Spark's V1 LongWrapper).
+            (V::Long(7), ts_utc, Some(V::TimestampMicros(7))),
+            (V::Long(7), ts_local, Some(V::LocalTimestampMicros(7))),
+            (V::Long(7), ts_millis, Some(V::TimestampMicros(7_000))),
+            (V::Long(7), time_micros, Some(V::TimeMicros(7))),
+            (V::Int(7), DataType::Date32, Some(V::Date(7))),
+            // Avro promotions.
+            (V::Int(7), DataType::Int64, Some(V::Long(7))),
+            (V::Int(7), DataType::Float64, Some(V::Double(7.0))),
+            (V::Long(7), DataType::Float64, Some(V::Double(7.0))),
+            (V::Float(1.5), DataType::Float64, Some(V::Double(1.5))),
+            (V::Int(7), DataType::Int16, Some(V::Int(7))),
+            (
+                V::String("s".into()),
+                DataType::Utf8,
+                Some(V::String("s".into())),
+            ),
+            (V::Bytes(vec![1]), DataType::Binary, Some(V::Bytes(vec![1]))),
+            // No conversion exists.
+            (V::String("s".into()), DataType::Int64, None),
+            (V::Long(7), DataType::Int32, None),
+            (V::Double(1.0), DataType::Int64, None),
+        ];
+        for (value, data_type, expected) in cases {
+            assert_eq!(
+                coerce_stat_value(value.clone(), &data_type),
+                expected,
+                "{value:?} as {data_type:?}"
+            );
+        }
     }
 
     #[test]
