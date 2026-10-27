@@ -512,61 +512,66 @@ impl TableCreateBuilder {
             .put_file_if_absent(&properties_path, body.into_bytes())
             .await?;
 
-        if self.timeline_layout_version == 2 {
-            let timeline_path: String = props
-                .get(HudiTableConfig::TimelinePath.as_ref())
-                .cloned()
-                .unwrap_or_else(|| "timeline".to_string());
-            let marker = format!("{HUDI_METADATA_DIR}/{timeline_path}/.keep");
-            storage.put_file(&marker, b"".as_slice()).await?;
-        }
         // No data column is known before the first commit, so the column_stats
         // definition starts with the always-indexed meta fields; every commit
         // then sets it to the indexed columns (write::metadata).
         let index_definition_written = self.metadata_enabled && self.column_stats_enabled;
-        if index_definition_written {
-            let meta_columns = crate::metadata::table::column_stats::columns_to_index(
-                &crate::write::append::schema_with_meta_fields(&arrow_schema::Schema::empty()),
-                crate::metadata::table::encode::StatsIndexVersion::V1,
-                &[],
-                0,
-            );
-            let meta_columns = if self.populates_meta_fields {
-                meta_columns
-            } else {
-                Vec::new()
-            };
-            let version = if self.table_version >= 9 {
-                crate::metadata::table::encode::StatsIndexVersion::V2
-            } else {
-                crate::metadata::table::encode::StatsIndexVersion::V1
-            };
-            if let Some(json) = crate::write::metadata::column_stats_index_definition_json(
-                None,
-                &meta_columns,
-                version,
-            )? {
-                storage
-                    .put_file(crate::write::metadata::DEFAULT_INDEX_DEFINITION_PATH, json)
-                    .await?;
+        let finished: Result<()> = async {
+            if self.timeline_layout_version == 2 {
+                let timeline_path: String = props
+                    .get(HudiTableConfig::TimelinePath.as_ref())
+                    .cloned()
+                    .unwrap_or_else(|| "timeline".to_string());
+                let marker = format!("{HUDI_METADATA_DIR}/{timeline_path}/.keep");
+                storage.put_file(&marker, b"".as_slice()).await?;
             }
+            if index_definition_written {
+                let meta_columns = crate::metadata::table::column_stats::columns_to_index(
+                    &crate::write::append::schema_with_meta_fields(&arrow_schema::Schema::empty()),
+                    crate::metadata::table::encode::StatsIndexVersion::V1,
+                    &[],
+                    0,
+                );
+                let meta_columns = if self.populates_meta_fields {
+                    meta_columns
+                } else {
+                    Vec::new()
+                };
+                let version = if self.table_version >= 9 {
+                    crate::metadata::table::encode::StatsIndexVersion::V2
+                } else {
+                    crate::metadata::table::encode::StatsIndexVersion::V1
+                };
+                if let Some(json) = crate::write::metadata::column_stats_index_definition_json(
+                    None,
+                    &meta_columns,
+                    version,
+                )? {
+                    storage
+                        .put_file(crate::write::metadata::DEFAULT_INDEX_DEFINITION_PATH, json)
+                        .await?;
+                }
+            }
+            if self.metadata_enabled {
+                bootstrap_metadata_table(
+                    &storage,
+                    &table_name,
+                    self.table_version,
+                    self.record_index_enabled,
+                    self.column_stats_enabled,
+                    partition_stats_enabled,
+                )
+                .await?;
+            }
+            Ok(())
         }
-        if self.metadata_enabled
-            && let Err(error) = bootstrap_metadata_table(
-                &storage,
-                &table_name,
-                self.table_version,
-                self.record_index_enabled,
-                self.column_stats_enabled,
-                partition_stats_enabled,
-            )
-            .await
-        {
-            // hoodie.properties already advertises the MDT partitions this
-            // bootstrap failed to build. Leaving it behind would make the
-            // half-created table open normally with an index that claims to
-            // exist but is empty. The partial metadata table must go too:
-            // its timeline instants are written with put-if-absent under
+        .await;
+        if let Err(error) = finished {
+            // hoodie.properties already advertises the table and the MDT
+            // partitions a failed step did not build. Leaving it behind would
+            // make the half-created table open normally with an index that
+            // claims to exist but is empty. A partial metadata table must go
+            // too: its timeline instants are written with put-if-absent under
             // deterministic names, so leaving them makes every retry fail.
             // Only files this call created are removed.
             let _ = remove_partial_metadata_table(&storage).await;

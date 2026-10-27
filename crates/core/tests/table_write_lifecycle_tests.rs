@@ -614,6 +614,35 @@ async fn test_record_index_requires_metadata() {
     assert!(err.to_string().contains("record index requires"));
 }
 
+/// A create that fails after writing `hoodie.properties` removes it, whichever
+/// later step fails, so the path never opens as a half-created table.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_failed_create_leaves_no_table_properties() {
+    use std::os::unix::fs::PermissionsExt;
+    for blocked in [".hoodie/timeline", ".hoodie/.index_defs"] {
+        let dir = tempdir().unwrap();
+        let blocked_dir = dir.path().join(blocked);
+        std::fs::create_dir_all(&blocked_dir).unwrap();
+        std::fs::set_permissions(&blocked_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(blocked_dir.join("probe"), b"").is_ok() {
+            // Permissions do not block writes here (e.g. running as root).
+            return;
+        }
+        let result = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .create()
+            .await;
+        std::fs::set_permissions(&blocked_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err(), "{blocked}");
+        assert!(
+            !dir.path().join(".hoodie/hoodie.properties").exists(),
+            "{blocked}: hoodie.properties left behind"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_record_index_off_falls_back_to_simple_index() {
     let dir = tempdir().unwrap();
