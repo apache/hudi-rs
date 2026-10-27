@@ -2586,6 +2586,107 @@ async fn test_complex_key_generator_encodes_single_key_field() {
     }
 }
 
+/// Below table version 9 a declared complex key generator with one record key
+/// field may have stored bare keys, so writes are refused (Java
+/// `validateAgainstTableProperties`) until the validation is turned off.
+#[tokio::test]
+async fn test_tv8_complex_key_generator_with_single_key_field_requires_opt_out() {
+    let cases = [
+        ("hoodie.table.keygenerator.type", "COMPLEX"),
+        (
+            "hoodie.table.keygenerator.class",
+            "org.apache.hudi.keygen.ComplexKeyGenerator",
+        ),
+    ];
+    for (key, value) in cases {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_version(8)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        // Bare keys, as a 1.0.x writer stored them.
+        table
+            .append([city_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap();
+        rewrite_table_props(
+            dir.path(),
+            &["hoodie.table.keygenerator.type"],
+            &[(key, value)],
+        );
+
+        let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let err = table
+            .upsert([city_batch(vec![("a", "sf", 10)])])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::Unsupported(msg)
+                if msg.contains("hoodie.write.complex.keygen.validation.enable")),
+            "{key}={value}: {err}"
+        );
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(
+            meta_keys(&batches),
+            vec![("a".to_string(), "city=sf".to_string())],
+            "{key}={value}"
+        );
+
+        let mut table = Table::new_with_options(
+            dir.path().to_str().unwrap(),
+            [("hoodie.write.complex.keygen.validation.enable", "false")],
+        )
+        .await
+        .unwrap();
+        table
+            .upsert([city_batch(vec![("b", "sf", 2)])])
+            .await
+            .unwrap();
+    }
+}
+
+/// Java refuses to write a table version 8 table whose single record key and
+/// several partition fields make it a complex key generator table, so such a
+/// table is not created unless the validation is turned off.
+#[tokio::test]
+async fn test_tv8_create_with_single_key_and_partition_fields_requires_opt_out() {
+    let dir = tempdir().unwrap();
+    let err = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_table_version(8)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city", "value"])
+        .create()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Unsupported(msg)
+            if msg.contains("hoodie.write.complex.keygen.validation.enable")),
+        "{err}"
+    );
+    assert!(!dir.path().join(".hoodie/hoodie.properties").exists());
+
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_table_version(8)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city", "value"])
+        .with_option("hoodie.write.complex.keygen.validation.enable", "false")
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([city_batch(vec![("a", "sf", 1)])])
+        .await
+        .unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(meta_keys(&batches)[0].0, "id:a");
+}
+
 #[tokio::test]
 async fn test_urlencoded_partition_path_matches_java_escaping() {
     let dir = tempdir().unwrap();

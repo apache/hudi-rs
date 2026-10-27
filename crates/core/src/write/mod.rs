@@ -32,7 +32,10 @@ pub(crate) mod sizing;
 pub(crate) use append::set_commit_timezone;
 pub use append::{AppendResult, append_batches, append_batches_only};
 pub use create::TableCreateBuilder;
-pub(crate) use keygen::ensure_supported_key_generator;
+pub(crate) use keygen::{
+    complex_keygen_validation_enabled, ensure_complex_keygen_validated,
+    ensure_supported_key_generator,
+};
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;
 pub use rewrite::{

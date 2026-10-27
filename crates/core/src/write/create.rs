@@ -242,6 +242,23 @@ impl TableCreateBuilder {
                 self.table_version
             )));
         }
+        // Java records the complex key generator for one record key field and
+        // several partition fields, then refuses to write it below version 9.
+        if self.table_version < 9
+            && self.record_key_fields.len() == 1
+            && self.partition_fields.len() > 1
+            && crate::write::complex_keygen_validation_enabled(|key| {
+                self.options.get(key).map(String::as_str)
+            })
+        {
+            return Err(CoreError::Unsupported(format!(
+                "a table version {} table with one record key field and several partition \
+                 fields uses the complex key generator, which Java writers refuse below table \
+                 version 9 unless {}=false",
+                self.table_version,
+                crate::write::keygen::COMPLEX_KEYGEN_VALIDATION
+            )));
+        }
         if self.table_version >= 8 && self.timeline_layout_version != 2 {
             return Err(CoreError::Write(format!(
                 "Table version {} requires timeline layout version 2",

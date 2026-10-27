@@ -57,6 +57,9 @@ const DEFAULT_PARTITION_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 /// Java `HoodieWriteConfig.COMPLEX_KEYGEN_NEW_ENCODING`.
 const COMPLEX_KEYGEN_NEW_ENCODING: &str = "hoodie.write.complex.keygen.new.encoding";
 
+/// Java `HoodieWriteConfig.ENABLE_COMPLEX_KEYGEN_VALIDATION`.
+pub(crate) const COMPLEX_KEYGEN_VALIDATION: &str = "hoodie.write.complex.keygen.validation.enable";
+
 /// Whether the table's key generator stores a single-field record key as
 /// `field:value` (Java `ComplexKeyGenerator`) rather than the bare value
 /// (`SimpleKeyGenerator`, `NonpartitionedKeyGenerator`).
@@ -122,6 +125,58 @@ fn encodes_single_key_field_name(hudi_configs: &HudiConfigs) -> Result<bool> {
 /// Fail a write on a table whose key generator the writer cannot reproduce.
 pub(crate) fn ensure_supported_key_generator(hudi_configs: &HudiConfigs) -> Result<()> {
     encodes_single_key_field_name(hudi_configs).map(|_| ())
+}
+
+/// Java `BaseHoodieWriteClient.validateAgainstTableProperties`: below table
+/// version 9, a table declaring the complex key generator with one record key
+/// field may hold bare keys from releases that did not encode the field name,
+/// so writing `field:value` keys would duplicate its records. Writes are
+/// refused until the validation is turned off.
+pub(crate) fn ensure_complex_keygen_validated(hudi_configs: &HudiConfigs) -> Result<()> {
+    let table_version: Option<isize> = hudi_configs.try_get(TableVersion)?.map(Into::into);
+    let record_key_fields: Vec<String> = hudi_configs
+        .try_get(RecordKeyFields)?
+        .map(Into::into)
+        .unwrap_or_default();
+    if table_version.is_none_or(|v| v >= 9)
+        || record_key_fields.len() != 1
+        || !complex_keygen_validation_enabled(|key| hudi_configs.get_raw(key))
+        || !declares_complex_key_generator(hudi_configs)
+    {
+        return Ok(());
+    }
+    Err(CoreError::Unsupported(format!(
+        "this table version {} table uses the complex key generator with the single record \
+         key field '{}'; Hudi 0.14.1 through 1.0.2 writers may have stored its keys without the \
+         field name, so writing it can duplicate records. Set {COMPLEX_KEYGEN_VALIDATION}=false \
+         once the table is known to be unaffected",
+        table_version.unwrap_or_default(),
+        record_key_fields[0]
+    )))
+}
+
+/// Whether [`COMPLEX_KEYGEN_VALIDATION`] is on (the default).
+pub(crate) fn complex_keygen_validation_enabled<'a>(
+    get_raw: impl Fn(&str) -> Option<&'a str>,
+) -> bool {
+    !get_raw(COMPLEX_KEYGEN_VALIDATION).is_some_and(|v| v.trim().eq_ignore_ascii_case("false"))
+}
+
+/// Java `KeyGeneratorType.isComplexKeyGenerator`: only a declared type or
+/// class counts, never one inferred from the field lists.
+fn declares_complex_key_generator(hudi_configs: &HudiConfigs) -> bool {
+    if let Some(key_generator_type) = hudi_configs.get_raw(KeyGeneratorType.as_ref()) {
+        return matches!(key_generator_type.trim(), "COMPLEX" | "COMPLEX_AVRO");
+    }
+    matches!(
+        hudi_configs
+            .get_raw(KeyGeneratorClass.as_ref())
+            .map(str::trim),
+        Some(
+            "org.apache.hudi.keygen.ComplexKeyGenerator"
+                | "org.apache.hudi.keygen.ComplexAvroKeyGenerator"
+        )
+    )
 }
 
 fn unsupported_key_generator(config: &str, value: &str) -> CoreError {
