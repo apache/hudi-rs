@@ -2678,6 +2678,15 @@ async fn test_complex_key_generator_encodes_single_key_field() {
             vec![("a".to_string(), 10), ("b".to_string(), 2)],
             "{key}={value}"
         );
+
+        // A delete filter on the key column takes the column value.
+        table.delete("id = 'a'").await.unwrap();
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(
+            rows_by_id(&batches),
+            vec![("b".to_string(), 2)],
+            "{key}={value}"
+        );
     }
 }
 

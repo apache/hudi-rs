@@ -2271,19 +2271,31 @@ fn keys_from_record_key_filter(table: &Table, filter: &Filter) -> Result<Option<
     if !is_key_field {
         return Ok(None);
     }
-    match filter.operator {
-        ExprOperator::Eq | ExprOperator::In => Ok(Some(
-            filter
-                .values
-                .iter()
-                .map(|record_key| HoodieKey {
-                    record_key: record_key.clone(),
-                    partition_path: String::new(),
-                })
-                .collect(),
-        )),
-        _ => Ok(None),
+    if !matches!(filter.operator, ExprOperator::Eq | ExprOperator::In) {
+        return Ok(None);
     }
+    // A filter on the key column holds column values, which the complex key
+    // generator stores as `field:value`. A generator the writer cannot
+    // reproduce falls back to the scan path.
+    let encode_field_name = filter.field != MetaField::RecordKey.as_ref()
+        && match crate::write::keygen::encodes_single_key_field_name(&table.hudi_configs) {
+            Ok(encodes) => encodes,
+            Err(_) => return Ok(None),
+        };
+    Ok(Some(
+        filter
+            .values
+            .iter()
+            .map(|value| HoodieKey {
+                record_key: if encode_field_name {
+                    format!("{}:{value}", filter.field)
+                } else {
+                    value.clone()
+                },
+                partition_path: String::new(),
+            })
+            .collect(),
+    ))
 }
 
 fn partition_paths_for_batch(batch: &RecordBatch) -> Vec<String> {

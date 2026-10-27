@@ -42,7 +42,7 @@ use crate::index::HoodieKey;
 /// Partition paths use hive-style (`field=value/...`) when
 /// `hoodie.datasource.write.hive_style_partitioning` is true; otherwise value-only
 /// segments. Null or empty partition values map to [`DEFAULT_PARTITION_PATH`].
-/// Partition columns are not stripped from the batch — callers must leave them in
+/// Partition columns are not stripped from the batch: callers must leave them in
 /// the written Parquet.
 /// Placeholder instant for pre-fence validation passes: [`hoodie_keys_for_batch`]
 /// uses the instant only to FORMAT auto-generated keys, never to decide errors,
@@ -69,7 +69,7 @@ pub(crate) const COMPLEX_KEYGEN_VALIDATION: &str = "hoodie.write.complex.keygen.
 /// lists (`KeyGenUtils.inferKeyGeneratorType`). Generators whose keys or partition
 /// paths the writer does not reproduce are rejected, since writing with a
 /// different encoding would split a key across two index entries.
-fn encodes_single_key_field_name(hudi_configs: &HudiConfigs) -> Result<bool> {
+pub(crate) fn encodes_single_key_field_name(hudi_configs: &HudiConfigs) -> Result<bool> {
     let complex = if let Some(class) = hudi_configs
         .get_raw(KeyGeneratorClass.as_ref())
         .map(str::trim)
