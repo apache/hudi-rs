@@ -33,7 +33,8 @@ use parquet::arrow::ArrowWriter;
 
 use crate::Result;
 use crate::config::table::HudiTableConfig::{
-    RecordMergeStrategy, TableVersion, TimelineLayoutVersion, TimelinePath,
+    MetadataTablePartitions, PopulatesMetaFields, RecordMergeStrategy, TableVersion,
+    TimelineLayoutVersion, TimelinePath,
 };
 use crate::error::CoreError;
 use crate::merge::RecordMergeStrategyValue;
@@ -71,6 +72,8 @@ impl AppendOnlyWriter {
     pub(crate) async fn write(&self, batch: RecordBatch) -> Result<AppendResult> {
         self.ensure_append_only()?;
         self.ensure_unpartitioned()?;
+        self.ensure_no_meta_fields()?;
+        self.ensure_no_metadata_table().await?;
 
         let request_instant = Self::current_timestamp();
         let completion_instant = request_instant.clone();
@@ -145,6 +148,47 @@ impl AppendOnlyWriter {
             ));
         }
 
+        Ok(())
+    }
+
+    /// The written base file carries only the batch's columns, so a table that
+    /// populates the `_hoodie_*` meta fields would get a file without them.
+    fn ensure_no_meta_fields(&self) -> Result<()> {
+        let populates_meta_fields: bool = self
+            .table
+            .hudi_configs
+            .get_or_default(PopulatesMetaFields)
+            .into();
+        if populates_meta_fields {
+            return Err(CoreError::Unsupported(
+                "append_only currently supports only tables with hoodie.populate.meta.fields=false"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The metadata table is not updated, so its file listings would miss the
+    /// new base file.
+    async fn ensure_no_metadata_table(&self) -> Result<()> {
+        let partitions: Vec<String> = self
+            .table
+            .hudi_configs
+            .get_or_default(MetadataTablePartitions)
+            .into();
+        let has_metadata_dir = self
+            .table
+            .file_system_view
+            .storage
+            .list_dirs(Some(HUDI_METADATA_DIR))
+            .await?
+            .iter()
+            .any(|dir| dir == "metadata");
+        if !partitions.is_empty() || has_metadata_dir {
+            return Err(CoreError::Unsupported(
+                "append_only currently supports only tables without a metadata table".to_string(),
+            ));
+        }
         Ok(())
     }
 

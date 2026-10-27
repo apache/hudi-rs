@@ -238,3 +238,46 @@ async fn append_only_rejects_empty_and_mismatched_batches() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn append_only_rejects_tables_with_meta_fields_or_metadata_table() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))])?;
+
+    let meta_fields_dir = tempdir()?;
+    write_table_properties(meta_fields_dir.path())?;
+    let props = meta_fields_dir.path().join(".hoodie/hoodie.properties");
+    let rewritten = fs::read_to_string(&props)?.replace(
+        "hoodie.populate.meta.fields=false",
+        "hoodie.populate.meta.fields=true",
+    );
+    fs::write(&props, rewritten)?;
+    let mut table = Table::new(meta_fields_dir.path().to_str().expect("valid temp path")).await?;
+    let error = table.append_only([batch.clone()]).await.unwrap_err();
+    assert!(
+        matches!(error, CoreError::Unsupported(message) if message.contains("hoodie.populate.meta.fields=false"))
+    );
+
+    let mdt_dir = tempdir()?;
+    write_table_properties(mdt_dir.path())?;
+    fs::create_dir_all(mdt_dir.path().join(".hoodie/metadata/.hoodie"))?;
+    fs::write(
+        mdt_dir
+            .path()
+            .join(".hoodie/metadata/.hoodie/hoodie.properties"),
+        "hoodie.table.name=test_table_metadata\n",
+    )?;
+    let mut table = Table::new(mdt_dir.path().to_str().expect("valid temp path")).await?;
+    let error = table.append_only([batch]).await.unwrap_err();
+    assert!(
+        matches!(error, CoreError::Unsupported(message) if message.contains("without a metadata table"))
+    );
+    assert!(
+        fs::read_dir(mdt_dir.path().join(".hoodie"))?
+            .filter_map(|entry| entry.ok())
+            .all(|entry| !entry.file_name().to_string_lossy().ends_with(".commit")),
+        "a rejected append must not write a commit"
+    );
+
+    Ok(())
+}
