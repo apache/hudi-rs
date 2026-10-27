@@ -147,13 +147,15 @@ After each completed action (inside the second critical section), the data
 timeline is archived when completed commits exceed `hoodie.keep.max.commits`
 (default 30), retaining `hoodie.keep.min.commits` (default 20): the oldest
 instants move into `.hoodie/timeline/history/` as `HoodieLSMTimelineInstant`
-parquet files tracked by `manifest_N` + `_version_` files. Reads never open
-the history: an instant below the earliest active instant counts as committed
-(Java's `isBeforeTimelineStarts`), since archival only moves completed
-instants, and the same rule admits MDT base files whose instant the MDT
-timeline has archived. The MDT's own timeline is *not* archived: like the Java
-writer, MDT archival is bounded by MDT compaction, which is not implemented
-natively.
+parquet files tracked by `manifest_N` + `_version_` files. Archival keeps
+the last completed commit before the earliest pending write instant (including
+Spark-scheduled compaction and clustering), so the reader's archival boundary
+never passes a pending instant. Reads never open the history: an instant below
+the earliest active instant counts as committed (Java's
+`isBeforeTimelineStarts`), since archival only moves completed instants, and
+the same rule admits MDT base files whose instant the MDT timeline has
+archived. The MDT's own timeline is *not* archived: like the Java writer, MDT
+archival is bounded by MDT compaction, which is not implemented natively.
 
 ## 4. Writing data
 

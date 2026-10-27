@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
+use hudi_core::config::table::TableTypeValue;
 use hudi_core::metadata::commit::HoodieCommitMetadata;
 use hudi_core::table::Table;
 use hudi_core::table::partition::PartitionPruner;
@@ -395,4 +396,140 @@ async fn test_repeated_archival_rotates_manifests_and_retains_three() {
         .unwrap();
     let total: usize = rows.iter().map(RecordBatch::num_rows).sum();
     assert_eq!(total, 16);
+}
+
+/// Next 17-digit instant time after `ts` (1 ms later).
+fn next_instant(ts: &str) -> String {
+    format!("{:017}", ts.parse::<u64>().unwrap() + 1)
+}
+
+/// Plants a pending instant (`{ts}.{pending_suffix}`) right after the first
+/// commit, with a stray base file in a new file group stamped with that
+/// instant (the partial output of a table service that never completed),
+/// then commits enough to trigger archival. Returns the first commit's
+/// instant and whether its completed file is still on the active timeline.
+async fn plant_pending_then_archive(
+    dir: &Path,
+    table_type: TableTypeValue,
+    pending_suffix: &str,
+) -> (String, bool) {
+    let mut table = Table::create(dir.to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(table_type)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        // File listing then comes from storage, where the stray file is visible.
+        .with_metadata(false)
+        .with_option("hoodie.keep.min.commits", "2")
+        .with_option("hoodie.keep.max.commits", "3")
+        .create()
+        .await
+        .unwrap();
+    let first = table
+        .append([batch(vec![("k0", "sf", 0)])])
+        .await
+        .unwrap()
+        .instant;
+
+    let pending_ts = next_instant(&first);
+    let timeline = dir.join(".hoodie/timeline");
+    std::fs::write(timeline.join(format!("{pending_ts}.{pending_suffix}")), b"").unwrap();
+    let partition = dir.join("city=sf");
+    let base = std::fs::read_dir(&partition)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .find(|n| n.ends_with(".parquet"))
+        .unwrap();
+    std::fs::copy(
+        partition.join(&base),
+        partition.join(format!(
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee-0_0-0-0_{pending_ts}.parquet"
+        )),
+    )
+    .unwrap();
+
+    for i in 1..6 {
+        let id = format!("k{i}");
+        table
+            .append([batch(vec![(id.as_str(), "sf", i)])])
+            .await
+            .unwrap();
+    }
+    let first_active = std::fs::read_dir(&timeline)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .any(|n| n.starts_with(&format!("{first}_")));
+    (first, first_active)
+}
+
+async fn read_row_count(dir: &Path) -> usize {
+    let table = Table::new(dir.to_str().unwrap()).await.unwrap();
+    table
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum()
+}
+
+/// A pending clustering plan must keep the last completed commit before it on
+/// the active timeline. Archiving that commit moves the reader's archival
+/// boundary past the pending instant, and the plan's partial output (a new
+/// file group) reads as committed.
+#[tokio::test]
+async fn test_archival_retains_commit_before_pending_clustering() {
+    let dir = tempdir().unwrap();
+    let (first, first_active) = plant_pending_then_archive(
+        dir.path(),
+        TableTypeValue::CopyOnWrite,
+        "clustering.requested",
+    )
+    .await;
+    assert_eq!(
+        read_row_count(dir.path()).await,
+        6,
+        "the pending clustering's output must not read as committed"
+    );
+    assert!(
+        first_active,
+        "the completed commit before the pending clustering ({first}) must stay active"
+    );
+}
+
+/// Same for a pending compaction plan on a merge-on-read table.
+#[tokio::test]
+async fn test_archival_retains_commit_before_pending_compaction() {
+    let dir = tempdir().unwrap();
+    let (first, first_active) = plant_pending_then_archive(
+        dir.path(),
+        TableTypeValue::MergeOnRead,
+        "compaction.requested",
+    )
+    .await;
+    assert_eq!(
+        read_row_count(dir.path()).await,
+        6,
+        "the pending compaction's output must not read as committed"
+    );
+    assert!(
+        first_active,
+        "the completed commit before the pending compaction ({first}) must stay active"
+    );
+}
+
+/// A pending clean is not a write action and does not hold archival back
+/// (Java bounds archival by the write timeline's pending instants only).
+#[tokio::test]
+async fn test_archival_not_blocked_by_pending_clean() {
+    let dir = tempdir().unwrap();
+    let (first, first_active) =
+        plant_pending_then_archive(dir.path(), TableTypeValue::CopyOnWrite, "clean.requested")
+            .await;
+    assert!(
+        !first_active,
+        "a pending clean must not stop archival of {first}"
+    );
 }

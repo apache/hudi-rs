@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use crate::Result;
 use crate::error::CoreError;
 use crate::storage::Storage;
+use crate::write::rollback::action_from_fencing_name;
 
 /// Java `hoodie.keep.min.commits` default.
 pub(crate) const DEFAULT_KEEP_MIN_COMMITS: usize = 20;
@@ -119,17 +120,48 @@ pub(crate) async fn archive_timeline_if_needed(
         });
         let _ = requested;
     }
-    // Pending = fenced without a completed file.
+    // Pending = fenced without a completed file. Only write actions count
+    // (Java's `getWriteTimeline`): a pending clean or rollback writes no data
+    // files a reader could mistake for committed.
     let completed_set: std::collections::HashSet<&str> =
         completed.iter().map(|c| c.requested.as_str()).collect();
-    for ts in fencing_by_instant.keys() {
-        if !completed_set.contains(ts.as_str()) && earliest_pending.as_ref().is_none_or(|e| ts < e)
+    for (ts, names) in &fencing_by_instant {
+        let is_write_action = names.iter().any(|name| {
+            matches!(
+                action_from_fencing_name(name, ts).as_str(),
+                "" | "commit"
+                    | "deltacommit"
+                    | "compaction"
+                    | "logcompaction"
+                    | "replacecommit"
+                    | "clustering"
+            )
+        });
+        if is_write_action
+            && !completed_set.contains(ts.as_str())
+            && earliest_pending.as_ref().is_none_or(|e| ts < e)
         {
             earliest_pending = Some(ts.clone());
         }
     }
 
     completed.sort_by(|a, b| a.requested.cmp(&b.requested));
+    let is_commit_action =
+        |action: &str| matches!(action, "commit" | "deltacommit" | "replacecommit");
+    // Retain the last completed commit before the earliest pending instant
+    // (Java `completedCommitBeforeEarliestPendingInstant`): the reader treats
+    // everything below the earliest active commit as committed, and pending
+    // compaction/clustering instants do not count as commits there, so
+    // archiving up to the pending instant would make its partial output
+    // readable.
+    let retain_from_pending = earliest_pending.map(|pending| {
+        completed
+            .iter()
+            .filter(|c| is_commit_action(&c.action) && c.requested < pending)
+            .map(|c| c.requested.clone())
+            .next_back()
+            .unwrap_or(pending)
+    });
     // A replacecommit's partitionToReplaceFileIds is what hides the file
     // groups it replaced; until a cleaner physically deletes those groups,
     // archiving it resurrects their rows. Java blocks archival at the first
@@ -149,12 +181,10 @@ pub(crate) async fn archive_timeline_if_needed(
         .filter(|c| c.action == "savepoint")
         .map(|c| c.requested.clone())
         .min();
-    let earliest_pending = [earliest_pending, earliest_replace, earliest_savepoint]
+    let retain_from = [retain_from_pending, earliest_replace, earliest_savepoint]
         .into_iter()
         .flatten()
         .min();
-    let is_commit_action =
-        |action: &str| matches!(action, "commit" | "deltacommit" | "replacecommit");
     let commit_count = completed
         .iter()
         .filter(|c| is_commit_action(&c.action))
@@ -166,15 +196,15 @@ pub(crate) async fn archive_timeline_if_needed(
         return Ok(());
     }
 
-    // Archive the oldest commits down to `min_keep`, but never at or past the
-    // earliest pending instant; sweep along non-commit actions (rollbacks) up
-    // to the newest archived commit.
+    // Archive the oldest commits down to `min_keep`, but never at or past
+    // `retain_from`; sweep along non-commit actions (rollbacks) up to the
+    // newest archived commit.
     let mut commits_to_archive = commit_count - min_keep;
     let mut max_archived_commit: Option<String> = None;
     let mut to_archive: Vec<CompletedInstant> = Vec::new();
     for instant in &completed {
-        if let Some(pending) = &earliest_pending
-            && instant.requested.as_str() >= pending.as_str()
+        if let Some(bound) = &retain_from
+            && instant.requested.as_str() >= bound.as_str()
         {
             break;
         }

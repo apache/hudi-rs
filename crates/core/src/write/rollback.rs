@@ -67,7 +67,7 @@ pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
 /// Must not depend on which of an instant's fencing files is listed first —
 /// directory listing order is filesystem-specific (ext4 returns hash order,
 /// so `.inflight` can precede `.commit.requested`).
-fn action_from_fencing_name(name: &str, timestamp: &str) -> String {
+pub(crate) fn action_from_fencing_name(name: &str, timestamp: &str) -> String {
     let rest = name.trim_start_matches(timestamp).trim_start_matches('.');
     match rest {
         "inflight" | "requested" => String::new(),
