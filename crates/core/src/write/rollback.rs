@@ -264,9 +264,11 @@ async fn rollback_requests_from_markers(
     Ok(requests)
 }
 
-/// The table-relative form of a path in a rollback plan, matched on the URL
-/// path so the scheme a plan's writer used does not matter (Java
-/// `FSUtils.getRelativePartitionPath`).
+/// The table-relative form of a path in a rollback plan, matched on the path
+/// so the scheme spelling a plan's writer used does not matter (Java
+/// `FSUtils.getRelativePartitionPath`). Java writes these paths unescaped
+/// (`StoragePath.toString`), so they are split as text rather than parsed as
+/// URLs, which would escape them a second time.
 fn relative_to_base(base: &url::Url, path: &str) -> Result<String> {
     if let Some(relative) = path
         .strip_prefix(base.as_str().trim_end_matches('/'))
@@ -274,20 +276,40 @@ fn relative_to_base(base: &url::Url, path: &str) -> Result<String> {
     {
         return Ok(relative.to_string());
     }
-    let path_part = match url::Url::parse(path) {
-        Ok(url) => url.path().to_string(),
-        Err(_) if !path.starts_with('/') => return Ok(path.to_string()),
-        Err(_) => path.to_string(),
+    let not_under_base = || {
+        CoreError::Unsupported(format!(
+            "rollback plan path {path} is not under the table base path {base}"
+        ))
     };
-    path_part
-        .strip_prefix(base.path().trim_end_matches('/'))
+    let raw_path = match path.split_once(':') {
+        Some((scheme, rest))
+            if scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c)) =>
+        {
+            match rest.strip_prefix("//") {
+                Some(rest) => {
+                    let (authority, raw_path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+                    if authority != base.authority() {
+                        return Err(not_under_base());
+                    }
+                    raw_path
+                }
+                None => rest,
+            }
+        }
+        _ if !path.starts_with('/') => return Ok(path.to_string()),
+        _ => path,
+    };
+    let base_path = percent_encoding::percent_decode_str(base.path())
+        .decode_utf8()
+        .map_err(|_| not_under_base())?;
+    raw_path
+        .strip_prefix(base_path.trim_end_matches('/'))
         .and_then(|rest| rest.strip_prefix('/'))
         .map(str::to_string)
-        .ok_or_else(|| {
-            CoreError::Unsupported(format!(
-                "rollback plan path {path} is not under the table base path {base}"
-            ))
-        })
+        .ok_or_else(not_under_base)
 }
 
 async fn rollback_instant(
@@ -511,6 +533,34 @@ mod tests {
         );
         assert!(relative_to_base(&base, "file:///tmp/other/f.parquet").is_err());
         assert!(relative_to_base(&base, "file:///tmp/t2/f.parquet").is_err());
+    }
+
+    /// Java writes plan paths unescaped, so they are matched as raw text: a
+    /// literal `%` stays literal, and the bucket must be the table's.
+    #[test]
+    fn test_relative_to_base_takes_java_paths_verbatim() {
+        let base = url::Url::parse("file:///tmp/t/").unwrap();
+        for (path, relative) in [
+            ("file:/tmp/t/city=a b/f.parquet", "city=a b/f.parquet"),
+            (
+                "file:/tmp/t/city=caf\u{e9}/f.parquet",
+                "city=caf\u{e9}/f.parquet",
+            ),
+            (
+                "file:/tmp/t/city=2024%2F01/f.parquet",
+                "city=2024%2F01/f.parquet",
+            ),
+        ] {
+            assert_eq!(relative_to_base(&base, path).unwrap(), relative);
+        }
+        let spaced = url::Url::from_directory_path("/tmp/my t").unwrap();
+        assert_eq!(
+            relative_to_base(&spaced, "file:/tmp/my t/f.parquet").unwrap(),
+            "f.parquet"
+        );
+        let s3 = url::Url::parse("s3://bucket/t").unwrap();
+        assert!(relative_to_base(&s3, "s3a://other-bucket/t/f.parquet").is_err());
+        assert!(relative_to_base(&s3, "s3a://bucket/t/f.parquet").is_ok());
     }
 
     /// Regression: on ext4 the bare COW inflight can be listed before the

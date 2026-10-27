@@ -543,6 +543,58 @@ fn fabricate_pending_rollback(
     relative
 }
 
+/// Java writes plan paths unescaped (`StoragePath.toString`), so a partition
+/// with spaces or non-ASCII characters appears raw in `filesToBeDeleted`.
+#[tokio::test]
+async fn test_pending_rollback_deletes_java_plan_paths_with_special_characters() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000013";
+    let rollback_ts = "30000101000000014";
+    let timeline = dir.path().join(".hoodie/timeline");
+    std::fs::write(timeline.join(format!("{crashed_ts}.commit.requested")), b"").unwrap();
+    std::fs::write(timeline.join(format!("{crashed_ts}.inflight")), b"").unwrap();
+    let partition = "city=san jos\u{e9}";
+    let file_name = format!("11111111-2222-3333-4444-555555555555-0_0-0-0_{crashed_ts}.parquet");
+    std::fs::create_dir_all(dir.path().join(partition)).unwrap();
+    let partial = dir.path().join(partition).join(&file_name);
+    std::fs::write(&partial, b"partial parquet bytes").unwrap();
+    let plan = HoodieRollbackPlan {
+        instant_to_rollback: Some(HoodieInstantInfo {
+            commit_time: crashed_ts.to_string(),
+            action: "commit".to_string(),
+        }),
+        rollback_requests: Some(vec![HoodieRollbackRequest {
+            partition_path: partition.to_string(),
+            file_id: Some(file_name.split('_').next().unwrap().to_string()),
+            latest_base_instant: Some(crashed_ts.to_string()),
+            files_to_be_deleted: vec![format!(
+                "file:{}/{partition}/{file_name}",
+                dir.path().to_str().unwrap()
+            )],
+            log_blocks_to_be_deleted: Some(Default::default()),
+        }]),
+        version: Some(1),
+    };
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.requested")),
+        plan.to_avro_bytes().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.inflight")),
+        b"",
+    )
+    .unwrap();
+
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    assert_eq!(pending_rollbacks(&timeline), Vec::<String>::new());
+    assert!(!partial.exists(), "the planned file must be deleted");
+}
+
 /// A rollback left pending by a crash is completed by the next write on its
 /// own instant, as Java resumes it, instead of a second rollback being
 /// minted while the first stays pending forever.
