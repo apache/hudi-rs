@@ -337,16 +337,18 @@ pub(crate) async fn archive_timeline_if_needed(
     }
 
     // Remove archived instants from the active timeline: fencing files first
-    // (ascending), completed files after.
+    // (ascending), completed files after. A fencing file that survives stops
+    // archival before any completed file goes, since an instant with fencing
+    // files and no completed file reads as a failed write to roll back.
     for instant in &to_archive {
         for fencing in fencing_by_instant
             .get(&instant.requested)
             .into_iter()
             .flatten()
         {
-            let _ = storage
+            storage
                 .delete_file(&format!("{timeline_dir}/{fencing}"))
-                .await;
+                .await?;
         }
     }
     for instant in &to_archive {
@@ -548,5 +550,126 @@ mod lifecycle_tests {
             .map(RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 12);
+    }
+}
+
+#[cfg(test)]
+mod delete_failure_tests {
+    use super::archive_timeline_if_needed;
+    use crate::config::HudiConfigs;
+    use crate::storage::Storage;
+    use async_trait::async_trait;
+    use futures::StreamExt;
+    use futures::stream::BoxStream;
+    use object_store::local::LocalFileSystem;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
+    };
+    use std::sync::Arc;
+
+    /// Fails every delete of an `.inflight` file.
+    #[derive(Debug)]
+    struct InflightDeleteFails(Arc<dyn ObjectStore>);
+
+    impl std::fmt::Display for InflightDeleteFails {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "InflightDeleteFails({})", self.0)
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for InflightDeleteFails {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult> {
+            self.0.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>> {
+            self.0.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+            self.0.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            let inner = self.0.clone();
+            locations
+                .then(move |location| {
+                    let inner = inner.clone();
+                    async move {
+                        let location = location?;
+                        if location.as_ref().ends_with(".inflight") {
+                            return Err(object_store::Error::Generic {
+                                store: "InflightDeleteFails",
+                                source: "delete failed".into(),
+                            });
+                        }
+                        inner
+                            .delete_stream(futures::stream::once(async { Ok(location) }).boxed())
+                            .next()
+                            .await
+                            .unwrap()
+                    }
+                })
+                .boxed()
+        }
+
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+            self.0.list(prefix)
+        }
+
+        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+            self.0.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.0.copy_opts(from, to, options).await
+        }
+    }
+
+    /// A fencing file archival cannot delete must stop it before any
+    /// completed file goes: an archived instant left with fencing files and
+    /// no completed file reads as a failed write, which the next write's
+    /// eager rollback would undo.
+    #[tokio::test]
+    async fn test_archival_keeps_completed_files_when_fencing_delete_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=4).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants {
+            std::fs::write(timeline.join(format!("{ts}.commit.requested")), b"").unwrap();
+            std::fs::write(timeline.join(format!("{ts}.inflight")), b"").unwrap();
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let store = Arc::new(InflightDeleteFails(Arc::new(LocalFileSystem::new())));
+        let storage =
+            Storage::new_with_object_store(base_url, store, Arc::new(HudiConfigs::empty()));
+
+        let result = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+
+        for ts in &instants {
+            assert!(
+                !timeline.join(format!("{ts}.inflight")).exists()
+                    || timeline.join(format!("{ts}_{ts}.commit")).exists(),
+                "{ts} is left looking pending"
+            );
+        }
+        assert!(result.is_err());
     }
 }
