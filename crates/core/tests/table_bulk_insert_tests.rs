@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use std::fs;
 use std::sync::Arc;
 
@@ -220,7 +239,7 @@ async fn append_only_rejects_empty_and_mismatched_batches() -> Result<()> {
         .await
         .unwrap_err();
     assert!(
-        matches!(error, CoreError::InvalidValue(message) if message.contains("at least one RecordBatch"))
+        matches!(error, CoreError::Write(message) if message.contains("at least one RecordBatch"))
     );
 
     let ints = RecordBatch::try_new(
@@ -233,7 +252,7 @@ async fn append_only_rejects_empty_and_mismatched_batches() -> Result<()> {
     )?;
     let error = table.append_only([ints, strings]).await.unwrap_err();
     assert!(
-        matches!(error, CoreError::InvalidValue(message) if message.contains("share the same schema"))
+        matches!(error, CoreError::Write(message) if message.contains("share the same schema"))
     );
 
     Ok(())
@@ -278,6 +297,90 @@ async fn append_only_rejects_tables_with_meta_fields_or_metadata_table() -> Resu
             .all(|entry| !entry.file_name().to_string_lossy().ends_with(".commit")),
         "a rejected append must not write a commit"
     );
+
+    Ok(())
+}
+
+fn id_name_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(names)),
+        ],
+    )
+    .expect("valid batch")
+}
+
+#[tokio::test]
+async fn append_only_rejects_zero_rows_and_table_schema_mismatch() -> Result<()> {
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+
+    let error = table
+        .append_only([id_name_batch(vec![], vec![])])
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CoreError::Write(message) if message.contains("at least one row")));
+
+    table
+        .append_only([id_name_batch(vec![1], vec!["alice"])])
+        .await?;
+    let ids_only = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+        vec![Arc::new(Int32Array::from(vec![2]))],
+    )?;
+    let error = table.append_only([ids_only]).await.unwrap_err();
+    assert!(
+        matches!(error, CoreError::Write(message) if message.contains("does not match table schema"))
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_only_handle_reads_its_own_writes() -> Result<()> {
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+
+    table
+        .append_only([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
+        .await?;
+    table
+        .append_only([id_name_batch(vec![3], vec!["carol"])])
+        .await?;
+
+    let rows: usize = table
+        .read(&ReadOptions::new())
+        .await?
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_only_accepts_cleared_metadata_partitions_property() -> Result<()> {
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    let props = temp_dir.path().join(".hoodie/hoodie.properties");
+    let mut content = fs::read_to_string(&props)?;
+    content.push_str("\nhoodie.table.metadata.partitions=\n");
+    fs::write(&props, content)?;
+    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+
+    let result = table
+        .append_only([id_name_batch(vec![1], vec!["alice"])])
+        .await?;
+    assert_eq!(result.num_rows, 1);
 
     Ok(())
 }

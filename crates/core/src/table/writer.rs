@@ -11,7 +11,7 @@
  *
  * Unless required by applicable law or agreed to in writing,
  * software distributed under the License is distributed on an
- * AS IS BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
  * KIND, either express or implied.  See the License for the
  * specific language governing permissions and limitations
  * under the License.
@@ -127,9 +127,9 @@ impl AppendOnlyWriter {
             .into();
 
         if RecordMergeStrategyValue::from_str(&strategy)? != RecordMergeStrategyValue::AppendOnly {
-            return Err(CoreError::Unsupported(format!(
-                "append_only is only supported for append-only tables. Found merge strategy '{strategy}'"
-            )));
+            return Err(CoreError::Unsupported(
+                "append_only requires hoodie.record.merge.mode=append_only".to_string(),
+            ));
         }
 
         Ok(())
@@ -184,7 +184,7 @@ impl AppendOnlyWriter {
             .await?
             .iter()
             .any(|dir| dir == "metadata");
-        if !partitions.is_empty() || has_metadata_dir {
+        if partitions.iter().any(|p| !p.is_empty()) || has_metadata_dir {
             return Err(CoreError::Unsupported(
                 "append_only currently supports only tables without a metadata table".to_string(),
             ));
