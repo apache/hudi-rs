@@ -1,3 +1,22 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * AS IS BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
 use std::fs;
 use std::sync::Arc;
 
@@ -7,7 +26,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::error::CoreError;
 use hudi_core::error::Result;
-use hudi_core::table::Table;
+use hudi_core::table::{ReadOptions, Table};
 use tempfile::tempdir;
 
 fn write_table_properties(base_dir: &std::path::Path) -> Result<()> {
@@ -94,7 +113,7 @@ async fn bulk_insert_writes_records_and_commit() -> Result<()> {
 
     let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
     let records = reopened
-        .read_snapshot(std::iter::empty::<(&str, &str, &str)>())
+        .read(&ReadOptions::new())
         .await?;
     assert_eq!(records.len(), 1);
 

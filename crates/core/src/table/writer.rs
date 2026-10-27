@@ -27,7 +27,7 @@ use apache_avro::schema::AvroSchema;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Utc;
-use object_store::PutPayload;
+use object_store::{ObjectStoreExt, PutPayload};
 use object_store::path::Path;
 use parquet::arrow::ArrowWriter;
 
