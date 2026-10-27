@@ -516,6 +516,81 @@ async fn detect_num_file_groups(
     }
 }
 
+/// Refuse to write a table whose metadata table has a layout this writer does
+/// not maintain: other index partitions would go stale, a partition an async
+/// indexer is still building would miss the write, and a partitioned record
+/// index hashes keys per data partition into file groups this writer cannot
+/// address.
+pub(crate) async fn ensure_supported_metadata_layout(table: &Table) -> Result<()> {
+    use crate::config::table::HudiTableConfig::MetadataTablePartitions;
+    use crate::error::CoreError;
+    if !table.is_metadata_table_enabled() {
+        return Ok(());
+    }
+    let supported = [
+        MetadataPartitionType::Files,
+        MetadataPartitionType::ColumnStats,
+        MetadataPartitionType::PartitionStats,
+        MetadataPartitionType::RecordIndex,
+    ]
+    .map(|partition| partition.partition_name());
+    let partitions: Vec<String> = table
+        .hudi_configs
+        .get_or_default(MetadataTablePartitions)
+        .into();
+    if let Some(partition) = partitions
+        .iter()
+        .map(|p| p.trim())
+        .find(|p| !p.is_empty() && !supported.contains(p))
+    {
+        return Err(CoreError::Unsupported(format!(
+            "writing a table whose metadata table has the '{partition}' partition \
+             ({}) is not supported; supported partitions are {}",
+            MetadataTablePartitions.as_ref(),
+            supported.join(", ")
+        )));
+    }
+    let inflight_key = "hoodie.table.metadata.partitions.inflight";
+    if let Some(inflight) = table
+        .hudi_configs
+        .as_options()
+        .get(inflight_key)
+        .filter(|value| value.split(',').any(|p| !p.trim().is_empty()))
+    {
+        return Err(CoreError::Unsupported(format!(
+            "writing a table whose metadata table partitions are still being built \
+             ({inflight_key}={inflight}) is not supported"
+        )));
+    }
+    if crate::index::is_record_index_enabled(table) {
+        let storage = table.file_system_view.storage.as_ref();
+        let partition = MetadataPartitionType::RecordIndex.partition_name();
+        for (file_id, _, _) in mdt_partition_latest_slices(storage, partition).await? {
+            if !is_global_record_index_file_id(&file_id) {
+                return Err(CoreError::Unsupported(format!(
+                    "writing a table with a partitioned record index \
+                     (hoodie.metadata.record.level.index.enable, file group '{file_id}') \
+                     is not supported"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Java names global record index file groups `record-index-NNNN-0` and
+/// partitioned ones `record-index-<escapedPartition>-NNNN-0`.
+fn is_global_record_index_file_id(file_id: &str) -> bool {
+    file_id
+        .strip_prefix("record-index-")
+        .and_then(|rest| rest.split_once('-'))
+        .is_some_and(|(index, suffix)| {
+            [index, suffix]
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        })
+}
+
 /// Whether `column_stats` is listed in `hoodie.table.metadata.partitions`.
 pub fn is_column_stats_enabled(table: &Table) -> bool {
     mdt_partition_enabled(table, MetadataPartitionType::ColumnStats)
@@ -1437,6 +1512,22 @@ mod tests {
                 .ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile")
         );
         assert_eq!(logs.len(), 1);
+    }
+
+    #[test]
+    fn test_global_record_index_file_id() {
+        assert!(is_global_record_index_file_id("record-index-0000-0"));
+        assert!(is_global_record_index_file_id("record-index-0012-0"));
+        for partitioned in [
+            "record-index-sf-0000-0",
+            "record-index-2024-0000-0",
+            "record-index-2024-01-01-0003-0",
+        ] {
+            assert!(
+                !is_global_record_index_file_id(partitioned),
+                "{partitioned}"
+            );
+        }
     }
 
     #[tokio::test]

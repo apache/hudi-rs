@@ -228,6 +228,11 @@ strategy id. Written partitions:
   each write.
 - **record_index** — record key → file group location, 10 shards.
 
+A write to a table whose metadata table lists any other partition, has
+partitions still being built (`hoodie.table.metadata.partitions.inflight`),
+or holds a partitioned record index fails with `Unsupported` before it
+requests an instant, since those partitions would go stale.
+
 Reading merges base HFile records with log records using
 `MetadataPayloadMerger` (`metadata/payload_merger.rs`), the native equivalent
 of Java's `HoodieMetadataPayload`: files-partition maps merge with tombstone

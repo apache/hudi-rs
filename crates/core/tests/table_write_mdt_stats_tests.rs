@@ -27,6 +27,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::HudiConfigs;
 use hudi_core::config::table::{HudiTableConfig, TableTypeValue};
+use hudi_core::error::CoreError;
 use hudi_core::file_group::log_file::scanner::{LogFileScanner, ScanResult};
 use hudi_core::hfile::HFileReader;
 use hudi_core::metadata::table::encode::{
@@ -698,4 +699,113 @@ async fn test_partition_stats_recompute_reads_log_only_column_stats_groups() {
         assert_eq!(sf_value.value_count, 3, "tv{version}");
         assert!(sf_value.is_tight_bound, "tv{version}");
     }
+}
+
+/// Rewrite `hoodie.properties` the way another writer would have left it.
+fn set_table_props(dir: &Path, set: &[(&str, &str)]) {
+    let path = dir.join(".hoodie/hoodie.properties");
+    let mut rewritten: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|line| {
+            let key = line.split_once('=').map(|(k, _)| k).unwrap_or(line);
+            !set.iter().any(|(k, _)| *k == key)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    for (key, value) in set {
+        rewritten.push_str(&format!("{key}={value}\n"));
+    }
+    std::fs::write(&path, rewritten).unwrap();
+}
+
+fn timeline_file_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join(".hoodie/timeline"))
+        .unwrap()
+        .count()
+}
+
+#[tokio::test]
+async fn test_write_rejects_metadata_partitions_it_does_not_maintain() {
+    let all = "files,column_stats,partition_stats,record_index";
+    let cases = [
+        (
+            "hoodie.table.metadata.partitions",
+            format!("{all},bloom_filters"),
+            "bloom_filters",
+        ),
+        (
+            "hoodie.table.metadata.partitions",
+            format!("{all},secondary_index_idx_city"),
+            "secondary_index_idx_city",
+        ),
+        (
+            "hoodie.table.metadata.partitions",
+            format!("{all},expr_index_idx_value"),
+            "expr_index_idx_value",
+        ),
+        (
+            "hoodie.table.metadata.partitions.inflight",
+            "secondary_index_idx_city".to_string(),
+            "secondary_index_idx_city",
+        ),
+    ];
+    for (key, value, named) in cases {
+        let dir = tempdir().unwrap();
+        let mut table = create_partitioned(dir.path(), TableTypeValue::CopyOnWrite).await;
+        table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+        set_table_props(dir.path(), &[(key, &value)]);
+        let instants = timeline_file_count(dir.path());
+
+        let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let err = table
+            .upsert([batch(vec![("a", "sf", 2)])])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CoreError::Unsupported(msg) if msg.contains(named) && msg.contains(key)),
+            "{key}={value}: {err}"
+        );
+        let err = table.delete("value = 1").await;
+        assert!(
+            matches!(&err, Err(CoreError::Unsupported(_))),
+            "{key}={value}: {err:?}"
+        );
+        assert_eq!(timeline_file_count(dir.path()), instants, "{key}={value}");
+    }
+}
+
+#[tokio::test]
+async fn test_write_rejects_partitioned_record_index() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path(), TableTypeValue::MergeOnRead).await;
+    table
+        .append([batch(vec![("a", "sf", 1), ("b", "nyc", 2)])])
+        .await
+        .unwrap();
+    // A partitioned record index names its file groups
+    // record-index-<escapedPartition>-NNNN-0.
+    let rli_dir = dir.path().join(".hoodie/metadata/record_index");
+    for entry in std::fs::read_dir(&rli_dir).unwrap() {
+        let name = entry.unwrap().file_name().to_string_lossy().to_string();
+        if name.contains("record-index-") {
+            std::fs::rename(
+                rli_dir.join(&name),
+                rli_dir.join(name.replace("record-index-", "record-index-sf-")),
+            )
+            .unwrap();
+        }
+    }
+    let instants = timeline_file_count(dir.path());
+
+    let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    let err = table
+        .upsert([batch(vec![("a", "sf", 10)])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Unsupported(msg) if msg.contains("record-index-sf-")),
+        "{err}"
+    );
+    assert_eq!(timeline_file_count(dir.path()), instants);
 }
