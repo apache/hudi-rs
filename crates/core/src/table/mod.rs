@@ -93,10 +93,11 @@ pub mod file_pruner;
 pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
-pub mod writer;
 mod validation;
+mod writer;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
+pub use writer::AppendResult;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -121,7 +122,7 @@ use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
-use crate::table::writer::{BulkInsertResult, BulkInsertWriter};
+use crate::table::writer::AppendOnlyWriter;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
@@ -1236,12 +1237,28 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
-    /// Bulk insert a record batch into an append-only table.
+    /// Append record batches to an append-only table as one new base file.
     ///
-    /// This delegates to the bulk insert writer and is intentionally narrow:
-    /// it only supports append-only tables and writes a fresh base file.
-    pub async fn bulk_insert(&self, batch: RecordBatch) -> Result<BulkInsertResult> {
-        BulkInsertWriter::new(self).write(batch).await
+    /// Intentionally narrow: it only supports unpartitioned append-only tables,
+    /// and all batches must share one schema.
+    pub async fn append_only(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<AppendResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        let Some(first) = batches.first() else {
+            return Err(CoreError::InvalidValue(
+                "append requires at least one RecordBatch".to_string(),
+            ));
+        };
+        let schema = first.schema();
+        if batches.iter().any(|batch| batch.schema() != schema) {
+            return Err(CoreError::InvalidValue(
+                "All RecordBatches in append must share the same schema".to_string(),
+            ));
+        }
+        let batch = arrow::compute::concat_batches(&schema, &batches)?;
+        AppendOnlyWriter::new(self).write(batch).await
     }
 
     /// Compute estimated table-level statistics for scan planning.

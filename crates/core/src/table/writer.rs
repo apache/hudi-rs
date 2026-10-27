@@ -27,8 +27,8 @@ use apache_avro::schema::AvroSchema;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Utc;
-use object_store::{ObjectStoreExt, PutPayload};
 use object_store::path::Path;
+use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 
 use crate::Result;
@@ -44,31 +44,31 @@ use crate::storage::util::join_url_segments;
 use crate::table::Table;
 use crate::timeline::instant::Instant;
 
-/// Result of a bulk insert write.
+/// Result of an append write.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BulkInsertResult {
+pub struct AppendResult {
     pub instant: String,
     pub commit_relative_path: String,
     pub base_file_path: String,
     pub num_rows: usize,
 }
 
-/// Minimal bulk insert writer for append-only tables.
+/// Minimal writer for append-only tables.
 #[derive(Clone, Debug)]
-pub struct BulkInsertWriter {
+pub(crate) struct AppendOnlyWriter {
     table: Table,
 }
 
 static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
-impl BulkInsertWriter {
-    pub fn new(table: &Table) -> Self {
+impl AppendOnlyWriter {
+    pub(crate) fn new(table: &Table) -> Self {
         Self {
             table: table.clone(),
         }
     }
 
-    pub async fn write(&self, batch: RecordBatch) -> Result<BulkInsertResult> {
+    pub(crate) async fn write(&self, batch: RecordBatch) -> Result<AppendResult> {
         self.ensure_append_only()?;
         self.ensure_unpartitioned()?;
 
@@ -108,7 +108,7 @@ impl BulkInsertWriter {
             return Err(error);
         }
 
-        Ok(BulkInsertResult {
+        Ok(AppendResult {
             instant: request_instant,
             commit_relative_path,
             base_file_path,
@@ -125,7 +125,7 @@ impl BulkInsertWriter {
 
         if RecordMergeStrategyValue::from_str(&strategy)? != RecordMergeStrategyValue::AppendOnly {
             return Err(CoreError::Unsupported(format!(
-                "Bulk insert is only supported for append-only tables. Found merge strategy '{strategy}'"
+                "append_only is only supported for append-only tables. Found merge strategy '{strategy}'"
             )));
         }
 
@@ -141,7 +141,7 @@ impl BulkInsertWriter {
 
         if !partition_fields.is_empty() {
             return Err(CoreError::Unsupported(
-                "Bulk insert currently supports only unpartitioned append-only tables".to_string(),
+                "append_only currently supports only unpartitioned append-only tables".to_string(),
             ));
         }
 
