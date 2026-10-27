@@ -990,7 +990,15 @@ fn ensure_set_columns_updatable(table: &Table, updates: &RecordBatch) -> Result<
         .hudi_configs
         .get_or_default(crate::config::table::HudiTableConfig::PartitionFields)
         .into();
-    identity.extend(partition_fields);
+    // A custom key generator records each field as `<name>:<type>`.
+    identity.extend(
+        partition_fields
+            .into_iter()
+            .map(|field| match field.split_once(':') {
+                Some((name, _)) => name.to_string(),
+                None => field,
+            }),
+    );
     for field in updates.schema().fields() {
         if identity.iter().any(|name| name == field.name()) {
             return Err(CoreError::Write(format!(

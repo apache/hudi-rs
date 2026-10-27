@@ -2626,6 +2626,49 @@ async fn test_unsupported_key_generators_block_only_key_deriving_writes() {
     }
 }
 
+/// A custom key generator types its partition fields (`city:simple`); SET of
+/// the bare column name must still be refused as a partition column.
+#[tokio::test]
+async fn test_update_rejects_set_of_typed_partition_field() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([city_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap();
+        rewrite_table_props(
+            dir.path(),
+            &["hoodie.table.keygenerator.type"],
+            &[
+                (
+                    "hoodie.table.keygenerator.class",
+                    "org.apache.hudi.keygen.CustomKeyGenerator",
+                ),
+                ("hoodie.table.partition.fields", "city:simple"),
+            ],
+        );
+        let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let set_city = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("city", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["la"]))],
+        )
+        .unwrap();
+        let result = table.update("id = 'a'", set_city).await;
+        assert!(
+            matches!(&result, Err(CoreError::Write(msg)) if msg.contains("'city'")),
+            "{table_type:?}: {result:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_complex_key_generator_encodes_single_key_field() {
     // Spark records the key generator by class; SqlKeyGenerator with no origin
