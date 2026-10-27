@@ -24,7 +24,10 @@ use std::sync::Arc;
 
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
-use hudi_core::metadata::rollback::HoodieRollbackMetadata;
+use hudi_core::config::table::TableTypeValue;
+use hudi_core::metadata::rollback::{
+    HoodieInstantInfo, HoodieRollbackMetadata, HoodieRollbackPlan, HoodieRollbackRequest,
+};
 use hudi_core::table::Table;
 use tempfile::tempdir;
 
@@ -301,12 +304,21 @@ async fn test_rollback_fails_when_data_file_delete_fails() {
         completed_rollbacks(&timeline).is_empty(),
         "no rollback may complete while the file survives"
     );
+    let pending = pending_rollbacks(&timeline);
+    assert_eq!(
+        pending.len(),
+        1,
+        "the persisted plan stays pending: {pending:?}"
+    );
 
-    // Once the delete can succeed, the next write finishes the rollback.
+    // Once the delete can succeed, the next write finishes the same rollback.
     table.append([batch(vec![("b", "la", 2)])]).await.unwrap();
     assert!(!partition.join(&partial_file).exists());
     assert!(!timeline.join(format!("{crashed_ts}.inflight")).exists());
-    assert_eq!(completed_rollbacks(&timeline).len(), 1);
+    let completed = completed_rollbacks(&timeline);
+    assert_eq!(completed.len(), 1);
+    assert!(completed[0].starts_with(&format!("{}_", pending[0])));
+    assert_eq!(pending_rollbacks(&timeline), Vec::<String>::new());
     let rows = table
         .read(&hudi_core::table::ReadOptions::new())
         .await
@@ -359,4 +371,297 @@ async fn test_rollback_fails_when_orphan_mdt_delete_fails() {
         .await
         .unwrap();
     assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+fn timeline_names(timeline: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(timeline)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Rollback instants with a plan but no completed file.
+fn pending_rollbacks(timeline: &Path) -> Vec<String> {
+    let names = timeline_names(timeline);
+    names
+        .iter()
+        .filter_map(|n| n.strip_suffix(".rollback.requested"))
+        .filter(|ts| {
+            !names
+                .iter()
+                .any(|n| n.starts_with(&format!("{ts}_")) && n.ends_with(".rollback"))
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn absolute(table: &Table, relative: &str) -> String {
+    format!(
+        "{}/{relative}",
+        table.base_url().as_str().trim_end_matches('/')
+    )
+}
+
+/// The plan follows Java's table-version-8 marker-based shape, which Spark
+/// re-executes when it finds the rollback pending: one request per marker,
+/// absolute paths in `filesToBeDeleted` (log files included), an empty
+/// `logBlocksToBeDeleted`, and the file id and failed instant filled in.
+#[tokio::test]
+async fn test_rollback_plan_matches_java_v8_marker_based_shape() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000004";
+    let timeline = dir.path().join(".hoodie/timeline");
+    std::fs::write(
+        timeline.join(format!("{crashed_ts}.deltacommit.requested")),
+        b"",
+    )
+    .unwrap();
+    std::fs::write(
+        timeline.join(format!("{crashed_ts}.deltacommit.inflight")),
+        b"",
+    )
+    .unwrap();
+    let log_id = "11111111-2222-3333-4444-555555555555-0";
+    let base_id = "66666666-7777-8888-9999-000000000000-0";
+    let log_file = format!("city=sf/.{log_id}_{crashed_ts}.log.1_0-0-0");
+    let base_file = format!("city=la/{base_id}_0-0-0_{crashed_ts}.parquet");
+    for file in [&log_file, &base_file] {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"partial").unwrap();
+    }
+    let marker_dir = dir.path().join(".hoodie/.temp").join(crashed_ts);
+    std::fs::create_dir_all(&marker_dir).unwrap();
+    std::fs::write(marker_dir.join("MARKERS.type"), b"TIMELINE_SERVER_BASED").unwrap();
+    std::fs::write(
+        marker_dir.join("MARKERS0"),
+        format!("{log_file}.marker.CREATE\n{base_file}.marker.CREATE\n"),
+    )
+    .unwrap();
+
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    assert!(!dir.path().join(&log_file).exists());
+    assert!(!dir.path().join(&base_file).exists());
+    let requested = timeline_names(&timeline)
+        .into_iter()
+        .find(|n| n.ends_with(".rollback.requested"))
+        .expect("rollback plan");
+    let plan =
+        HoodieRollbackPlan::from_avro_bytes(&std::fs::read(timeline.join(&requested)).unwrap())
+            .unwrap();
+    assert_eq!(plan.version, Some(1));
+    let target = plan.instant_to_rollback.as_ref().unwrap();
+    assert_eq!(target.commit_time, crashed_ts);
+    assert_eq!(target.action, "deltacommit");
+    let mut requests = plan.rollback_requests.clone().unwrap();
+    requests.sort_by(|a, b| a.partition_path.cmp(&b.partition_path));
+    assert_eq!(requests.len(), 2, "one request per marker: {requests:?}");
+    for (request, (partition, file_id, file)) in requests.iter().zip([
+        ("city=la", base_id, &base_file),
+        ("city=sf", log_id, &log_file),
+    ]) {
+        assert_eq!(request.partition_path, partition);
+        assert_eq!(request.file_id.as_deref(), Some(file_id));
+        assert_eq!(request.latest_base_instant.as_deref(), Some(crashed_ts));
+        assert_eq!(request.files_to_be_deleted, vec![absolute(&table, file)]);
+        assert_eq!(
+            request.log_blocks_to_be_deleted,
+            Some(Default::default()),
+            "v8 rollback deletes log files; logBlocksToBeDeleted must be an empty map"
+        );
+    }
+
+    let completed = timeline_names(&timeline)
+        .into_iter()
+        .find(|n| n.ends_with(".rollback"))
+        .unwrap();
+    let metadata =
+        HoodieRollbackMetadata::from_avro_bytes(&std::fs::read(timeline.join(completed)).unwrap())
+            .unwrap();
+    assert_eq!(metadata.total_files_deleted, 2);
+    assert_eq!(
+        metadata.partition_metadata["city=sf"].success_delete_files,
+        vec![absolute(&table, &log_file)]
+    );
+}
+
+/// Fabricates the state a crash leaves after the rollback plan of a failed
+/// write is persisted: the failed write (unless `target_unfenced`) plus
+/// `{rollback_ts}.rollback.requested|inflight` carrying a v8 plan.
+fn fabricate_pending_rollback(
+    table: &Table,
+    dir: &Path,
+    crashed_ts: &str,
+    rollback_ts: &str,
+    target_unfenced: bool,
+) -> String {
+    let partial = fabricate_crashed_write(dir, crashed_ts, false);
+    let timeline = dir.join(".hoodie/timeline");
+    if target_unfenced {
+        std::fs::remove_file(timeline.join(format!("{crashed_ts}.commit.requested"))).unwrap();
+        std::fs::remove_file(timeline.join(format!("{crashed_ts}.inflight"))).unwrap();
+    }
+    let relative = format!("city=sf/{partial}");
+    let plan = HoodieRollbackPlan {
+        instant_to_rollback: Some(HoodieInstantInfo {
+            commit_time: crashed_ts.to_string(),
+            action: "commit".to_string(),
+        }),
+        rollback_requests: Some(vec![HoodieRollbackRequest {
+            partition_path: "city=sf".to_string(),
+            file_id: Some(partial.split('_').next().unwrap().to_string()),
+            latest_base_instant: Some(crashed_ts.to_string()),
+            files_to_be_deleted: vec![absolute(table, &relative)],
+            log_blocks_to_be_deleted: Some(Default::default()),
+        }]),
+        version: Some(1),
+    };
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.requested")),
+        plan.to_avro_bytes().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.inflight")),
+        b"",
+    )
+    .unwrap();
+    relative
+}
+
+/// A rollback left pending by a crash is completed by the next write on its
+/// own instant, as Java resumes it, instead of a second rollback being
+/// minted while the first stays pending forever.
+#[tokio::test]
+async fn test_pending_rollback_resumed_by_next_write() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000005";
+    let rollback_ts = "30000101000000006";
+    let partial = fabricate_pending_rollback(&table, dir.path(), crashed_ts, rollback_ts, false);
+
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert_eq!(
+        pending_rollbacks(&timeline),
+        Vec::<String>::new(),
+        "no rollback may stay pending"
+    );
+    let completed = completed_rollbacks(&timeline);
+    assert_eq!(completed.len(), 1, "{completed:?}");
+    assert!(
+        completed[0].starts_with(&format!("{rollback_ts}_")),
+        "the pending rollback instant itself must complete: {completed:?}"
+    );
+    assert!(!dir.path().join(&partial).exists());
+    assert!(!timeline.join(format!("{crashed_ts}.inflight")).exists());
+    assert!(
+        !timeline
+            .join(format!("{crashed_ts}.commit.requested"))
+            .exists()
+    );
+    let rows = table
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+}
+
+/// The failed instant may already be gone when the rollback is resumed (Java
+/// deletes it before completing the rollback); the plan alone drives it.
+#[tokio::test]
+async fn test_pending_rollback_resumed_after_target_unfenced() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000007";
+    let rollback_ts = "30000101000000008";
+    let partial = fabricate_pending_rollback(&table, dir.path(), crashed_ts, rollback_ts, true);
+
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert_eq!(pending_rollbacks(&timeline), Vec::<String>::new());
+    let completed = completed_rollbacks(&timeline);
+    assert_eq!(completed.len(), 1, "{completed:?}");
+    assert!(completed[0].starts_with(&format!("{rollback_ts}_")));
+    assert!(!dir.path().join(&partial).exists());
+}
+
+/// An unreadable plan on a rollback that never reached inflight is discarded
+/// (Java `getPendingRollbackInfos`), and the failed write gets a new rollback.
+#[tokio::test]
+async fn test_unreadable_requested_rollback_plan_is_discarded() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000009";
+    let partial = fabricate_crashed_write(dir.path(), crashed_ts, false);
+    let timeline = dir.path().join(".hoodie/timeline");
+    let rollback_ts = "30000101000000010";
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.requested")),
+        b"not avro",
+    )
+    .unwrap();
+
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    assert!(
+        !timeline
+            .join(format!("{rollback_ts}.rollback.requested"))
+            .exists()
+    );
+    assert_eq!(pending_rollbacks(&timeline), Vec::<String>::new());
+    assert_eq!(completed_rollbacks(&timeline).len(), 1);
+    assert!(!dir.path().join("city=sf").join(&partial).exists());
+}
+
+/// A pending rollback of a compaction belongs to the table service that owns
+/// the compaction; the writer leaves it alone.
+#[tokio::test]
+async fn test_pending_rollback_of_compaction_is_not_resumed() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let timeline = dir.path().join(".hoodie/timeline");
+    let rollback_ts = "30000101000000011";
+    let plan = HoodieRollbackPlan {
+        instant_to_rollback: Some(HoodieInstantInfo {
+            commit_time: "30000101000000012".to_string(),
+            action: "compaction".to_string(),
+        }),
+        rollback_requests: Some(Vec::new()),
+        version: Some(1),
+    };
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.requested")),
+        plan.to_avro_bytes().unwrap(),
+    )
+    .unwrap();
+
+    table.append([batch(vec![("b", "sf", 2)])]).await.unwrap();
+
+    assert_eq!(pending_rollbacks(&timeline), vec![rollback_ts.to_string()]);
+    assert!(completed_rollbacks(&timeline).is_empty());
 }

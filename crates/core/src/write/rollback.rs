@@ -19,14 +19,17 @@
 //! Eager marker-based rollback of failed writes (Java `EAGER` cleaning policy).
 //!
 //! At write start, any pending data instant (fenced but never completed) is
-//! rolled back: its marker-listed base/log files are deleted (tv8+ rollback is
-//! deletion-only), its completed-but-orphaned MDT deltacommit and MDT log
-//! files are removed, a `rollback` instant records the operation, and the
-//! failed instant's fencing files and marker dir are cleaned up.
+//! rolled back: a `rollback` plan listing its marker-listed base/log files is
+//! persisted, those files are deleted (tv8+ rollback is deletion-only), its
+//! completed-but-orphaned MDT deltacommit and MDT log files are removed, the
+//! rollback completes, and the failed instant's fencing files and marker dir
+//! are cleaned up. A rollback interrupted after its plan was persisted is
+//! resumed from that plan.
 
 use std::collections::HashMap;
 
 use crate::Result;
+use crate::error::CoreError;
 use crate::metadata::rollback::{
     HoodieInstantInfo, HoodieRollbackMetadata, HoodieRollbackPartitionMetadata, HoodieRollbackPlan,
     HoodieRollbackRequest,
@@ -47,18 +50,99 @@ struct PendingInstant {
     fencing_files: Vec<String>,
 }
 
+/// A rollback whose plan was persisted but which never completed.
+struct PendingRollback {
+    timestamp: String,
+    plan: HoodieRollbackPlan,
+    inflight: bool,
+}
+
 /// Roll back all pending data instants (Java `rollbackFailedWrites`, EAGER).
 ///
 /// Single-writer: any pending instant belongs to a crashed previous write.
-/// Rollback instants themselves and MDT-internal instants are never targets.
+/// A rollback left pending by a crash is resumed on its own instant and plan
+/// (Java `getPendingRollbackInfos`), whether or not its target is still
+/// pending; MDT-internal instants are never targets.
 pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
     let storage = table.file_system_view.storage.clone();
     let timeline = timeline_dir(table);
-    let pending = find_pending_instants(storage.as_ref(), &timeline).await?;
-    for instant in pending {
-        rollback_instant(table, storage.as_ref(), &timeline, &instant).await?;
+    let (pending, pending_rollbacks) = find_pending_instants(storage.as_ref(), &timeline).await?;
+    let mut resumable = HashMap::new();
+    for rollback in pending_rollbacks {
+        let Some(rollback) = load_pending_rollback(storage.as_ref(), &timeline, rollback).await?
+        else {
+            continue;
+        };
+        let Some(target) = rollback.plan.instant_to_rollback.clone() else {
+            continue;
+        };
+        // Rollbacks of table-service instants belong to that service.
+        if !matches!(
+            target.action.as_str(),
+            "commit" | "deltacommit" | "replacecommit"
+        ) {
+            continue;
+        }
+        resumable.entry(target.commit_time).or_insert(rollback);
+    }
+    let mut targets: Vec<(String, Option<PendingInstant>)> = pending
+        .into_iter()
+        .map(|instant| (instant.timestamp.clone(), Some(instant)))
+        .collect();
+    targets.extend(
+        resumable
+            .keys()
+            .filter(|ts| !targets.iter().any(|(t, _)| t == *ts))
+            .map(|ts| (ts.clone(), None))
+            .collect::<Vec<_>>(),
+    );
+    targets.sort_by(|a, b| a.0.cmp(&b.0));
+    for (failed_ts, instant) in targets {
+        let rollback = resumable.remove(&failed_ts);
+        rollback_instant(
+            table,
+            storage.as_ref(),
+            &timeline,
+            &failed_ts,
+            instant.as_ref(),
+            rollback,
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// Reads a pending rollback's plan. An unreadable plan on a rollback that
+/// never reached inflight is deleted (nothing ran yet); one that did is
+/// skipped, as Java does.
+async fn load_pending_rollback(
+    storage: &Storage,
+    timeline_dir: &str,
+    rollback: PendingInstant,
+) -> Result<Option<PendingRollback>> {
+    let requested = format!("{}.rollback.requested", rollback.timestamp);
+    let inflight = rollback
+        .fencing_files
+        .iter()
+        .any(|n| n.ends_with(".inflight"));
+    let bytes = storage
+        .get_file_data(&format!("{timeline_dir}/{requested}"))
+        .await?;
+    match HoodieRollbackPlan::from_avro_bytes(&bytes) {
+        Ok(plan) => Ok(Some(PendingRollback {
+            timestamp: rollback.timestamp,
+            plan,
+            inflight,
+        })),
+        Err(_) => {
+            if !inflight {
+                storage
+                    .delete_file(&format!("{timeline_dir}/{requested}"))
+                    .await?;
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// The action infix of a fencing file name: `{ts}.{action}.requested|inflight`
@@ -78,15 +162,16 @@ pub(crate) fn action_from_fencing_name(name: &str, timestamp: &str) -> String {
     }
 }
 
+/// Pending data instants to roll back, and pending rollback instants.
 async fn find_pending_instants(
     storage: &Storage,
     timeline_dir: &str,
-) -> Result<Vec<PendingInstant>> {
+) -> Result<(Vec<PendingInstant>, Vec<PendingInstant>)> {
     let files = match storage.list_files(Some(timeline_dir)).await {
         Ok(files) => files,
         Err(crate::storage::error::StorageError::ObjectStoreError(
             object_store::Error::NotFound { .. },
-        )) => return Ok(Vec::new()),
+        )) => return Ok((Vec::new(), Vec::new())),
         Err(error) => return Err(error.into()),
     };
     let mut completed = std::collections::HashSet::new();
@@ -114,17 +199,13 @@ async fn find_pending_instants(
             completed.insert(timestamp);
         }
     }
-    let mut pending: Vec<PendingInstant> = fenced
-        .into_iter()
-        .filter(|(ts, _)| !completed.contains(ts))
-        // Rollback/compaction-style instants are never rolled back here.
-        .filter(|(_, (action, _))| {
-            matches!(
-                action.as_str(),
-                "commit" | "deltacommit" | "replacecommit" | ""
-            )
-        })
-        .map(|(timestamp, (action, fencing_files))| PendingInstant {
+    let mut pending = Vec::new();
+    let mut rollbacks = Vec::new();
+    for (timestamp, (action, fencing_files)) in fenced {
+        if completed.contains(&timestamp) {
+            continue;
+        }
+        let instant = PendingInstant {
             timestamp,
             action: if action.is_empty() {
                 "commit".to_string()
@@ -132,94 +213,177 @@ async fn find_pending_instants(
                 action
             },
             fencing_files,
-        })
-        .collect();
+        };
+        match instant.action.as_str() {
+            "commit" | "deltacommit" | "replacecommit" => pending.push(instant),
+            "rollback" => rollbacks.push(instant),
+            // Compaction-style instants are never rolled back here.
+            _ => {}
+        }
+    }
     pending.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    Ok(pending)
+    rollbacks.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    Ok((pending, rollbacks))
+}
+
+/// Java `MarkerBasedRollbackStrategy` at table version 8+: one request per
+/// marker, deleting the file whether base or log, by absolute path.
+async fn rollback_requests_from_markers(
+    table: &Table,
+    storage: &Storage,
+    failed_ts: &str,
+) -> Result<Vec<HoodieRollbackRequest>> {
+    // Markers tell us exactly what the failed write intended to put. A crash
+    // before markers means no data or MDT files were written (markers are
+    // written first), so an empty list still produces a valid rollback.
+    let markers = read_markers(storage, failed_ts).await?;
+    let base = table.base_url();
+    let base = base.as_str().trim_end_matches('/');
+    let mut requests = Vec::new();
+    for marker in &markers {
+        let Some((file_path, _io_type)) = parse_marker_name(marker) else {
+            continue;
+        };
+        let (partition, file_name) = match file_path.rsplit_once('/') {
+            Some((partition, name)) => (partition, name),
+            None => ("", file_path.as_str()),
+        };
+        let file_id = file_name
+            .trim_start_matches('.')
+            .split('_')
+            .next()
+            .unwrap_or_default();
+        requests.push(HoodieRollbackRequest {
+            partition_path: partition.to_string(),
+            file_id: Some(file_id.to_string()),
+            latest_base_instant: Some(failed_ts.to_string()),
+            files_to_be_deleted: vec![format!("{base}/{file_path}")],
+            log_blocks_to_be_deleted: Some(HashMap::new()),
+        });
+    }
+    Ok(requests)
+}
+
+/// The table-relative form of a path in a rollback plan, matched on the URL
+/// path so the scheme a plan's writer used does not matter (Java
+/// `FSUtils.getRelativePartitionPath`).
+fn relative_to_base(base: &url::Url, path: &str) -> Result<String> {
+    if let Some(relative) = path
+        .strip_prefix(base.as_str().trim_end_matches('/'))
+        .and_then(|rest| rest.strip_prefix('/'))
+    {
+        return Ok(relative.to_string());
+    }
+    let path_part = match url::Url::parse(path) {
+        Ok(url) => url.path().to_string(),
+        Err(_) if !path.starts_with('/') => return Ok(path.to_string()),
+        Err(_) => path.to_string(),
+    };
+    path_part
+        .strip_prefix(base.path().trim_end_matches('/'))
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+        .ok_or_else(|| {
+            CoreError::Unsupported(format!(
+                "rollback plan path {path} is not under the table base path {base}"
+            ))
+        })
 }
 
 async fn rollback_instant(
     table: &Table,
     storage: &Storage,
     timeline_dir: &str,
-    pending: &PendingInstant,
+    failed_ts: &str,
+    pending: Option<&PendingInstant>,
+    resumed: Option<PendingRollback>,
 ) -> Result<()> {
     let start_time = std::time::Instant::now();
-    let failed_ts = &pending.timestamp;
 
-    // Markers tell us exactly what the failed write intended to put. A crash
-    // before markers means no data or MDT files were written (markers are
-    // written first), so an empty list still produces a valid rollback.
-    let markers = read_markers(storage, failed_ts).await?;
-    let mut requests_by_partition: HashMap<String, HoodieRollbackRequest> = HashMap::new();
+    // Persist the plan before deleting anything, so a rollback interrupted
+    // midway is resumed from the same plan and instant.
+    let (rollback_ts, plan) = match resumed {
+        Some(rollback) => {
+            if !rollback.inflight {
+                storage
+                    .put_file_if_absent(
+                        &format!("{timeline_dir}/{}.rollback.inflight", rollback.timestamp),
+                        Vec::new(),
+                    )
+                    .await?;
+            }
+            (rollback.timestamp, rollback.plan)
+        }
+        None => {
+            let action = pending.map_or("commit", |p| p.action.as_str());
+            let plan = HoodieRollbackPlan {
+                instant_to_rollback: Some(HoodieInstantInfo {
+                    commit_time: failed_ts.to_string(),
+                    action: action.to_string(),
+                }),
+                rollback_requests: Some(
+                    rollback_requests_from_markers(table, storage, failed_ts).await?,
+                ),
+                version: Some(1),
+            };
+            let rollback_ts = generate_instant_time().await;
+            storage
+                .put_file_if_absent(
+                    &format!("{timeline_dir}/{rollback_ts}.rollback.requested"),
+                    plan.to_avro_bytes()?,
+                )
+                .await?;
+            storage
+                .put_file_if_absent(
+                    &format!("{timeline_dir}/{rollback_ts}.rollback.inflight"),
+                    Vec::new(),
+                )
+                .await?;
+            (rollback_ts, plan)
+        }
+    };
+    let target = plan
+        .instant_to_rollback
+        .clone()
+        .unwrap_or(HoodieInstantInfo {
+            commit_time: failed_ts.to_string(),
+            action: "commit".to_string(),
+        });
+
+    let base = table.base_url();
     let mut partition_meta: HashMap<String, HoodieRollbackPartitionMetadata> = HashMap::new();
     let mut total_deleted = 0i32;
-    for marker in &markers {
-        let Some((file_path, _io_type)) = parse_marker_name(marker) else {
-            continue;
-        };
-        let (partition, file_name) = match file_path.rsplit_once('/') {
-            Some((partition, name)) => (partition.to_string(), name.to_string()),
-            None => (String::new(), file_path.clone()),
-        };
-        let is_log_file = file_name.starts_with('.') && file_name.contains(".log.");
-        let request = requests_by_partition
-            .entry(partition.clone())
-            .or_insert_with(|| HoodieRollbackRequest {
-                partition_path: partition.clone(),
-                file_id: None,
-                latest_base_instant: None,
-                files_to_be_deleted: Vec::new(),
-                log_blocks_to_be_deleted: None,
-            });
-        if is_log_file {
-            request
-                .log_blocks_to_be_deleted
-                .get_or_insert_with(HashMap::new)
-                .insert(file_path.clone(), 1);
-        } else {
-            request.files_to_be_deleted.push(file_path.clone());
-        }
-        // A surviving file must fail the rollback (Java `RollbackHelper.deleteFiles`):
-        // completing it unfences the instant, and once archival passes the
-        // instant the file reads as committed.
-        if let Err(error) = storage.delete_file(&file_path).await
-            && storage.exists(&file_path).await.unwrap_or(true)
+    for request in plan.rollback_requests.iter().flatten() {
+        if request
+            .log_blocks_to_be_deleted
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
         {
-            return Err(error.into());
+            return Err(CoreError::Unsupported(format!(
+                "rollback {rollback_ts} appends rollback blocks to log files, which table \
+                 version 8+ does not use"
+            )));
         }
-        let meta = partition_meta.entry(partition.clone()).or_insert_with(|| {
-            HoodieRollbackPartitionMetadata {
-                partition_path: partition.clone(),
-                ..Default::default()
+        for file in &request.files_to_be_deleted {
+            let relative = relative_to_base(&base, file)?;
+            // A surviving file must fail the rollback (Java `RollbackHelper.deleteFiles`):
+            // completing it unfences the instant, and once archival passes the
+            // instant the file reads as committed.
+            if let Err(error) = storage.delete_file(&relative).await
+                && storage.exists(&relative).await.unwrap_or(true)
+            {
+                return Err(error.into());
             }
-        });
-        total_deleted += 1;
-        meta.success_delete_files.push(file_path);
+            let meta = partition_meta
+                .entry(request.partition_path.clone())
+                .or_insert_with(|| HoodieRollbackPartitionMetadata {
+                    partition_path: request.partition_path.clone(),
+                    ..Default::default()
+                });
+            total_deleted += 1;
+            meta.success_delete_files.push(file.clone());
+        }
     }
-
-    // Rollback plan + lifecycle on its own (new) instant.
-    let rollback_ts = generate_instant_time().await;
-    let plan = HoodieRollbackPlan {
-        instant_to_rollback: Some(HoodieInstantInfo {
-            commit_time: failed_ts.clone(),
-            action: pending.action.clone(),
-        }),
-        rollback_requests: Some(requests_by_partition.into_values().collect()),
-        version: Some(1),
-    };
-    storage
-        .put_file_if_absent(
-            &format!("{timeline_dir}/{rollback_ts}.rollback.requested"),
-            plan.to_avro_bytes()?,
-        )
-        .await?;
-    storage
-        .put_file_if_absent(
-            &format!("{timeline_dir}/{rollback_ts}.rollback.inflight"),
-            Vec::new(),
-        )
-        .await?;
 
     // Remove the orphan MDT deltacommit (and its log blocks) if the crashed
     // write got as far as committing the MDT. Required: once the failed
@@ -233,13 +397,10 @@ async fn rollback_instant(
         start_rollback_time: rollback_ts.clone(),
         time_taken_in_millis: start_time.elapsed().as_millis() as i64,
         total_files_deleted: total_deleted,
-        commits_rollback: vec![failed_ts.clone()],
+        commits_rollback: vec![failed_ts.to_string()],
         partition_metadata: partition_meta,
         version: Some(1),
-        instants_rollback: vec![HoodieInstantInfo {
-            commit_time: failed_ts.clone(),
-            action: pending.action.clone(),
-        }],
+        instants_rollback: vec![target],
     };
     let completion = if is_layout_two(table) {
         generate_instant_time().await
@@ -254,16 +415,13 @@ async fn rollback_instant(
         .await?;
 
     // Java order: inflight first, then requested, then the marker dir.
-    for fencing in pending
-        .fencing_files
+    let fencing_files = pending
+        .map(|p| p.fencing_files.as_slice())
+        .unwrap_or_default();
+    for fencing in fencing_files
         .iter()
         .filter(|n| n.ends_with(".inflight"))
-        .chain(
-            pending
-                .fencing_files
-                .iter()
-                .filter(|n| n.ends_with(".requested")),
-        )
+        .chain(fencing_files.iter().filter(|n| n.ends_with(".requested")))
     {
         let _ = storage
             .delete_file(&format!("{timeline_dir}/{fencing}"))
@@ -331,7 +489,29 @@ async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::action_from_fencing_name;
+    use super::{action_from_fencing_name, relative_to_base};
+
+    /// Plan paths written by either engine resolve to the same table-relative
+    /// path, whatever scheme spelling the writer used.
+    #[test]
+    fn test_relative_to_base_accepts_any_scheme_spelling() {
+        let base = url::Url::parse("file:///tmp/t/").unwrap();
+        for path in [
+            "file:///tmp/t/city=sf/f.parquet",
+            "file:/tmp/t/city=sf/f.parquet",
+            "/tmp/t/city=sf/f.parquet",
+            "city=sf/f.parquet",
+        ] {
+            assert_eq!(relative_to_base(&base, path).unwrap(), "city=sf/f.parquet");
+        }
+        let s3 = url::Url::parse("s3://bucket/t").unwrap();
+        assert_eq!(
+            relative_to_base(&s3, "s3a://bucket/t/f.parquet").unwrap(),
+            "f.parquet"
+        );
+        assert!(relative_to_base(&base, "file:///tmp/other/f.parquet").is_err());
+        assert!(relative_to_base(&base, "file:///tmp/t2/f.parquet").is_err());
+    }
 
     /// Regression: on ext4 the bare COW inflight can be listed before the
     /// action-bearing requested file; "inflight" must never leak out as an

@@ -139,7 +139,10 @@ deltacommit source already admits it.
 - Failed writes are rolled back **eagerly** on the next table load for write:
   markers identify files to delete, orphan MDT deltacommits are removed, and a
   rollback plan + metadata (Avro OCF) are written like the Java writer's
-  rollback action.
+  rollback action. The plan takes Java's table-version-8 marker-based shape
+  (one request per file, absolute paths) and is persisted before any delete;
+  a delete that leaves its file behind fails the rollback, and a pending
+  rollback is resumed on its own instant by the next write.
 
 ### 3.5 LSM timeline archival
 
