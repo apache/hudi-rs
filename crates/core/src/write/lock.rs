@@ -27,6 +27,12 @@
 //!
 //! Only [`InProcessLockProvider`] exists today (Java's single-writer default);
 //! the trait is the seam for external providers (DynamoDB, ZK, ...) later.
+//!
+//! A table supports one writer handle at a time, in this process or any
+//! other. The lock serializes instant minting and completion only: there is
+//! no conflict detection at commit, and eager rollback treats every pending
+//! write instant as failed, so a second concurrent writer handle can roll back
+//! a write that is still running.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

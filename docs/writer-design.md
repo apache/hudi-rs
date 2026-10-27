@@ -103,6 +103,13 @@ registry). Two short critical sections per write:
 
 The data-writing work between the two sections runs outside any lock.
 
+A table supports one writer handle at a time, including across `Table`
+handles in the same process. The lock does not make concurrent writers safe:
+planning reads a snapshot taken before the request section, nothing detects
+conflicts at completion, and eager rollback (§3.4) treats every pending write
+instant as failed, so a second writer can roll back a write that is still
+running.
+
 ### 3.3 Ordering and fencing
 
 Writes are ordered so that readers can always fence correctly:
