@@ -25,6 +25,7 @@ use std::sync::Arc;
 use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::table::TableTypeValue;
+use hudi_core::error::CoreError;
 use hudi_core::metadata::rollback::{
     HoodieInstantInfo, HoodieRollbackMetadata, HoodieRollbackPlan, HoodieRollbackRequest,
 };
@@ -724,6 +725,57 @@ async fn test_inflight_rollback_without_readable_plan_is_skipped() {
         assert_eq!(completed_rollbacks(&timeline).len(), 1, "{plan:?}");
         assert!(!dir.path().join("city=sf").join(&partial).exists());
     }
+}
+
+/// Java reverts a completed target to inflight before deleting its files,
+/// which this writer does not do; resuming such a rollback here would delete
+/// committed files under a commit that stays published.
+#[tokio::test]
+async fn test_pending_rollback_of_completed_instant_is_refused() {
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    let committed = table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+    let data_file = std::fs::read_dir(dir.path().join("city=sf"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .find(|name| name.ends_with(".parquet"))
+        .unwrap();
+    let relative = format!("city=sf/{data_file}");
+
+    let timeline = dir.path().join(".hoodie/timeline");
+    let rollback_ts = "30000101000000017";
+    let plan = HoodieRollbackPlan {
+        instant_to_rollback: Some(HoodieInstantInfo {
+            commit_time: committed.instant.clone(),
+            action: "commit".to_string(),
+        }),
+        rollback_requests: Some(vec![HoodieRollbackRequest {
+            partition_path: "city=sf".to_string(),
+            file_id: Some(data_file.split('_').next().unwrap().to_string()),
+            latest_base_instant: Some(committed.instant.clone()),
+            files_to_be_deleted: vec![absolute(&table, &relative)],
+            log_blocks_to_be_deleted: Some(Default::default()),
+        }]),
+        version: Some(1),
+    };
+    std::fs::write(
+        timeline.join(format!("{rollback_ts}.rollback.requested")),
+        plan.to_avro_bytes().unwrap(),
+    )
+    .unwrap();
+
+    let result = table.append([batch(vec![("b", "sf", 2)])]).await;
+    assert!(
+        dir.path().join(&relative).exists(),
+        "committed data file must survive"
+    );
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Unsupported(msg)
+            if msg.contains(rollback_ts) && msg.contains(&committed.instant)),
+        "{err}"
+    );
+    assert_eq!(pending_rollbacks(&timeline), vec![rollback_ts.to_string()]);
 }
 
 /// A pending rollback of a compaction belongs to the table service that owns

@@ -61,12 +61,13 @@ struct PendingRollback {
 ///
 /// Single-writer: any pending instant belongs to a crashed previous write.
 /// A rollback left pending by a crash is resumed on its own instant and plan
-/// (Java `getPendingRollbackInfos`), whether or not its target is still
-/// pending; MDT-internal instants are never targets.
+/// (Java `getPendingRollbackInfos`), whether its target is still pending or
+/// already gone; MDT-internal instants are never targets.
 pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
     let storage = table.file_system_view.storage.clone();
     let timeline = timeline_dir(table);
-    let (pending, pending_rollbacks) = find_pending_instants(storage.as_ref(), &timeline).await?;
+    let (pending, pending_rollbacks, completed) =
+        find_pending_instants(storage.as_ref(), &timeline).await?;
     let mut resumable = HashMap::new();
     for rollback in pending_rollbacks {
         let Some(rollback) = load_pending_rollback(storage.as_ref(), &timeline, rollback).await?
@@ -82,6 +83,15 @@ pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
             "commit" | "deltacommit" | "replacecommit"
         ) {
             continue;
+        }
+        // Java reverts a completed target to inflight before deleting its
+        // files; deleting them under a published commit would corrupt it.
+        if completed.contains(&target.commit_time) {
+            return Err(CoreError::Unsupported(format!(
+                "pending rollback {} targets completed instant {}; complete the rollback \
+                 with the engine that scheduled it",
+                rollback.timestamp, target.commit_time
+            )));
         }
         resumable.entry(target.commit_time).or_insert(rollback);
     }
@@ -166,16 +176,21 @@ pub(crate) fn action_from_fencing_name(name: &str, timestamp: &str) -> String {
     }
 }
 
-/// Pending data instants to roll back, and pending rollback instants.
+/// Pending data instants to roll back, pending rollback instants, and the
+/// timestamps of completed instants.
 async fn find_pending_instants(
     storage: &Storage,
     timeline_dir: &str,
-) -> Result<(Vec<PendingInstant>, Vec<PendingInstant>)> {
+) -> Result<(
+    Vec<PendingInstant>,
+    Vec<PendingInstant>,
+    std::collections::HashSet<String>,
+)> {
     let files = match storage.list_files(Some(timeline_dir)).await {
         Ok(files) => files,
         Err(crate::storage::error::StorageError::ObjectStoreError(
             object_store::Error::NotFound { .. },
-        )) => return Ok((Vec::new(), Vec::new())),
+        )) => return Ok(Default::default()),
         Err(error) => return Err(error.into()),
     };
     let mut completed = std::collections::HashSet::new();
@@ -227,7 +242,7 @@ async fn find_pending_instants(
     }
     pending.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     rollbacks.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    Ok((pending, rollbacks))
+    Ok((pending, rollbacks, completed))
 }
 
 /// Java `MarkerBasedRollbackStrategy` at table version 8+: one request per
