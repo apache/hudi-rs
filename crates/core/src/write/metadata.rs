@@ -947,10 +947,13 @@ async fn compute_partition_stats_records(
 /// is live) and log files ordered by version/completion, not lexicographically.
 ///
 /// Returns `(file id, base hfile relative path, ordered log relative paths)`.
+/// The base is `None` for a log-only file group: Spark initializes
+/// column_stats and partition_stats that way, and every log of such a group
+/// is live.
 pub(crate) async fn mdt_partition_latest_slices(
     storage: &Storage,
     partition: &str,
-) -> Result<Vec<(String, String, Vec<String>)>> {
+) -> Result<Vec<(String, Option<String>, Vec<String>)>> {
     use std::str::FromStr;
     let dir = format!("{METADATA_BASE}/{partition}");
     let listed = match storage.list_files(Some(&dir)).await {
@@ -1038,19 +1041,17 @@ pub(crate) async fn mdt_partition_latest_slices(
             })
             .add_base_file(base)?;
     }
+    let mut log_only: BTreeMap<String, Vec<crate::file_group::log_file::LogFile>> = BTreeMap::new();
     for log in logs {
-        // Skip log-only groups: an MDT file group is unreadable without its
-        // bootstrap HFile base, and slice association needs a base slice.
-        let Some(group) = groups.get_mut(&log.file_id) else {
-            continue;
-        };
-        group.add_log_file(log)?;
+        match groups.get_mut(&log.file_id) {
+            Some(group) => {
+                group.add_log_file(log)?;
+            }
+            None => log_only.entry(log.file_id.clone()).or_default().push(log),
+        }
     }
     let mut out = Vec::new();
-    let mut ids: Vec<_> = groups.keys().cloned().collect();
-    ids.sort();
-    for id in ids {
-        let group = &groups[&id];
+    for (id, group) in &groups {
         let Some(slice) = group.get_file_slice_as_of("99999999999999999") else {
             continue;
         };
@@ -1063,8 +1064,17 @@ pub(crate) async fn mdt_partition_latest_slices(
             .iter()
             .map(|log| format!("{dir}/{}", log.file_name()))
             .collect();
-        out.push((id, base_path, logs));
+        out.push((id.clone(), Some(base_path), logs));
     }
+    for (id, mut logs) in log_only {
+        logs.sort();
+        let logs = logs
+            .iter()
+            .map(|log| format!("{dir}/{}", log.file_name()))
+            .collect();
+        out.push((id, None, logs));
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
     Ok(out)
 }
 
@@ -1081,7 +1091,7 @@ pub(crate) async fn load_column_stats_records(
     let mut base_paths = Vec::new();
     let mut log_paths = Vec::new();
     for (_, base, logs) in mdt_partition_latest_slices(storage.as_ref(), partition).await? {
-        base_paths.push(base);
+        base_paths.extend(base);
         log_paths.extend(logs);
     }
 
@@ -1326,7 +1336,7 @@ mod tests {
     async fn slices_for_with_timeline(
         files: &[&str],
         committed: &[&str],
-    ) -> Result<Vec<(String, String, Vec<String>)>> {
+    ) -> Result<Vec<(String, Option<String>, Vec<String>)>> {
         let dir = tempfile::tempdir().unwrap();
         let partition_dir = dir.path().join(".hoodie/metadata/column_stats");
         std::fs::create_dir_all(&partition_dir).unwrap();
@@ -1347,7 +1357,7 @@ mod tests {
         mdt_partition_latest_slices(storage.as_ref(), "column_stats").await
     }
 
-    async fn slices_for(files: &[&str]) -> Result<Vec<(String, String, Vec<String>)>> {
+    async fn slices_for(files: &[&str]) -> Result<Vec<(String, Option<String>, Vec<String>)>> {
         // All referenced instants committed.
         slices_for_with_timeline(
             files,
@@ -1378,7 +1388,11 @@ mod tests {
         assert_eq!(slices.len(), 1);
         let (file_id, base, logs) = &slices[0];
         assert_eq!(file_id, "col-stats-0000-0");
-        assert!(base.ends_with("col-stats-0000-0_0-1-0_00000000000000030.hfile"));
+        assert!(
+            base.as_ref()
+                .unwrap()
+                .ends_with("col-stats-0000-0_0-1-0_00000000000000030.hfile")
+        );
         assert_eq!(logs.len(), 1);
         assert!(logs[0].ends_with(".col-stats-0000-0_00000000000000040.log.1_0-0-0"));
     }
@@ -1519,19 +1533,33 @@ mod tests {
         assert_eq!(slices.len(), 1);
         let (_, base, logs) = &slices[0];
         assert!(
-            base.ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile"),
-            "committed base must stay active, got {base}"
+            base.as_ref()
+                .unwrap()
+                .ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile"),
+            "committed base must stay active, got {base:?}"
         );
         assert_eq!(logs.len(), 1);
     }
 
     #[tokio::test]
-    async fn test_mdt_latest_slice_skips_log_only_group_and_missing_partition() {
-        // A group with logs but no HFile base is unreadable and skipped.
-        let slices = slices_for(&[".col-stats-0000-0_00000000000000020.log.1_0-0-0"])
-            .await
-            .unwrap();
-        assert!(slices.is_empty());
+    async fn test_mdt_latest_slice_log_only_group_and_missing_partition() {
+        // Spark lays out column_stats as log-only file groups: every log of
+        // such a group is live, in log order.
+        let slices = slices_for(&[
+            ".col-stats-0000-0_00000000000000020.log.1_0-0-0",
+            ".col-stats-0000-0_00000000000000001.log.1_0-0-0",
+            ".col-stats-0001-0_00000000000000001.log.1_0-0-0",
+        ])
+        .await
+        .unwrap();
+        assert_eq!(slices.len(), 2);
+        let (file_id, base, logs) = &slices[0];
+        assert_eq!(file_id, "col-stats-0000-0");
+        assert!(base.is_none());
+        assert_eq!(logs.len(), 2);
+        assert!(logs[0].ends_with(".col-stats-0000-0_00000000000000001.log.1_0-0-0"));
+        assert!(logs[1].ends_with(".col-stats-0000-0_00000000000000020.log.1_0-0-0"));
+        assert_eq!(slices[1].0, "col-stats-0001-0");
 
         // Missing partition directory is an empty result, not an error.
         let dir = tempfile::tempdir().unwrap();

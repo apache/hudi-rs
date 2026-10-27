@@ -88,7 +88,7 @@ async fn load_record_index_map(
     for (_, base, logs) in
         crate::write::metadata::mdt_partition_latest_slices(storage.as_ref(), partition).await?
     {
-        base_paths.push(base);
+        base_paths.extend(base);
         log_paths.extend(logs);
     }
 

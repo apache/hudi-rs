@@ -659,3 +659,43 @@ async fn test_partition_stats_local_timestamp_merge_keeps_min_le_max() {
         assert!(sf_ts.is_tight_bound, "tv{version}");
     }
 }
+
+/// Spark lays out column_stats as log-only MDT file groups (no HFile base).
+/// The partition_stats recompute must still read the survivors' stats from
+/// those logs, or the tight bound it writes drops every earlier file.
+#[tokio::test]
+async fn test_partition_stats_recompute_reads_log_only_column_stats_groups() {
+    for version in [8, 9] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_version(version)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([batch(vec![("a", "sf", 1), ("b", "sf", 3)])])
+            .await
+            .unwrap();
+        let (bases, logs) = list_mdt_partition_files(dir.path(), "column_stats");
+        assert!(!logs.is_empty(), "tv{version}: survivors live in logs");
+        for base in bases {
+            std::fs::remove_file(dir.path().join(base)).unwrap();
+        }
+        table.append([batch(vec![("c", "sf", 10)])]).await.unwrap();
+
+        let part_stats = read_stats_records(&table, dir.path(), "partition_stats").await;
+        let sf_value = part_stats
+            .get(&partition_stats_index_key("city=sf", "value"))
+            .expect("partition stats for value");
+        assert_eq!(
+            (sf_value.min_value.clone(), sf_value.max_value.clone()),
+            (long_stat(1), long_stat(10)),
+            "tv{version}"
+        );
+        assert_eq!(sf_value.value_count, 3, "tv{version}");
+        assert!(sf_value.is_tight_bound, "tv{version}");
+    }
+}
