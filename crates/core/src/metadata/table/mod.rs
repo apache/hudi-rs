@@ -537,7 +537,6 @@ impl Table {
         let data_pending = self.timeline.all_pending_instant_times().await?;
 
         let mut valid: HashSet<String> = self.valid_from_completed_data_instants();
-        valid.extend(self.archived_data_instants().await?);
         valid.extend(self.valid_from_mdt_delta_commits(mdt, &data_pending));
         valid.extend(Self::valid_from_sentinel_commits(mdt));
 
@@ -592,25 +591,13 @@ impl Table {
             .collect()
     }
 
-    /// Source 1b — data instants already archived off the active timeline.
-    ///
-    /// Java has no such source: its archiver refuses to pass the metadata
-    /// table's latest compaction, so by the time a data instant is archived its
-    /// metadata log blocks have been compacted into a base file, which needs no
-    /// instant fencing. This writer does not compact the metadata table, so
-    /// those blocks stay live in log files and would be fenced out the moment
-    /// their instant left the active timeline — every file that commit added
-    /// would vanish from listings.
-    async fn archived_data_instants(&self) -> Result<HashSet<String>> {
-        crate::write::archival::archived_instant_times(
-            &self.file_system_view.storage,
-            &crate::write::append::timeline_dir(self),
-        )
-        .await
-    }
-
     /// Source 2 — completed metadata delta commits with no *pending* data
     /// instant of the same name.
+    ///
+    /// This source is also what keeps a data instant archived off the data
+    /// timeline readable: an archived instant is never pending, and the
+    /// metadata table keeps its delta commits active until compaction folds
+    /// their log blocks into base files.
     ///
     /// An indexing delta commit has no data instant at all and is valid. One
     /// whose data instant is still pending is the case where the data write

@@ -124,11 +124,11 @@ deltacommit is trusted unless its data instant is *pending* on the data
 timeline, plus the MDT bootstrap prefix and rolled-back instants. Because the
 writer fences the data instant before touching the MDT, a crash between the
 MDT deltacommit and the data commit leaves a pending data instant, and that MDT
-commit stays invisible until rollback removes it. The writer adds one source
-Java does not need: data instants already archived off the active timeline.
-Java's archiver never passes the MDT's latest compaction, so an archived
-instant's MDT blocks are always in a base file; this writer does not compact
-the MDT, so those blocks stay in log files and must remain readable.
+commit stays invisible until rollback removes it. The valid set has the same
+sources as Java's and never reads the archived timeline: an archived data
+instant is never pending, and the MDT keeps its deltacommit active until MDT
+compaction folds the instant's log blocks into a base file, so the MDT
+deltacommit source already admits it.
 
 ### 3.4 Markers and rollback
 
@@ -147,11 +147,13 @@ After each completed action (inside the second critical section), the data
 timeline is archived when completed commits exceed `hoodie.keep.max.commits`
 (default 30), retaining `hoodie.keep.min.commits` (default 20): the oldest
 instants move into `.hoodie/timeline/history/` as `HoodieLSMTimelineInstant`
-parquet files tracked by `manifest_N` + `_version_` files. Readers union
-archived instants back in wherever instant validity matters (snapshot
-visibility floor, MDT fencing). The MDT's own timeline is *not* archived —
-like the Java writer, MDT archival is bounded by MDT compaction, which is not
-implemented natively.
+parquet files tracked by `manifest_N` + `_version_` files. Reads never open
+the history: an instant below the earliest active instant counts as committed
+(Java's `isBeforeTimelineStarts`), since archival only moves completed
+instants, and the same rule admits MDT base files whose instant the MDT
+timeline has archived. The MDT's own timeline is *not* archived: like the Java
+writer, MDT archival is bounded by MDT compaction, which is not implemented
+natively.
 
 ## 4. Writing data
 

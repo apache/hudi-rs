@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, BinaryArray, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 
@@ -408,46 +408,6 @@ fn write_lsm_parquet(
     writer
         .close()
         .map_err(|e| CoreError::Timeline(format!("close LSM parquet: {e}")))?;
-    Ok(out)
-}
-
-/// Requested times of all archived instants (for MDT valid-instants fencing:
-/// archived instants are completed instants whose active-timeline files are
-/// gone). Empty when no history exists.
-pub(crate) async fn archived_instant_times(
-    storage: &Storage,
-    timeline_dir: &str,
-) -> Result<std::collections::HashSet<String>> {
-    let history_dir = format!("{timeline_dir}/history");
-    let (version, manifest) = read_manifest(storage, &history_dir).await?;
-    let mut out = std::collections::HashSet::new();
-    if version == 0 {
-        return Ok(out);
-    }
-    for entry in &manifest.files {
-        let bytes = storage
-            .get_file_data(&format!("{history_dir}/{}", entry.file_name))
-            .await?;
-        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-            bytes::Bytes::from(bytes.to_vec()),
-        )
-        .map_err(|e| CoreError::Timeline(format!("open LSM parquet: {e}")))?
-        .build()
-        .map_err(|e| CoreError::Timeline(format!("read LSM parquet: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| CoreError::Timeline(format!("read LSM batch: {e}")))?;
-            let Some(column) = batch.column_by_name("instantTime") else {
-                continue;
-            };
-            if let Some(strings) = column.as_any().downcast_ref::<StringArray>() {
-                for i in 0..strings.len() {
-                    if !strings.is_null(i) {
-                        out.insert(strings.value(i).to_string());
-                    }
-                }
-            }
-        }
-    }
     Ok(out)
 }
 

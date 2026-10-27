@@ -796,18 +796,29 @@ pub(crate) async fn mdt_partition_latest_slices(
         )) => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
-    // Admit only bases whose instant completed on the MDT timeline: a crash
+    // Admit only bases whose instant is committed on the MDT timeline: a crash
     // between writing a compaction HFile and completing its .commit must not
     // let the orphan base shadow the committed slice (and silently drop the
-    // still-live pre-compaction logs). Log blocks are fenced separately by
-    // the callers via valid_metadata_instants.
+    // still-live pre-compaction logs). Committed means completed on the active
+    // timeline or below its earliest commit instant, which archival only moves
+    // past completed ones. Log blocks are fenced separately by the callers via
+    // valid_metadata_instants.
     let mdt_timeline_dir = format!("{METADATA_BASE}/.hoodie/timeline");
     let mut completed_mdt_instants: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    let mut earliest_active: Option<String> = None;
     match storage.list_files(Some(&mdt_timeline_dir)).await {
         Ok(files) => {
             for file in files {
                 let name = file.name;
+                if let Ok(instant) = Instant::from_str(&name)
+                    && crate::timeline::DEFAULT_LOADING_ACTIONS.contains(&instant.action)
+                    && earliest_active
+                        .as_ref()
+                        .is_none_or(|earliest| instant.timestamp < *earliest)
+                {
+                    earliest_active = Some(instant.timestamp);
+                }
                 if !name.chars().next().is_some_and(|c| c.is_ascii_digit())
                     || name.ends_with(".requested")
                     || name.ends_with(".inflight")
@@ -823,9 +834,12 @@ pub(crate) async fn mdt_partition_latest_slices(
         )) => {}
         Err(error) => return Err(error.into()),
     }
-    // Archived MDT instants completed before leaving the active timeline.
-    completed_mdt_instants
-        .extend(crate::write::archival::archived_instant_times(storage, &mdt_timeline_dir).await?);
+    let is_committed = |timestamp: &String| {
+        completed_mdt_instants.contains(timestamp)
+            || earliest_active
+                .as_ref()
+                .is_some_and(|earliest| timestamp < earliest)
+    };
 
     // Two passes: log-to-slice association requires the base files to be in
     // place first, and storage listing order is not guaranteed.
@@ -835,7 +849,7 @@ pub(crate) async fn mdt_partition_latest_slices(
         let name = file.name;
         if name.ends_with(".hfile") && !name.starts_with('.') {
             let base = crate::file_group::base_file::BaseFile::from_str(&name)?;
-            if !completed_mdt_instants.contains(&base.commit_timestamp) {
+            if !is_committed(&base.commit_timestamp) {
                 continue;
             }
             bases.push(base);
@@ -1203,6 +1217,54 @@ mod tests {
         assert!(base.ends_with("col-stats-0000-0_0-1-0_00000000000000030.hfile"));
         assert_eq!(logs.len(), 1);
         assert!(logs[0].ends_with(".col-stats-0000-0_00000000000000040.log.1_0-0-0"));
+    }
+
+    #[tokio::test]
+    async fn test_mdt_latest_slice_admits_archived_base_without_reading_history() {
+        // The bootstrap base's instant (t=10) is archived off the MDT timeline,
+        // which now starts at t=20, and the history cannot be parsed. The base
+        // sits below the archival boundary, so it is committed; the t=40 base
+        // has no completed instant and stays fenced.
+        let dir = tempfile::tempdir().unwrap();
+        let partition_dir = dir.path().join(".hoodie/metadata/column_stats");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        for name in [
+            "col-stats-0000-0_0-0-0_00000000000000010.hfile",
+            ".col-stats-0000-0_00000000000000020.log.1_0-0-0",
+            "col-stats-0000-0_0-1-0_00000000000000040.hfile",
+        ] {
+            std::fs::write(partition_dir.join(name), b"").unwrap();
+        }
+        let timeline_dir = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+        let history_dir = timeline_dir.join("history");
+        std::fs::create_dir_all(&history_dir).unwrap();
+        std::fs::write(
+            timeline_dir.join("00000000000000020_00000000000000021.deltacommit"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::write(timeline_dir.join("00000000000000040.commit.requested"), b"").unwrap();
+        std::fs::write(history_dir.join("_version_"), b"1").unwrap();
+        std::fs::write(
+            history_dir.join("manifest_1"),
+            br#"{"files":[{"fileName":"00000000000000010_00000000000000010_0.parquet","fileLen":3}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            history_dir.join("00000000000000010_00000000000000010_0.parquet"),
+            b"bad",
+        )
+        .unwrap();
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let storage = Storage::new_with_base_url(base_url).unwrap();
+
+        let slices = mdt_partition_latest_slices(storage.as_ref(), "column_stats")
+            .await
+            .unwrap();
+        assert_eq!(slices.len(), 1);
+        let (_, base, logs) = &slices[0];
+        assert!(base.ends_with("col-stats-0000-0_0-0-0_00000000000000010.hfile"));
+        assert_eq!(logs.len(), 1);
     }
 
     #[tokio::test]

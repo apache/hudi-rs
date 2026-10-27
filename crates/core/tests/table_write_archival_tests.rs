@@ -252,6 +252,73 @@ async fn test_stale_write_handle_sees_archived_commits() {
     );
 }
 
+/// Reads of an MDT-enabled table never consult the archived timeline: a
+/// history file that cannot be parsed must not fail a snapshot read, the MDT
+/// file listing, or a stats-pruned read.
+#[tokio::test]
+async fn test_reads_do_not_depend_on_archived_history() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_option("hoodie.keep.min.commits", "4")
+        .with_option("hoodie.keep.max.commits", "6")
+        .create()
+        .await
+        .unwrap();
+    for i in 0..8 {
+        let id = format!("k{i}");
+        table
+            .append([batch(vec![(id.as_str(), "sf", i)])])
+            .await
+            .unwrap();
+    }
+
+    let history = dir.path().join(".hoodie/timeline/history");
+    let mut corrupted = 0;
+    for entry in std::fs::read_dir(&history).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "parquet") {
+            std::fs::write(&path, b"not a parquet file").unwrap();
+            corrupted += 1;
+        }
+    }
+    assert!(corrupted > 0, "archival must have written a history file");
+
+    let reopened = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    let slices = reopened
+        .get_file_slices(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(slices.len(), 8);
+
+    let partition_schema = reopened.get_partition_schema().await.unwrap();
+    let pruner =
+        PartitionPruner::new(&[], &partition_schema, reopened.hudi_configs.as_ref()).unwrap();
+    let records = reopened
+        .read_metadata_table_files_partition(&pruner)
+        .await
+        .unwrap();
+    assert_eq!(records["city=sf"].active_file_names().len(), 8);
+
+    let rows = reopened
+        .read(&hudi_core::table::ReadOptions::new())
+        .await
+        .unwrap();
+    assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 8);
+
+    let filtered = reopened
+        .read(
+            &hudi_core::table::ReadOptions::new()
+                .with_filters([("value", ">=", "5")])
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(filtered.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+}
+
 /// Repeated archival runs must roll the manifest version, keep every L0 file
 /// listed in the newest manifest, and prune manifests beyond the retention
 /// window (3 versions).
