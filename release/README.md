@@ -269,7 +269,7 @@ Release Manager
 [6] https://github.com/apache/hudi-rs/actions/runs/xxx
 [7] https://pypi.org/project/hudi/x.y.zrcN/
 [8] https://crates.io/crates/hudi/x.y.z-rc.N
-[9] https://github.com/apache/hudi-rs?tab=readme-ov-file#usage-examples
+[9] https://github.com/apache/hudi-rs?tab=readme-ov-file#reading-tables
 ```
 
 ## After VOTE passes

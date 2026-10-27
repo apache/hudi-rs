@@ -63,7 +63,7 @@ on-disk tier, which a merge-on-read merge spills to when a file group's log reco
 and a C++ toolchain; `default-features = false` drops it, and a merge that would have spilled then
 fails instead.
 
-## Usage Examples
+## Reading Tables
 
 > [!NOTE]
 > These examples expect a Hudi table exists at `/tmp/trips_table`, created using
