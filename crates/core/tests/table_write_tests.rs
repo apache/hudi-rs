@@ -1458,6 +1458,84 @@ async fn test_auto_keys_unique_across_size_split_chunks() {
     assert_eq!(seen.len(), 4);
 }
 
+/// Auto-generated keys are unique across the batches of one overwrite, and
+/// the record index holds exactly the keys stored in the files.
+#[tokio::test]
+async fn test_auto_keys_unique_across_overwrite_batches() {
+    for (table_type, dynamic) in [
+        (TableTypeValue::CopyOnWrite, false),
+        (TableTypeValue::CopyOnWrite, true),
+        (TableTypeValue::MergeOnRead, false),
+        (TableTypeValue::MergeOnRead, true),
+    ] {
+        let ctx = format!("{table_type:?} dynamic={dynamic}");
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(table_type)
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([partitioned_batch(vec![("x", "sf", 0)])])
+            .await
+            .unwrap();
+        let batches = [
+            partitioned_batch(vec![("a", "sf", 1), ("b", "sf", 2)]),
+            partitioned_batch(vec![("c", "sf", 3), ("d", "sf", 4)]),
+        ];
+        if dynamic {
+            table.dynamic_partition_overwrite(batches).await.unwrap();
+        } else {
+            table.overwrite(batches).await.unwrap();
+        }
+
+        let mut stored = std::collections::HashSet::new();
+        let mut instant = String::new();
+        for rows in table.read(&ReadOptions::new()).await.unwrap() {
+            let keys = rows
+                .column_by_name("_hoodie_record_key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let commit_times = rows
+                .column_by_name("_hoodie_commit_time")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            for row in 0..rows.num_rows() {
+                assert!(
+                    stored.insert(keys.value(row).to_string()),
+                    "{ctx}: duplicate auto key {}",
+                    keys.value(row)
+                );
+                instant = commit_times.value(row).to_string();
+            }
+        }
+        assert_eq!(stored.len(), 4, "{ctx}");
+
+        let candidates: Vec<HoodieKey> = (0..8)
+            .map(|row| HoodieKey {
+                record_key: format!("{instant}_0_{row}"),
+                partition_path: "city=sf".to_string(),
+            })
+            .collect();
+        let located = hudi_core::index::for_table(&table)
+            .tag_location(&table, &candidates)
+            .await
+            .unwrap();
+        let indexed: std::collections::HashSet<String> = candidates
+            .iter()
+            .filter(|key| located.get(*key).and_then(Option::as_ref).is_some())
+            .map(|key| key.record_key.clone())
+            .collect();
+        assert_eq!(indexed, stored, "{ctx}");
+    }
+}
+
 #[tokio::test]
 async fn test_cow_delete_then_rli_lookup_misses_deleted_key() {
     // P0-1: RLI deletes must not poison subsequent index lookups.

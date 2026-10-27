@@ -912,9 +912,14 @@ pub(crate) fn prepare_batches_for_write_with_offset(
         return Ok(batches.to_vec());
     }
 
+    // Rows are numbered across all batches of the call, so auto keys and
+    // sequence numbers stay unique within the commit.
+    let mut batch_offset = row_id_offset;
     batches
         .iter()
         .map(|batch| {
+            let row_id_offset = batch_offset;
+            batch_offset += batch.num_rows();
             if batch
                 .column_by_name(MetaField::RecordKey.as_ref())
                 .is_some()
