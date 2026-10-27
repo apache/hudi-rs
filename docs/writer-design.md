@@ -217,7 +217,8 @@ strategy id. Written partitions:
 
 - **files** — per-partition file listings plus `__all_partitions__`.
 - **column_stats** — per file × column, V2 encoding at table version 9
-  (typed primitive wrappers + `valueType`), tight-bound. Columns follow Java's
+  (typed primitive wrappers + `valueType`) unless the index definition records
+  V1 (a table upgraded from version 8), tight-bound. Columns follow Java's
   AVRO-record-type rules per index version (decimals and binary included; V1
   skips decimals outside `decimal(30,15)`), honor
   `hoodie.metadata.index.column.stats.column.list` and
@@ -225,13 +226,16 @@ strategy id. Written partitions:
   in `.hoodie/.index_defs/index.json`, which Spark requires before it uses
   the stats for data skipping.
 - **partition_stats** — per partition × column, recomputed tight-bound on
-  each write.
+  each write. The recompute fails the write when a surviving stat cannot be
+  converted to the column's current type, rather than writing a tight bound
+  it cannot compute.
 - **record_index** — record key → file group location, 10 shards.
 
-A write to a table whose metadata table lists any other partition, has
-partitions still being built (`hoodie.table.metadata.partitions.inflight`),
-or holds a partitioned record index fails with `Unsupported` before it
-requests an instant, since those partitions would go stale.
+A write to a table whose metadata table lists any other partition, or holds a
+partitioned record index, fails with `Unsupported` before it requests an
+instant, since those partitions would go stale. Writes are likewise refused
+while `hoodie.table.metadata.partitions.inflight` is non-empty, e.g. while a
+Spark async index build is unfinished.
 
 Reading merges base HFile records with log records using
 `MetadataPayloadMerger` (`metadata/payload_merger.rs`), the native equivalent
