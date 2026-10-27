@@ -374,6 +374,49 @@ async fn test_rollback_fails_when_orphan_mdt_delete_fails() {
     assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
 }
 
+/// An MDT partition the rollback cannot list may hold the failed instant's
+/// log blocks; completing the rollback would delete the orphan deltacommit
+/// and leave those blocks to read as valid.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_rollback_fails_when_mdt_partition_listing_fails() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempdir().unwrap();
+    let mut table = create_partitioned(dir.path()).await;
+    table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
+
+    let crashed_ts = "30000101000000018";
+    fabricate_crashed_write(dir.path(), crashed_ts, true);
+    let mdt_files = dir.path().join(".hoodie/metadata/files");
+    std::fs::set_permissions(&mdt_files, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&mdt_files).is_ok() {
+        std::fs::set_permissions(&mdt_files, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipping: directory permissions do not block listing here");
+        return;
+    }
+
+    let result = table.append([batch(vec![("b", "la", 2)])]).await;
+    std::fs::set_permissions(&mdt_files, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert!(completed_rollbacks(&timeline).is_empty());
+    assert!(
+        dir.path()
+            .join(".hoodie/metadata/.hoodie/timeline")
+            .join(format!("{crashed_ts}_{crashed_ts}.deltacommit"))
+            .exists(),
+        "the orphan MDT deltacommit must stay until its log blocks are deleted"
+    );
+
+    table.append([batch(vec![("b", "la", 2)])]).await.unwrap();
+    assert!(
+        !mdt_files
+            .join(format!(".files-0000-0_{crashed_ts}.log.1_0-0-0"))
+            .exists()
+    );
+    assert_eq!(completed_rollbacks(&timeline).len(), 1);
+}
+
 fn timeline_names(timeline: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(timeline)
         .unwrap()

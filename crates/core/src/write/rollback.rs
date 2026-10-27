@@ -509,8 +509,12 @@ async fn rollback_orphan_mdt_commit(storage: &Storage, failed_ts: &str) -> Resul
                 continue;
             }
             let dir = format!("{METADATA_BASE}/{partition}");
-            let Ok(files) = storage.list_files(Some(&dir)).await else {
-                continue;
+            let files = match storage.list_files(Some(&dir)).await {
+                Ok(files) => files,
+                Err(crate::storage::error::StorageError::ObjectStoreError(
+                    object_store::Error::NotFound { .. },
+                )) => continue,
+                Err(error) => return Err(error.into()),
             };
             for file in files {
                 // MDT log files embed the data instant: `.{fileId}_{ts}.log.N_...`.
