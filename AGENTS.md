@@ -56,13 +56,14 @@ cargo test -p hudi-core --lib --no-default-features
 toolchain in front of every consumer, for a tier that only engages when a merge exceeds
 `hoodie.memory.merge.max.size`.
 
-It is **default-on in `hudi-core`, `hudi-datafusion` and `hudi`**, and the latter two forward it
-rather than taking `hudi-core` with its defaults: a consumer can only opt out of a feature its
-direct dependency exposes, and unification through `hudi-datafusion` would otherwise hand the tier
-back. The opt-out is therefore `default-features = false` on `hudi`, and it holds with the
-`datafusion` feature on. **The Python wheel and the cxx bridge do not opt out** — both take `hudi`
-with defaults and build RocksDB. Dropping the feature removes the tier, and a merge past the budget
-then fails with a `CoreError::Unsupported` naming the config rather than spilling, which is why the
+It is **default-on in `hudi-core`, `hudi-datafusion`, `hudi` and `hudi-jvm-ffi`**, and the latter
+three forward it rather than taking their dependency with its defaults: a consumer can only opt out
+of a feature its direct dependency exposes, and unification through `hudi-datafusion` would
+otherwise hand the tier back. The opt-out is therefore `default-features = false` on `hudi`, and it
+holds with the `datafusion` feature on; a consumer of `hudi-jvm-ffi` makes the same call there.
+**The Python wheel and the cxx bridge do not opt out** — both take `hudi` with defaults and build
+RocksDB. Dropping the feature removes the tier, and a merge past the budget then fails with a
+`CoreError::Unsupported` naming the config rather than spilling, which is why the
 published artifacts keep it.
 
 A test that needs the disk tier must be `#[cfg(feature = "spill-rocksdb")]`; the
