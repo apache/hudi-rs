@@ -2404,6 +2404,60 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
     }
 }
 
+/// An update that sets `_hoodie_is_deleted = true` deletes the matched rows
+/// on either table type, as Java's merge handle does.
+#[tokio::test]
+async fn test_update_setting_hoodie_is_deleted_removes_row_and_index_entry() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([flagged_batch(vec![
+                ("a", "sf", 1, false),
+                ("b", "sf", 2, false),
+            ])])
+            .await
+            .unwrap();
+        let set_deleted = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "_hoodie_is_deleted",
+                DataType::Boolean,
+                true,
+            )])),
+            vec![Arc::new(BooleanArray::from(vec![true]))],
+        )
+        .unwrap();
+        table.update("id = 'a'", set_deleted).await.unwrap();
+
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(
+            rows_by_id(&batches),
+            vec![("b".to_string(), 2)],
+            "{table_type:?}"
+        );
+        let keys: Vec<HoodieKey> = ["a", "b"]
+            .iter()
+            .map(|key| HoodieKey {
+                record_key: key.to_string(),
+                partition_path: "city=sf".to_string(),
+            })
+            .collect();
+        let located = hudi_core::index::for_table(&table)
+            .tag_location(&table, &keys)
+            .await
+            .unwrap();
+        assert!(located[&keys[0]].is_none(), "{table_type:?}");
+        assert!(located[&keys[1]].is_some(), "{table_type:?}");
+    }
+}
+
 /// Rewrite `hoodie.properties` the way another writer would have left it.
 fn rewrite_table_props(base: &std::path::Path, remove: &[&str], set: &[(&str, &str)]) {
     let path = base.join(".hoodie/hoodie.properties");

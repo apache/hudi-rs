@@ -3301,10 +3301,28 @@ fn merge_file_group_task(
                         rli_deletes,
                     });
                 }
-                (
-                    restamp_matched_rows(&updated, &mask, &ctx.instant)?,
-                    matched,
-                )
+                let updated = restamp_matched_rows(&updated, &mask, &ctx.instant)?;
+                // Setting the delete marker deletes the row, as an upsert does.
+                let delete_markers = delete_marker_rows(&updated);
+                let doomed: Vec<bool> = (0..updated.num_rows())
+                    .map(|row| delete_markers[row] && mask.value(row))
+                    .collect();
+                let updated = if doomed.contains(&true) {
+                    let updated_keys = keys(&updated, key_field)?;
+                    let partitions = string_values(&updated, MetaField::PartitionPath.as_ref())?;
+                    let mut survivors = Vec::with_capacity(updated.num_rows());
+                    for (row, doomed) in doomed.into_iter().enumerate() {
+                        if doomed {
+                            rli_deletes.push((updated_keys[row].clone(), partitions[row].clone()));
+                        } else {
+                            survivors.push(row as u32);
+                        }
+                    }
+                    take_batch(&updated, &survivors)?
+                } else {
+                    updated
+                };
+                (updated, matched)
             }
         };
         let merged = restamp_file_name(&merged, &plan.out_name)?;
