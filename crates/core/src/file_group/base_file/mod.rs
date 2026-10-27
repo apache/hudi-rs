@@ -18,6 +18,7 @@
  */
 pub mod hfile;
 pub mod lance;
+mod lance_arrow;
 pub mod parquet;
 pub mod reader;
 
