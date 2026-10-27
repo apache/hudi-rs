@@ -81,6 +81,7 @@ async fn append_batches_inner(
     batches: &[RecordBatch],
     require_append_only: bool,
 ) -> Result<AppendResult> {
+    crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
     if !table.is_mor() {
         if require_append_only {

@@ -2476,8 +2476,10 @@ fn nullable_city_batch(rows: Vec<(&str, Option<&str>, i64)>) -> RecordBatch {
     .unwrap()
 }
 
+/// Writes that derive keys from data refuse a key generator they cannot
+/// reproduce; deletes and COW updates, which take keys from the table, do not.
 #[tokio::test]
-async fn test_write_rejects_unsupported_key_generators() {
+async fn test_unsupported_key_generators_block_only_key_deriving_writes() {
     let cases = [
         ("hoodie.table.keygenerator.type", "TIMESTAMP"),
         ("hoodie.table.keygenerator.type", "CUSTOM"),
@@ -2494,40 +2496,79 @@ async fn test_write_rejects_unsupported_key_generators() {
             "com.example.UserKeyGenerator",
         ),
     ];
-    for (key, value) in cases {
-        let dir = tempdir().unwrap();
-        Table::create(dir.path().to_str().unwrap())
-            .with_table_name("t")
-            .with_record_key_fields(["id"])
-            .with_partition_fields(["city"])
-            .create()
-            .await
-            .unwrap();
-        rewrite_table_props(
-            dir.path(),
-            &["hoodie.table.keygenerator.type"],
-            &[(key, value)],
-        );
-        let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
-        let err = table
-            .upsert([city_batch(vec![("a", "sf", 1)])])
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, CoreError::Unsupported(msg) if msg.contains(key) && msg.contains(value)),
-            "{key}={value}: {err}"
-        );
-        let err = table
-            .delete_keys([HoodieKey {
-                record_key: "a".to_string(),
-                partition_path: "sf".to_string(),
-            }])
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, CoreError::Unsupported(_)),
-            "{key}={value}: {err}"
-        );
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        for (key, value) in cases {
+            let dir = tempdir().unwrap();
+            let mut table = Table::create(dir.path().to_str().unwrap())
+                .with_table_name("t")
+                .with_table_type(table_type.clone())
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .create()
+                .await
+                .unwrap();
+            table
+                .append([city_batch(vec![
+                    ("a", "sf", 1),
+                    ("b", "sf", 2),
+                    ("c", "sf", 3),
+                ])])
+                .await
+                .unwrap();
+            rewrite_table_props(
+                dir.path(),
+                &["hoodie.table.keygenerator.type"],
+                &[(key, value)],
+            );
+            let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            let rejected = [
+                table
+                    .upsert([city_batch(vec![("a", "sf", 10)])])
+                    .await
+                    .err(),
+                table.append([city_batch(vec![("d", "sf", 4)])]).await.err(),
+                table
+                    .overwrite([city_batch(vec![("d", "sf", 4)])])
+                    .await
+                    .err(),
+            ];
+            for err in rejected {
+                assert!(
+                    matches!(&err, Some(CoreError::Unsupported(msg))
+                        if msg.contains(key) && msg.contains(value)),
+                    "{table_type:?} {key}={value}: {err:?}"
+                );
+            }
+
+            table
+                .delete_keys([HoodieKey {
+                    record_key: "a".to_string(),
+                    partition_path: "city=sf".to_string(),
+                }])
+                .await
+                .unwrap();
+            table.delete("value = 2").await.unwrap();
+            let update = table.update("id = 'c'", set_value(30)).await;
+            if table_type == TableTypeValue::CopyOnWrite {
+                update.unwrap();
+            } else {
+                assert!(
+                    matches!(&update, Err(CoreError::Unsupported(_))),
+                    "{key}={value}: {update:?}"
+                );
+            }
+            let expected = if table_type == TableTypeValue::CopyOnWrite {
+                30
+            } else {
+                3
+            };
+            let batches = table.read(&ReadOptions::new()).await.unwrap();
+            assert_eq!(
+                rows_by_id(&batches),
+                vec![("c".to_string(), expected)],
+                "{table_type:?} {key}={value}"
+            );
+        }
     }
 }
 

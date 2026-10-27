@@ -139,6 +139,7 @@ pub async fn upsert_batches(
     batches: &[RecordBatch],
     options: UpsertOptions,
 ) -> Result<WriteResult> {
+    crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
     ensure_configured_record_key(table)?;
     if table.is_mor() {
@@ -826,6 +827,7 @@ where
 }
 
 pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
+    crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
     // Insert-overwrite writes new BASE file groups + a replacecommit on both
     // COW and MOR (Java uses the same executor for either table type).
@@ -875,6 +877,7 @@ pub async fn dynamic_partition_overwrite_batches(
     table: &mut Table,
     batches: &[RecordBatch],
 ) -> Result<WriteResult> {
+    crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
     // Works on COW and MOR alike (see overwrite_batches).
     ensure_supported_merge_configs(table)?;
@@ -1768,6 +1771,7 @@ async fn mor_update_filter(
     filter: Filter,
     updates: RecordBatch,
 ) -> Result<WriteResult> {
+    crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     ensure_mor_merge_supported(table)?;
     ensure_configured_record_key(table)?;
     let Some((old, _, _, _)) = data_for_filter_matches(table, &filter).await? else {
