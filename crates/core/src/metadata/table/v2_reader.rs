@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Reads the metadata table's `files` partition through the version two file
+//! Reads metadata-table partitions through the version two file
 //! group reader.
 //!
 //! Every metadata-table concern lives here and none of it reaches `reader_v2`,
@@ -121,6 +121,16 @@ impl MetadataTableV2Reader {
     /// value: `files`, `record_index`, `column_stats`, `bloom_filters`,
     /// `partition_stats`, `secondary_index_*`). The decoded-record layer only
     /// exists for `files`; the others come back as raw Arrow.
+    pub(crate) async fn read_partition_batch(
+        &self,
+        file_slice: &FileSlice,
+        keys: &[&str],
+        partition: &str,
+    ) -> Result<RecordBatch> {
+        self.read_partition_batch(file_slice, keys, FilesPartitionRecord::PARTITION_NAME)
+            .await
+    }
+
     pub(crate) async fn read_partition_batch(
         &self,
         file_slice: &FileSlice,

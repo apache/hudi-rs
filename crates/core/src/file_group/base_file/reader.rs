@@ -96,6 +96,8 @@ impl KeyMatcher<'_> {
 pub struct BaseFileReadOptions {
     /// Target batch size (number of rows per batch) for streaming reads.
     pub batch_size: Option<usize>,
+    /// Physical rows to select, relative to retained row groups. Parquet only.
+    pub row_selection: Option<parquet::arrow::arrow_reader::RowSelection>,
     /// Column projection by names.
     pub projection: Option<Vec<String>>,
     /// Known base-file size in bytes, when the caller already has file metadata.
@@ -150,6 +152,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BaseFileReadOptions")
             .field("batch_size", &self.batch_size)
+            .field("row_selection", &self.row_selection)
             .field("projection", &self.projection)
             .field("known_file_size", &self.known_file_size)
             .field("key_predicate", &self.key_predicate)
@@ -189,6 +192,15 @@ impl BaseFileReadOptions {
     /// [`Self::row_index_column`].
     pub fn with_row_index_column(mut self, name: impl Into<String>) -> Self {
         self.row_index_column = Some(name.into());
+        self
+    }
+
+    /// Select physical rows within the retained Parquet row groups.
+    pub fn with_row_selection(
+        mut self,
+        selection: parquet::arrow::arrow_reader::RowSelection,
+    ) -> Self {
+        self.row_selection = Some(selection);
         self
     }
 
