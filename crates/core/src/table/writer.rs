@@ -95,10 +95,20 @@ impl AppendOnlyWriter {
             schema_json,
         );
         let commit_relative_path = instant.relative_path_with_base(HUDI_METADATA_DIR)?;
-        // An errored PUT may still have stored the commit, so the base file it
-        // references stays; without the commit, readers ignore the file.
-        self.write_commit_file(&commit_relative_path, &commit_metadata)
-            .await?;
+        if let Err(error) = self
+            .write_commit_file(&commit_relative_path, &commit_metadata)
+            .await
+        {
+            // An errored PUT may still have stored the commit, which needs the
+            // base file. Without the commit the file must go: no requested
+            // instant marks it pending, so it reads as committed once a later
+            // commit starts the timeline after this instant.
+            let storage = &self.table.file_system_view.storage;
+            if let Ok(false) = storage.exists(&commit_relative_path).await {
+                let _ = storage.delete_file(&base_file_path).await;
+            }
+            return Err(error);
+        }
 
         Ok(AppendResult {
             instant: request_instant,
@@ -346,6 +356,40 @@ mod tests {
             assert!(result.is_err(), "{fault:?}: the faulted PUT must surface");
             assert!(!store.is_armed(), "{fault:?}: the commit PUT was not hit");
             assert_eq!(row_count(uri).await, rows_after_error, "{fault:?}");
+        }
+    }
+
+    /// A later commit moves the timeline start past the failed instant, so a
+    /// base file left without its commit would then read as committed.
+    #[tokio::test]
+    async fn test_failed_commit_put_then_append_reads_only_committed_rows() {
+        for (fault, rows_after_retry) in [(PutFault::LandedThenError, 5), (PutFault::NotLanded, 3)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut table = version_6_table(dir.path()).await;
+            let storage = table.file_system_view.storage.clone();
+            let store =
+                FaultyPutStore::new_for_any_put(storage.object_store.clone(), fault, |path| {
+                    path.as_ref().ends_with(".commit")
+                });
+            table.file_system_view.storage = Storage::new_with_object_store(
+                storage.base_url.as_ref().clone(),
+                store,
+                storage.hudi_configs.clone(),
+            );
+            let batch = |ids: Vec<i32>| {
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+                    vec![Arc::new(Int32Array::from(ids))],
+                )
+                .unwrap()
+            };
+            assert!(table.append_only([batch(vec![1, 2])]).await.is_err());
+
+            let mut retry = Table::new(uri).await.unwrap();
+            retry.append_only([batch(vec![3, 4, 5])]).await.unwrap();
+            assert_eq!(row_count(uri).await, rows_after_retry, "{fault:?}");
         }
     }
 
