@@ -384,3 +384,53 @@ async fn append_only_accepts_cleared_metadata_partitions_property() -> Result<()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn append_only_writes_version_6_commit_metadata() -> Result<()> {
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+
+    let result = table
+        .append_only([id_name_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"])])
+        .await?;
+
+    let commit: serde_json::Value = serde_json::from_slice(&fs::read(
+        temp_dir.path().join(&result.commit_relative_path),
+    )?)
+    .expect("v1 commit metadata is JSON");
+    assert_eq!(commit["operationType"], "BULK_INSERT");
+    let stats = commit["partitionToWriteStats"][""]
+        .as_array()
+        .expect("write stats under the empty partition path");
+    assert_eq!(stats.len(), 1);
+    let stat = &stats[0];
+    let file_id = stat["fileId"].as_str().expect("fileId");
+    assert_eq!(
+        result.base_file_path,
+        format!("{file_id}_0-0-0_{}.parquet", result.instant)
+    );
+    assert_eq!(stat["path"], result.base_file_path.as_str());
+    assert_eq!(stat["partitionPath"], "");
+    assert_eq!(stat["numWrites"], 3);
+    assert_eq!(stat["numInserts"], 3);
+    let file_size = fs::metadata(temp_dir.path().join(&result.base_file_path))?.len();
+    assert_eq!(stat["fileSizeInBytes"], file_size);
+
+    let schema: serde_json::Value = serde_json::from_str(
+        commit["extraMetadata"]["schema"]
+            .as_str()
+            .expect("the commit records the write schema"),
+    )
+    .expect("the recorded schema is JSON");
+    assert_eq!(schema["type"], "record");
+    assert_eq!(
+        schema["fields"],
+        serde_json::json!([
+            {"name": "id", "type": "int"},
+            {"name": "name", "type": {"type": "string", "avro.java.string": "String"}},
+        ])
+    );
+
+    Ok(())
+}

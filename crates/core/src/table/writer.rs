@@ -41,6 +41,7 @@ use crate::storage::error::StorageError;
 use crate::storage::util::join_url_segments;
 use crate::table::Table;
 use crate::timeline::instant::Instant;
+use crate::write::append::arrow_schema_to_avro_json;
 
 /// Result of an append write.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +72,7 @@ impl AppendOnlyWriter {
         self.ensure_unpartitioned()?;
         self.ensure_no_meta_fields()?;
         self.ensure_no_metadata_table().await?;
+        let schema_json = arrow_schema_to_avro_json(batch.schema().as_ref())?;
 
         let request_instant = Self::current_timestamp();
         let instant = Instant::from_str(&format!("{request_instant}.commit"))?;
@@ -90,6 +92,7 @@ impl AppendOnlyWriter {
             &base_file_path,
             batch.num_rows() as i64,
             file_size,
+            schema_json,
         );
         let commit_relative_path = instant.relative_path_with_base(HUDI_METADATA_DIR)?;
         // An errored PUT may still have stored the commit, so the base file it
@@ -220,6 +223,7 @@ impl AppendOnlyWriter {
         base_file_path: &str,
         num_rows: i64,
         file_size: i64,
+        schema_json: String,
     ) -> HoodieCommitMetadata {
         let write_stat = HoodieWriteStat {
             file_id: Some(file_id.to_string()),
@@ -258,7 +262,8 @@ impl AppendOnlyWriter {
             operation_type: Some("BULK_INSERT".to_string()),
             partition_to_write_stats: Some(HashMap::from([(String::new(), vec![write_stat])])),
             compacted: Some(false),
-            extra_metadata: None,
+            // Spark reads a null extraMetadata as a null map and fails on it.
+            extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
         }
     }
 
@@ -342,5 +347,32 @@ mod tests {
             assert!(!store.is_armed(), "{fault:?}: the commit PUT was not hit");
             assert_eq!(row_count(uri).await, rows_after_error, "{fault:?}");
         }
+    }
+
+    /// The commit records the write schema as Avro, so a batch whose schema
+    /// Avro cannot express is refused before any file is written.
+    #[tokio::test]
+    async fn test_schema_without_avro_form_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = version_6_table(dir.path()).await;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            )])),
+            vec![Arc::new(arrow::array::TimestampNanosecondArray::from(
+                vec![1],
+            ))],
+        )
+        .unwrap();
+        assert!(table.append_only([batch]).await.is_err());
+        let written: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name != ".hoodie")
+            .collect();
+        assert!(written.is_empty(), "unexpected files: {written:?}");
     }
 }

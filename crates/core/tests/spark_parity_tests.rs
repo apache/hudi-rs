@@ -986,3 +986,55 @@ async fn parity_f_cdc_enabled_spark_table() {
         "spark CDC read should surface changes after {begin}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario H: append_only on a table version 6 table (timeline layout v1) →
+// Spark reads.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
+async fn parity_h_append_only_table_version_6_spark_reads() {
+    if !enabled() {
+        return;
+    }
+    let env = spark_env();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t");
+    let hoodie_dir = path.join(".hoodie");
+    std::fs::create_dir_all(&hoodie_dir).unwrap();
+    std::fs::write(
+        hoodie_dir.join("hoodie.properties"),
+        [
+            "hoodie.table.name=parity",
+            "hoodie.table.type=COPY_ON_WRITE",
+            "hoodie.table.version=6",
+            "hoodie.timeline.layout.version=1",
+            "hoodie.populate.meta.fields=false",
+            "hoodie.base.file.format=parquet",
+        ]
+        .join("\n"),
+    )
+    .unwrap();
+
+    let mut table = Table::new(path.to_str().unwrap()).await.unwrap();
+    table
+        .append_only([batch(&[row("a", None, 1, 10), row("b", None, 1, 20)])])
+        .await
+        .unwrap();
+    table
+        .append_only([batch(&[row("c", None, 2, 30)])])
+        .await
+        .unwrap();
+
+    let expected = vec![
+        row("a", None, 1, 10),
+        row("b", None, 1, 20),
+        row("c", None, 2, 30),
+    ];
+    assert_eq!(rs_read(&path).await, expected, "rs self-read");
+    assert_eq!(
+        spark_read(&env, &path),
+        expected,
+        "spark must read the table version 6 table append_only wrote"
+    );
+}
