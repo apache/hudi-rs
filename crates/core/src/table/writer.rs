@@ -92,13 +92,10 @@ impl AppendOnlyWriter {
             file_size,
         );
         let commit_relative_path = instant.relative_path_with_base(HUDI_METADATA_DIR)?;
-        if let Err(error) = self
-            .write_commit_file(&commit_relative_path, &commit_metadata)
-            .await
-        {
-            let _ = self.delete_file(&base_file_path).await;
-            return Err(error);
-        }
+        // An errored PUT may still have stored the commit, so the base file it
+        // references stays; without the commit, readers ignore the file.
+        self.write_commit_file(&commit_relative_path, &commit_metadata)
+            .await?;
 
         Ok(AppendResult {
             instant: request_instant,
@@ -217,18 +214,6 @@ impl AppendOnlyWriter {
         Ok(())
     }
 
-    async fn delete_file(&self, relative_path: &str) -> Result<()> {
-        let storage = self.table.file_system_view.storage.clone();
-        let object_url = join_url_segments(&storage.base_url, &[relative_path])?;
-        let object_path = Path::from_url_path(object_url.path()).map_err(StorageError::from)?;
-        storage
-            .object_store
-            .delete(&object_path)
-            .await
-            .map_err(StorageError::from)?;
-        Ok(())
-    }
-
     fn build_commit_metadata(
         &self,
         file_id: &str,
@@ -284,5 +269,78 @@ impl AppendOnlyWriter {
     ) -> Result<()> {
         self.put_file(commit_relative_path, metadata.to_json_bytes()?)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use super::*;
+    use crate::storage::Storage;
+    use crate::storage::fault::{FaultyPutStore, PutFault};
+    use crate::table::ReadOptions;
+
+    async fn version_6_table(base_dir: &std::path::Path) -> Table {
+        let hoodie_dir = base_dir.join(".hoodie");
+        std::fs::create_dir_all(&hoodie_dir).unwrap();
+        let properties = [
+            "hoodie.table.name=t",
+            "hoodie.table.type=COPY_ON_WRITE",
+            "hoodie.table.version=6",
+            "hoodie.timeline.layout.version=1",
+            "hoodie.populate.meta.fields=false",
+            "hoodie.base.file.format=parquet",
+        ]
+        .join("\n");
+        std::fs::write(hoodie_dir.join("hoodie.properties"), properties).unwrap();
+        Table::new(base_dir.to_str().unwrap()).await.unwrap()
+    }
+
+    async fn row_count(base_uri: &str) -> usize {
+        Table::new(base_uri)
+            .await
+            .unwrap()
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    /// A commit PUT that errors may still have stored the commit, so the base
+    /// file it references must survive the error.
+    #[tokio::test]
+    async fn test_failed_commit_put_keeps_written_base_file() {
+        for (fault, rows_after_error) in [(PutFault::LandedThenError, 2), (PutFault::NotLanded, 0)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut table = version_6_table(dir.path()).await;
+            let storage = table.file_system_view.storage.clone();
+            let store =
+                FaultyPutStore::new_for_any_put(storage.object_store.clone(), fault, |path| {
+                    path.as_ref().ends_with(".commit")
+                });
+            table.file_system_view.storage = Storage::new_with_object_store(
+                storage.base_url.as_ref().clone(),
+                store.clone(),
+                storage.hudi_configs.clone(),
+            );
+
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+                vec![Arc::new(Int32Array::from(vec![1, 2]))],
+            )
+            .unwrap();
+            let result = table.append_only([batch]).await;
+            assert!(result.is_err(), "{fault:?}: the faulted PUT must surface");
+            assert!(!store.is_armed(), "{fault:?}: the commit PUT was not hit");
+            assert_eq!(row_count(uri).await, rows_after_error, "{fault:?}");
+        }
     }
 }

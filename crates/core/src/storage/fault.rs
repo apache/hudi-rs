@@ -17,11 +17,11 @@
  * under the License.
  */
 
-//! An object store that fails one conditional put.
+//! An object store that fails one put.
 //!
-//! Test-only. It models the ambiguous outcomes of a cloud conditional PUT: the
-//! request times out after the object landed, or a retried `If-None-Match`
-//! request reports the object its own first attempt created.
+//! Test-only. It models the ambiguous outcomes of a cloud PUT: the request
+//! times out after the object landed, or a retried `If-None-Match` request
+//! reports the object its own first attempt created.
 
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -46,11 +46,13 @@ pub(crate) enum PutFault {
     NotLanded,
 }
 
-/// Wraps a store and fails the first create-mode put whose path matches.
+/// Wraps a store and fails the first create-mode put whose path matches, or
+/// the first matching put of any mode when built with [`Self::new_for_any_put`].
 pub(crate) struct FaultyPutStore {
     inner: Arc<dyn ObjectStore>,
     matches: Box<dyn Fn(&Path) -> bool + Send + Sync>,
     fault: PutFault,
+    create_only: bool,
     armed: AtomicBool,
 }
 
@@ -60,10 +62,29 @@ impl FaultyPutStore {
         fault: PutFault,
         matches: impl Fn(&Path) -> bool + Send + Sync + 'static,
     ) -> Arc<Self> {
+        Self::build(inner, fault, true, matches)
+    }
+
+    /// Faults overwrite puts too, for writers that do not use create mode.
+    pub(crate) fn new_for_any_put(
+        inner: Arc<dyn ObjectStore>,
+        fault: PutFault,
+        matches: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::build(inner, fault, false, matches)
+    }
+
+    fn build(
+        inner: Arc<dyn ObjectStore>,
+        fault: PutFault,
+        create_only: bool,
+        matches: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) -> Arc<Self> {
         Arc::new(Self {
             inner,
             matches: Box::new(matches),
             fault,
+            create_only,
             armed: AtomicBool::new(true),
         })
     }
@@ -94,7 +115,7 @@ impl ObjectStore for FaultyPutStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        if !matches!(opts.mode, PutMode::Create)
+        if (self.create_only && !matches!(opts.mode, PutMode::Create))
             || !(self.matches)(location)
             || !self.armed.swap(false, Ordering::SeqCst)
         {
