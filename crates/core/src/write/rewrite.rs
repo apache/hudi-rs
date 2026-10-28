@@ -3324,7 +3324,7 @@ fn merge_file_group_task(
                 // Setting the delete marker deletes the row, as an upsert does.
                 let delete_markers = delete_marker_rows(&updated);
                 let doomed: Vec<bool> = (0..updated.num_rows())
-                    .map(|row| delete_markers[row] && mask.value(row))
+                    .map(|row| delete_markers[row] && mask.is_valid(row) && mask.value(row))
                     .collect();
                 let updated = if doomed.contains(&true) {
                     let updated_keys = keys(&updated, key_field)?;

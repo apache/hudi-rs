@@ -1241,6 +1241,65 @@ async fn test_delete_by_filter_keeps_rows_with_null_filter_column() {
     }
 }
 
+/// An update by filter that deletes rows carrying a delete marker leaves a
+/// marked row whose filter column is null.
+#[tokio::test]
+async fn test_update_by_filter_keeps_marked_rows_with_null_filter_column() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, true),
+        Field::new("_hoodie_is_deleted", DataType::Boolean, true),
+    ]));
+    let rows = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b"])),
+            Arc::new(Int64Array::from(vec![None, Some(20)])),
+            Arc::new(BooleanArray::from(vec![true, false])),
+        ],
+    )
+    .unwrap();
+    table.append([rows]).await.unwrap();
+
+    table.update("value = 20", set_value(30)).await.unwrap();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let mut rows: Vec<(String, Option<i64>)> = batches
+        .iter()
+        .flat_map(|batch| {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let values = batch
+                .column_by_name("value")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            (0..batch.num_rows())
+                .map(|row| {
+                    let value = values.is_valid(row).then(|| values.value(row));
+                    (ids.value(row).to_string(), value)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![("a".to_string(), None), ("b".to_string(), Some(30))]
+    );
+}
+
 #[tokio::test]
 async fn test_delete_by_record_key_equality_routes_keyed_path() {
     let dir = tempdir().unwrap();
