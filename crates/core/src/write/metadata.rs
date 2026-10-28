@@ -1408,12 +1408,15 @@ pub(crate) fn instant_to_epoch_millis_in(instant: &str, timezone: &str) -> i64 {
         })
 }
 
-/// Resolve the table's timeline timezone for [`instant_to_epoch_millis_in`].
+/// The zone the table's instants are minted in: `hoodie.table.timeline.timezone`,
+/// or LOCAL when the table does not set it, as Java's `HoodieTableConfig`
+/// defaults it (Spark does not persist the property).
 pub(crate) fn timeline_timezone(hudi_configs: &crate::config::HudiConfigs) -> String {
-    let value: String = hudi_configs
-        .get_or_default(crate::config::table::HudiTableConfig::TimelineTimezone)
-        .into();
-    value
+    use crate::config::table::{HudiTableConfig::TimelineTimezone, TimelineTimezoneValue};
+    if !hudi_configs.contains(TimelineTimezone) {
+        return TimelineTimezoneValue::Local.as_ref().to_string();
+    }
+    hudi_configs.get_or_default(TimelineTimezone).into()
 }
 
 pub(crate) fn instant_to_epoch_millis(instant: &str) -> i64 {

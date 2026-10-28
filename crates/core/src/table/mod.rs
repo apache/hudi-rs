@@ -236,7 +236,9 @@ impl Table {
         crate::write::metadata::ensure_supported_metadata_layout(self).await?;
         // Instants must be minted in the table's declared timeline timezone
         // (Spark writers default to LOCAL); set before any instant is minted.
-        crate::write::set_commit_timezone(&self.timezone());
+        crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
+            &self.hudi_configs,
+        ));
         // Eager rollback of crashed writes (Java rollbackFailedWrites) before
         // any new instant is minted.
         crate::write::rollback::rollback_failed_writes(self).await?;

@@ -3110,7 +3110,15 @@ async fn upserts_into_spark_written_table_read_through_metadata_table() {
         // The second upsert plans through the metadata table, merging Spark's
         // base files with the first upsert's log blocks.
         table.upsert([rows.clone()]).await.unwrap();
-        table.upsert([rows.clone()]).await.unwrap();
+        // Spark leaves the timeline timezone unset, which Java reads as LOCAL.
+        let local_now = || chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
+        let before = local_now();
+        let instant = table.upsert([rows.clone()]).await.unwrap().instant;
+        let after = local_now();
+        assert!(
+            before <= instant && instant <= after,
+            "{format:?}: instant {instant} must be local time in [{before}, {after}]"
+        );
 
         let table = Table::new(&path).await.unwrap();
         let after = data_rows(table.read(&ReadOptions::new()).await.unwrap());
