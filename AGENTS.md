@@ -12,8 +12,8 @@ crates/
   core/         hudi-core — avro_to_arrow, config, expr, file_group, hfile, keygen, merge, metadata,
                 record, schema, statistics, storage, table, timeline, util
   datafusion/   hudi-datafusion — DataFusion TableProvider (feature: datafusion)
+  ffi/          hudi-ffi — plain C ABI for JVM and C++ engine callers via the Arrow C Data Interface
   hudi/         public umbrella crate; re-exports core + (optional) datafusion
-  jvm-ffi/      hudi-jvm-ffi — plain C ABI for JVM callers via the Arrow C Data Interface
   test/         shared test fixtures
 python/         PyO3 bindings (module hudi._internal); tests in python/tests
 cpp/            cxx bindings; bridge in cpp/src/lib.rs
