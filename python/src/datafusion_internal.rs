@@ -91,6 +91,6 @@ impl HudiDataFusionDataSource {
         let provider = Arc::new(self.table.clone());
         let codec = extract_codec(session)?;
         let ffi_provider = FFI_TableProvider::new_with_ffi_codec(provider, false, None, codec);
-        PyCapsule::new(py, ffi_provider, Some(cr"datafusion_table_provider".into()))
+        PyCapsule::new_with_value(py, ffi_provider, c"datafusion_table_provider")
     }
 }

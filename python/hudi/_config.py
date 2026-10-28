@@ -38,6 +38,13 @@ HudiTableConfig = Enum(
 )
 HudiTableConfig.__doc__ = (
     "Configurations for Hudi tables, most of them are persisted in `hoodie.properties`."
+    "\n\n"
+    "Examples:\n"
+    "    >>> from hudi import HudiTableConfig\n"
+    "    >>> HudiTableConfig.BASE_PATH.value\n"
+    "    'hoodie.base.path'\n"
+    "    >>> HudiTableConfig.TABLE_NAME.value\n"
+    "    'hoodie.table.name'\n"
 )
 
 HudiReadConfig = Enum(
@@ -47,7 +54,16 @@ HudiReadConfig = Enum(
     module=__name__,
     qualname="HudiReadConfig",
 )
-HudiReadConfig.__doc__ = "Configurations for reading Hudi tables."
+HudiReadConfig.__doc__ = (
+    "Configurations for reading Hudi tables."
+    "\n\n"
+    "Examples:\n"
+    "    >>> from hudi import HudiReadConfig\n"
+    "    >>> HudiReadConfig.QUERY_TYPE.value\n"
+    "    'hoodie.read.query.type'\n"
+    "    >>> HudiReadConfig.AS_OF_TIMESTAMP.value\n"
+    "    'hoodie.read.as.of.timestamp'\n"
+)
 
 HudiPlanConfig = Enum(
     "HudiPlanConfig",
@@ -56,6 +72,13 @@ HudiPlanConfig = Enum(
     module=__name__,
     qualname="HudiPlanConfig",
 )
-HudiPlanConfig.__doc__ = "Configurations for query planning in Hudi."
+HudiPlanConfig.__doc__ = (
+    "Configurations for query planning in Hudi."
+    "\n\n"
+    "Examples:\n"
+    "    >>> from hudi import HudiPlanConfig\n"
+    "    >>> HudiPlanConfig.LISTING_PARALLELISM.value\n"
+    "    'hoodie.plan.listing.parallelism'\n"
+)
 
 __all__ = ["HudiPlanConfig", "HudiReadConfig", "HudiTableConfig"]

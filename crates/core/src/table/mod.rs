@@ -94,8 +94,10 @@ pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
 mod validation;
+mod writer;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
+pub use writer::AppendResult;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -120,6 +122,7 @@ use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
+use crate::table::writer::AppendOnlyWriter;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
@@ -1232,6 +1235,74 @@ impl Table {
             });
 
         Ok(Box::pin(combined_stream))
+    }
+
+    /// Append record batches to an append-only table as one new base file.
+    ///
+    /// Intentionally narrow: it only supports unpartitioned append-only tables,
+    /// and all batches must share one schema matching the table's.
+    pub async fn append_only(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<AppendResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        let Some(first) = batches.first() else {
+            return Err(CoreError::Write(
+                "append requires at least one RecordBatch".to_string(),
+            ));
+        };
+        let schema = first.schema();
+        if batches.iter().any(|batch| batch.schema() != schema) {
+            return Err(CoreError::Write(
+                "All RecordBatches in append must share the same schema".to_string(),
+            ));
+        }
+        self.ensure_append_schema_matches_table(schema.as_ref())
+            .await?;
+        let batch = arrow::compute::concat_batches(&schema, &batches)?;
+        if batch.num_rows() == 0 {
+            return Err(CoreError::Write(
+                "append requires at least one row".to_string(),
+            ));
+        }
+        let result = AppendOnlyWriter::new(self).write(batch).await?;
+        // The commit is durable; a failed refresh must not turn it into an error.
+        if let Ok(timeline) =
+            Timeline::new_from_storage(self.hudi_configs.clone(), self.storage_options.clone())
+                .await
+        {
+            self.timeline = timeline;
+        }
+        if let Ok(file_system_view) =
+            FileSystemView::new(self.hudi_configs.clone(), self.storage_options.clone()).await
+        {
+            self.file_system_view = file_system_view;
+        }
+        self.cached_metadata_table = Arc::new(OnceCell::new());
+        self.cached_estimator = Arc::new(OnceCell::new());
+        Ok(result)
+    }
+
+    async fn ensure_append_schema_matches_table(&self, batch_schema: &Schema) -> Result<()> {
+        if self.timeline.completed_commits.is_empty() {
+            return Ok(());
+        }
+        let table_schema = self.get_schema().await?;
+        let fields = |schema: &Schema| {
+            schema
+                .fields()
+                .iter()
+                .map(|f| (f.name().clone(), f.data_type().clone()))
+                .collect::<Vec<_>>()
+        };
+        if fields(&table_schema) == fields(batch_schema) {
+            return Ok(());
+        }
+        Err(CoreError::Write(format!(
+            "append batch schema does not match table schema (table fields={:?}, batch fields={:?})",
+            fields(&table_schema),
+            fields(batch_schema),
+        )))
     }
 
     /// Compute estimated table-level statistics for scan planning.
