@@ -12,8 +12,8 @@ crates/
   core/         hudi-core — avro_to_arrow, config, expr, file_group, hfile, keygen, merge, metadata,
                 record, schema, statistics, storage, table, timeline, util
   datafusion/   hudi-datafusion — DataFusion TableProvider (feature: datafusion)
+  ffi/          hudi-ffi — plain C ABI for JVM and C++ engine callers via the Arrow C Data Interface
   hudi/         public umbrella crate; re-exports core + (optional) datafusion
-  jvm-ffi/      hudi-jvm-ffi — plain C ABI for JVM callers via the Arrow C Data Interface
   test/         shared test fixtures
 python/         PyO3 bindings (module hudi._internal); tests in python/tests
 cpp/            cxx bindings; bridge in cpp/src/lib.rs
@@ -25,7 +25,10 @@ benchmark/filegroup/ file-group read benchmark (fg-bench / fg-gen)
 
 The [`Makefile`](./Makefile) is the canonical command surface — **prefer `make <target>`** so agents
 and humans run what CI runs. Cargo / maturin go through [`build-wrapper.sh`](./build-wrapper.sh)
-(macOS 26+ SDK env vars).
+(macOS 26+ SDK env vars; on macOS arm64 it also builds dependencies at opt-level 1, without which
+the `hudi-datafusion` test binaries and the Python extension fail to link, see
+[#844](https://github.com/apache/hudi-rs/issues/844)). On an arm64 Mac, run `cargo test` for
+`hudi-datafusion` through the wrapper: `./build-wrapper.sh cargo test -p hudi-datafusion`.
 
 ```bash
 make setup-venv && source .venv/bin/activate

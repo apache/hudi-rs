@@ -45,18 +45,18 @@ dynamic = ["version"]
 devel = [
     "pytest==9.1.1",
     "coverage==7.16.2",
-    "ruff==0.15.18",
+    "ruff==0.17.1",
     "mypy==2.4.0",
     "pre-commit",
 ]
 lint = [
-    "ruff==0.15.18",
+    "ruff==0.17.1",
     "mypy==2.4.0",
 ]
 datafusion = [
     # The FFI contract is per DataFusion major: keep the Python package on the
     # same major as the Rust workspace's datafusion dependency.
-    "datafusion>=54.0.0,<55",
+    "datafusion>=55.0.0,<56",
 ]
 
 [tool.maturin]
@@ -87,6 +87,7 @@ exclude = "^tests"
 strict = true
 
 [tool.pytest.ini_options]
+addopts = "--doctest-modules"
 testpaths = [
     "tests",
     "hudi",

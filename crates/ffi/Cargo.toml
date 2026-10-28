@@ -17,7 +17,7 @@
 
 
 [package]
-name = "hudi-jvm-ffi"
+name = "hudi-ffi"
 # Not published to crates.io yet; the release workflow's publish matrix
 # deliberately excludes it.
 publish = false
@@ -25,12 +25,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Plain C ABI over hudi-rs, so a JVM can call it through the Arrow C Data Interface."
+description = "Plain C ABI over hudi-rs, so a JVM or a C++ engine can call it through the Arrow C Data Interface."
 homepage.workspace = true
 repository.workspace = true
 
 [lib]
-name = "hudi_jvm_ffi"
+name = "hudi_ffi"
 crate-type = ["cdylib", "rlib"]
 
 [features]
