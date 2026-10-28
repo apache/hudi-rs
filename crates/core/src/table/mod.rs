@@ -1430,21 +1430,7 @@ impl Table {
             return Ok(());
         }
         let table_schema = self.get_schema().await?;
-        let fields = |schema: &Schema| {
-            schema
-                .fields()
-                .iter()
-                .map(|f| (f.name().clone(), f.data_type().clone()))
-                .collect::<Vec<_>>()
-        };
-        if fields(&table_schema) == fields(batch_schema) {
-            return Ok(());
-        }
-        Err(CoreError::Write(format!(
-            "append batch schema does not match table schema (table fields={:?}, batch fields={:?})",
-            fields(&table_schema),
-            fields(batch_schema),
-        )))
+        crate::write::append::ensure_batch_schema_matches(&table_schema, batch_schema)
     }
 
     /// Compute estimated table-level statistics for scan planning.

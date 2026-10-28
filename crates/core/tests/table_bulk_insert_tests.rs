@@ -593,3 +593,115 @@ async fn append_only_version_6_commits_support_time_travel_and_incremental_reads
 
     Ok(())
 }
+
+fn narrow_types_batch(ids: Vec<i32>) -> RecordBatch {
+    use arrow::array::{Int16Array, LargeStringArray, ListArray};
+    use arrow::datatypes::Int32Type;
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("small", DataType::Int16, false),
+        Field::new("label", DataType::LargeUtf8, false),
+        Field::new(
+            "tags",
+            DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+            false,
+        ),
+    ]));
+    let small: Vec<i16> = ids.iter().map(|id| (*id as i16) * -100).collect();
+    let labels: Vec<String> = ids.iter().map(|id| format!("label{id}")).collect();
+    let tags = ListArray::from_iter_primitive::<Int32Type, _, _>(
+        ids.iter().map(|id| Some(vec![Some(*id), Some(id * 10)])),
+    );
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(Int16Array::from(small)),
+            Arc::new(LargeStringArray::from(labels)),
+            Arc::new(tags),
+        ],
+    )
+    .expect("valid batch")
+}
+
+/// Rows rendered as text, sorted, so the check does not depend on the Arrow
+/// type each column reads back as.
+fn rendered_rows(batches: &[RecordBatch]) -> Vec<String> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+    let options = FormatOptions::default();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let formatters: Vec<_> = batch
+            .columns()
+            .iter()
+            .map(|column| ArrayFormatter::try_new(column.as_ref(), &options).expect("formatter"))
+            .collect();
+        for row in 0..batch.num_rows() {
+            let cells: Vec<String> = formatters
+                .iter()
+                .map(|f| f.value(row).to_string())
+                .collect();
+            rows.push(cells.join("|"));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// Int16, LargeUtf8 and list item nullability do not survive the Avro commit
+/// schema, so the table schema differs from the batch that wrote it.
+#[tokio::test]
+async fn append_only_accepts_types_the_avro_commit_schema_widens() -> Result<()> {
+    for write_properties in [write_table_properties, write_layout_v2_table_properties] {
+        let temp_dir = tempdir()?;
+        write_properties(temp_dir.path())?;
+        let uri = temp_dir.path().to_str().expect("valid temp path");
+        let mut table = Table::new(uri).await?;
+
+        table.append_only([narrow_types_batch(vec![1, 2])]).await?;
+        table.append_only([narrow_types_batch(vec![3])]).await?;
+
+        let records = Table::new(uri).await?.read(&ReadOptions::new()).await?;
+        assert_eq!(
+            rendered_rows(&records),
+            vec![
+                "1|-100|label1|[1, 10]",
+                "2|-200|label2|[2, 20]",
+                "3|-300|label3|[3, 30]",
+            ]
+        );
+
+        let retyped = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("small", DataType::Utf8, false),
+                Field::new("label", DataType::LargeUtf8, false),
+                Field::new(
+                    "tags",
+                    DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                    false,
+                ),
+            ])),
+            narrow_types_batch(vec![4])
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(index, column)| {
+                    if index == 1 {
+                        Arc::new(StringArray::from(vec!["x"])) as _
+                    } else {
+                        column.clone()
+                    }
+                })
+                .collect(),
+        )?;
+        let error = table.append_only([retyped]).await.unwrap_err();
+        assert!(
+            matches!(error, CoreError::Write(message) if message.contains("does not match table schema"))
+        );
+    }
+
+    Ok(())
+}

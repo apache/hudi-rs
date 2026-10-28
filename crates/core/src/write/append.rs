@@ -810,8 +810,22 @@ async fn ensure_append_schema_matches_table(
         return Ok(());
     }
     let table_schema = table.get_schema().await?;
-    let batch_data = strip_meta_fields_from_schema(batch_schema);
-    if schemas_equal_by_fields(&table_schema, &batch_data) {
+    ensure_batch_schema_matches(&table_schema, &strip_meta_fields_from_schema(batch_schema))
+}
+
+/// The table schema resolves from the Avro schema in commit metadata, and the
+/// Arrow to Avro mapping is lossy (Int16 becomes Int32, LargeUtf8 becomes
+/// Utf8), so a batch also matches when its Avro round trip equals the table.
+pub(crate) fn ensure_batch_schema_matches(
+    table_schema: &arrow_schema::Schema,
+    batch_data: &arrow_schema::Schema,
+) -> Result<()> {
+    if schemas_equal_by_fields(table_schema, batch_data) {
+        return Ok(());
+    }
+    let round_trip = arrow_schema_to_avro_json(batch_data)
+        .and_then(|avro| crate::schema::resolver::avro_json_to_arrow_schema(&avro));
+    if round_trip.is_ok_and(|schema| schemas_equal_by_fields(table_schema, &schema)) {
         return Ok(());
     }
     Err(CoreError::Write(format!(
