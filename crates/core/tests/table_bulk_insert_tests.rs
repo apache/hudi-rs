@@ -26,7 +26,7 @@ use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::error::CoreError;
 use hudi_core::error::Result;
-use hudi_core::table::{ReadOptions, Table};
+use hudi_core::table::{QueryType, ReadOptions, Table};
 use tempfile::tempdir;
 
 fn write_table_properties(base_dir: &std::path::Path) -> Result<()> {
@@ -183,6 +183,21 @@ async fn append_only_writes_layout_v2_commit() -> Result<()> {
     let commit_file = temp_dir.path().join(&result.commit_relative_path);
     assert!(commit_file.exists(), "layout v2 commit file should exist");
 
+    let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+    let records = reopened.read(&ReadOptions::new()).await?;
+    let read_batch = concat_batches(&records[0].schema(), &records)?;
+    assert_eq!(read_batch.num_rows(), 1);
+    let ids = read_batch
+        .column_by_name("id")
+        .and_then(|array| array.as_any().downcast_ref::<Int32Array>())
+        .expect("expected id column");
+    let names = read_batch
+        .column_by_name("name")
+        .and_then(|array| array.as_any().downcast_ref::<StringArray>())
+        .expect("expected name column");
+    assert_eq!(ids.values(), &[7]);
+    assert_eq!(names.value(0), "delta");
+
     Ok(())
 }
 
@@ -229,31 +244,33 @@ async fn append_only_writes_multiple_batches_as_one_file() -> Result<()> {
 
 #[tokio::test]
 async fn append_only_rejects_empty_and_mismatched_batches() -> Result<()> {
-    let temp_dir = tempdir()?;
-    write_table_properties(temp_dir.path())?;
+    for write_properties in [write_table_properties, write_layout_v2_table_properties] {
+        let temp_dir = tempdir()?;
+        write_properties(temp_dir.path())?;
 
-    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+        let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
-    let error = table
-        .append_only(Vec::<RecordBatch>::new())
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, CoreError::Write(message) if message.contains("at least one RecordBatch"))
-    );
+        let error = table
+            .append_only(Vec::<RecordBatch>::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Write(message) if message.contains("at least one RecordBatch"))
+        );
 
-    let ints = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-        vec![Arc::new(Int32Array::from(vec![1]))],
-    )?;
-    let strings = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
-        vec![Arc::new(StringArray::from(vec!["1"]))],
-    )?;
-    let error = table.append_only([ints, strings]).await.unwrap_err();
-    assert!(
-        matches!(error, CoreError::Write(message) if message.contains("share the same schema"))
-    );
+        let ints = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![1]))],
+        )?;
+        let strings = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["1"]))],
+        )?;
+        let error = table.append_only([ints, strings]).await.unwrap_err();
+        assert!(
+            matches!(error, CoreError::Write(message) if message.contains("share the same schema"))
+        );
+    }
 
     Ok(())
 }
@@ -318,27 +335,29 @@ fn id_name_batch(ids: Vec<i32>, names: Vec<&str>) -> RecordBatch {
 
 #[tokio::test]
 async fn append_only_rejects_zero_rows_and_table_schema_mismatch() -> Result<()> {
-    let temp_dir = tempdir()?;
-    write_table_properties(temp_dir.path())?;
-    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+    for write_properties in [write_table_properties, write_layout_v2_table_properties] {
+        let temp_dir = tempdir()?;
+        write_properties(temp_dir.path())?;
+        let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
-    let error = table
-        .append_only([id_name_batch(vec![], vec![])])
-        .await
-        .unwrap_err();
-    assert!(matches!(error, CoreError::Write(message) if message.contains("at least one row")));
+        let error = table
+            .append_only([id_name_batch(vec![], vec![])])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CoreError::Write(message) if message.contains("at least one row")));
 
-    table
-        .append_only([id_name_batch(vec![1], vec!["alice"])])
-        .await?;
-    let ids_only = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
-        vec![Arc::new(Int32Array::from(vec![2]))],
-    )?;
-    let error = table.append_only([ids_only]).await.unwrap_err();
-    assert!(
-        matches!(error, CoreError::Write(message) if message.contains("does not match table schema"))
-    );
+        table
+            .append_only([id_name_batch(vec![1], vec!["alice"])])
+            .await?;
+        let ids_only = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(vec![2]))],
+        )?;
+        let error = table.append_only([ids_only]).await.unwrap_err();
+        assert!(
+            matches!(error, CoreError::Write(message) if message.contains("does not match table schema"))
+        );
+    }
 
     Ok(())
 }
@@ -430,6 +449,146 @@ async fn append_only_writes_version_6_commit_metadata() -> Result<()> {
             {"name": "id", "type": "int"},
             {"name": "name", "type": {"type": "string", "avro.java.string": "String"}},
         ])
+    );
+
+    Ok(())
+}
+
+fn append_property(base_dir: &std::path::Path, property: &str) -> Result<()> {
+    let props = base_dir.join(".hoodie/hoodie.properties");
+    let mut content = fs::read_to_string(&props)?;
+    content.push('\n');
+    content.push_str(property);
+    fs::write(&props, content)?;
+    Ok(())
+}
+
+fn has_completed_commit(base_dir: &std::path::Path) -> Result<bool> {
+    Ok(fs::read_dir(base_dir.join(".hoodie"))?
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_name().to_string_lossy().ends_with(".commit")))
+}
+
+#[tokio::test]
+async fn append_only_rejects_non_append_only_merge_strategy() -> Result<()> {
+    for write_properties in [write_table_properties, write_layout_v2_table_properties] {
+        let temp_dir = tempdir()?;
+        write_properties(temp_dir.path())?;
+        // A table without meta fields must be append-only, so only one that
+        // populates them can declare another merge strategy.
+        let props = temp_dir.path().join(".hoodie/hoodie.properties");
+        let rewritten = fs::read_to_string(&props)?.replace(
+            "hoodie.populate.meta.fields=false",
+            "hoodie.populate.meta.fields=true",
+        );
+        fs::write(&props, rewritten)?;
+        append_property(
+            temp_dir.path(),
+            "hoodie.table.record.merge.strategy=overwrite_with_latest",
+        )?;
+        let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+
+        let error = table
+            .append_only([id_name_batch(vec![1], vec!["alice"])])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, CoreError::Unsupported(message) if message.contains("requires hoodie.record.merge.mode=append_only"))
+        );
+        assert!(!has_completed_commit(temp_dir.path())?);
+        assert!(table.read(&ReadOptions::new()).await?.is_empty());
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_only_rejects_metadata_partitions_property_without_metadata_dir() -> Result<()> {
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    append_property(temp_dir.path(), "hoodie.table.metadata.partitions=files")?;
+    assert!(!temp_dir.path().join(".hoodie/metadata").exists());
+    let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
+
+    let error = table
+        .append_only([id_name_batch(vec![1], vec!["alice"])])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, CoreError::Unsupported(message) if message.contains("without a metadata table"))
+    );
+    assert!(!has_completed_commit(temp_dir.path())?);
+
+    Ok(())
+}
+
+async fn ids_read_with(base_uri: &str, options: ReadOptions) -> Result<Vec<i32>> {
+    let table = Table::new(base_uri).await?;
+    let mut ids: Vec<i32> = table
+        .read(&options)
+        .await?
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column_by_name("id")
+                .and_then(|array| array.as_any().downcast_ref::<Int32Array>())
+                .expect("expected id column")
+                .values()
+                .to_vec()
+        })
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+#[tokio::test]
+async fn append_only_version_6_commits_support_time_travel_and_incremental_reads() -> Result<()> {
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    let uri = temp_dir.path().to_str().expect("valid temp path");
+    let mut table = Table::new(uri).await?;
+
+    let first = table
+        .append_only([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
+        .await?;
+    let second = table
+        .append_only([id_name_batch(vec![3], vec!["carol"])])
+        .await?;
+    let third = table
+        .append_only([id_name_batch(vec![4, 5], vec!["dave", "erin"])])
+        .await?;
+
+    let as_of = |instant: &str| ReadOptions::new().with_as_of_timestamp(instant);
+    assert_eq!(ids_read_with(uri, as_of(&first.instant)).await?, vec![1, 2]);
+    assert_eq!(
+        ids_read_with(uri, as_of(&second.instant)).await?,
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        ids_read_with(uri, as_of(&third.instant)).await?,
+        vec![1, 2, 3, 4, 5]
+    );
+
+    let incremental = |start: &str| {
+        ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(start)
+    };
+    assert_eq!(
+        ids_read_with(
+            uri,
+            incremental(&first.instant).with_end_timestamp(&second.instant)
+        )
+        .await?,
+        vec![3]
+    );
+    assert_eq!(
+        ids_read_with(uri, incremental(&first.instant)).await?,
+        vec![3, 4, 5]
+    );
+    assert_eq!(
+        ids_read_with(uri, incremental(&third.instant)).await?,
+        Vec::<i32>::new()
     );
 
     Ok(())
