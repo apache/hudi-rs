@@ -1371,8 +1371,9 @@ impl Table {
 
     /// Append record batches to an append-only table as one new commit.
     ///
-    /// Requires the append-only record merge strategy, and all batches must
-    /// share one schema matching the table's. Tables at version 8 and 9 take
+    /// Requires the append-only record merge strategy, except on merge-on-read
+    /// tables at version 8 and 9, and all batches must share one schema
+    /// matching the table's. Tables at version 8 and 9 take
     /// the native write path. Older tables take a narrow path that only
     /// supports unpartitioned tables with `hoodie.populate.meta.fields=false`
     /// and no metadata table, and writes one base file.
