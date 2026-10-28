@@ -35,20 +35,17 @@ use crate::file_group::record_batches::RecordBatches;
 use crate::index::{HoodieIndex, HoodieKey, is_record_index_enabled};
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::record_merger::RecordMerger;
-use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
+use crate::metadata::commit::HoodieWriteStat;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::{ReadOptions, Table};
-use crate::timeline::instant::{Action, Instant};
+use crate::timeline::instant::Action;
 use crate::write::append::{
     ensure_copy_on_write, generate_instant_time, is_layout_two, prepare_batches_for_write,
     timeline_dir,
 };
 use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
-use crate::write::metadata::{
-    instant_to_epoch_millis, is_column_stats_enabled, update_column_stats_partitions,
-    update_files_partition_entries, update_record_index,
-};
+use crate::write::metadata::{instant_to_epoch_millis, is_column_stats_enabled};
 
 /// Result of an upsert, delete, or overwrite write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1706,65 +1703,28 @@ async fn mor_upsert_batches(
         }
         return Err(error);
     }
-    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
-    if table.is_metadata_table_enabled() {
-        let mdt_result = async {
-            if !files_mdt.is_empty() {
-                mdt_stats.insert(
-                    "files".to_string(),
-                    update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await?,
-                );
-            }
-            if is_record_index_enabled(table) && !rli_entries.is_empty() {
-                let rli_stats =
-                    update_record_index(storage.as_ref(), &instant, &rli_entries).await?;
-                if !rli_stats.is_empty() {
-                    mdt_stats.insert("record_index".to_string(), rli_stats);
-                }
-            }
-            if is_column_stats_enabled(table) && !stats_updates.is_empty() {
-                let stats_map = update_column_stats_partitions(
-                    table,
-                    &instant,
-                    &stats_updates,
-                    incoming.schema().as_ref(),
-                    &[],
-                )
-                .await?;
-                mdt_stats.extend(stats_map);
-            }
-            Ok::<(), CoreError>(())
-        }
-        .await;
-        if let Err(error) = mdt_result {
-            for path in written_paths {
-                let _ = storage.delete_file(&path).await;
-            }
-            return Err(error);
-        }
-    }
-    // Critical section 2: complete deltacommit + MDT, then bookkeeping.
-    let lock = crate::write::lock::lock_provider_for(table);
-    let cs2 = lock.lock().await?;
-    if table.is_metadata_table_enabled()
-        && let Err(error) =
-            crate::write::metadata::write_metadata_commit(storage.as_ref(), &instant, mdt_stats)
-                .await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
-    // An errored PUT may still have stored the completed instant, so the
-    // written files stay; the next write's rollback removes them only if the
-    // instant is still pending.
-    complete_deltacommit(table, &instant, "UPSERT", stats, incoming.schema().as_ref()).await?;
-    // Durable from here: best-effort maintenance must not fail the write.
-    let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
-    drop(cs2);
-    let _ = table.timeline.reload_completed_commits().await;
-    table.clear_read_caches();
+    let commit_bytes = crate::write::commit_metadata_bytes(
+        table,
+        "UPSERT",
+        crate::write::stats_by_partition(stats),
+        None,
+        incoming.schema().as_ref(),
+    )?;
+    crate::write::complete_write(
+        table,
+        &instant,
+        Action::DeltaCommit,
+        commit_bytes,
+        incoming.schema().as_ref(),
+        crate::write::MetadataTableUpdates {
+            files: files_mdt,
+            record_index: rli_entries,
+            column_stats: stats_updates,
+            replaced_paths: Vec::new(),
+        },
+        &written_paths,
+    )
+    .await?;
     Ok(WriteResult {
         instant,
         num_writes: incoming.num_rows(),
@@ -1904,77 +1864,43 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
             ..Default::default()
         });
     }
-    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
-    if table.is_metadata_table_enabled() {
-        let mdt_result = async {
-            if !files_mdt.is_empty() {
-                mdt_stats.insert(
-                    "files".to_string(),
-                    update_files_partition_entries(storage.as_ref(), &instant, &files_mdt).await?,
-                );
-            }
-            if is_record_index_enabled(table) {
-                let entries = delete_keys
-                    .iter()
-                    .filter(|key| locations.contains_key(&key.record_key))
-                    .map(|key| RecordIndexEntry {
-                        record_key: key.record_key.clone(),
-                        partition_path: key.partition_path.clone(),
-                        file_id: String::new(),
-                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                            &instant,
-                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                        ),
-                        is_deleted: true,
-                    })
-                    .collect::<Vec<_>>();
-                if !entries.is_empty() {
-                    let rli_stats =
-                        update_record_index(storage.as_ref(), &instant, &entries).await?;
-                    if !rli_stats.is_empty() {
-                        mdt_stats.insert("record_index".to_string(), rli_stats);
-                    }
-                }
-            }
-            Ok::<(), CoreError>(())
-        }
-        .await;
-        if let Err(error) = mdt_result {
-            for path in written_paths {
-                let _ = storage.delete_file(&path).await;
-            }
-            return Err(error);
-        }
-    }
-    // Critical section 2: complete deltacommit + MDT, then bookkeeping.
-    let lock = crate::write::lock::lock_provider_for(table);
-    let cs2 = lock.lock().await?;
-    if table.is_metadata_table_enabled()
-        && let Err(error) =
-            crate::write::metadata::write_metadata_commit(storage.as_ref(), &instant, mdt_stats)
-                .await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
-    // An errored PUT may still have stored the completed instant, so the
-    // written files stay; the next write's rollback removes them only if the
-    // instant is still pending.
-    complete_deltacommit(
+    let record_index = delete_keys
+        .iter()
+        .filter(|key| locations.contains_key(&key.record_key))
+        .map(|key| RecordIndexEntry {
+            record_key: key.record_key.clone(),
+            partition_path: key.partition_path.clone(),
+            file_id: String::new(),
+            instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                &instant,
+                &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+            ),
+            is_deleted: true,
+        })
+        .collect::<Vec<_>>();
+    let schema = table.get_schema_with_meta_fields().await?;
+    let commit_bytes = crate::write::commit_metadata_bytes(
+        table,
+        "DELETE",
+        crate::write::stats_by_partition(stats),
+        None,
+        &schema,
+    )?;
+    crate::write::complete_write(
         table,
         &instant,
-        "DELETE",
-        stats,
-        table.get_schema_with_meta_fields().await?.as_ref(),
+        Action::DeltaCommit,
+        commit_bytes,
+        &schema,
+        crate::write::MetadataTableUpdates {
+            files: files_mdt,
+            record_index,
+            column_stats: Vec::new(),
+            replaced_paths: Vec::new(),
+        },
+        &written_paths,
     )
     .await?;
-    // Durable from here: best-effort maintenance must not fail the write.
-    let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), &instant).await;
-    drop(cs2);
-    let _ = table.timeline.reload_completed_commits().await;
-    table.clear_read_caches();
     Ok(WriteResult {
         instant,
         num_writes: 0,
@@ -1982,56 +1908,6 @@ async fn mor_delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         num_inserts: 0,
         num_deletes: deleted,
     })
-}
-
-async fn complete_deltacommit(
-    table: &Table,
-    instant: &str,
-    operation: &str,
-    stats: Vec<HoodieWriteStat>,
-    schema: &arrow_schema::Schema,
-) -> Result<()> {
-    let storage = table.file_system_view.storage.clone();
-    let timeline = timeline_dir(table);
-    // Fencing happened at write start (before data files); this only completes.
-    let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
-    for stat in stats {
-        let partition = stat.partition_path.clone().unwrap_or_default();
-        partition_to_write_stats
-            .entry(partition)
-            .or_default()
-            .push(stat);
-    }
-    let metadata = HoodieCommitMetadata {
-        version: Some(1),
-        operation_type: Some(operation.to_string()),
-        partition_to_write_stats: Some(partition_to_write_stats),
-        compacted: Some(false),
-        extra_metadata: Some(HashMap::from([(
-            "schema".to_string(),
-            // Commit metadata carries the data schema (no _hoodie_* meta
-            // fields), matching the Java writer; some callers pass batches
-            // that were read back with meta fields.
-            crate::write::append::arrow_schema_to_avro_json(
-                &crate::write::append::strip_meta_fields_from_schema(schema),
-            )?,
-        )])),
-    };
-    let layout_two = is_layout_two(table);
-    let completed = if layout_two {
-        Some(generate_instant_time().await)
-    } else {
-        None
-    };
-    let commit = Instant::new_completed(instant.to_string(), Action::DeltaCommit, completed)?;
-    let path = commit.relative_path_with_base(&timeline)?;
-    let bytes = if layout_two {
-        metadata.to_avro_bytes()?
-    } else {
-        metadata.to_json_bytes()?
-    };
-    storage.put_file_if_absent(&path, bytes).await?;
-    Ok(())
 }
 
 /// Java merges the incoming record with the existing one BEFORE deciding a
@@ -2925,120 +2801,31 @@ async fn finalize_rewrite_commit(
     inserts: usize,
     deletes: usize,
 ) -> Result<WriteResult> {
-    let storage = table.file_system_view.storage.clone();
-    // Data schema only (no _hoodie_* meta fields) in commit metadata, like
-    // the Java writer; delete/update paths pass batches read with meta fields.
-    let schema_json = crate::write::append::arrow_schema_to_avro_json(
-        &crate::write::append::strip_meta_fields_from_schema(schema.as_ref()),
+    let commit_bytes = crate::write::commit_metadata_bytes(
+        table,
+        operation,
+        partition_to_write_stats,
+        match kind {
+            RewriteKind::Replace => Some(partition_to_replace_file_ids),
+            RewriteKind::Commit => None,
+        },
+        schema.as_ref(),
     )?;
-    let layout_two = is_layout_two(table);
-    let bytes = match kind {
-        RewriteKind::Replace => {
-            let metadata = crate::metadata::replace_commit::HoodieReplaceCommitMetadata {
-                version: Some(1),
-                operation_type: Some(operation.to_string()),
-                partition_to_write_stats: Some(partition_to_write_stats),
-                compacted: Some(false),
-                extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
-                partition_to_replace_file_ids: Some(partition_to_replace_file_ids),
-            };
-            if layout_two {
-                metadata.to_avro_bytes()?
-            } else {
-                metadata.to_json_bytes()?
-            }
-        }
-        RewriteKind::Commit => {
-            let metadata = HoodieCommitMetadata {
-                version: Some(1),
-                operation_type: Some(operation.to_string()),
-                partition_to_write_stats: Some(partition_to_write_stats),
-                compacted: Some(false),
-                extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
-            };
-            if layout_two {
-                metadata.to_avro_bytes()?
-            } else {
-                metadata.to_json_bytes()?
-            }
-        }
-    };
-
-    // Crash-consistency: MDT files + MDT deltacommit before completed data commit.
-    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
-    if table.is_metadata_table_enabled() {
-        let mdt_result = async {
-            // Replaced bases stay listed in MDT files/column_stats until clean,
-            // like Java: readers exclude replaced file groups via replacecommit
-            // metadata, and deleting here would break time-travel before clean.
-            if !additions.is_empty() {
-                mdt_stats.insert(
-                    "files".to_string(),
-                    update_files_partition_entries(storage.as_ref(), instant, &additions).await?,
-                );
-            }
-            if is_record_index_enabled(table) {
-                let entries = rli_entries;
-                if !entries.is_empty() {
-                    let stats = update_record_index(storage.as_ref(), instant, &entries).await?;
-                    if !stats.is_empty() {
-                        mdt_stats.insert("record_index".to_string(), stats);
-                    }
-                }
-            }
-            if is_column_stats_enabled(table) && !stats_updates.is_empty() {
-                // Replaced/rewritten bases are excluded from the tight-bound
-                // partition_stats scan; survivors come from latest file slices.
-                let stats = update_column_stats_partitions(
-                    table,
-                    instant,
-                    &stats_updates,
-                    schema.as_ref(),
-                    old_paths,
-                )
-                .await?;
-                mdt_stats.extend(stats);
-            }
-            Ok::<(), CoreError>(())
-        }
-        .await;
-        if let Err(error) = mdt_result {
-            for path in written_paths {
-                let _ = storage.delete_file(&path).await;
-            }
-            return Err(error);
-        }
-    }
-
-    // Critical section 2: complete the action, then bookkeeping under lock.
-    let lock = crate::write::lock::lock_provider_for(table);
-    let cs2 = lock.lock().await?;
-    if table.is_metadata_table_enabled()
-        && let Err(error) =
-            crate::write::metadata::write_metadata_commit(storage.as_ref(), instant, mdt_stats)
-                .await
-    {
-        for path in written_paths {
-            let _ = storage.delete_file(&path).await;
-        }
-        return Err(error);
-    }
-    let completed = if layout_two {
-        Some(generate_instant_time().await)
-    } else {
-        None
-    };
-    let commit = Instant::new_completed(instant.to_string(), action, completed)?;
-    let path = commit.relative_path_with_base(&timeline_dir(table))?;
-    // An errored PUT may still have stored the completed instant, so the
-    // written files stay; the next write's rollback removes them only if the
-    // instant is still pending.
-    storage.put_file_if_absent(&path, bytes).await?;
-    // Durable from here: best-effort maintenance must not fail the write.
-    let _ = crate::write::post_complete_bookkeeping(table, storage.as_ref(), instant).await;
-    drop(cs2);
-    let _ = table.timeline.reload_completed_commits().await;
-    table.clear_read_caches();
+    crate::write::complete_write(
+        table,
+        instant,
+        action,
+        commit_bytes,
+        schema.as_ref(),
+        crate::write::MetadataTableUpdates {
+            files: additions,
+            record_index: rli_entries,
+            column_stats: stats_updates,
+            replaced_paths: old_paths.to_vec(),
+        },
+        &written_paths,
+    )
+    .await?;
     Ok(WriteResult {
         instant: instant.to_string(),
         num_writes,
@@ -3730,7 +3517,32 @@ mod lifecycle_tests {
             num_writes: Some(rows.num_rows() as i64),
             ..Default::default()
         };
-        super::complete_deltacommit(table, &instant, "UPSERT", vec![stat], schema.as_ref())
+        let bytes = crate::write::commit_metadata_bytes(
+            table,
+            "UPSERT",
+            crate::write::stats_by_partition(vec![stat]),
+            None,
+            schema.as_ref(),
+        )
+        .unwrap();
+        let completion = if super::is_layout_two(table) {
+            Some(crate::write::append::generate_instant_time().await)
+        } else {
+            None
+        };
+        let completed = crate::timeline::instant::Instant::new_completed(
+            instant.clone(),
+            crate::timeline::instant::Action::DeltaCommit,
+            completion,
+        )
+        .unwrap();
+        storage
+            .put_file_if_absent(
+                &completed
+                    .relative_path_with_base(&super::timeline_dir(table))
+                    .unwrap(),
+                bytes,
+            )
             .await
             .unwrap();
     }

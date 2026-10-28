@@ -288,22 +288,6 @@ async fn bootstrap_empty_hfile_partition(
     .await
 }
 
-/// Append a files-partition HFile data block to the metadata table log file.
-///
-/// Returns the `files` partition write stats for the caller's single MDT
-/// deltacommit (see [`write_metadata_commit`]).
-pub async fn update_files_partition(
-    data_storage: &Storage,
-    instant: &str,
-    files: &[(String, String, i64)],
-) -> Result<Vec<HoodieWriteStat>> {
-    let entries = files
-        .iter()
-        .map(|(partition, file_name, size)| (partition.clone(), file_name.clone(), *size, false))
-        .collect::<Vec<_>>();
-    update_files_partition_entries(data_storage, instant, &entries).await
-}
-
 /// Apply file additions and deletions to the metadata table files partition.
 ///
 /// Returns the `files` partition write stats for the caller's single MDT

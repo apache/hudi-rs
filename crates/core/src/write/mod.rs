@@ -393,6 +393,181 @@ pub(crate) fn build_delete_log_block(
     ))
 }
 
+/// What a write adds to the metadata table when it completes.
+#[derive(Default)]
+pub(crate) struct MetadataTableUpdates {
+    /// `files` partition entries as (partition path, file name, size, is_deleted).
+    pub files: Vec<(String, String, i64, bool)>,
+    pub record_index: Vec<crate::metadata::table::encode::RecordIndexEntry>,
+    pub column_stats: Vec<metadata::StatsFileUpdate>,
+    /// Base files this write replaced or rewrote. The column stats update
+    /// leaves them out of its partition_stats scan; they stay listed in the
+    /// `files` partition until clean, like Java, because readers exclude
+    /// replaced file groups through the replacecommit metadata and deleting
+    /// them here would break time travel.
+    pub replaced_paths: Vec<String>,
+}
+
+/// Group flat write stats by partition path, the shape commit metadata carries.
+pub(crate) fn stats_by_partition(
+    stats: Vec<crate::metadata::commit::HoodieWriteStat>,
+) -> HashMap<String, Vec<crate::metadata::commit::HoodieWriteStat>> {
+    let mut by_partition: HashMap<String, Vec<_>> = HashMap::new();
+    for stat in stats {
+        let partition = stat.partition_path.clone().unwrap_or_default();
+        by_partition.entry(partition).or_default().push(stat);
+    }
+    by_partition
+}
+
+/// The bytes a completed data instant carries: commit metadata, or
+/// replacecommit metadata when `partition_to_replace_file_ids` is given, as
+/// Avro on timeline layout 2 and JSON otherwise. The recorded schema carries
+/// no `_hoodie_*` meta fields, like the Java writer; callers may pass batches
+/// that were read back with them.
+pub(crate) fn commit_metadata_bytes(
+    table: &crate::table::Table,
+    operation: &str,
+    partition_to_write_stats: HashMap<String, Vec<crate::metadata::commit::HoodieWriteStat>>,
+    partition_to_replace_file_ids: Option<HashMap<String, Vec<String>>>,
+    schema: &arrow_schema::Schema,
+) -> Result<Vec<u8>> {
+    let schema_json =
+        append::arrow_schema_to_avro_json(&append::strip_meta_fields_from_schema(schema))?;
+    let extra_metadata = Some(HashMap::from([("schema".to_string(), schema_json)]));
+    let layout_two = append::is_layout_two(table);
+    match partition_to_replace_file_ids {
+        Some(partition_to_replace_file_ids) => {
+            let metadata = crate::metadata::replace_commit::HoodieReplaceCommitMetadata {
+                version: Some(1),
+                operation_type: Some(operation.to_string()),
+                partition_to_write_stats: Some(partition_to_write_stats),
+                compacted: Some(false),
+                extra_metadata,
+                partition_to_replace_file_ids: Some(partition_to_replace_file_ids),
+            };
+            if layout_two {
+                metadata.to_avro_bytes()
+            } else {
+                metadata.to_json_bytes()
+            }
+        }
+        None => {
+            let metadata = crate::metadata::commit::HoodieCommitMetadata {
+                version: Some(1),
+                operation_type: Some(operation.to_string()),
+                partition_to_write_stats: Some(partition_to_write_stats),
+                compacted: Some(false),
+                extra_metadata,
+            };
+            if layout_two {
+                metadata.to_avro_bytes()
+            } else {
+                metadata.to_json_bytes()
+            }
+        }
+    }
+}
+
+/// Complete a write whose data files are already on storage, in the order
+/// crash consistency needs: metadata table updates first, then under the lock
+/// the metadata table deltacommit, the completed data instant and post-commit
+/// bookkeeping, then a reload of this handle's timeline. Finishing the data
+/// timeline last lets readers fence metadata table contents by completed data
+/// instants. The metadata table log writes are work and run unlocked; only
+/// completion runs in the critical section.
+///
+/// A failure before the completed instant is stored deletes `written_paths`.
+/// An errored PUT of the instant may still have stored it, so the files stay
+/// and the next write's rollback removes them only if the instant is still
+/// pending. From the stored instant on, bookkeeping and the reload are best
+/// effort: a transient failure must not turn a committed write into an error
+/// the caller would retry.
+///
+/// Returns the completed instant's path relative to the table base.
+pub(crate) async fn complete_write(
+    table: &mut crate::table::Table,
+    instant: &str,
+    action: Action,
+    commit_bytes: Vec<u8>,
+    schema: &arrow_schema::Schema,
+    updates: MetadataTableUpdates,
+    written_paths: &[String],
+) -> Result<String> {
+    let storage = table.file_system_view.storage.clone();
+    let mut mdt_stats = HashMap::new();
+    if table.is_metadata_table_enabled() {
+        let mdt_result = async {
+            if !updates.files.is_empty() {
+                mdt_stats.insert(
+                    "files".to_string(),
+                    metadata::update_files_partition_entries(
+                        storage.as_ref(),
+                        instant,
+                        &updates.files,
+                    )
+                    .await?,
+                );
+            }
+            if crate::index::is_record_index_enabled(table) && !updates.record_index.is_empty() {
+                let stats =
+                    metadata::update_record_index(storage.as_ref(), instant, &updates.record_index)
+                        .await?;
+                if !stats.is_empty() {
+                    mdt_stats.insert("record_index".to_string(), stats);
+                }
+            }
+            if metadata::is_column_stats_enabled(table) && !updates.column_stats.is_empty() {
+                let stats = metadata::update_column_stats_partitions(
+                    table,
+                    instant,
+                    &updates.column_stats,
+                    schema,
+                    &updates.replaced_paths,
+                )
+                .await?;
+                mdt_stats.extend(stats);
+            }
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        if let Err(error) = mdt_result {
+            for path in written_paths {
+                let _ = storage.delete_file(path).await;
+            }
+            return Err(error);
+        }
+    }
+
+    let lock = lock::lock_provider_for(table);
+    let critical_section = lock.lock().await?;
+    if table.is_metadata_table_enabled()
+        && let Err(error) =
+            metadata::write_metadata_commit(storage.as_ref(), instant, mdt_stats).await
+    {
+        for path in written_paths {
+            let _ = storage.delete_file(path).await;
+        }
+        return Err(error);
+    }
+    let completion = if append::is_layout_two(table) {
+        Some(append::generate_instant_time().await)
+    } else {
+        None
+    };
+    let completed = Instant::new_completed(instant.to_string(), action, completion)?;
+    let commit_relative_path = completed.relative_path_with_base(&append::timeline_dir(table))?;
+    storage
+        .put_file_if_absent(&commit_relative_path, commit_bytes)
+        .await?;
+    let _ = post_complete_bookkeeping(table, storage.as_ref(), instant).await;
+    drop(critical_section);
+
+    let _ = table.timeline.reload_completed_commits().await;
+    table.clear_read_caches();
+    Ok(commit_relative_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

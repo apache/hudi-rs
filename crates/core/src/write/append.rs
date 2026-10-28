@@ -36,21 +36,17 @@ use crate::config::table::HudiTableConfig::{
 };
 use crate::config::table::TableTypeValue;
 use crate::error::CoreError;
-use crate::index::is_record_index_enabled;
 use crate::merge::RecordMergeStrategyValue;
 use crate::metadata::HUDI_METADATA_DIR;
-use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
+use crate::metadata::commit::HoodieWriteStat;
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::{AppendResult, Table};
-use crate::timeline::instant::{Action, Instant};
+use crate::timeline::instant::Action;
 use crate::write::keygen::{
     hoodie_keys_for_batch, hoodie_keys_for_batch_with_offset, relative_data_path,
 };
-use crate::write::metadata::{
-    is_column_stats_enabled, update_column_stats_partitions, update_files_partition,
-    update_record_index,
-};
+use crate::write::metadata::is_column_stats_enabled;
 
 static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
@@ -330,101 +326,26 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         return Err(error);
     }
 
-    let commit_metadata = HoodieCommitMetadata {
-        version: Some(1),
-        operation_type: Some("INSERT".to_string()),
-        partition_to_write_stats: Some(write_stats),
-        compacted: Some(false),
-        // Java HoodieCommitMetadata.extraMetadata is non-null; null → NPE in Spark.
-        extra_metadata: Some(HashMap::from([(
-            "schema".to_string(),
-            arrow_schema_to_avro_json(&schema)?,
-        )])),
-    };
-    let commit_bytes = if layout_two {
-        commit_metadata.to_avro_bytes()?
-    } else {
-        commit_metadata.to_json_bytes()?
-    };
-
-    // Crash-consistency order: data files → MDT files → MDT deltacommit →
-    // completed data commit. Finalizing the data timeline last means readers
-    // fence MDT contents by completed data instants. MDT log-file writes are
-    // "work" (unlocked); only completion runs in critical section 2.
-    let mut mdt_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
-    if table.is_metadata_table_enabled() {
-        let mdt_result = async {
-            mdt_stats.insert(
-                "files".to_string(),
-                update_files_partition(storage.as_ref(), &request_instant, &files_mdt).await?,
-            );
-            if is_record_index_enabled(table) {
-                let stats =
-                    update_record_index(storage.as_ref(), &request_instant, &rli_entries).await?;
-                if !stats.is_empty() {
-                    mdt_stats.insert("record_index".to_string(), stats);
-                }
-            }
-            if is_column_stats_enabled(table) && !stats_updates.is_empty() {
-                let stats = update_column_stats_partitions(
-                    table,
-                    &request_instant,
-                    &stats_updates,
-                    schema.as_ref(),
-                    &[],
-                )
-                .await?;
-                mdt_stats.extend(stats);
-            }
-            Ok::<(), crate::error::CoreError>(())
-        }
-        .await;
-        if let Err(error) = mdt_result {
-            for path in &written_paths {
-                let _ = storage.delete_file(path).await;
-            }
-            return Err(error);
-        }
-    }
-
-    // Critical section 2: complete the action (MDT deltacommit + data commit
-    // with a completion time minted under the lock), then bookkeeping.
-    let cs2 = lock.lock().await?;
-    if table.is_metadata_table_enabled()
-        && let Err(error) = crate::write::metadata::write_metadata_commit(
-            storage.as_ref(),
-            &request_instant,
-            mdt_stats,
-        )
-        .await
-    {
-        for path in &written_paths {
-            let _ = storage.delete_file(path).await;
-        }
-        return Err(error);
-    }
-    let completion = if layout_two {
-        Some(generate_instant_time().await)
-    } else {
-        None
-    };
-    let instant = Instant::new_completed(request_instant.clone(), action, completion)?;
-    let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
-    // An errored PUT may still have stored the completed instant, so the
-    // written files stay; the next write's rollback removes them only if the
-    // instant is still pending.
-    storage
-        .put_file_if_absent(&commit_relative_path, commit_bytes)
-        .await?;
-    // The commit is durable from here: post-commit maintenance (markers,
-    // archival) and handle refresh are best-effort — a transient failure must
-    // not turn a committed write into an Err the caller would retry.
-    let _ =
-        crate::write::post_complete_bookkeeping(table, storage.as_ref(), &request_instant).await;
-    drop(cs2);
-
-    let _ = table.timeline.reload_completed_commits().await;
-    table.clear_read_caches();
+    let commit_bytes =
+        crate::write::commit_metadata_bytes(table, "INSERT", write_stats, None, schema.as_ref())?;
+    let commit_relative_path = crate::write::complete_write(
+        table,
+        &request_instant,
+        action,
+        commit_bytes,
+        schema.as_ref(),
+        crate::write::MetadataTableUpdates {
+            files: files_mdt
+                .into_iter()
+                .map(|(partition, file_name, size)| (partition, file_name, size, false))
+                .collect(),
+            record_index: rli_entries,
+            column_stats: stats_updates,
+            replaced_paths: Vec::new(),
+        },
+        &written_paths,
+    )
+    .await?;
 
     Ok(AppendResult {
         instant: request_instant,
