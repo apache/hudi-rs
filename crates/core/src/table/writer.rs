@@ -70,6 +70,9 @@ impl AppendOnlyWriter {
         self.ensure_no_metadata_table().await?;
         let schema_json = arrow_schema_to_avro_json(batch.schema().as_ref())?;
 
+        crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
+            &self.table.hudi_configs,
+        ));
         let request_instant = crate::write::append::generate_instant_time().await;
         let instant = Instant::from_str(&format!("{request_instant}.commit"))?;
 
