@@ -42,9 +42,6 @@ const HEADER_SIZE_NO_CHECKSUM: usize = MAGIC_LENGTH + 2 * SIZEOF_INT32 + SIZEOF_
 /// - 4 bytes: on-disk data size with header
 pub const BLOCK_HEADER_SIZE: usize = HEADER_SIZE_NO_CHECKSUM + SIZEOF_BYTE + 2 * SIZEOF_INT32;
 
-/// Checksum size (each checksum is 4 bytes)
-const CHECKSUM_SIZE: usize = SIZEOF_INT32;
-
 /// Parsed block header information.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -100,13 +97,6 @@ impl BlockHeader {
         })
     }
 
-    /// Calculate the number of checksum bytes.
-    pub fn checksum_bytes_count(&self) -> usize {
-        let on_disk_with_header = BLOCK_HEADER_SIZE + self.on_disk_size_without_header;
-        let num_chunks = on_disk_with_header.div_ceil(self.bytes_per_checksum);
-        num_chunks * CHECKSUM_SIZE
-    }
-
     /// Returns the total on-disk size including header.
     pub fn on_disk_size_with_header(&self) -> usize {
         BLOCK_HEADER_SIZE + self.on_disk_size_without_header
@@ -128,8 +118,7 @@ impl HFileBlock {
 
         // Extract the compressed data (between header and checksum)
         let data_start = BLOCK_HEADER_SIZE;
-        let data_end =
-            data_start + header.on_disk_size_without_header - header.checksum_bytes_count();
+        let data_end = header.on_disk_data_size_with_header;
 
         // For uncompressed blocks, on_disk_size == uncompressed_size
         // For compressed blocks, we need to decompress
@@ -336,6 +325,48 @@ mod tests {
         let header = BlockHeader::parse(&bytes).unwrap();
         assert_eq!(header.on_disk_size_with_header(), BLOCK_HEADER_SIZE + 100);
         assert_eq!(header.block_type, HFileBlockType::Data);
+    }
+
+    #[test]
+    fn test_parse_gz_block_at_checksum_chunk_boundary() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let bytes_per_checksum = 16384usize;
+        let checksum_size = SIZEOF_INT32;
+        let (input, compressed) = (16000..16384)
+            .find_map(|len| {
+                let input = vec![b'x'; len];
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+                encoder.write_all(&input).unwrap();
+                let compressed = encoder.finish().unwrap();
+                let data_size = BLOCK_HEADER_SIZE + compressed.len();
+                (data_size == bytes_per_checksum - 1).then_some((input, compressed))
+            })
+            .expect("a stored GZIP block one byte below the checksum boundary");
+        let data_size = BLOCK_HEADER_SIZE + compressed.len();
+        let num_chunks = data_size.div_ceil(bytes_per_checksum);
+        let checksum_bytes = num_chunks * checksum_size;
+        assert!(num_chunks < (data_size + checksum_bytes).div_ceil(bytes_per_checksum));
+        eprintln!(
+            "synthetic GZIP boundary: N={data_size}, C={}, chunks={num_chunks}, checksum_bytes={checksum_bytes}",
+            compressed.len()
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DATABLK*");
+        bytes.extend_from_slice(&((compressed.len() + checksum_bytes) as i32).to_be_bytes());
+        bytes.extend_from_slice(&(input.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&(-1i64).to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&(bytes_per_checksum as i32).to_be_bytes());
+        bytes.extend_from_slice(&(data_size as i32).to_be_bytes());
+        assert_eq!(bytes.len(), BLOCK_HEADER_SIZE);
+        bytes.extend_from_slice(&compressed);
+        bytes.resize(bytes.len() + checksum_bytes, 0);
+
+        let block = HFileBlock::parse(&bytes, CompressionCodec::Gzip).unwrap();
+        assert_eq!(block.data, input);
     }
 
     #[test]
