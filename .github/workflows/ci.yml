@@ -248,14 +248,14 @@ jobs:
         if: ${{ !((matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13')) }}
         run: |
           source .venv/bin/activate
-          pytest -v
+          pytest -v python
           
       - name: Python unit tests with coverage report
         # Only compute coverage for ubuntu-24.04 with Python 3.13
         if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
         run: |
           source .venv/bin/activate
-          coverage run --include 'python/hudi/*' -m pytest -v
+          coverage run --include 'python/hudi/*' -m pytest -v python
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
           
       - name: Upload coverage report
