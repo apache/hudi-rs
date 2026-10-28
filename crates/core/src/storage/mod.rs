@@ -107,9 +107,10 @@ pub struct Storage {
 /// which makes them exact and independent of the OS page cache: a warm re-read
 /// reports the same bytes as a cold one. Wall-clock does not have that property,
 /// which is what makes these the transferable numbers when comparing read paths.
-/// The boundary also bounds the scope: footer fetches happen before the
-/// counting wrapper is installed and log-file IO never crosses it, so these
-/// two count base-file column-chunk reads only.
+/// The boundary also bounds the scope: footer fetches use an uncounted path
+/// inside that reader (so replacing `ParquetObjectReader` does not pull them
+/// into these counters) and log-file IO never crosses it, so these two count
+/// base-file column-chunk reads only.
 ///
 /// All fields are `AtomicU64` under an `Arc` because the parquet stream is
 /// polled on whichever worker thread drives it, while a consumer may read the
