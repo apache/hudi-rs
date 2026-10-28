@@ -1195,6 +1195,52 @@ async fn test_delete_by_non_key_column_scan() {
     );
 }
 
+/// A row whose filter column is null does not match the filter.
+#[tokio::test]
+async fn test_delete_by_filter_keeps_rows_with_null_filter_column() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, true),
+        ]));
+        let rows = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])),
+                Arc::new(Int64Array::from(vec![Some(10), None, Some(20)])),
+            ],
+        )
+        .unwrap();
+        table.append([rows]).await.unwrap();
+
+        let deleted = table.delete("value = 20").await.unwrap();
+        assert_eq!(deleted.num_deletes, 1, "{table_type:?}");
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        let mut ids: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                ids.iter().flatten().map(str::to_string).collect::<Vec<_>>()
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"], "{table_type:?}");
+    }
+}
+
 #[tokio::test]
 async fn test_delete_by_record_key_equality_routes_keyed_path() {
     let dir = tempdir().unwrap();

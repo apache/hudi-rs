@@ -3286,7 +3286,7 @@ fn merge_file_group_task(
                 let old_keys = keys(&old, key_field)?;
                 let old_partitions = string_values(&old, MetaField::PartitionPath.as_ref())?;
                 for index in 0..old.num_rows() {
-                    if mask.value(index) {
+                    if mask.is_valid(index) && mask.value(index) {
                         matched += 1;
                         if ctx.collect_rli_deletes {
                             rli_deletes
