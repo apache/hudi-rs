@@ -28,14 +28,14 @@ permissions:
 
 jobs:
   check-pr:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24.22.1
 
       - name: Linting commit
         env:

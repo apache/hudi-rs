@@ -18,6 +18,8 @@
  */
 pub mod hfile;
 pub mod lance;
+mod lance_arrow;
+mod lance_object_store;
 pub mod parquet;
 pub mod reader;
 
