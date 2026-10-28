@@ -42,7 +42,7 @@ use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
-use crate::table::Table;
+use crate::table::{AppendResult, Table};
 use crate::timeline::instant::{Action, Instant};
 use crate::write::keygen::{
     hoodie_keys_for_batch, hoodie_keys_for_batch_with_offset, relative_data_path,
@@ -51,15 +51,6 @@ use crate::write::metadata::{
     is_column_stats_enabled, update_column_stats_partitions, update_files_partition,
     update_record_index,
 };
-
-/// Result of an append write.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AppendResult {
-    pub instant: String,
-    pub commit_relative_path: String,
-    pub base_file_path: String,
-    pub num_rows: usize,
-}
 
 static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 

@@ -268,7 +268,7 @@ async fn append_only_rejects_tables_with_meta_fields_or_metadata_table() -> Resu
     let props = meta_fields_dir.path().join(".hoodie/hoodie.properties");
     let rewritten = fs::read_to_string(&props)?.replace(
         "hoodie.populate.meta.fields=false",
-        "hoodie.populate.meta.fields=true",
+        "hoodie.populate.meta.fields=true\nhoodie.table.record.merge.strategy=append_only",
     );
     fs::write(&props, rewritten)?;
     let mut table = Table::new(meta_fields_dir.path().to_str().expect("valid temp path")).await?;

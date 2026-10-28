@@ -22,8 +22,6 @@ use std::io::Cursor;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use apache_avro::Writer as AvroWriter;
-use apache_avro::schema::AvroSchema;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use chrono::Utc;
@@ -33,8 +31,7 @@ use parquet::arrow::ArrowWriter;
 
 use crate::Result;
 use crate::config::table::HudiTableConfig::{
-    MetadataTablePartitions, PopulatesMetaFields, RecordMergeStrategy, TableVersion,
-    TimelineLayoutVersion, TimelinePath,
+    MetadataTablePartitions, PopulatesMetaFields, RecordMergeStrategy,
 };
 use crate::error::CoreError;
 use crate::merge::RecordMergeStrategyValue;
@@ -54,7 +51,7 @@ pub struct AppendResult {
     pub num_rows: usize,
 }
 
-/// Minimal writer for append-only tables.
+/// Minimal writer for append-only tables below table version 8 (timeline layout v1).
 #[derive(Clone, Debug)]
 pub(crate) struct AppendOnlyWriter {
     table: Table,
@@ -76,15 +73,7 @@ impl AppendOnlyWriter {
         self.ensure_no_metadata_table().await?;
 
         let request_instant = Self::current_timestamp();
-        let completion_instant = request_instant.clone();
-        let layout_two = self.is_layout_two();
-        let instant_name = if layout_two {
-            format!("{request_instant}_{completion_instant}.commit")
-        } else {
-            format!("{request_instant}.commit")
-        };
-        let instant = Instant::from_str(&instant_name)?;
-        let timeline_dir = self.timeline_dir();
+        let instant = Instant::from_str(&format!("{request_instant}.commit"))?;
 
         let file_id = format!("bulk-insert-{request_instant}");
         let write_token = "0-0-0";
@@ -102,7 +91,7 @@ impl AppendOnlyWriter {
             batch.num_rows() as i64,
             file_size,
         );
-        let commit_relative_path = instant.relative_path_with_base(&timeline_dir)?;
+        let commit_relative_path = instant.relative_path_with_base(HUDI_METADATA_DIR)?;
         if let Err(error) = self
             .write_commit_file(&commit_relative_path, &commit_metadata)
             .await
@@ -190,25 +179,6 @@ impl AppendOnlyWriter {
             ));
         }
         Ok(())
-    }
-
-    fn is_layout_two(&self) -> bool {
-        let table_version: isize = self.table.hudi_configs.get_or_default(TableVersion).into();
-        let layout_version: isize = self
-            .table
-            .hudi_configs
-            .get_or_default(TimelineLayoutVersion)
-            .into();
-        table_version >= 8 && layout_version == 2
-    }
-
-    fn timeline_dir(&self) -> String {
-        if self.is_layout_two() {
-            let timeline_path: String = self.table.hudi_configs.get_or_default(TimelinePath).into();
-            format!("{HUDI_METADATA_DIR}/{timeline_path}")
-        } else {
-            HUDI_METADATA_DIR.to_string()
-        }
     }
 
     fn current_timestamp() -> String {
@@ -302,7 +272,6 @@ impl AppendOnlyWriter {
             version: Some(1),
             operation_type: Some("BULK_INSERT".to_string()),
             partition_to_write_stats: Some(HashMap::from([(String::new(), vec![write_stat])])),
-            partition_to_replace_file_ids: None,
             compacted: Some(false),
             extra_metadata: None,
         }
@@ -313,18 +282,7 @@ impl AppendOnlyWriter {
         commit_relative_path: &str,
         metadata: &HoodieCommitMetadata,
     ) -> Result<()> {
-        let bytes = if self.is_layout_two() {
-            let schema = HoodieCommitMetadata::get_schema();
-            let mut writer = AvroWriter::new(&schema, Vec::new());
-            writer.append_ser(metadata)?;
-            writer.flush()?;
-            writer.into_inner()?
-        } else {
-            serde_json::to_vec(metadata).map_err(|e| {
-                CoreError::CommitMetadata(format!("Failed to serialize commit metadata: {e}"))
-            })?
-        };
-
-        self.put_file(commit_relative_path, bytes).await
+        self.put_file(commit_relative_path, metadata.to_json_bytes()?)
+            .await
     }
 }

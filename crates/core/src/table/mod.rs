@@ -97,11 +97,10 @@ mod validation;
 mod writer;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
-pub use writer::AppendResult;
 pub use crate::index::{HoodieKey, SimpleIndex};
-pub use crate::write::AppendResult;
 pub use crate::write::TableCreateBuilder;
 pub use crate::write::{UpsertOptions, WriteResult};
+pub use writer::AppendResult;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -381,17 +380,6 @@ impl Table {
     ) -> Result<AppendResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
         crate::write::append_batches(self, &batches).await
-    }
-
-    /// Append Arrow record batches using strict append-only merge mode.
-    ///
-    /// Requires the table to be configured with append-only record merge strategy.
-    pub async fn append_only(
-        &mut self,
-        batches: impl IntoIterator<Item = RecordBatch>,
-    ) -> Result<AppendResult> {
-        let batches: Vec<RecordBatch> = batches.into_iter().collect();
-        crate::write::append_batches_only(self, &batches).await
     }
 
     /// Upsert complete records by their configured record key.
@@ -1381,15 +1369,25 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
-    /// Append record batches to an append-only table as one new base file.
+    /// Append record batches to an append-only table as one new commit.
     ///
-    /// Intentionally narrow: it only supports unpartitioned append-only tables,
-    /// and all batches must share one schema matching the table's.
+    /// Requires the append-only record merge strategy, and all batches must
+    /// share one schema matching the table's. Tables at version 8 and 9 take
+    /// the native write path. Older tables take a narrow path that only
+    /// supports unpartitioned tables with `hoodie.populate.meta.fields=false`
+    /// and no metadata table, and writes one base file.
     pub async fn append_only(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<AppendResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        let table_version: isize = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::TableVersion)
+            .into();
+        if table_version >= 8 {
+            return crate::write::append_batches_only(self, &batches).await;
+        }
         let Some(first) = batches.first() else {
             return Err(CoreError::Write(
                 "append requires at least one RecordBatch".to_string(),

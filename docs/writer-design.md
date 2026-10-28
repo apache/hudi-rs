@@ -35,7 +35,11 @@ design as implemented in `crates/core/src/write/`.
 - `COPY_ON_WRITE` and `MERGE_ON_READ` (Parquet base files + Parquet-block log
   files), partitioned (hive-style) and non-partitioned tables.
 - Table versions 8 (Hudi 1.0.x) and 9 (Hudi 1.1.x, the default), timeline
-  layout v2 with completion-time instants.
+  layout v2 with completion-time instants. The one exception is
+  `append_only` on a table below version 8 (timeline layout v1), which takes
+  a narrow path in `table/writer.rs`: unpartitioned tables with
+  `hoodie.populate.meta.fields=false` and no metadata table, one base file
+  per call.
 - Metadata table (MDT) with `files`, `column_stats`, `partition_stats`, and
   `record_index` partitions, all enabled by default.
 - Marker-based rollback of failed writes, LSM timeline archival, in-process
