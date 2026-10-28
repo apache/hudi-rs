@@ -114,6 +114,81 @@ fn is_value_reinterpreting(file: &DataType, table: &DataType) -> bool {
     )
 }
 
+/// Java's `needsLogicalTypeRepair` (`AvroSchemaRepair`, and `SchemaRepair` for
+/// parquet) in Arrow terms: a file leaf type that Java relabels as the table's
+/// type, keeping the stored i64.
+///
+/// * A plain long the table declares as a timezone-less timestamp, as a writer
+///   without local-timestamp support stores it.
+/// * A tz-aware micros label on millis values ([`is_value_reinterpreting`]).
+///
+/// [`evolve_array`] reaches the same values for a base file, through
+/// `arrow_cast` and the tz-aware reinterpret arm respectively.
+pub(crate) fn needs_logical_type_repair(file: &DataType, table: &DataType) -> bool {
+    matches!(
+        (file, table),
+        (
+            DataType::Int64,
+            DataType::Timestamp(TimeUnit::Millisecond | TimeUnit::Microsecond, None),
+        )
+    ) || is_value_reinterpreting(file, table)
+}
+
+/// [`needs_logical_type_repair`] lifted through the container arms, as
+/// [`pair_is_value_reinterpreting`] lifts [`is_value_reinterpreting`].
+fn pair_needs_logical_type_repair(file: &DataType, table: &DataType) -> bool {
+    if needs_logical_type_repair(file, table) {
+        return true;
+    }
+    match (file, table) {
+        // Each file child against its table child, matched as the top level
+        // matches columns: exact name first, then case-insensitively, with an
+        // ambiguous match counting as needing the repair.
+        (DataType::Struct(ff), DataType::Struct(tf)) => ff.iter().any(|f| {
+            if let Some(t) = tf.iter().find(|t| t.name() == f.name()) {
+                return pair_needs_logical_type_repair(f.data_type(), t.data_type());
+            }
+            let mut matches = tf
+                .iter()
+                .filter(|t| t.name().eq_ignore_ascii_case(f.name()));
+            match (matches.next(), matches.next()) {
+                (Some(t), None) => pair_needs_logical_type_repair(f.data_type(), t.data_type()),
+                (Some(_), Some(_)) => true,
+                (None, _) => false,
+            }
+        }),
+        (DataType::List(f), DataType::List(t))
+        | (DataType::LargeList(f), DataType::LargeList(t))
+        | (DataType::Map(f, _), DataType::Map(t, _)) => {
+            pair_needs_logical_type_repair(f.data_type(), t.data_type())
+        }
+        _ => false,
+    }
+}
+
+/// Whether any column of `file_schema`, at any depth, needs the logical-type
+/// repair to read as `table_schema`.
+///
+/// This decides whether a predicate may be evaluated on the file's physical
+/// values, so a column that matches the table ambiguously counts as needing it:
+/// over-reporting costs pushdown, under-reporting drops rows.
+pub(crate) fn schema_needs_logical_type_repair(
+    file_schema: &arrow_schema::Schema,
+    table_schema: &arrow_schema::Schema,
+) -> bool {
+    file_schema
+        .fields()
+        .iter()
+        .any(|f| match index_of_ci(table_schema, f.name()) {
+            Ok(Some(idx)) => pair_needs_logical_type_repair(
+                f.data_type(),
+                table_schema.fields()[idx].data_type(),
+            ),
+            Ok(None) => false,
+            Err(_) => true,
+        })
+}
+
 /// [`is_value_reinterpreting`] lifted through the container arms, mirroring the
 /// recursion in [`evolve_array`] so a nested affected field is not missed.
 /// Container drift returns `false`; the read itself rejects that pairing.
@@ -1735,5 +1810,142 @@ mod tests {
             vec!["l".to_string()],
             "and so must one inside a list"
         );
+    }
+
+    /// `schema_needs_logical_type_repair` and the container arms of
+    /// `pair_needs_logical_type_repair`, which gate row filter pushdown into a
+    /// parquet log block.
+    mod logical_type_repair_gate {
+        use super::super::schema_needs_logical_type_repair;
+        use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
+        use std::sync::Arc;
+
+        fn micros_utc() -> DataType {
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        }
+        fn millis_utc() -> DataType {
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into()))
+        }
+        fn millis_local() -> DataType {
+            DataType::Timestamp(TimeUnit::Millisecond, None)
+        }
+        fn schema(fields: Vec<Field>) -> Schema {
+            Schema::new(fields)
+        }
+        fn col(name: &str, data_type: DataType) -> Field {
+            Field::new(name, data_type, true)
+        }
+        fn needs(file: Vec<Field>, table: Vec<Field>) -> bool {
+            schema_needs_logical_type_repair(&schema(file), &schema(table))
+        }
+        fn strukt(fields: Vec<Field>) -> DataType {
+            DataType::Struct(Fields::from(fields))
+        }
+
+        #[test]
+        fn top_level_leaf_pairs() {
+            assert!(needs(
+                vec![col("ts", micros_utc())],
+                vec![col("ts", millis_utc())]
+            ));
+            assert!(needs(
+                vec![col("ts", DataType::Int64)],
+                vec![col("ts", millis_local())]
+            ));
+            assert!(!needs(
+                vec![col("ts", micros_utc())],
+                vec![col("ts", micros_utc())]
+            ));
+            assert!(!needs(
+                vec![col("ts", DataType::Timestamp(TimeUnit::Microsecond, None))],
+                vec![col("ts", millis_local())]
+            ));
+            // A column the table does not have cannot be misread against it.
+            assert!(!needs(
+                vec![col("ts", micros_utc())],
+                vec![col("other", millis_utc())]
+            ));
+            // Matched case-insensitively when there is no exact match.
+            assert!(needs(
+                vec![col("TS", micros_utc())],
+                vec![col("ts", millis_utc())]
+            ));
+        }
+
+        #[test]
+        fn top_level_ambiguous_match_counts_as_needing_repair() {
+            let table = vec![col("ts", DataType::Utf8), col("TS", DataType::Utf8)];
+            assert!(needs(vec![col("Ts", DataType::Utf8)], table.clone()));
+            // An exact name is not ambiguous.
+            assert!(!needs(vec![col("ts", DataType::Utf8)], table));
+        }
+
+        #[test]
+        fn struct_child() {
+            let file = |name: &str| vec![col("s", strukt(vec![col(name, micros_utc())]))];
+            let table = vec![col("s", strukt(vec![col("ts", millis_utc())]))];
+            assert!(needs(file("ts"), table.clone()));
+            assert!(needs(file("TS"), table.clone()));
+            assert!(!needs(file("other"), table));
+            assert!(!needs(
+                file("ts"),
+                vec![col("s", strukt(vec![col("ts", micros_utc())]))]
+            ));
+        }
+
+        #[test]
+        fn struct_child_ambiguous_match_counts_as_needing_repair() {
+            let table = vec![col(
+                "s",
+                strukt(vec![col("ts", DataType::Utf8), col("TS", DataType::Utf8)]),
+            )];
+            let file = |name: &str| vec![col("s", strukt(vec![col(name, DataType::Utf8)]))];
+            assert!(needs(file("Ts"), table.clone()));
+            // An exact name is preferred, so it is not ambiguous.
+            assert!(!needs(file("ts"), table));
+        }
+
+        #[test]
+        fn list_element() {
+            let list = |t: DataType| DataType::List(Arc::new(Field::new("element", t, true)));
+            let large = |t: DataType| DataType::LargeList(Arc::new(Field::new("item", t, true)));
+            assert!(needs(
+                vec![col("l", list(micros_utc()))],
+                vec![col("l", list(millis_utc()))]
+            ));
+            assert!(needs(
+                vec![col("l", large(micros_utc()))],
+                vec![col("l", large(millis_utc()))]
+            ));
+            assert!(!needs(
+                vec![col("l", list(micros_utc()))],
+                vec![col("l", list(micros_utc()))]
+            ));
+        }
+
+        #[test]
+        fn map_value() {
+            let map = |v: DataType| {
+                DataType::Map(
+                    Arc::new(Field::new(
+                        "key_value",
+                        strukt(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            col("value", v),
+                        ]),
+                        false,
+                    )),
+                    false,
+                )
+            };
+            assert!(needs(
+                vec![col("m", map(DataType::Int64))],
+                vec![col("m", map(millis_local()))]
+            ));
+            assert!(!needs(
+                vec![col("m", map(DataType::Int64))],
+                vec![col("m", map(DataType::Int64))]
+            ));
+        }
     }
 }
