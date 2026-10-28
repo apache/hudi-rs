@@ -20,11 +20,9 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
 
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
-use chrono::Utc;
 use object_store::path::Path;
 use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
@@ -58,8 +56,6 @@ pub(crate) struct AppendOnlyWriter {
     table: Table,
 }
 
-static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
-
 impl AppendOnlyWriter {
     pub(crate) fn new(table: &Table) -> Self {
         Self {
@@ -74,7 +70,7 @@ impl AppendOnlyWriter {
         self.ensure_no_metadata_table().await?;
         let schema_json = arrow_schema_to_avro_json(batch.schema().as_ref())?;
 
-        let request_instant = Self::current_timestamp();
+        let request_instant = crate::write::append::generate_instant_time().await;
         let instant = Instant::from_str(&format!("{request_instant}.commit"))?;
 
         let file_id = format!("bulk-insert-{request_instant}");
@@ -189,22 +185,6 @@ impl AppendOnlyWriter {
             ));
         }
         Ok(())
-    }
-
-    fn current_timestamp() -> String {
-        let now = Utc::now().timestamp_millis();
-
-        loop {
-            let last = LAST_EPOCH_MILLIS.load(Ordering::Relaxed);
-            let next = if now <= last { last + 1 } else { now };
-
-            if LAST_EPOCH_MILLIS
-                .compare_exchange(last, next, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                return format!("{next:017}");
-            }
-        }
     }
 
     fn write_parquet_bytes(&self, batch: &RecordBatch) -> Result<Vec<u8>> {

@@ -104,11 +104,19 @@ async fn append_only_writes_records_and_commit() -> Result<()> {
         ],
     )?;
 
+    // Instants other writers mint before this write must order before it.
+    let earlier_instant = chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
     let result = table.append_only([batch]).await?;
     assert_eq!(result.num_rows, 3);
     assert_eq!(
         result.commit_relative_path,
         format!(".hoodie/{}.commit", result.instant)
+    );
+    assert!(
+        chrono::NaiveDateTime::parse_from_str(&result.instant, "%Y%m%d%H%M%S%3f").is_ok()
+            && result.instant >= earlier_instant,
+        "instant {} must be a yyyyMMddHHmmssSSS time at or after {earlier_instant}",
+        result.instant
     );
 
     let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
