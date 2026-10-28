@@ -372,18 +372,6 @@ impl Table {
         TableCreateBuilder::new(base_uri)
     }
 
-    /// Append Arrow record batches as a new INSERT commit (unpartitioned COW or MOR).
-    ///
-    /// After a successful write the in-memory timeline and file-system view cache
-    /// are refreshed so subsequent reads see new data.
-    pub async fn append(
-        &mut self,
-        batches: impl IntoIterator<Item = RecordBatch>,
-    ) -> Result<AppendResult> {
-        let batches: Vec<RecordBatch> = batches.into_iter().collect();
-        crate::write::append_batches(self, &batches).await
-    }
-
     /// Upsert complete records by their configured record key.
     ///
     /// If a key occurs more than once in an input batch, the row with the
@@ -1371,15 +1359,18 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
-    /// Append record batches to an append-only table as one new commit.
+    /// Append record batches as one new INSERT commit, like Hudi's bulk insert:
+    /// new file groups without an index lookup. All batches must share one
+    /// schema matching the table's.
     ///
-    /// Requires the append-only record merge strategy, except on merge-on-read
-    /// tables at version 8 and 9, and all batches must share one schema
-    /// matching the table's. Tables at version 8 and 9 take
-    /// the native write path. Older tables take a narrow path that only
-    /// supports unpartitioned tables with `hoodie.populate.meta.fields=false`
+    /// Tables at version 8 and 9 take the native write path, for COW and MOR,
+    /// partitioned or not. Older tables take a narrow path that only supports
+    /// unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
     /// and no metadata table, and writes one base file.
-    pub async fn append_only(
+    ///
+    /// After a successful write the in-memory timeline and file-system view
+    /// cache are refreshed so subsequent reads see the new data.
+    pub async fn append(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<AppendResult> {
@@ -1389,7 +1380,7 @@ impl Table {
             .get(HudiTableConfig::TableVersion)
             .map_or(0, isize::from);
         if table_version >= 8 {
-            return crate::write::append_batches_only(self, &batches).await;
+            return crate::write::append_batches(self, &batches).await;
         }
         let Some(first) = batches.first() else {
             return Err(CoreError::Write(

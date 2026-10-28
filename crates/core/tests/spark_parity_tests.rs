@@ -1026,12 +1026,12 @@ async fn parity_f_cdc_enabled_spark_table() {
 }
 
 // ---------------------------------------------------------------------------
-// Scenario H: append_only on a table version 6 table (timeline layout v1) →
+// Scenario H: append on a table version 6 table (timeline layout v1) →
 // Spark reads.
 // ---------------------------------------------------------------------------
 #[tokio::test]
 #[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
-async fn parity_h_append_only_table_version_6_spark_reads() {
+async fn parity_h_append_table_version_6_spark_reads() {
     if !enabled() {
         return;
     }
@@ -1056,11 +1056,11 @@ async fn parity_h_append_only_table_version_6_spark_reads() {
 
     let mut table = Table::new(path.to_str().unwrap()).await.unwrap();
     table
-        .append_only([batch(&[row("a", None, 1, 10), row("b", None, 1, 20)])])
+        .append([batch(&[row("a", None, 1, 10), row("b", None, 1, 20)])])
         .await
         .unwrap();
     table
-        .append_only([batch(&[row("c", None, 2, 30)])])
+        .append([batch(&[row("c", None, 2, 30)])])
         .await
         .unwrap();
 
@@ -1073,6 +1073,6 @@ async fn parity_h_append_only_table_version_6_spark_reads() {
     assert_eq!(
         spark_read(&env, &path),
         expected,
-        "spark must read the table version 6 table append_only wrote"
+        "spark must read the table version 6 table append wrote"
     );
 }

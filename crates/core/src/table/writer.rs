@@ -126,7 +126,8 @@ impl AppendOnlyWriter {
 
         if RecordMergeStrategyValue::from_str(&strategy)? != RecordMergeStrategyValue::AppendOnly {
             return Err(CoreError::Unsupported(
-                "append_only requires hoodie.record.merge.mode=append_only".to_string(),
+                "append below table version 8 requires hoodie.record.merge.mode=append_only"
+                    .to_string(),
             ));
         }
 
@@ -142,7 +143,8 @@ impl AppendOnlyWriter {
 
         if !partition_fields.is_empty() {
             return Err(CoreError::Unsupported(
-                "append_only currently supports only unpartitioned append-only tables".to_string(),
+                "append below table version 8 supports only unpartitioned append-only tables"
+                    .to_string(),
             ));
         }
 
@@ -159,7 +161,7 @@ impl AppendOnlyWriter {
             .into();
         if populates_meta_fields {
             return Err(CoreError::Unsupported(
-                "append_only currently supports only tables with hoodie.populate.meta.fields=false"
+                "append below table version 8 supports only tables with hoodie.populate.meta.fields=false"
                     .to_string(),
             ));
         }
@@ -184,7 +186,8 @@ impl AppendOnlyWriter {
             .any(|dir| dir == "metadata");
         if partitions.iter().any(|p| !p.is_empty()) || has_metadata_dir {
             return Err(CoreError::Unsupported(
-                "append_only currently supports only tables without a metadata table".to_string(),
+                "append below table version 8 supports only tables without a metadata table"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -335,7 +338,7 @@ mod tests {
                 vec![Arc::new(Int32Array::from(vec![1, 2]))],
             )
             .unwrap();
-            let result = table.append_only([batch]).await;
+            let result = table.append([batch]).await;
             assert!(result.is_err(), "{fault:?}: the faulted PUT must surface");
             assert!(!store.is_armed(), "{fault:?}: the commit PUT was not hit");
             assert_eq!(row_count(uri).await, rows_after_error, "{fault:?}");
@@ -368,10 +371,10 @@ mod tests {
                 )
                 .unwrap()
             };
-            assert!(table.append_only([batch(vec![1, 2])]).await.is_err());
+            assert!(table.append([batch(vec![1, 2])]).await.is_err());
 
             let mut retry = Table::new(uri).await.unwrap();
-            retry.append_only([batch(vec![3, 4, 5])]).await.unwrap();
+            retry.append([batch(vec![3, 4, 5])]).await.unwrap();
             assert_eq!(row_count(uri).await, rows_after_retry, "{fault:?}");
         }
     }
@@ -393,7 +396,7 @@ mod tests {
             ))],
         )
         .unwrap();
-        assert!(table.append_only([batch]).await.is_err());
+        assert!(table.append([batch]).await.is_err());
         let written: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|entry| entry.ok())

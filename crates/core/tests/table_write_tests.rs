@@ -180,32 +180,6 @@ async fn test_create_and_append_then_read() {
 }
 
 #[tokio::test]
-async fn test_append_only_requires_append_only_merge_mode() {
-    let dir = tempdir().unwrap();
-    let mut table = Table::create(dir.path().to_str().unwrap())
-        .with_table_name("trips")
-        .with_record_key_fields(["id"])
-        .with_populates_meta_fields(false)
-        .create()
-        .await
-        .unwrap();
-    table.append_only([sample_batch()]).await.unwrap();
-
-    let dir = tempdir().unwrap();
-    let mut upsertable = Table::create(dir.path().to_str().unwrap())
-        .with_table_name("trips")
-        .with_record_key_fields(["id"])
-        .with_ordering_fields(["event_time"])
-        .create()
-        .await
-        .unwrap();
-    let err = upsertable
-        .append_only([ordered_batch(vec![("a", 1, 1)])])
-        .await;
-    assert!(matches!(err, Err(CoreError::Unsupported(_))));
-}
-
-#[tokio::test]
 async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
     let dir = tempdir().unwrap();
     let root = dir.path();

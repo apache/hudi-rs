@@ -29,15 +29,15 @@ design as implemented in `crates/core/src/write/`.
 
 **In scope**
 
-- Table creation (`Table::create`) and write verbs: `append` / `append_only`,
+- Table creation (`Table::create`) and write verbs: `append`,
   `upsert` / `upsert_with`, `update`, `delete` / `delete_keys`, `overwrite`,
   `dynamic_partition_overwrite`.
 - `COPY_ON_WRITE` and `MERGE_ON_READ` (Parquet base files + Parquet-block log
   files), partitioned (hive-style) and non-partitioned tables.
 - Table versions 8 (Hudi 1.0.x) and 9 (Hudi 1.1.x, the default), timeline
   layout v2 with completion-time instants. The one exception is
-  `append_only` on a table below version 8 (timeline layout v1), which takes
-  a narrow path in `table/writer.rs`: unpartitioned tables with
+  `append` on a table below version 8 (timeline layout v1), which takes
+  a narrow path in `table/writer.rs`: unpartitioned append-only tables with
   `hoodie.populate.meta.fields=false` and no metadata table, one base file
   per call.
 - Metadata table (MDT) with `files`, `column_stats`, `partition_stats`, and
@@ -170,7 +170,7 @@ archival is bounded by MDT compaction, which is not implemented natively.
 
 | Verb | Semantics |
 |------|-----------|
-| `append` / `append_only` | Bulk-insert-like: new file groups per call, no index lookup, size-split into `hoodie.parquet.max.file.size` buckets. |
+| `append` | Bulk-insert-like: new file groups per call, no index lookup, size-split into `hoodie.parquet.max.file.size` buckets. Below version 8, one base file per call on unpartitioned append-only tables (see §1). |
 | `upsert` / `upsert_with` | Index-tagged updates + inserts. Updates rewrite their file group (COW) or append log blocks to their file slice (MOR). Inserts pack into existing small files first. |
 | `update` | SQL-style column update on rows matching a filter. |
 | `delete` / `delete_keys` | Filter- or key-based deletes. A file group left empty still receives an empty base file version so the deletion is durable for all readers. |
@@ -318,7 +318,7 @@ crates/core/src/write/
   mod.rs        shared helpers: write task pool, fencing, bookkeeping,
                 schema alignment, log/parquet file tasks
   create.rs     Table::create builder, hoodie.properties, MDT bootstrap
-  append.rs     append verbs, instant time generation, parquet writer props
+  append.rs     append verb, instant time generation, parquet writer props
   rewrite.rs    upsert/update/delete/overwrite engines (COW rewrite groups,
                 MOR delta logs), instant request/complete helpers
   sizing.rs     small-file packing: SizingConfig, insert bucket assignment

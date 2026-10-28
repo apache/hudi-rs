@@ -106,7 +106,7 @@ async fn append_only_writes_records_and_commit() -> Result<()> {
 
     // Instants other writers mint before this write must order before it.
     let earlier_instant = chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
-    let result = table.append_only([batch]).await?;
+    let result = table.append([batch]).await?;
     assert_eq!(result.num_rows, 3);
     assert_eq!(
         result.commit_relative_path,
@@ -156,7 +156,7 @@ async fn append_only_rejects_partitioned_tables() -> Result<()> {
     let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
     let batch = RecordBatch::try_new(schema.into(), vec![Arc::new(Int32Array::from(vec![1]))])?;
 
-    let error = table.append_only([batch]).await.unwrap_err();
+    let error = table.append([batch]).await.unwrap_err();
     assert!(
         matches!(error, CoreError::Unsupported(message) if message.contains("unpartitioned append-only tables"))
     );
@@ -184,7 +184,7 @@ async fn append_only_writes_layout_v2_commit() -> Result<()> {
         ],
     )?;
 
-    let result = table.append_only([batch]).await?;
+    let result = table.append([batch]).await?;
     assert!(result.commit_relative_path.starts_with(".hoodie/timeline/"));
     assert!(result.commit_relative_path.ends_with(".commit"));
 
@@ -235,7 +235,7 @@ async fn append_only_writes_multiple_batches_as_one_file() -> Result<()> {
         ],
     )?;
 
-    let result = table.append_only([first, second]).await?;
+    let result = table.append([first, second]).await?;
     assert_eq!(result.num_rows, 3);
 
     let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
@@ -258,10 +258,7 @@ async fn append_only_rejects_empty_and_mismatched_batches() -> Result<()> {
 
         let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
-        let error = table
-            .append_only(Vec::<RecordBatch>::new())
-            .await
-            .unwrap_err();
+        let error = table.append(Vec::<RecordBatch>::new()).await.unwrap_err();
         assert!(
             matches!(error, CoreError::Write(message) if message.contains("at least one RecordBatch"))
         );
@@ -274,7 +271,7 @@ async fn append_only_rejects_empty_and_mismatched_batches() -> Result<()> {
             Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
             vec![Arc::new(StringArray::from(vec!["1"]))],
         )?;
-        let error = table.append_only([ints, strings]).await.unwrap_err();
+        let error = table.append([ints, strings]).await.unwrap_err();
         assert!(
             matches!(error, CoreError::Write(message) if message.contains("share the same schema"))
         );
@@ -297,7 +294,7 @@ async fn append_only_rejects_tables_with_meta_fields_or_metadata_table() -> Resu
     );
     fs::write(&props, rewritten)?;
     let mut table = Table::new(meta_fields_dir.path().to_str().expect("valid temp path")).await?;
-    let error = table.append_only([batch.clone()]).await.unwrap_err();
+    let error = table.append([batch.clone()]).await.unwrap_err();
     assert!(
         matches!(error, CoreError::Unsupported(message) if message.contains("hoodie.populate.meta.fields=false"))
     );
@@ -312,7 +309,7 @@ async fn append_only_rejects_tables_with_meta_fields_or_metadata_table() -> Resu
         "hoodie.table.name=test_table_metadata\n",
     )?;
     let mut table = Table::new(mdt_dir.path().to_str().expect("valid temp path")).await?;
-    let error = table.append_only([batch]).await.unwrap_err();
+    let error = table.append([batch]).await.unwrap_err();
     assert!(
         matches!(error, CoreError::Unsupported(message) if message.contains("without a metadata table"))
     );
@@ -349,19 +346,19 @@ async fn append_only_rejects_zero_rows_and_table_schema_mismatch() -> Result<()>
         let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
         let error = table
-            .append_only([id_name_batch(vec![], vec![])])
+            .append([id_name_batch(vec![], vec![])])
             .await
             .unwrap_err();
         assert!(matches!(error, CoreError::Write(message) if message.contains("at least one row")));
 
         table
-            .append_only([id_name_batch(vec![1], vec!["alice"])])
+            .append([id_name_batch(vec![1], vec!["alice"])])
             .await?;
         let ids_only = RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
             vec![Arc::new(Int32Array::from(vec![2]))],
         )?;
-        let error = table.append_only([ids_only]).await.unwrap_err();
+        let error = table.append([ids_only]).await.unwrap_err();
         assert!(
             matches!(error, CoreError::Write(message) if message.contains("does not match table schema"))
         );
@@ -377,10 +374,10 @@ async fn append_only_handle_reads_its_own_writes() -> Result<()> {
     let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
     table
-        .append_only([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
+        .append([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
         .await?;
     table
-        .append_only([id_name_batch(vec![3], vec!["carol"])])
+        .append([id_name_batch(vec![3], vec!["carol"])])
         .await?;
 
     let rows: usize = table
@@ -405,7 +402,7 @@ async fn append_only_accepts_cleared_metadata_partitions_property() -> Result<()
     let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
     let result = table
-        .append_only([id_name_batch(vec![1], vec!["alice"])])
+        .append([id_name_batch(vec![1], vec!["alice"])])
         .await?;
     assert_eq!(result.num_rows, 1);
 
@@ -419,7 +416,7 @@ async fn append_only_writes_version_6_commit_metadata() -> Result<()> {
     let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
     let result = table
-        .append_only([id_name_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"])])
+        .append([id_name_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"])])
         .await?;
 
     let commit: serde_json::Value = serde_json::from_slice(&fs::read(
@@ -478,8 +475,14 @@ fn has_completed_commit(base_dir: &std::path::Path) -> Result<bool> {
 }
 
 #[tokio::test]
-async fn append_only_rejects_non_append_only_merge_strategy() -> Result<()> {
-    for write_properties in [write_table_properties, write_layout_v2_table_properties] {
+async fn append_requires_append_only_merge_strategy_below_version_8() -> Result<()> {
+    for (write_properties, rejected) in [
+        (
+            write_table_properties as fn(&std::path::Path) -> Result<()>,
+            true,
+        ),
+        (write_layout_v2_table_properties, false),
+    ] {
         let temp_dir = tempdir()?;
         write_properties(temp_dir.path())?;
         // A table without meta fields must be append-only, so only one that
@@ -496,10 +499,13 @@ async fn append_only_rejects_non_append_only_merge_strategy() -> Result<()> {
         )?;
         let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
-        let error = table
-            .append_only([id_name_batch(vec![1], vec!["alice"])])
-            .await
-            .unwrap_err();
+        let result = table.append([id_name_batch(vec![1], vec!["alice"])]).await;
+        if !rejected {
+            // Version 8 and 9 append is an insert, valid on upsertable tables.
+            result?;
+            continue;
+        }
+        let error = result.unwrap_err();
         assert!(
             matches!(error, CoreError::Unsupported(message) if message.contains("requires hoodie.record.merge.mode=append_only"))
         );
@@ -519,7 +525,7 @@ async fn append_only_rejects_metadata_partitions_property_without_metadata_dir()
     let mut table = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
 
     let error = table
-        .append_only([id_name_batch(vec![1], vec!["alice"])])
+        .append([id_name_batch(vec![1], vec!["alice"])])
         .await
         .unwrap_err();
     assert!(
@@ -557,13 +563,13 @@ async fn append_only_version_6_commits_support_time_travel_and_incremental_reads
     let mut table = Table::new(uri).await?;
 
     let first = table
-        .append_only([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
+        .append([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
         .await?;
     let second = table
-        .append_only([id_name_batch(vec![3], vec!["carol"])])
+        .append([id_name_batch(vec![3], vec!["carol"])])
         .await?;
     let third = table
-        .append_only([id_name_batch(vec![4, 5], vec!["dave", "erin"])])
+        .append([id_name_batch(vec![4, 5], vec!["dave", "erin"])])
         .await?;
 
     let as_of = |instant: &str| ReadOptions::new().with_as_of_timestamp(instant);
@@ -668,8 +674,8 @@ async fn append_only_accepts_types_the_avro_commit_schema_widens() -> Result<()>
         let uri = temp_dir.path().to_str().expect("valid temp path");
         let mut table = Table::new(uri).await?;
 
-        table.append_only([narrow_types_batch(vec![1, 2])]).await?;
-        table.append_only([narrow_types_batch(vec![3])]).await?;
+        table.append([narrow_types_batch(vec![1, 2])]).await?;
+        table.append([narrow_types_batch(vec![3])]).await?;
 
         let records = Table::new(uri).await?.read(&ReadOptions::new()).await?;
         assert_eq!(
@@ -705,7 +711,7 @@ async fn append_only_accepts_types_the_avro_commit_schema_widens() -> Result<()>
                 })
                 .collect(),
         )?;
-        let error = table.append_only([retyped]).await.unwrap_err();
+        let error = table.append([retyped]).await.unwrap_err();
         assert!(
             matches!(error, CoreError::Write(message) if message.contains("does not match table schema"))
         );
@@ -727,7 +733,7 @@ async fn append_only_without_table_version_takes_the_version_6_path() -> Result<
     let mut table = Table::new_with_options(uri, [(SkipConfigValidation, "true")]).await?;
 
     let result = table
-        .append_only([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
+        .append([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
         .await?;
     assert_eq!(
         result.commit_relative_path,

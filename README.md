@@ -357,7 +357,9 @@ let mut table = Table::create("/tmp/trips_table")
 
 `append` behaves like Hudi's bulk insert: it writes new file groups without
 an index lookup, splitting input into files bounded by
-`hoodie.parquet.max.file.size`.
+`hoodie.parquet.max.file.size`. On tables below version 8 it takes a narrow
+path: unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
+and no metadata table, one base file per call.
 
 ```rust
 use arrow_array::RecordBatch;

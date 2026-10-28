@@ -29,8 +29,8 @@ mod rewrite;
 pub(crate) mod rollback;
 pub(crate) mod sizing;
 
+pub use append::append_batches;
 pub(crate) use append::set_commit_timezone;
-pub use append::{append_batches, append_batches_only};
 pub use create::TableCreateBuilder;
 pub(crate) use keygen::{
     complex_keygen_validation_enabled, ensure_complex_keygen_validated,
