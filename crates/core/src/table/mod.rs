@@ -94,13 +94,12 @@ pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
 mod validation;
-mod writer;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
 pub use crate::index::{HoodieKey, SimpleIndex};
 pub use crate::write::TableCreateBuilder;
+pub use crate::write::append::AppendResult;
 pub use crate::write::{UpsertOptions, WriteResult};
-pub use writer::AppendResult;
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -125,7 +124,6 @@ use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
-use crate::table::writer::AppendOnlyWriter;
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
@@ -1366,7 +1364,8 @@ impl Table {
     /// Tables at version 8 and 9 take the native write path, for COW and MOR,
     /// partitioned or not. Older tables take a narrow path that only supports
     /// unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
-    /// and no metadata table, and writes one base file.
+    /// and no metadata table, and writes one base file; see
+    /// `write::append::append_version_6` for what that path leaves out.
     ///
     /// After a successful write the in-memory timeline and file-system view
     /// cache are refreshed so subsequent reads see the new data.
@@ -1375,56 +1374,7 @@ impl Table {
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<AppendResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
-        let table_version = self
-            .hudi_configs
-            .get(HudiTableConfig::TableVersion)
-            .map_or(0, isize::from);
-        if table_version >= 8 {
-            return crate::write::append_batches(self, &batches).await;
-        }
-        let Some(first) = batches.first() else {
-            return Err(CoreError::Write(
-                "append requires at least one RecordBatch".to_string(),
-            ));
-        };
-        let schema = first.schema();
-        if batches.iter().any(|batch| batch.schema() != schema) {
-            return Err(CoreError::Write(
-                "All RecordBatches in append must share the same schema".to_string(),
-            ));
-        }
-        self.ensure_append_schema_matches_table(schema.as_ref())
-            .await?;
-        let batch = arrow::compute::concat_batches(&schema, &batches)?;
-        if batch.num_rows() == 0 {
-            return Err(CoreError::Write(
-                "append requires at least one row".to_string(),
-            ));
-        }
-        let result = AppendOnlyWriter::new(self).write(batch).await?;
-        // The commit is durable; a failed refresh must not turn it into an error.
-        if let Ok(timeline) =
-            Timeline::new_from_storage(self.hudi_configs.clone(), self.storage_options.clone())
-                .await
-        {
-            self.timeline = timeline;
-        }
-        if let Ok(file_system_view) =
-            FileSystemView::new(self.hudi_configs.clone(), self.storage_options.clone()).await
-        {
-            self.file_system_view = file_system_view;
-        }
-        self.cached_metadata_table = Arc::new(OnceCell::new());
-        self.cached_estimator = Arc::new(OnceCell::new());
-        Ok(result)
-    }
-
-    async fn ensure_append_schema_matches_table(&self, batch_schema: &Schema) -> Result<()> {
-        if self.timeline.completed_commits.is_empty() {
-            return Ok(());
-        }
-        let table_schema = self.get_schema().await?;
-        crate::write::append::ensure_batch_schema_matches(&table_schema, batch_schema)
+        crate::write::append_batches(self, &batches).await
     }
 
     /// Compute estimated table-level statistics for scan planning.

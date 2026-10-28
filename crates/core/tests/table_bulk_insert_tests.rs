@@ -507,7 +507,7 @@ async fn append_requires_append_only_merge_strategy_below_version_8() -> Result<
         }
         let error = result.unwrap_err();
         assert!(
-            matches!(error, CoreError::Unsupported(message) if message.contains("requires hoodie.record.merge.mode=append_only"))
+            matches!(error, CoreError::Unsupported(message) if message.contains("requires hoodie.table.record.merge.strategy=append_only"))
         );
         assert!(!has_completed_commit(temp_dir.path())?);
         assert!(table.read(&ReadOptions::new()).await?.is_empty());

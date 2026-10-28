@@ -31,18 +31,18 @@ use parquet::arrow::ArrowWriter;
 
 use crate::Result;
 use crate::config::table::HudiTableConfig::{
-    PopulatesMetaFields, RecordMergeStrategy, TableType, TableVersion, TimelineLayoutVersion,
-    TimelinePath,
+    MetadataTablePartitions, PartitionFields, PopulatesMetaFields, RecordMergeStrategy, TableType,
+    TableVersion, TimelineLayoutVersion, TimelinePath,
 };
 use crate::config::table::TableTypeValue;
 use crate::error::CoreError;
 use crate::merge::RecordMergeStrategyValue;
 use crate::metadata::HUDI_METADATA_DIR;
-use crate::metadata::commit::HoodieWriteStat;
+use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
-use crate::table::{AppendResult, Table};
-use crate::timeline::instant::Action;
+use crate::table::Table;
+use crate::timeline::instant::{Action, Instant};
 use crate::write::keygen::{
     hoodie_keys_for_batch, hoodie_keys_for_batch_with_offset, relative_data_path,
 };
@@ -50,8 +50,24 @@ use crate::write::metadata::is_column_stats_enabled;
 
 static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
+/// What an append wrote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppendResult {
+    /// Timestamp of the completed instant.
+    pub instant: String,
+    /// Path of the completed instant, relative to the table base.
+    pub commit_relative_path: String,
+    /// Path of the first base file written, relative to the table base.
+    pub base_file_path: String,
+    /// Rows written.
+    pub num_rows: usize,
+}
+
 /// Append one or more record batches as a single INSERT commit.
 pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+    if table_version(table) < 8 {
+        return append_version_6(table, batches).await;
+    }
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
     if !table.is_mor() {
@@ -59,28 +75,11 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     }
     ensure_supported_table_type(table)?;
 
-    if batches.is_empty() {
-        return Err(CoreError::Write(
-            "append requires at least one RecordBatch".to_string(),
-        ));
-    }
-    let schema = batches[0].schema();
-    for batch in batches.iter().skip(1) {
-        if batch.schema().as_ref() != schema.as_ref() {
-            return Err(CoreError::Write(
-                "All RecordBatches in append must share the same schema".to_string(),
-            ));
-        }
-    }
+    let schema = ensure_batches_share_schema(batches)?;
     ensure_append_schema_matches_table(table, schema.as_ref()).await?;
     // Must be expressible in commit metadata (Avro JSON) before fencing.
     arrow_schema_to_avro_json(&strip_meta_fields_from_schema(schema.as_ref()))?;
-    let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    if num_rows == 0 {
-        return Err(CoreError::Write(
-            "append requires at least one row".to_string(),
-        ));
-    }
+    let num_rows = ensure_rows_present(batches)?;
 
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
 
@@ -393,6 +392,184 @@ fn ensure_supported_table_type(table: &Table) -> Result<()> {
     match TableTypeValue::from_str(&table_type)? {
         TableTypeValue::CopyOnWrite | TableTypeValue::MergeOnRead => Ok(()),
     }
+}
+
+fn table_version(table: &Table) -> isize {
+    table.hudi_configs.get(TableVersion).map_or(0, isize::from)
+}
+
+fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<arrow_schema::SchemaRef> {
+    let Some(first) = batches.first() else {
+        return Err(CoreError::Write(
+            "append requires at least one RecordBatch".to_string(),
+        ));
+    };
+    let schema = first.schema();
+    if batches
+        .iter()
+        .skip(1)
+        .any(|batch| batch.schema().as_ref() != schema.as_ref())
+    {
+        return Err(CoreError::Write(
+            "All RecordBatches in append must share the same schema".to_string(),
+        ));
+    }
+    Ok(schema)
+}
+
+fn ensure_rows_present(batches: &[RecordBatch]) -> Result<usize> {
+    let num_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    if num_rows == 0 {
+        return Err(CoreError::Write(
+            "append requires at least one row".to_string(),
+        ));
+    }
+    Ok(num_rows)
+}
+
+/// The narrow path for tables below version 8: one base file for an
+/// unpartitioned append-only table with `hoodie.populate.meta.fields=false`
+/// and no metadata table, in the layout 0.x readers expect.
+///
+/// The completed commit is the only timeline file it writes. It takes no
+/// lock, fences no requested or inflight instant, rolls back no earlier
+/// failed write, and writes no markers and no archival, so it does not share
+/// `complete_write` with the version 8 path, and a crashed write leaves
+/// nothing on the timeline for a later writer to roll back.
+async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+    let schema = ensure_batches_share_schema(batches)?;
+    if !table.timeline.completed_commits.is_empty() {
+        ensure_batch_schema_matches(&table.get_schema().await?, schema.as_ref())?;
+    }
+    let num_rows = ensure_rows_present(batches)?;
+    ensure_version_6_append_only(table)?;
+    ensure_unpartitioned(table)?;
+    ensure_no_meta_fields(table)?;
+    ensure_no_metadata_table(table).await?;
+    // The commit records the write schema as Avro; refuse before any file is written.
+    let schema_json = arrow_schema_to_avro_json(schema.as_ref())?;
+
+    set_commit_timezone(&crate::write::metadata::timeline_timezone(
+        &table.hudi_configs,
+    ));
+    let instant = generate_instant_time().await;
+    let file_id = format!("bulk-insert-{instant}");
+    let base_file_path = format!("{file_id}_0-0-0_{instant}.parquet");
+    let storage = table.file_system_view.storage.clone();
+    let bytes = write_parquet_bytes_with_props(parquet_writer_props(table), batches)?;
+    let file_size = bytes.len() as i64;
+    storage.put_file(&base_file_path, bytes).await?;
+
+    let write_stat = HoodieWriteStat {
+        file_id: Some(file_id),
+        path: Some(base_file_path.clone()),
+        num_writes: Some(num_rows as i64),
+        num_deletes: Some(0),
+        num_update_writes: Some(0),
+        num_inserts: Some(num_rows as i64),
+        total_write_bytes: Some(file_size),
+        total_write_errors: Some(0),
+        partition_path: Some(String::new()),
+        file_size_in_bytes: Some(file_size),
+        num_updates: Some(0),
+        ..Default::default()
+    };
+    let commit = HoodieCommitMetadata {
+        version: Some(1),
+        operation_type: Some("BULK_INSERT".to_string()),
+        partition_to_write_stats: Some(HashMap::from([(String::new(), vec![write_stat])])),
+        compacted: Some(false),
+        // Spark reads a null extraMetadata as a null map and fails on it.
+        extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
+    };
+    let commit_relative_path = Instant::new_completed(instant.clone(), Action::Commit, None)?
+        .relative_path_with_base(HUDI_METADATA_DIR)?;
+    if let Err(error) = storage
+        .put_file(&commit_relative_path, commit.to_json_bytes()?)
+        .await
+    {
+        // An errored PUT may still have stored the commit, which needs the
+        // base file. Without the commit the file must go: no requested
+        // instant marks it pending, so it reads as committed once a later
+        // commit starts the timeline after this instant.
+        if let Ok(false) = storage.exists(&commit_relative_path).await {
+            let _ = storage.delete_file(&base_file_path).await;
+        }
+        return Err(error.into());
+    }
+    // The commit is durable; a failed refresh must not turn it into an error.
+    let _ = table.timeline.reload_completed_commits().await;
+    table.clear_read_caches();
+    Ok(AppendResult {
+        instant,
+        commit_relative_path,
+        base_file_path,
+        num_rows,
+    })
+}
+
+fn ensure_version_6_append_only(table: &Table) -> Result<()> {
+    let strategy: String = table
+        .hudi_configs
+        .get_or_default(RecordMergeStrategy)
+        .into();
+    if RecordMergeStrategyValue::from_str(&strategy)? != RecordMergeStrategyValue::AppendOnly {
+        return Err(CoreError::Unsupported(
+            "append below table version 8 requires hoodie.table.record.merge.strategy=append_only"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_unpartitioned(table: &Table) -> Result<()> {
+    let partition_fields: Vec<String> = table.hudi_configs.get_or_default(PartitionFields).into();
+    if !partition_fields.is_empty() {
+        return Err(CoreError::Unsupported(
+            "append below table version 8 supports only unpartitioned append-only tables"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The written base file carries only the batch's columns, so a table that
+/// populates the `_hoodie_*` meta fields would get a file without them.
+fn ensure_no_meta_fields(table: &Table) -> Result<()> {
+    let populates_meta_fields: bool = table
+        .hudi_configs
+        .get_or_default(PopulatesMetaFields)
+        .into();
+    if populates_meta_fields {
+        return Err(CoreError::Unsupported(
+            "append below table version 8 supports only tables with hoodie.populate.meta.fields=false"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// The metadata table is not updated, so its file listings would miss the
+/// new base file.
+async fn ensure_no_metadata_table(table: &Table) -> Result<()> {
+    let partitions: Vec<String> = table
+        .hudi_configs
+        .get_or_default(MetadataTablePartitions)
+        .into();
+    let has_metadata_dir = table
+        .file_system_view
+        .storage
+        .list_dirs(Some(HUDI_METADATA_DIR))
+        .await?
+        .iter()
+        .any(|dir| dir == "metadata");
+    if partitions.iter().any(|p| !p.is_empty()) || has_metadata_dir {
+        return Err(CoreError::Unsupported(
+            "append below table version 8 supports only tables without a metadata table"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn is_layout_two(table: &Table) -> bool {
@@ -1121,5 +1298,130 @@ mod tests {
         )
         .unwrap();
         assert!(table.append([id_batch(1), other]).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod version_6_tests {
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::record_batch::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+
+    use crate::storage::Storage;
+    use crate::storage::fault::{FaultyPutStore, PutFault};
+    use crate::table::{ReadOptions, Table};
+
+    async fn version_6_table(base_dir: &std::path::Path) -> Table {
+        let hoodie_dir = base_dir.join(".hoodie");
+        std::fs::create_dir_all(&hoodie_dir).unwrap();
+        let properties = [
+            "hoodie.table.name=t",
+            "hoodie.table.type=COPY_ON_WRITE",
+            "hoodie.table.version=6",
+            "hoodie.timeline.layout.version=1",
+            "hoodie.populate.meta.fields=false",
+            "hoodie.base.file.format=parquet",
+        ]
+        .join("\n");
+        std::fs::write(hoodie_dir.join("hoodie.properties"), properties).unwrap();
+        Table::new(base_dir.to_str().unwrap()).await.unwrap()
+    }
+
+    async fn row_count(base_uri: &str) -> usize {
+        Table::new(base_uri)
+            .await
+            .unwrap()
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum()
+    }
+
+    fn id_batch(ids: Vec<i32>) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(Int32Array::from(ids))],
+        )
+        .unwrap()
+    }
+
+    fn fault_commit_put(table: &mut Table, fault: PutFault) -> Arc<FaultyPutStore> {
+        let storage = table.file_system_view.storage.clone();
+        let store = FaultyPutStore::new_for_any_put(storage.object_store.clone(), fault, |path| {
+            path.as_ref().ends_with(".commit")
+        });
+        table.file_system_view.storage = Storage::new_with_object_store(
+            storage.base_url.as_ref().clone(),
+            store.clone(),
+            storage.hudi_configs.clone(),
+        );
+        store
+    }
+
+    /// A commit PUT that errors may still have stored the commit, so the base
+    /// file it references must survive the error.
+    #[tokio::test]
+    async fn test_failed_commit_put_keeps_written_base_file() {
+        for (fault, rows_after_error) in [(PutFault::LandedThenError, 2), (PutFault::NotLanded, 0)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut table = version_6_table(dir.path()).await;
+            let store = fault_commit_put(&mut table, fault);
+
+            let result = table.append([id_batch(vec![1, 2])]).await;
+            assert!(result.is_err(), "{fault:?}: the faulted PUT must surface");
+            assert!(!store.is_armed(), "{fault:?}: the commit PUT was not hit");
+            assert_eq!(row_count(uri).await, rows_after_error, "{fault:?}");
+        }
+    }
+
+    /// A later commit moves the timeline start past the failed instant, so a
+    /// base file left without its commit would then read as committed.
+    #[tokio::test]
+    async fn test_failed_commit_put_then_append_reads_only_committed_rows() {
+        for (fault, rows_after_retry) in [(PutFault::LandedThenError, 5), (PutFault::NotLanded, 3)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let uri = dir.path().to_str().unwrap();
+            let mut table = version_6_table(dir.path()).await;
+            fault_commit_put(&mut table, fault);
+            assert!(table.append([id_batch(vec![1, 2])]).await.is_err());
+
+            let mut retry = Table::new(uri).await.unwrap();
+            retry.append([id_batch(vec![3, 4, 5])]).await.unwrap();
+            assert_eq!(row_count(uri).await, rows_after_retry, "{fault:?}");
+        }
+    }
+
+    /// The commit records the write schema as Avro, so a batch whose schema
+    /// Avro cannot express is refused before any file is written.
+    #[tokio::test]
+    async fn test_schema_without_avro_form_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = version_6_table(dir.path()).await;
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+                false,
+            )])),
+            vec![Arc::new(arrow::array::TimestampNanosecondArray::from(
+                vec![1],
+            ))],
+        )
+        .unwrap();
+        assert!(table.append([batch]).await.is_err());
+        let written: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| name != ".hoodie")
+            .collect();
+        assert!(written.is_empty(), "unexpected files: {written:?}");
     }
 }
