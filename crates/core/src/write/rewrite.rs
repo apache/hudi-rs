@@ -1211,7 +1211,7 @@ async fn mor_upsert_batches(
     )?;
     let instant = request_deltacommit(table, "UPSERT").await?;
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
-    let incoming_keys = keys(&incoming, &key_name)?;
+    let incoming_keys: Vec<String> = tagged_keys.iter().map(|k| k.record_key.clone()).collect();
     let locations = mor_file_locations(table, &tagged_keys).await?;
     let mut update_indices: HashMap<(String, String), Vec<u32>> = HashMap::new();
     let mut insert_indices_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
@@ -2057,11 +2057,10 @@ async fn moved_keys_rejected_by_event_time(
     let Some(ordering_field) = ordering_fields.first() else {
         return Ok(rejected);
     };
-    let key_name = record_key_name(table, incoming)?;
-    let incoming_keys = keys(incoming, &key_name)?;
+    let incoming_keys = hoodie_keys_for_batch(&table.hudi_configs, incoming, None)?;
     let mut incoming_row_by_key = HashMap::new();
-    for (row, key) in incoming_keys.iter().enumerate() {
-        incoming_row_by_key.insert(key.clone(), row);
+    for (row, key) in incoming_keys.into_iter().enumerate() {
+        incoming_row_by_key.insert(key.record_key, row);
     }
     let reader = table
         .create_file_group_reader_with_options(

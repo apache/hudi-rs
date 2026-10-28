@@ -2779,6 +2779,81 @@ async fn test_complex_key_generator_encodes_single_key_field() {
     }
 }
 
+/// Upserts locate stored rows by their encoded complex record key: a flagged
+/// row deletes, a stale flagged row loses, a flagged move only deletes, and a
+/// stale move keeps the stored row, with the same counts as a simple key.
+#[tokio::test]
+async fn test_complex_key_upsert_matches_stored_rows() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let mut results = Vec::new();
+        for complex in [false, true] {
+            let dir = tempdir().unwrap();
+            Table::create(dir.path().to_str().unwrap())
+                .with_table_name("t")
+                .with_table_type(table_type.clone())
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_ordering_fields(["value"])
+                .create()
+                .await
+                .unwrap();
+            if complex {
+                rewrite_table_props(
+                    dir.path(),
+                    &["hoodie.table.keygenerator.type"],
+                    &[("hoodie.table.keygenerator.type", "COMPLEX")],
+                );
+            }
+            let mut table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            table
+                .append([flagged_batch(vec![
+                    ("a", "sf", 10, false),
+                    ("b", "sf", 10, false),
+                    ("c", "sf", 10, false),
+                    ("f", "sf", 10, false),
+                    ("g", "sf", 10, false),
+                ])])
+                .await
+                .unwrap();
+            let result = table
+                .upsert([flagged_batch(vec![
+                    ("a", "sf", 20, true),
+                    ("b", "sf", 5, true),
+                    ("c", "nyc", 20, true),
+                    ("e", "nyc", 20, false),
+                    ("f", "sf", 20, false),
+                    ("g", "nyc", 5, false),
+                ])])
+                .await
+                .unwrap();
+
+            let batches = table.read(&ReadOptions::new()).await.unwrap();
+            let label = format!("{table_type:?} complex={complex}");
+            assert_eq!(
+                rows_by_id(&batches),
+                vec![
+                    ("b".to_string(), 10),
+                    ("e".to_string(), 20),
+                    ("f".to_string(), 20),
+                    ("g".to_string(), 10),
+                ],
+                "{label}"
+            );
+            let prefix = if complex { "id:" } else { "" };
+            assert_eq!(
+                meta_keys(&batches),
+                [("b", "sf"), ("e", "nyc"), ("f", "sf"), ("g", "sf")]
+                    .iter()
+                    .map(|(key, city)| (format!("{prefix}{key}"), format!("city={city}")))
+                    .collect::<Vec<_>>(),
+                "{label}"
+            );
+            results.push((result.num_updates, result.num_inserts, result.num_deletes));
+        }
+        assert_eq!(results[0], results[1], "{table_type:?}");
+    }
+}
+
 /// Below table version 9 a declared complex key generator with one record key
 /// field may have stored bare keys, so writes are refused (Java
 /// `validateAgainstTableProperties`) until the validation is turned off.
