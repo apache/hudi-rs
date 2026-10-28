@@ -28,12 +28,17 @@ use apache_avro::types::Value;
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::records::{FilesPartitionRecord, MetadataRecordType};
-use crate::schema::avsc::{hoodie_metadata_schema, strip_avro_line_comments};
+use crate::schema::avsc::strip_avro_line_comments;
 
-/// JSON text of the metadata schema embedded into HFile file-info under key `schema`.
+/// JSON text of the metadata table writer schema, embedded into HFile file-info
+/// under key `schema` and into log block headers.
 ///
-/// Matches Java `HoodieMetadataRecord.SCHEMA$`: string fields and map key types carry
+/// Matches the schema Java writes metadata table files with:
+/// `HoodieMetadataRecord.SCHEMA$` with the five `_hoodie_*` meta fields
+/// prepended as nullable strings, always null. Readers merge a file slice to its
+/// base file's schema, so every block in a slice must carry the same fields. String fields and map key types of the record carry
 /// `"avro.java.string":"String"` so Spark's `GenericDatumReader` materializes
 /// `java.lang.String` instead of `Utf8` (required by `constructFilesMetadataPayload`
 /// and `fetchBaseFileRecordsByKeys`).
@@ -49,7 +54,7 @@ pub fn hoodie_metadata_schema_json() -> Result<&'static str> {
             .find('{')
             .map(|i| cleaned[i..].trim().to_string())
             .unwrap_or(cleaned);
-        inject_avro_java_string_props(&json)
+        inject_avro_java_string_props(&json).and_then(|json| prepend_meta_fields(&json))
     })
     .as_deref()
     .map_err(|e| {
@@ -57,6 +62,21 @@ pub fn hoodie_metadata_schema_json() -> Result<&'static str> {
             "vendored HoodieMetadata.avsc failed to annotate: {e}"
         ))
     })
+}
+
+/// Prepend the meta fields in Java `HoodieAvroUtils.addMetadataFields` form.
+fn prepend_meta_fields(schema_json: &str) -> std::result::Result<String, String> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(schema_json).map_err(|e| e.to_string())?;
+    let fields = value
+        .get_mut("fields")
+        .and_then(serde_json::Value::as_array_mut)
+        .ok_or("metadata schema has no fields")?;
+    let meta_fields = MetaField::field_names().into_iter().map(|name| {
+        serde_json::json!({"name": name, "type": ["null", "string"], "doc": "", "default": null})
+    });
+    fields.splice(0..0, meta_fields);
+    serde_json::to_string(&value).map_err(|e| e.to_string())
 }
 
 /// Annotate Avro JSON so Java readers decode strings as `java.lang.String`.
@@ -114,7 +134,25 @@ pub fn record_index_metadata_avro_schema_json() -> Result<&'static str> {
 }
 
 fn metadata_schema() -> Result<&'static Schema> {
-    hoodie_metadata_schema()
+    static SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
+    SCHEMA
+        .get_or_init(|| {
+            hoodie_metadata_schema_json()
+                .map_err(|e| e.to_string())
+                .and_then(|json| Schema::parse_str(json).map_err(|e| e.to_string()))
+        })
+        .as_ref()
+        .map_err(|e| CoreError::MetadataTable(format!("metadata writer schema: {e}")))
+}
+
+/// Encode a `HoodieMetadataRecord` with null meta fields, per [`metadata_schema`].
+fn encode_metadata_record(fields: Vec<(String, Value)>) -> Result<Vec<u8>> {
+    let record = MetaField::field_names()
+        .into_iter()
+        .map(|name| (name.to_string(), null_union()))
+        .chain(fields)
+        .collect();
+    apache_avro::to_avro_datum(metadata_schema()?, Value::Record(record)).map_err(CoreError::from)
 }
 
 fn null_union() -> Value {
@@ -248,7 +286,7 @@ pub fn encode_files_record(
             ]),
         );
     }
-    let value = Value::Record(vec![
+    encode_metadata_record(vec![
         ("key".to_string(), Value::String(String::new())),
         ("type".to_string(), Value::Int(record_type as i32)),
         (
@@ -259,8 +297,7 @@ pub fn encode_files_record(
         ("ColumnStatsMetadata".to_string(), null_union()),
         ("recordIndexMetadata".to_string(), null_union()),
         ("SecondaryIndexMetadata".to_string(), null_union()),
-    ]);
-    apache_avro::to_avro_datum(metadata_schema()?, value).map_err(CoreError::from)
+    ])
 }
 
 /// A location stored in the record_index metadata partition.
@@ -320,7 +357,7 @@ pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
         ])),
     );
     // Empty Avro key — real key lives only on the HFile key (see encode_files_record).
-    let value = Value::Record(vec![
+    encode_metadata_record(vec![
         ("key".to_string(), Value::String(String::new())),
         (
             "type".to_string(),
@@ -331,8 +368,7 @@ pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
         ("ColumnStatsMetadata".to_string(), null_union()),
         ("recordIndexMetadata".to_string(), rli_payload),
         ("SecondaryIndexMetadata".to_string(), null_union()),
-    ]);
-    apache_avro::to_avro_datum(metadata_schema()?, value).map_err(CoreError::from)
+    ])
 }
 
 /// Match Java `HoodieMetadataPayload.createRecordIndexUpdate` fileId packing.
@@ -811,7 +847,7 @@ fn encode_column_stats_record(
             ),
         ])),
     );
-    let value = Value::Record(vec![
+    encode_metadata_record(vec![
         ("key".to_string(), Value::String(String::new())),
         ("type".to_string(), Value::Int(record_type as i32)),
         ("filesystemMetadata".to_string(), null_union()),
@@ -819,8 +855,7 @@ fn encode_column_stats_record(
         ("ColumnStatsMetadata".to_string(), payload),
         ("recordIndexMetadata".to_string(), null_union()),
         ("SecondaryIndexMetadata".to_string(), null_union()),
-    ]);
-    apache_avro::to_avro_datum(metadata_schema()?, value).map_err(CoreError::from)
+    ])
 }
 
 /// Avro union branch indices for minValue/maxValue wrappers (null = 0).
@@ -957,6 +992,28 @@ mod tests {
         assert!(
             json.contains("\"type\":\"map\"") && json.contains("avro.java.string"),
             "map types need java.string for map-key typing: {json}"
+        );
+    }
+
+    #[test]
+    fn metadata_records_carry_null_meta_fields_like_java() {
+        let schema: serde_json::Value =
+            serde_json::from_str(hoodie_metadata_schema_json().unwrap()).unwrap();
+        assert_eq!(schema["name"], "HoodieMetadataRecord");
+        let fields = schema["fields"].as_array().unwrap();
+        for (field, name) in fields.iter().zip(MetaField::field_names()) {
+            assert_eq!(
+                field,
+                &serde_json::json!({"name": name, "type": ["null", "string"], "doc": "", "default": null})
+            );
+        }
+        assert_eq!(fields[5]["name"], "key");
+
+        // Byte for byte what Spark 1.1.1 writes for an empty `__all_partitions__`:
+        // five null meta fields, empty key, type 1, empty map, four null indexes.
+        assert_eq!(
+            encode_all_partitions(Vec::new()).unwrap(),
+            [0, 0, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0]
         );
     }
 

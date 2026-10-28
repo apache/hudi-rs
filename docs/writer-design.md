@@ -249,7 +249,9 @@ record is tight-bound or a tombstone, record-index entries take the newest.
 The merger is resolved from the MDT's declared merge-strategy id and errors on
 anything unknown. Records decode with the **writer schema of the container
 they came from** (base HFile or log block), so mixed-writer tables decode
-correctly.
+correctly. A file slice merges to its base file's schema, so the writer uses
+Java's metadata table writer schema: `HoodieMetadataRecord` with the five
+`_hoodie_*` meta fields prepended, always null.
 
 ## 6. Query semantics (writer-relevant)
 

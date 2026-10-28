@@ -2967,3 +2967,32 @@ async fn test_empty_record_key_rejected() {
         "a rejected key must not leave a commit"
     );
 }
+
+/// Spark writes its metadata table files with the `_hoodie_*` meta fields, and
+/// readers merge a metadata file slice to its base file's schema, so rs blocks
+/// appended to Spark's base files must carry those fields too.
+#[tokio::test]
+async fn upserts_into_spark_written_table_read_through_metadata_table() {
+    let data_rows = |batches: Vec<RecordBatch>| -> RecordBatch {
+        let batch = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let data_columns: Vec<usize> = (0..batch.num_columns())
+            .filter(|&i| !batch.schema().field(i).name().starts_with("_hoodie_"))
+            .collect();
+        batch.project(&data_columns).unwrap()
+    };
+    for format in [hudi_test::TableFormat::Cow, hudi_test::TableFormat::MorAvro] {
+        let path = hudi_test::SampleTable::V9TxnsSimpleOverwrite.path_fresh(format);
+        let mut table = Table::new(&path).await.unwrap();
+        let rows = data_rows(table.read(&ReadOptions::new()).await.unwrap());
+        assert!(rows.num_rows() > 0);
+
+        // The second upsert plans through the metadata table, merging Spark's
+        // base files with the first upsert's log blocks.
+        table.upsert([rows.clone()]).await.unwrap();
+        table.upsert([rows.clone()]).await.unwrap();
+
+        let table = Table::new(&path).await.unwrap();
+        let after = data_rows(table.read(&ReadOptions::new()).await.unwrap());
+        assert_eq!(after.num_rows(), rows.num_rows(), "{format:?}");
+    }
+}

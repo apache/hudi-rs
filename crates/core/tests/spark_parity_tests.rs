@@ -652,6 +652,44 @@ async fn parity_d_interleaved_writers() {
             expected,
             "[{type_name}] spark read after interleaved writes"
         );
+
+        // rs upserts twice on a Spark-created table, so the second write and
+        // the reads merge Spark's metadata table base files with rs log blocks.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t");
+        spark_write(
+            &env,
+            &path,
+            "upsert",
+            type_name,
+            true,
+            &[row("a", Some("sf"), 1, 10), row("b", Some("nyc"), 1, 20)],
+        );
+        let mut table = Table::new(path.to_str().unwrap()).await.unwrap();
+        table
+            .upsert([batch(&[row("a", Some("sf"), 2, 11)])])
+            .await
+            .unwrap();
+        table
+            .upsert([batch(&[row("c", Some("sf"), 1, 30)])])
+            .await
+            .unwrap();
+
+        let expected = vec![
+            row("a", Some("sf"), 2, 11),
+            row("b", Some("nyc"), 1, 20),
+            row("c", Some("sf"), 1, 30),
+        ];
+        assert_eq!(
+            rs_read(&path).await,
+            expected,
+            "[{type_name}] rs read after rs writes on a spark-created table"
+        );
+        assert_eq!(
+            spark_read(&env, &path),
+            expected,
+            "[{type_name}] spark read after rs writes on a spark-created table"
+        );
     }
 }
 

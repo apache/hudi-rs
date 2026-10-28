@@ -838,7 +838,10 @@ mod tests {
 
         // Survivor spans [5s, 6s] in millis; the new file holds 1s in micros.
         let bytes = spark_v2_long_stats_bytes(5_000, 6_000, 15);
-        let survivor = decode_column_stats_entry(&bytes, None).unwrap().unwrap();
+        let schema = crate::schema::avsc::hoodie_metadata_schema().unwrap();
+        let survivor = decode_column_stats_entry(&bytes, Some(schema))
+            .unwrap()
+            .unwrap();
         let survivor = ColumnRangeStats {
             column_name: "ts".to_string(),
             min_value: survivor.min_value,
