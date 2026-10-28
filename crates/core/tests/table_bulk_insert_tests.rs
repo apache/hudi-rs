@@ -705,3 +705,33 @@ async fn append_only_accepts_types_the_avro_commit_schema_widens() -> Result<()>
 
     Ok(())
 }
+
+#[tokio::test]
+async fn append_only_without_table_version_takes_the_version_6_path() -> Result<()> {
+    use hudi_core::config::internal::HudiInternalConfig::SkipConfigValidation;
+
+    let temp_dir = tempdir()?;
+    write_table_properties(temp_dir.path())?;
+    let props = temp_dir.path().join(".hoodie/hoodie.properties");
+    let content = fs::read_to_string(&props)?.replace("hoodie.table.version=6\n", "");
+    fs::write(&props, content)?;
+    let uri = temp_dir.path().to_str().expect("valid temp path");
+    let mut table = Table::new_with_options(uri, [(SkipConfigValidation, "true")]).await?;
+
+    let result = table
+        .append_only([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
+        .await?;
+    assert_eq!(
+        result.commit_relative_path,
+        format!(".hoodie/{}.commit", result.instant)
+    );
+    let rows: usize = table
+        .read(&ReadOptions::new())
+        .await?
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 2);
+
+    Ok(())
+}

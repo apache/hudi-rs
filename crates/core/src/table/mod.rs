@@ -1381,10 +1381,10 @@ impl Table {
         batches: impl IntoIterator<Item = RecordBatch>,
     ) -> Result<AppendResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
-        let table_version: isize = self
+        let table_version = self
             .hudi_configs
-            .get_or_default(HudiTableConfig::TableVersion)
-            .into();
+            .get(HudiTableConfig::TableVersion)
+            .map_or(0, isize::from);
         if table_version >= 8 {
             return crate::write::append_batches_only(self, &batches).await;
         }
