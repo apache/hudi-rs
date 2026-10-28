@@ -33,7 +33,7 @@ use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
 use hudi_test::SampleTable;
-use hudi_test::util::explain_physical_plan;
+use hudi_test::util::{explain_physical_plan, get_i32_column};
 use hudi_test::v9_verification::{
     verify_partitioned_records, verify_v9_txns_table, verify_v9_txns_table_snapshot,
 };
@@ -510,4 +510,57 @@ async fn test_hudi_scan_exec_strips_filters_on_dropped_partition_columns() {
         err_message.contains("byteField"),
         "dropped partition projection error should name byteField, got: {err_message}"
     );
+}
+
+/// The partition column is a real TIMESTAMP declared as `EPOCHMICROSECONDS`. DataFusion
+/// pushes a typed timestamp literal down as the raw epoch integer in the column's unit,
+/// which is the declared encoding, so the key generator could always parse it. What kept
+/// this query from pruning was the provider: it classified partition predicates by the
+/// partition schema, which for a timestamp key generator holds only
+/// `_hoodie_partition_path`, so a predicate on `ts` never reached file listing and all
+/// four partitions were scanned.
+#[tokio::test]
+async fn test_timestamp_keygen_typed_literal_prunes_partitions() {
+    let base_url = SampleTable::V9TimebasedkeygenHivestyleEpochmicros.url_to_cow();
+    let ctx = SessionContext::new();
+    let hudi = HudiDataSource::new(base_url.as_str()).await.unwrap();
+    ctx.register_table("events", Arc::new(hudi)).unwrap();
+
+    let sql = "SELECT id FROM events \
+               WHERE ts >= TIMESTAMP '2024-03-01 00:00:00' AND ts < TIMESTAMP '2024-03-03 00:00:00' \
+               ORDER BY id";
+    let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| get_i32_column(batch, "id"))
+        .collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+
+    // Partition pruning widens the half-open upper bound to the boundary day, so
+    // `ts=2024-03-03` stays in the listing; DataFusion's Parquet statistics drop it at
+    // execution. What must not appear is the day before the range.
+    let plan = explain_physical_plan(&ctx, sql).await;
+    assert!(plan.contains("file_groups={3 groups:"), "{plan}");
+    for kept in ["ts=2024-03-01/", "ts=2024-03-02/", "ts=2024-03-03/"] {
+        assert!(plan.contains(kept), "{kept} must be listed:\n{plan}");
+    }
+    assert!(
+        !plan.contains("ts=2024-02-29/"),
+        "2024-02-29 must be pruned:\n{plan}"
+    );
+
+    // A predicate on the source column is forwarded for listing but is never exact: the
+    // day partition also holds row 2 at 18:30, which DataFusion must still filter out.
+    let batches = ctx
+        .sql("SELECT id FROM events WHERE ts = TIMESTAMP '2024-03-01 08:00:00'")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<i32> = batches
+        .iter()
+        .flat_map(|batch| get_i32_column(batch, "id"))
+        .collect();
+    assert_eq!(ids, vec![1]);
 }
