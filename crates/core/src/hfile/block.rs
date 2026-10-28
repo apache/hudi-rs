@@ -42,9 +42,6 @@ const HEADER_SIZE_NO_CHECKSUM: usize = MAGIC_LENGTH + 2 * SIZEOF_INT32 + SIZEOF_
 /// - 4 bytes: on-disk data size with header
 pub const BLOCK_HEADER_SIZE: usize = HEADER_SIZE_NO_CHECKSUM + SIZEOF_BYTE + 2 * SIZEOF_INT32;
 
-/// Checksum size (each checksum is 4 bytes)
-const CHECKSUM_SIZE: usize = SIZEOF_INT32;
-
 /// Parsed block header information.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -100,14 +97,6 @@ impl BlockHeader {
         })
     }
 
-    /// Checksum chunks cover header + data only, as the writer counts them.
-    pub fn checksum_bytes_count(&self) -> usize {
-        let num_chunks = self
-            .on_disk_data_size_with_header
-            .div_ceil(self.bytes_per_checksum);
-        num_chunks * CHECKSUM_SIZE
-    }
-
     /// Returns the total on-disk size including header.
     pub fn on_disk_size_with_header(&self) -> usize {
         BLOCK_HEADER_SIZE + self.on_disk_size_without_header
@@ -129,8 +118,7 @@ impl HFileBlock {
 
         // Extract the compressed data (between header and checksum)
         let data_start = BLOCK_HEADER_SIZE;
-        let data_end =
-            data_start + header.on_disk_size_without_header - header.checksum_bytes_count();
+        let data_end = header.on_disk_data_size_with_header;
 
         // For uncompressed blocks, on_disk_size == uncompressed_size
         // For compressed blocks, we need to decompress
@@ -340,26 +328,12 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_bytes_count_excludes_the_checksum_bytes() {
-        let mut bytes = vec![];
-        bytes.extend_from_slice(b"DATABLK*");
-        bytes.extend_from_slice(&163826i32.to_be_bytes()); // on_disk_size_without_header
-        bytes.extend_from_slice(&1048528i32.to_be_bytes()); // uncompressed_size_without_header
-        bytes.extend_from_slice(&(-1i64).to_be_bytes());
-        bytes.push(1);
-        bytes.extend_from_slice(&16384i32.to_be_bytes()); // bytes_per_checksum
-        bytes.extend_from_slice(&163819i32.to_be_bytes()); // on_disk_data_size_with_header
-
-        let header = BlockHeader::parse(&bytes).unwrap();
-        assert_eq!(header.checksum_bytes_count(), 40);
-    }
-
-    #[test]
     fn test_parse_gz_block_at_checksum_chunk_boundary() {
         use flate2::{Compression, write::GzEncoder};
         use std::io::Write;
 
         let bytes_per_checksum = 16384usize;
+        let checksum_size = SIZEOF_INT32;
         let (input, compressed) = (16000..16384)
             .find_map(|len| {
                 let input = vec![b'x'; len];
@@ -372,7 +346,7 @@ mod tests {
             .expect("a stored GZIP block one byte below the checksum boundary");
         let data_size = BLOCK_HEADER_SIZE + compressed.len();
         let num_chunks = data_size.div_ceil(bytes_per_checksum);
-        let checksum_bytes = num_chunks * CHECKSUM_SIZE;
+        let checksum_bytes = num_chunks * checksum_size;
         assert!(num_chunks < (data_size + checksum_bytes).div_ceil(bytes_per_checksum));
         eprintln!(
             "synthetic GZIP boundary: N={data_size}, C={}, chunks={num_chunks}, checksum_bytes={checksum_bytes}",
