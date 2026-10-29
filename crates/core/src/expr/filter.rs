@@ -21,10 +21,12 @@ use crate::Result;
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use arrow_arith::boolean;
-use arrow_array::{ArrayRef, BooleanArray, Datum, Scalar, StringArray};
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayAccessor, ArrayRef, BooleanArray, Datum, Scalar, StringArray};
 use arrow_cast::{CastOptions, cast_with_options};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
+use std::collections::HashSet;
 use std::str::FromStr;
 
 #[derive(Debug, Clone)]
@@ -365,6 +367,9 @@ impl SchemableFilter {
             ExprOperator::Gt => gt(value, &self.values[0]),
             ExprOperator::Gte => gt_eq(value, &self.values[0]),
             ExprOperator::In => {
+                if let Some(mask) = self.string_membership(value, false) {
+                    return Ok(mask);
+                }
                 // IN: value == values[0] OR value == values[1] OR ...
                 let mut result = eq(value, &self.values[0])?;
                 for filter_value in &self.values[1..] {
@@ -374,6 +379,9 @@ impl SchemableFilter {
                 Ok(result)
             }
             ExprOperator::NotIn => {
+                if let Some(mask) = self.string_membership(value, true) {
+                    return Ok(mask);
+                }
                 // NOT IN: value != values[0] AND value != values[1] AND ...
                 let mut result = neq(value, &self.values[0])?;
                 for filter_value in &self.values[1..] {
@@ -384,6 +392,55 @@ impl SchemableFilter {
             }
         }
         .map_err(|e| e.into())
+    }
+
+    /// `IN` / `NOT IN` over a string column as one hash set probe per row.
+    ///
+    /// The comparison chain above costs a pass over the column per value, so a
+    /// key lookup slows down with the number of keys asked for. `None` for a
+    /// non-string column, which keeps the chain. A null row is null either
+    /// way, as the comparison kernels leave it.
+    fn string_membership(&self, value: &dyn Datum, negate: bool) -> Option<BooleanArray> {
+        // One value is one kernel pass; the set only pays off past that.
+        if self.values.len() < 2 {
+            return None;
+        }
+        let (column, _) = value.get();
+        // The values were cast to the column's own string type.
+        fn first_str(array: &dyn arrow_array::Array) -> Option<&str> {
+            if let Some(a) = array.as_string_opt::<i32>() {
+                Some(a.value(0))
+            } else if let Some(a) = array.as_string_opt::<i64>() {
+                Some(a.value(0))
+            } else {
+                array.as_string_view_opt().map(|a| a.value(0))
+            }
+        }
+        let set: HashSet<&str> = self
+            .values
+            .iter()
+            .map(|scalar| first_str(scalar.get().0))
+            .collect::<Option<_>>()?;
+        fn probe<'a>(
+            column: impl ArrayAccessor<Item = &'a str>,
+            set: &HashSet<&str>,
+            negate: bool,
+        ) -> BooleanArray {
+            (0..column.len())
+                .map(|row| {
+                    (!column.is_null(row)).then(|| set.contains(column.value(row)) != negate)
+                })
+                .collect()
+        }
+        if let Some(column) = column.as_string_opt::<i32>() {
+            Some(probe(column, &set, negate))
+        } else if let Some(column) = column.as_string_opt::<i64>() {
+            Some(probe(column, &set, negate))
+        } else {
+            column
+                .as_string_view_opt()
+                .map(|column| probe(column, &set, negate))
+        }
     }
 }
 
@@ -568,6 +625,68 @@ mod tests {
         let result = SchemableFilter::cast_value(&["not_a_number"], &DataType::Int64);
         assert!(result.is_err());
 
+        Ok(())
+    }
+
+    /// `IN` and `NOT IN` on a string column take the hash set path; a null row
+    /// stays null, and the result matches the comparison chain the other
+    /// column types still use.
+    #[test]
+    fn test_in_on_string_columns_matches_the_comparison_chain() -> Result<()> {
+        use arrow_array::{LargeStringArray, StringViewArray};
+        let values = vec![Some("a"), Some("b"), None, Some("c"), Some("a")];
+        let expected_in =
+            BooleanArray::from(vec![Some(true), Some(false), None, Some(true), Some(true)]);
+        let expected_not_in = BooleanArray::from(vec![
+            Some(false),
+            Some(true),
+            None,
+            Some(false),
+            Some(false),
+        ]);
+        for data_type in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            let column: ArrayRef = match data_type {
+                DataType::Utf8 => Arc::new(StringArray::from(values.clone())),
+                DataType::LargeUtf8 => Arc::new(LargeStringArray::from(values.clone())),
+                _ => Arc::new(StringViewArray::from(values.clone())),
+            };
+            let schema = Schema::new(vec![Field::new("s", data_type.clone(), true)]);
+            let in_filter =
+                SchemableFilter::try_from((col("s").in_list(["a", "c", "zz"]), &schema))?;
+            assert!(
+                in_filter.string_membership(&column, false).is_some(),
+                "{data_type} takes the set path"
+            );
+            assert_eq!(
+                in_filter.apply_comparison(&column)?,
+                expected_in,
+                "{data_type}"
+            );
+            let not_in_filter =
+                SchemableFilter::try_from((col("s").not_in_list(["a", "c", "zz"]), &schema))?;
+            assert_eq!(
+                not_in_filter.apply_comparison(&column)?,
+                expected_not_in,
+                "{data_type}"
+            );
+        }
+        // A single value stays on the kernel, and a non-string column keeps
+        // the comparison chain.
+        let schema = create_test_schema();
+        let strings: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
+        let single = SchemableFilter::try_from((col("string_col").in_list(["a"]), &schema))?;
+        assert!(single.string_membership(&strings, false).is_none());
+        assert_eq!(
+            single.apply_comparison(&strings)?,
+            BooleanArray::from(vec![true, false])
+        );
+        let ints: ArrayRef = Arc::new(Int64Array::from(vec![Some(40), None, Some(60)]));
+        let filter = SchemableFilter::try_from((col("int_col").in_list(["40", "60"]), &schema))?;
+        assert!(filter.string_membership(&ints, false).is_none());
+        assert_eq!(
+            filter.apply_comparison(&ints)?,
+            BooleanArray::from(vec![Some(true), None, Some(true)])
+        );
         Ok(())
     }
 
