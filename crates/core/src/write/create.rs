@@ -31,6 +31,12 @@ use crate::storage::Storage;
 use crate::table::Table;
 use crate::write::metadata::bootstrap_metadata_table;
 
+/// Java's `GLOBAL_RECORD_LEVEL_INDEX_ENABLE_PROP` and its alternative key.
+const RECORD_INDEX_ENABLE_KEYS: [&str; 2] = [
+    "hoodie.metadata.global.record.level.index.enable",
+    "hoodie.metadata.record.index.enable",
+];
+
 const BUILDER_MANAGED_KEYS: &[&str] = &[
     "hoodie.base.path",
     "hoodie.table.name",
@@ -49,8 +55,6 @@ const BUILDER_MANAGED_KEYS: &[&str] = &[
     "hoodie.table.metadata.partitions",
     "hoodie.table.metadata.partitions.inflight",
     "hoodie.metadata.enable",
-    "hoodie.metadata.record.index.enable",
-    "hoodie.metadata.global.record.level.index.enable",
     "hoodie.metadata.index.column.stats.enable",
     "hoodie.metadata.index.partition.stats.enable",
     "hoodie.datasource.write.hive_style_partitioning",
@@ -77,6 +81,8 @@ pub struct TableCreateBuilder {
     ordering_fields: Vec<String>,
     metadata_enabled: bool,
     record_index_enabled: bool,
+    /// Java reads its record index key before the alternative.
+    record_index_set_by_java_key: bool,
     column_stats_enabled: bool,
     partition_stats_enabled: bool,
     hive_style_partitioning: bool,
@@ -99,6 +105,7 @@ impl TableCreateBuilder {
             ordering_fields: Vec::new(),
             metadata_enabled: true,
             record_index_enabled: true,
+            record_index_set_by_java_key: false,
             // Match Spark engine defaults: column stats on when MDT is on.
             column_stats_enabled: true,
             partition_stats_enabled: true,
@@ -222,9 +229,24 @@ impl TableCreateBuilder {
     /// Set an additional table property. A property that a dedicated builder
     /// method sets, such as the table name, type, version, key and partition
     /// fields or metadata layout, makes [`Self::create`] fail rather than
-    /// being overridden.
+    /// being overridden. The Java writer's record index switch,
+    /// `hoodie.metadata.global.record.level.index.enable` or its alternative
+    /// `hoodie.metadata.record.index.enable`, acts as
+    /// [`Self::with_record_index`], read the way Java's `Boolean.parseBoolean` is.
     pub fn with_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
-        self.options.insert(key.as_ref().to_string(), value.into());
+        let key = key.as_ref();
+        let value = value.into();
+        if key == RECORD_INDEX_ENABLE_KEYS[0] {
+            self.record_index_set_by_java_key = true;
+            return self.with_record_index(value.eq_ignore_ascii_case("true"));
+        }
+        if key == RECORD_INDEX_ENABLE_KEYS[1] {
+            if !self.record_index_set_by_java_key {
+                self.record_index_enabled = value.eq_ignore_ascii_case("true");
+            }
+            return self;
+        }
+        self.options.insert(key.to_string(), value);
         self
     }
 

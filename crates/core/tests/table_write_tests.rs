@@ -307,7 +307,6 @@ async fn test_create_rejects_managed_option_overrides_before_persisting() {
         ("hoodie.table.name", "renamed"),
         ("hoodie.table.version", "6"),
         ("hoodie.metadata.enable", "false"),
-        ("hoodie.metadata.global.record.level.index.enable", "false"),
     ] {
         let dir = tempdir().unwrap();
         let error = Table::create(dir.path().to_str().unwrap())
@@ -323,6 +322,42 @@ async fn test_create_rejects_managed_option_overrides_before_persisting() {
             !dir.path().join(".hoodie").exists(),
             "{key} left a partial table"
         );
+    }
+}
+
+/// The Java writer's record index switch and its alternative key turn the
+/// record index on or off like `with_record_index`.
+#[tokio::test]
+async fn test_create_reads_java_record_index_switch() {
+    const KEY: &str = "hoodie.metadata.global.record.level.index.enable";
+    const ALTERNATIVE: &str = "hoodie.metadata.record.index.enable";
+    for (options, enabled) in [
+        (vec![(KEY, "false")], false),
+        (vec![(ALTERNATIVE, "FALSE")], false),
+        (vec![(KEY, "true")], true),
+        (vec![(KEY, "true"), (ALTERNATIVE, "false")], true),
+    ] {
+        let dir = tempdir().unwrap();
+        let mut builder = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_record_index(!enabled);
+        for (key, value) in &options {
+            builder = builder.with_option(*key, *value);
+        }
+        builder.create().await.unwrap();
+        let properties =
+            std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        let partitions = properties
+            .lines()
+            .find_map(|line| line.strip_prefix("hoodie.table.metadata.partitions="))
+            .unwrap();
+        assert_eq!(
+            partitions.split(',').any(|p| p == "record_index"),
+            enabled,
+            "{options:?}: {partitions}"
+        );
+        assert!(!properties.contains(KEY) && !properties.contains(ALTERNATIVE));
     }
 }
 
