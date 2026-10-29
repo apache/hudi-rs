@@ -1813,6 +1813,46 @@ async fn test_upsert_rejects_batches_with_differing_schemas() {
     }
 }
 
+/// Rows written into a merge-on-read log file carry the file group id in
+/// `_hoodie_file_name`, as Java's append handle writes them; Spark SQL derives
+/// the record location from it.
+#[tokio::test]
+async fn test_mor_log_rows_name_their_file_group() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+    table
+        .upsert([batch(vec![("a", 2), ("b", 3)])])
+        .await
+        .unwrap();
+
+    let file_groups: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".parquet"))
+        .map(|name| name.split('_').next().unwrap().to_string())
+        .collect();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    for batch in &batches {
+        let names = batch
+            .column_by_name("_hoodie_file_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for name in names.iter().flatten() {
+            let file_id = name.split('_').next().unwrap();
+            assert!(file_groups.iter().any(|id| id == file_id), "{name}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_upsert_rejects_schema_mismatch() {
     let dir = tempdir().unwrap();

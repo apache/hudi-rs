@@ -510,8 +510,9 @@ pub(super) async fn mor_upsert_batches(
         let mut indices = update_rows.clone();
         indices.extend(&packed_rows);
         let update_batch = take_batch(&incoming, &indices)?;
+        // Java's append handle stamps log records with the file group id.
         let prepared =
-            prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &log_name)?;
+            prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &file_id)?;
         log_plans.push(LogTaskPlan {
             partition_path,
             file_id,
