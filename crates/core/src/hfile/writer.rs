@@ -40,7 +40,7 @@ impl HFileWriter {
         entries: &[(String, Vec<u8>)],
         mut file_info: BTreeMap<String, Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let mut entries = entries.to_vec();
+        let mut entries: Vec<&(String, Vec<u8>)> = entries.iter().collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
 
         let first_key = entries
@@ -54,7 +54,14 @@ impl HFileWriter {
             .transpose()?
             .unwrap_or_default();
 
-        let mut data = Vec::new();
+        // Per entry: two i32 lengths, the structured key (content + 12 bytes of
+        // framing), the value and a trailing byte.
+        let mut data = Vec::with_capacity(
+            entries
+                .iter()
+                .map(|(key, value)| key.len() + value.len() + 21)
+                .sum(),
+        );
         for (key, value) in &entries {
             let key = structured_key(key)?;
             let key_len = i32::try_from(key.len())
