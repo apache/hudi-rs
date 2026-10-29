@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use crate::Result;
 use crate::config::properties::escape_property;
-use crate::file_group::log_file::scanner::LogFileScanner;
+use crate::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
 use crate::file_group::log_file::writer::LogFileWriter;
 use crate::file_group::log_file::{BlockMetadataKey, BlockType};
 use crate::hfile::{HFileReader, HFileWriter};
@@ -1269,12 +1269,16 @@ pub(crate) async fn load_column_stats_records(
         let mut reader = HFileReader::open(storage.as_ref(), &base)
             .await
             .map_err(|e| crate::error::CoreError::HFile(format!("failed to open {base}: {e:?}")))?;
+        let schema = reader
+            .get_avro_schema()
+            .map_err(|e| crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}")))?
+            .cloned();
         let records = reader
             .lookup_records(&sorted_keys)
             .map_err(|e| crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}")))?;
         for (_, record) in records {
             let Some(record) = record else { continue };
-            apply_column_stats_record(&mut merged, wanted, &record)?;
+            apply_column_stats_record(&mut merged, wanted, &record, schema.as_ref())?;
         }
     }
     if !log_paths.is_empty() {
@@ -1282,8 +1286,12 @@ pub(crate) async fn load_column_stats_records(
         // (Java getValidInstantTimestamps); orphan MDT commits are skipped.
         let scanner = LogFileScanner::new(hudi_configs, storage);
         let range = InstantRange::exact_match(valid_instants.iter().cloned(), "UTC");
-        for record in &scanner.scan_hfile_records(log_paths, &range).await? {
-            apply_column_stats_record(&mut merged, wanted, record)?;
+        for HFileRecordGroup { schema, records } in
+            scanner.scan_hfile_records(log_paths, &range).await?
+        {
+            for record in &records {
+                apply_column_stats_record(&mut merged, wanted, record, schema.as_deref())?;
+            }
         }
     }
     Ok(merged)
@@ -1293,6 +1301,7 @@ fn apply_column_stats_record(
     merged: &mut HashMap<String, ColumnStatsMetadata>,
     wanted: &HashMap<String, (String, String)>,
     record: &crate::hfile::HFileRecord,
+    schema: Option<&apache_avro::Schema>,
 ) -> Result<()> {
     let Some(key) = record.key_as_str() else {
         return Ok(());
@@ -1300,7 +1309,7 @@ fn apply_column_stats_record(
     if !wanted.contains_key(key) {
         return Ok(());
     }
-    if let Some(stats) = decode_column_stats_entry(record.value(), record.avro_schema())? {
+    if let Some(stats) = decode_column_stats_entry(record.value(), schema)? {
         // Java HoodieMetadataPayload semantics: successive stats for a key
         // merge (range union + count sums) unless the newer record is a
         // tombstone or tight-bound, which replaces. Plain last-wins would

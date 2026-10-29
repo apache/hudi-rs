@@ -33,6 +33,7 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::metadata::merger::FilesPartitionMerger;
+use crate::metadata::payload_merger::MetadataPayloadMerger;
 use crate::metadata::table_record::FilesPartitionRecord;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
@@ -117,17 +118,38 @@ impl MetadataTableFileGroupReader {
                 .collect()
         };
 
-        let log_records = if log_file_paths.is_empty() {
-            vec![]
-        } else {
+        let mut merged = FilesPartitionMerger::new(schema.clone()).merge_for_keys(
+            &base_records,
+            &[],
+            &hfile_keys,
+        )?;
+        if !log_file_paths.is_empty() {
             let instant_range = self.create_instant_range_for_log_file_scan()?;
-            LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+            let groups = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
                 .scan_hfile_records(log_file_paths, &instant_range)
-                .await?
-        };
-
-        let merger = FilesPartitionMerger::new(schema);
-        merger.merge_for_keys(&base_records, &log_records, &hfile_keys)
+                .await?;
+            // Each block decodes with its own writer schema. A block holds a
+            // key at most once, so merging block by block keeps log order.
+            for group in groups {
+                let group_schema = group
+                    .schema
+                    .map_or_else(|| schema.clone(), |s| (*s).clone());
+                for (key, newer) in FilesPartitionMerger::new(group_schema).merge_for_keys(
+                    &[],
+                    &group.records,
+                    &hfile_keys,
+                )? {
+                    match merged.get_mut(&key) {
+                        Some(existing) => MetadataPayloadMerger
+                            .merge_file_infos(&mut existing.files, &newer.files),
+                        None => {
+                            merged.insert(key, newer);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(merged)
     }
 
     /// The window bounding which log instants this read admits.
