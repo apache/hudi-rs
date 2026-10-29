@@ -1583,6 +1583,60 @@ async fn test_input_meta_columns_are_replaced() {
     }
 }
 
+/// Batches are concatenated by position, so a later batch whose columns are
+/// renamed or reordered must be rejected rather than merged.
+#[tokio::test]
+async fn test_upsert_rejects_batches_with_differing_schemas() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+        let first = ordered_batch(vec![("a", 1, 10)]);
+        let schema = first.schema();
+        let reordered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                schema.field(0).clone(),
+                schema.field(2).clone(),
+                schema.field(1).clone(),
+            ])),
+            {
+                let other = ordered_batch(vec![("b", 2, 20)]);
+                vec![
+                    other.column(0).clone(),
+                    other.column(2).clone(),
+                    other.column(1).clone(),
+                ]
+            },
+        )
+        .unwrap();
+        let error = table
+            .upsert([first, reordered])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{table_type:?} accepted the batches"));
+        assert!(
+            matches!(error, CoreError::Schema(_)),
+            "{table_type:?}: {error}"
+        );
+        assert!(
+            std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('2')),
+            "{table_type:?}: rejected upsert left an instant"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_upsert_rejects_schema_mismatch() {
     let dir = tempdir().unwrap();

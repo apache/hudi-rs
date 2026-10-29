@@ -92,30 +92,8 @@ pub(super) async fn mor_upsert_batches(
         ));
     }
 
+    validate_write_input(table, batches, "upsert").await?;
     let incoming = concat(batches)?;
-    if incoming.num_rows() == 0 {
-        return Err(CoreError::Write(
-            "upsert requires at least one row".to_string(),
-        ));
-    }
-    let schema_check_batches = prepare_batches_for_write(
-        &table.hudi_configs,
-        std::slice::from_ref(&incoming),
-        "schema-check",
-        "schema-check",
-    )?;
-    if table
-        .timeline
-        .get_latest_commit_timestamp_as_option()
-        .is_some()
-    {
-        let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
-        if crate::write::align_batch_to_schema(&schema_check_batches[0], &table_schema).is_none() {
-            return Err(CoreError::Schema(
-                "upsert batch schema does not match the current table schema".to_string(),
-            ));
-        }
-    }
     let incoming_keys = batch_record_keys(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
     crate::write::keygen::validate_keygen_inputs(
