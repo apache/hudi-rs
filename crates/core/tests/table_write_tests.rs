@@ -219,7 +219,6 @@ async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
     );
 }
 
-/// A rejected write must leave no instant on the data timeline.
 fn timeline_file_count(base: &std::path::Path) -> usize {
     std::fs::read_dir(base.join(".hoodie/timeline"))
         .unwrap()
@@ -240,6 +239,7 @@ fn nullable_value_batch(nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>
     .unwrap()
 }
 
+/// A rejected write must leave no instant on the data timeline.
 fn assert_no_instant(base: &std::path::Path) {
     let names: Vec<String> = std::fs::read_dir(base.join(".hoodie/timeline"))
         .unwrap()

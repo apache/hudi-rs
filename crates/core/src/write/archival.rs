@@ -756,7 +756,7 @@ mod delete_failure_tests {
         write(format!("{}.compaction.inflight", ts(2)), b"");
         write(format!("{0}_{0}.commit", ts(2)), b"{}");
         write(format!("{}.clean.requested", ts(3)), b"clean plan");
-        write(format!("{}.clean.inflight", ts(3)), b"clean plan");
+        write(format!("{}.clean.inflight", ts(3)), b"clean inflight");
         write(format!("{0}_{0}.clean", ts(3)), b"{}");
         write(
             format!("{}.logcompaction.requested", ts(4)),
@@ -841,6 +841,12 @@ mod delete_failure_tests {
             2,
         )
         .await;
+        for ts in &instants {
+            assert!(
+                timeline.join(format!("{ts}_{ts}.commit")).exists(),
+                "{ts}: deletes must stop at the first failure"
+            );
+        }
 
         let storage = Storage::new_with_object_store(
             base_url,

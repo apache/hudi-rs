@@ -455,6 +455,11 @@ mod tests {
             pruner.should_include("date=2023-02-01/category=__HIVE_DEFAULT_PARTITION__/count=10")
         );
         assert!(!pruner.should_include("date=2023-02-01/category=A/count=10"));
+        let filter = Filter::try_from(("category", "=", "A")).unwrap();
+        let pruner = PartitionPruner::new(&[filter], &schema, &configs).unwrap();
+        assert!(
+            pruner.should_include("date=2023-02-01/category=__HIVE_DEFAULT_PARTITION__/count=10")
+        );
         // Filters on the other fields still prune.
         let filter = Filter::try_from(("date", ">", "2024-01-01")).unwrap();
         let pruner = PartitionPruner::new(&[filter], &schema, &configs).unwrap();
