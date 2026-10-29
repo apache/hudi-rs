@@ -386,7 +386,13 @@ async fn archived_instant_times(
             .get_file_data(&format!("{history_dir}/{}", entry.file_name))
             .await?;
         let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
-            .and_then(|builder| builder.build())
+            .and_then(|builder| {
+                let instant_time = parquet::arrow::ProjectionMask::columns(
+                    builder.parquet_schema(),
+                    ["instantTime"],
+                );
+                builder.with_projection(instant_time).build()
+            })
             .map_err(|e| CoreError::Timeline(format!("read LSM file {}: {e}", entry.file_name)))?;
         for batch in reader {
             let batch = batch.map_err(CoreError::ArrowError)?;
@@ -435,15 +441,14 @@ async fn publish_lsm_file(
             next_version.to_string().into_bytes(),
         )
         .await?;
-    // Retain only the last N manifest versions.
-    let stale_floor = next_version - RETAINED_MANIFEST_VERSIONS;
-    let mut stale = stale_floor;
-    while stale > 0 {
-        let path = format!("{history_dir}/manifest_{stale}");
-        if storage.delete_file(&path).await.is_err() {
-            break;
-        }
-        stale -= 1;
+    // Retain only the last N manifest versions; each publish retires one, so
+    // older ones went in earlier runs. A failed delete only leaves a stale
+    // manifest that `_version_` no longer names.
+    let stale = next_version - RETAINED_MANIFEST_VERSIONS;
+    if stale > 0 {
+        let _ = storage
+            .delete_file(&format!("{history_dir}/manifest_{stale}"))
+            .await;
     }
     Ok(())
 }
