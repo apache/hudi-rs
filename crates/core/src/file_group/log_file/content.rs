@@ -162,6 +162,48 @@ pub struct Decoder {
     /// `RefCell` because `decode_content` takes `&self`, and a `Decoder` is built
     /// per scan and used sequentially.
     registered: std::cell::RefCell<Option<(String, RegisteredWriterSchema)>>,
+    /// Base-row positions this reader covers, with the base file instant the
+    /// positions are relative to. A block whose `RECORD_POSITIONS` header names
+    /// that instant has its records outside the range skipped, before an Avro
+    /// record is decoded. See [`Decoder::with_positions_within`].
+    positions_within: Option<(std::ops::Range<u64>, String)>,
+}
+
+/// Keep the rows `keep` marks across the batches of a block, in order. Delete
+/// batches follow the data batches, as a block holds one kind or the other.
+fn keep_records(batches: RecordBatches, keep: Option<&[bool]>) -> Result<RecordBatches> {
+    let Some(keep) = keep else {
+        return Ok(batches);
+    };
+    let total = batches.num_data_rows() + batches.num_delete_rows();
+    if keep.len() != total {
+        return Err(CoreError::LogBlockError(format!(
+            "block holds {total} records but {} were marked to keep",
+            keep.len()
+        )));
+    }
+    let mut kept =
+        RecordBatches::new_with_capacity(batches.num_data_batches(), batches.num_delete_batches());
+    let mut offset = 0usize;
+    let mut filter = |batch: &RecordBatch| -> Result<RecordBatch> {
+        let mask =
+            arrow_array::BooleanArray::from(keep[offset..offset + batch.num_rows()].to_vec());
+        offset += batch.num_rows();
+        arrow::compute::filter_record_batch(batch, &mask).map_err(CoreError::ArrowError)
+    };
+    for batch in &batches.data_batches {
+        let batch = filter(batch)?;
+        if batch.num_rows() > 0 {
+            kept.push_data_batch(batch);
+        }
+    }
+    for (batch, instant) in &batches.delete_batches {
+        let batch = filter(batch)?;
+        if batch.num_rows() > 0 {
+            kept.push_delete_batch(batch, instant.clone());
+        }
+    }
+    Ok(kept)
 }
 
 impl Decoder {
@@ -255,7 +297,25 @@ impl Decoder {
             hfile_as_records: false,
             key_predicate: None,
             registered: std::cell::RefCell::new(None),
+            positions_within: None,
         }
+    }
+
+    /// Keep only the records at base-row positions inside `range`, when a
+    /// block's positions are relative to the base file at `base_instant`. The
+    /// caller decides whether every block carries such positions; one that does
+    /// not is decoded whole.
+    pub fn with_positions_within(
+        mut self,
+        range: Option<std::ops::Range<u64>>,
+        base_instant: Option<String>,
+    ) -> Self {
+        self.positions_within = range.zip(base_instant);
+        self
+    }
+
+    pub fn positions_within(&self) -> Option<&(std::ops::Range<u64>, String)> {
+        self.positions_within.as_ref()
     }
     pub fn decode_content(
         &self,
@@ -264,6 +324,28 @@ impl Decoder {
         fallback_length: u64,
         block_type: &BlockType,
         header: &HashMap<BlockMetadataKey, String>,
+    ) -> Result<LogBlockContent> {
+        self.decode_content_keeping(
+            reader,
+            log_format_version,
+            fallback_length,
+            block_type,
+            header,
+            None,
+        )
+    }
+
+    /// [`Self::decode_content`] keeping only the records `keep` marks, one flag
+    /// per record in block order. An Avro block skips the others without
+    /// decoding them; any other block is decoded and then filtered.
+    pub fn decode_content_keeping(
+        &self,
+        reader: &mut (impl Read + Seek),
+        log_format_version: &LogFormatVersion,
+        fallback_length: u64,
+        block_type: &BlockType,
+        header: &HashMap<BlockMetadataKey, String>,
+        keep: Option<&[bool]>,
     ) -> Result<LogBlockContent> {
         let content_length = if log_format_version.has_content_length() {
             let mut content_length_buf = [0u8; 8];
@@ -276,13 +358,15 @@ impl Decoder {
         let reader = reader.by_ref().take(content_length);
         match block_type {
             BlockType::AvroData => self
-                .decode_avro_record_content(reader, header)
+                .decode_avro_record_content(reader, header, keep)
                 .map(LogBlockContent::Records),
             BlockType::ParquetData => self
                 .decode_parquet_record_content(reader)
+                .and_then(|batches| keep_records(batches, keep))
                 .map(LogBlockContent::Records),
             BlockType::Delete => self
                 .decode_delete_record_content(reader, header)
+                .and_then(|batches| keep_records(batches, keep))
                 .map(LogBlockContent::Records),
             BlockType::HfileData => self.decode_hfile_content(reader, header),
             BlockType::Command => Ok(LogBlockContent::Empty),
@@ -467,6 +551,7 @@ impl Decoder {
         &self,
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
+        keep: Option<&[bool]>,
     ) -> Result<RecordBatches> {
         // V2 and V3 Avro data blocks share one layout (version, record count,
         // records): Hudi's HoodieAvroDataBlockVersion reports a record count for
@@ -484,18 +569,38 @@ impl Decoder {
         let mut record_count_buf = [0u8; 4];
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
+        if let Some(keep) = keep
+            && keep.len() != record_count as usize
+        {
+            return Err(CoreError::LogBlockError(format!(
+                "Avro data block holds {record_count} records but {} were marked to keep",
+                keep.len()
+            )));
+        }
 
         let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
 
         // Each datum is framed by Hudi with a four-byte length, so the bodies
-        // are read here and handed over one at a time.
+        // are read here and handed over one at a time, and a datum nobody wants
+        // is stepped over without being decoded.
         let mut body = Vec::new();
-        for _ in 0..record_count {
+        for index in 0..record_count as usize {
             let mut len_buf = [0u8; 4];
             reader.read_exact(&mut len_buf)?;
             let len = u32::from_be_bytes(len_buf) as usize;
+            if keep.is_some_and(|keep| !keep[index]) {
+                let skipped =
+                    std::io::copy(&mut reader.by_ref().take(len as u64), &mut std::io::sink())?;
+                if skipped != len as u64 {
+                    return Err(CoreError::LogBlockError(format!(
+                        "Avro data block record {index} is {len} bytes long but the block ends \
+                         after {skipped}"
+                    )));
+                }
+                continue;
+            }
             body.clear();
             body.resize(len, 0);
             reader.read_exact(&mut body)?;
@@ -773,7 +878,7 @@ mod tests {
 
         let mut header = HashMap::new();
         header.insert(BlockMetadataKey::Schema, schema_str.to_string());
-        let batches = decoder.decode_avro_record_content(reader, &header)?;
+        let batches = decoder.decode_avro_record_content(reader, &header, None)?;
 
         // Verify results
         assert_eq!(batches.num_data_batches(), 1, "Should have 1 batch");
@@ -820,6 +925,56 @@ mod tests {
     /// promotion Int to String". The
     /// block decodes at its own schema and is converted afterwards.
     #[test]
+    fn avro_records_marked_to_skip_are_stepped_over_without_decoding() -> Result<()> {
+        let writer_json =
+            r#"{"type":"record","name":"TestRecord","fields":[{"name":"num","type":"int"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(writer_json)?;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        for num in [1i32, 2, 3] {
+            let mut record = AvroRecord::new(&writer_schema).unwrap();
+            record.put("num", num);
+            let body = to_avro_datum(&writer_schema, record)?;
+            buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&body);
+        }
+        let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+
+        let kept = decoder.decode_avro_record_content(
+            buf.as_slice(),
+            &header,
+            Some(&[true, false, true]),
+        )?;
+        assert_eq!(kept.num_data_rows(), 2);
+        let nums = kept.concat_data_batches(kept.data_batches[0].schema())?;
+        let nums = nums
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int32Array>()
+            .unwrap();
+        assert_eq!(nums.values(), &[1, 3]);
+
+        let none = decoder.decode_avro_record_content(
+            buf.as_slice(),
+            &header,
+            Some(&[false, false, false]),
+        )?;
+        assert_eq!(none.num_data_rows(), 0);
+
+        let err = decoder
+            .decode_avro_record_content(buf.as_slice(), &header, Some(&[true, false]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("3 records but 2 were marked"),
+            "{err}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn test_extended_promotion_int_to_string_rewrites() -> Result<()> {
         let writer_json =
             r#"{"type":"record","name":"TestRecord","fields":[{"name":"num","type":"int"}]}"#;
@@ -839,7 +994,7 @@ mod tests {
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
-        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header, None)?;
 
         let batch = &batches.data_batches[0];
         assert_eq!(batch.schema().field(0).data_type(), &DataType::Utf8);
@@ -875,7 +1030,7 @@ mod tests {
         let header = HashMap::from([(BlockMetadataKey::Schema, writer_json.to_string())]);
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(required_json.to_string()));
-        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header, None)?;
 
         let col = batches.data_batches[0]
             .column(0)
@@ -978,7 +1133,7 @@ mod tests {
         buf.extend_from_slice(&0u32.to_be_bytes());
         let header = HashMap::from([(BlockMetadataKey::Schema, "{}".to_string())]);
         let err = Decoder::new(Arc::new(HudiConfigs::empty()))
-            .decode_avro_record_content(buf.as_slice(), &header)
+            .decode_avro_record_content(buf.as_slice(), &header, None)
             .expect_err("a V1 block must be refused");
         assert!(
             err.to_string().contains("Avro data block version V1"),
@@ -1004,8 +1159,11 @@ mod tests {
             buf.extend_from_slice(&bytes);
         }
         let header = HashMap::from([(BlockMetadataKey::Schema, schema_str.to_string())]);
-        let batches = Decoder::new(Arc::new(HudiConfigs::empty()))
-            .decode_avro_record_content(Cursor::new(buf), &header)?;
+        let batches = Decoder::new(Arc::new(HudiConfigs::empty())).decode_avro_record_content(
+            Cursor::new(buf),
+            &header,
+            None,
+        )?;
         assert_eq!(batches.num_data_rows(), 2);
         let ids = batches.data_batches[0]
             .column(0)
@@ -1042,7 +1200,7 @@ mod tests {
         buf.extend_from_slice(&3u32.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes());
         let err = Decoder::new(Arc::new(HudiConfigs::empty()))
-            .decode_avro_record_content(buf.as_slice(), &HashMap::new())
+            .decode_avro_record_content(buf.as_slice(), &HashMap::new(), None)
             .expect_err("a block with no schema header must be refused");
         assert!(err.to_string().contains("Schema not found"), "got: {err}");
     }
@@ -1146,7 +1304,7 @@ mod tests {
             (BlockMetadataKey::IsPartial, "true".to_string()),
         ]);
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
-        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header, None)?;
 
         assert_eq!(batches.num_data_rows(), 1);
         let batch = &batches.data_batches[0];
@@ -1191,7 +1349,7 @@ mod tests {
         ]);
         let decoder = Decoder::new(Arc::new(HudiConfigs::empty()))
             .with_reader_schema(Some(reader_schema_str.to_string()));
-        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header)?;
+        let batches = decoder.decode_avro_record_content(buf.as_slice(), &header, None)?;
 
         let batch = &batches.data_batches[0];
         assert_eq!(

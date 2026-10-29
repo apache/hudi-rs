@@ -71,6 +71,13 @@ mod ffi {
             self: &HudiFileGroupReader,
             file_slice: &HudiFileSlice,
         ) -> Result<*mut ArrowArrayStream>;
+        fn read_file_slice_from_paths_split(
+            self: &HudiFileGroupReader,
+            base_file_path: &CxxString,
+            log_file_paths: &CxxVector<CxxString>,
+            start: u64,
+            length: u64,
+        ) -> Result<*mut ArrowArrayStream>;
     }
 }
 
@@ -141,6 +148,45 @@ pub fn new_file_group_reader_with_options(
 }
 
 impl HudiFileGroupReader {
+    /// Reads the row groups of a base-file-only slice that a byte-range split
+    /// selects, so an engine that cuts one file into several splits gets each
+    /// row exactly once. A slice with log files accepts only a split covering
+    /// the whole base file and fails otherwise.
+    pub fn read_file_slice_from_paths_split(
+        &self,
+        base_file_path: &CxxString,
+        log_file_paths: &CxxVector<CxxString>,
+        start: u64,
+        length: u64,
+    ) -> std::result::Result<*mut ffi::ArrowArrayStream, String> {
+        let base_file_path = base_file_path
+            .to_str()
+            .map_err(|e| format!("Failed to convert CxxString to str: {e}"))?;
+        let log_file_paths = log_file_paths
+            .iter()
+            .map(|p| {
+                p.to_str()
+                    .map(String::from)
+                    .map_err(|e| format!("Failed to convert CxxString to str: {e}"))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let record_batch = self
+            .rt
+            .block_on(self.inner.read_file_slice_from_paths_split(
+                base_file_path,
+                log_file_paths,
+                &ReadOptions::new(),
+                start,
+                length,
+            ))
+            .map_err(|e| format!("Failed to read file slice split: {e}"))?;
+        let schema = record_batch.schema();
+        Ok(create_raw_pointer_for_record_batches(
+            vec![record_batch],
+            schema,
+        ))
+    }
+
     pub fn read_file_slice_from_paths(
         &self,
         base_file_path: &CxxString,

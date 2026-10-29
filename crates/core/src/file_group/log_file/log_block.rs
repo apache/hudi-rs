@@ -21,6 +21,9 @@ use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_format::LogFormatVersion;
+use crate::file_group::reader_v2::buffer::record_positions::{
+    decode_record_positions, encode_record_positions,
+};
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
 use crate::storage::reader::LogBlockFetcher;
@@ -326,6 +329,31 @@ pub struct DeferredContent {
 }
 
 impl LogBlock {
+    /// Which of this block's records the decoder's position range keeps, one
+    /// flag per record in block order; `None` keeps them all. Only a block whose
+    /// positions are relative to the decoder's base file instant is narrowed.
+    fn records_to_keep(&self, decoder: &Decoder) -> Result<Option<(Vec<u64>, Vec<bool>)>> {
+        let Some((range, base_instant)) = decoder.positions_within() else {
+            return Ok(None);
+        };
+        // HFile records are not length-prefixed, so they cannot be stepped over.
+        if self.block_type == BlockType::HfileData {
+            return Ok(None);
+        }
+        if self.base_file_instant_time_of_positions() != Some(base_instant.as_str()) {
+            return Ok(None);
+        }
+        let Some(encoded) = self.record_positions_header().filter(|h| !h.is_empty()) else {
+            return Ok(None);
+        };
+        let positions = decode_record_positions(encoded)?;
+        let keep = positions
+            .iter()
+            .map(|position| range.contains(position))
+            .collect();
+        Ok(Some((positions, keep)))
+    }
+
     /// Decode the content a headers-only scan did not decode.
     ///
     /// Three cases, in order: a block that already holds decoded content is left
@@ -384,14 +412,28 @@ impl LogBlock {
                 location.content_length,
             )));
         }
+        let narrowed = self.records_to_keep(decoder)?;
         let mut reader = std::io::Cursor::new(bytes);
-        self.content = decoder.decode_content(
+        self.content = decoder.decode_content_keeping(
             &mut reader,
             &self.format_version,
             location.content_length,
             &self.block_type,
             &self.header,
+            narrowed.as_ref().map(|(_, keep)| keep.as_slice()),
         )?;
+        if let Some((positions, keep)) = narrowed {
+            // The positions header must keep describing the records that are
+            // left, one position per record in block order.
+            let remaining = positions
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(position, keep)| keep.then_some(position));
+            self.header.insert(
+                BlockMetadataKey::RecordPositions,
+                encode_record_positions(remaining),
+            );
+        }
         // Content is decoded, so the means to fetch it again is dead weight.
         // Mirrors Java's `deflate()` releasing the block's `byte[]`. A block that
         // decodes to no content keeps its location: a command block decodes to
@@ -548,6 +590,52 @@ impl LogBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn records_to_keep_follows_the_decoders_position_range() {
+        use crate::config::HudiConfigs;
+        let header = HashMap::from([
+            (BlockMetadataKey::InstantTime, "20250102".to_string()),
+            (
+                BlockMetadataKey::RecordPositions,
+                encode_record_positions([5u64, 10, 15]),
+            ),
+            (
+                BlockMetadataKey::BaseFileInstantTimeOfRecordPositions,
+                "20250101".to_string(),
+            ),
+        ]);
+        let block = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::AvroData,
+            header,
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        let configs = std::sync::Arc::new(HudiConfigs::empty());
+
+        let within = Decoder::new(configs.clone())
+            .with_positions_within(Some(8..20), Some("20250101".to_string()));
+        assert_eq!(
+            block.records_to_keep(&within).unwrap(),
+            Some((vec![5, 10, 15], vec![false, true, true]))
+        );
+        let hfile = LogBlock::new(
+            LogFormatVersion::V1,
+            BlockType::HfileData,
+            block.header.clone(),
+            LogBlockContent::Empty,
+            HashMap::new(),
+        );
+        assert_eq!(hfile.records_to_keep(&within).unwrap(), None);
+
+        let other_base = Decoder::new(configs.clone())
+            .with_positions_within(Some(8..20), Some("20250103".to_string()));
+        assert_eq!(block.records_to_keep(&other_base).unwrap(), None);
+
+        let unranged = Decoder::new(configs);
+        assert_eq!(block.records_to_keep(&unranged).unwrap(), None);
+    }
 
     #[test]
     fn test_block_type_as_ref() {

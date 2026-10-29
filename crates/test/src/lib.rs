@@ -32,6 +32,7 @@ use zip::ZipArchive;
 
 pub mod gold;
 pub mod gold_options;
+pub mod synthetic;
 pub mod util;
 
 #[cfg(feature = "datafusion")]

@@ -53,6 +53,17 @@ use crate::error::CoreError;
 /// stripped before the merged output — it never appears in the reader's output.
 pub const ROW_INDEX_TEMPORARY_COLUMN_NAME: &str = "_tmp_metadata_row_index";
 
+/// Encode record positions as the Base64 + portable-Roaring64 `RECORD_POSITIONS`
+/// header value, the inverse of [`decode_record_positions`].
+pub fn encode_record_positions<I: IntoIterator<Item = u64>>(positions: I) -> String {
+    let bitmap: RoaringTreemap = positions.into_iter().collect();
+    let mut bytes = Vec::new();
+    bitmap
+        .serialize_into(&mut bytes)
+        .expect("a roaring bitmap serializes into a vector");
+    STANDARD.encode(bytes)
+}
+
 /// Decode the Base64 + portable-Roaring64 `RECORD_POSITIONS` header value into
 /// its record positions, in ascending order (the bitmap iteration order).
 ///

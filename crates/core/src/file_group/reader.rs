@@ -31,6 +31,7 @@ use crate::file_group::base_file::reader::{
 };
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+pub use crate::file_group::reader_v2::input_split::BaseFileRange;
 use crate::file_group::reader_v2::metadata_merger::resolve_custom_merger;
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::file_group::record_batches::RecordBatches;
@@ -85,6 +86,16 @@ impl std::fmt::Debug for FileGroupReader {
             .field("base_file_format", &self.base_file_format)
             .finish_non_exhaustive()
     }
+}
+
+/// How a byte-range split of a file slice is served.
+enum ByteSplit {
+    /// The split covers the whole base file, or the slice cannot be cut.
+    WholeSlice,
+    /// The split holds no row group midpoint.
+    Nothing,
+    /// The row groups the split selects.
+    RowGroups(BaseFileRange),
 }
 
 impl FileGroupReader {
@@ -731,8 +742,244 @@ impl FileGroupReader {
             log_file_paths,
             options,
             known_base_file_size,
+            None,
         )
         .await
+    }
+
+    /// Stream one part of a file slice: the base rows of `range` merged with the
+    /// log records addressed at them.
+    ///
+    /// The ranges of a slice come from [`Self::base_file_ranges`] and together
+    /// return exactly what [`Self::read_file_slice_stream`] returns, so a caller
+    /// can read one slice on several cores. Matching log records to a range
+    /// needs the record positions Hudi writes into log blocks under
+    /// `hoodie.write.record.positions`, read with
+    /// `hoodie.merge.use.record.positions`; when a block carries none, the first
+    /// range reads the whole slice and the others return nothing.
+    pub async fn read_file_slice_range_stream(
+        &self,
+        file_slice: &FileSlice,
+        options: &ReadOptions,
+        range: &BaseFileRange,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
+        let base_file_path = file_slice.base_file_relative_path()?;
+        let known_base_file_size = file_slice
+            .base_file
+            .as_ref()
+            .and_then(|f| f.file_metadata.as_ref())
+            .map(|metadata| metadata.size);
+        let log_file_paths: Vec<String> = file_slice
+            .log_files
+            .iter()
+            .map(|log_file| file_slice.log_file_relative_path(log_file))
+            .collect::<Result<Vec<String>>>()?;
+
+        self.read_file_slice_from_paths_stream_inner(
+            base_file_path.as_deref().unwrap_or(""),
+            log_file_paths,
+            options,
+            known_base_file_size,
+            Some(range.clone()),
+        )
+        .await
+    }
+
+    /// Cut a file slice's base file into at most `parts` ranges of row groups
+    /// with roughly equal bytes, for [`Self::read_file_slice_range_stream`].
+    ///
+    /// Reads the base file's footer. Returns fewer ranges than asked when the
+    /// file has fewer row groups, and none when the slice has no base file or
+    /// its format has no row groups, in which case the slice is read whole.
+    pub async fn base_file_ranges(
+        &self,
+        file_slice: &FileSlice,
+        parts: usize,
+    ) -> Result<Vec<BaseFileRange>> {
+        let Some(base_file_path) = file_slice.base_file_relative_path()? else {
+            return Ok(Vec::new());
+        };
+        if parts <= 1 {
+            return Ok(Vec::new());
+        }
+        let known_size = file_slice
+            .base_file
+            .as_ref()
+            .and_then(|f| f.file_metadata.as_ref())
+            .map(|metadata| metadata.size);
+        let spans = self
+            .reader_for_path(&base_file_path)?
+            .row_group_spans(&base_file_path, known_size)
+            .await
+            .map_err(|e| {
+                ReadFileSliceError(format!(
+                    "Failed to read the row groups of base file '{base_file_path}': {e:?}"
+                ))
+            })?;
+        let layout: Vec<(u64, u64)> = spans.iter().map(|span| (span.rows, span.bytes)).collect();
+        Ok(BaseFileRange::split(&layout, parts))
+    }
+
+    /// Reads the part of a file slice that a byte-range split
+    /// `[start, start + length)` of its base file selects, for an engine that
+    /// plans splits by byte range and reads each through this reader: the row
+    /// groups whose midpoint falls inside the split, the rule Spark's and
+    /// Velox's parquet readers apply, so the splits of one file together
+    /// return exactly the whole file and nothing twice.
+    ///
+    /// A slice with log files merges log records across the whole base file,
+    /// so it accepts only a split that covers the whole file; any other split
+    /// is an error rather than a subset. The same holds for a base file without
+    /// row groups. A split that holds no row group midpoint returns an empty
+    /// batch carrying the slice's data schema.
+    pub async fn read_file_slice_from_paths_split<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+        options: &ReadOptions,
+        start: u64,
+        length: u64,
+    ) -> Result<RecordBatch>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let log_file_paths: Vec<String> = log_file_paths
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        let range = match self
+            .byte_split_plan(base_file_path, &log_file_paths, start, length)
+            .await?
+        {
+            ByteSplit::WholeSlice => {
+                return self
+                    .read_file_slice_from_paths(base_file_path, log_file_paths, options)
+                    .await;
+            }
+            ByteSplit::Nothing => return self.empty_split_batch(base_file_path, options).await,
+            ByteSplit::RowGroups(range) => range,
+        };
+        let mut stream = self
+            .read_file_slice_from_paths_stream_inner(
+                base_file_path,
+                Vec::<String>::new(),
+                options,
+                None,
+                Some(range),
+            )
+            .await?;
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch?);
+        }
+        match batches.first() {
+            Some(first) => Ok(arrow::compute::concat_batches(&first.schema(), &batches)?),
+            None => self.empty_split_batch(base_file_path, options).await,
+        }
+    }
+
+    /// The batch a split that selects no rows returns: the slice's data schema,
+    /// narrowed to the read's projection like a split with rows would be.
+    async fn empty_split_batch(
+        &self,
+        base_file_path: &str,
+        options: &ReadOptions,
+    ) -> Result<RecordBatch> {
+        let options = self.resolve_read_options(options)?;
+        let empty = RecordBatch::new_empty(self.resolved_data_schema(base_file_path).await?);
+        project_batch_by_names(empty, options.projection.as_deref())
+    }
+
+    /// Streaming version of [`FileGroupReader::read_file_slice_from_paths_split`].
+    pub async fn read_file_slice_from_paths_split_stream<I, S>(
+        &self,
+        base_file_path: &str,
+        log_file_paths: I,
+        options: &ReadOptions,
+        start: u64,
+        length: u64,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let log_file_paths: Vec<String> = log_file_paths
+            .into_iter()
+            .map(|s| s.as_ref().to_string())
+            .collect();
+        match self
+            .byte_split_plan(base_file_path, &log_file_paths, start, length)
+            .await?
+        {
+            ByteSplit::WholeSlice => {
+                self.read_file_slice_from_paths_stream(base_file_path, log_file_paths, options)
+                    .await
+            }
+            ByteSplit::Nothing => Ok(futures::stream::empty().boxed()),
+            ByteSplit::RowGroups(range) => {
+                self.read_file_slice_from_paths_stream_inner(
+                    base_file_path,
+                    Vec::<String>::new(),
+                    options,
+                    None,
+                    Some(range),
+                )
+                .await
+            }
+        }
+    }
+
+    /// What a byte-range split of the slice's base file reads.
+    async fn byte_split_plan(
+        &self,
+        base_file_path: &str,
+        log_file_paths: &[String],
+        start: u64,
+        length: u64,
+    ) -> Result<ByteSplit> {
+        let end = start.saturating_add(length);
+        if base_file_path.is_empty() {
+            // A log-only slice has no bytes to split; the split that starts
+            // the (absent) file reads it.
+            return if start == 0 {
+                Ok(ByteSplit::WholeSlice)
+            } else {
+                Err(CoreError::Unsupported(format!(
+                    "A file slice without a base file cannot be split: got a split starting at {start}"
+                )))
+            };
+        }
+        let spans = self
+            .reader_for_path(base_file_path)?
+            .row_group_spans(base_file_path, None)
+            .await
+            .map_err(|e| {
+                ReadFileSliceError(format!(
+                    "Failed to read the row groups of base file '{base_file_path}': {e:?}"
+                ))
+            })?;
+        if !log_file_paths.is_empty() || spans.is_empty() {
+            let data_end = spans
+                .iter()
+                .map(|span| span.start + span.bytes)
+                .max()
+                .unwrap_or(0);
+            if start != 0 || end < data_end {
+                let why = if log_file_paths.is_empty() {
+                    "its base file has no row groups to cut"
+                } else {
+                    "its log records merge across the whole base file"
+                };
+                return Err(CoreError::Unsupported(format!(
+                    "A split of file slice '{base_file_path}' must cover the whole base file \
+                     because {why}: got start {start}, length {length}, base data ends at {data_end}"
+                )));
+            }
+            return Ok(ByteSplit::WholeSlice);
+        }
+        Ok(BaseFileRange::for_byte_split(&spans, start, length)
+            .map_or(ByteSplit::Nothing, ByteSplit::RowGroups))
     }
 
     /// Reads a file slice from paths as a stream of record batches.
@@ -756,8 +1003,14 @@ impl FileGroupReader {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
-        self.read_file_slice_from_paths_stream_inner(base_file_path, log_file_paths, options, None)
-            .await
+        self.read_file_slice_from_paths_stream_inner(
+            base_file_path,
+            log_file_paths,
+            options,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn read_file_slice_from_paths_stream_inner<I, S>(
@@ -766,6 +1019,7 @@ impl FileGroupReader {
         log_file_paths: I,
         options: &ReadOptions,
         known_base_file_size: Option<u64>,
+        base_file_range: Option<BaseFileRange>,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>>
     where
         I: IntoIterator<Item = S>,
@@ -774,7 +1028,12 @@ impl FileGroupReader {
         let options = self.resolve_read_options(options)?;
         if options.is_read_optimized()? {
             return self
-                .read_base_file_stream(base_file_path, &options, known_base_file_size)
+                .read_base_file_stream(
+                    base_file_path,
+                    &options,
+                    known_base_file_size,
+                    base_file_range,
+                )
                 .await;
         }
 
@@ -785,7 +1044,12 @@ impl FileGroupReader {
 
         if log_file_paths.is_empty() {
             return self
-                .read_base_file_stream(base_file_path, &options, known_base_file_size)
+                .read_base_file_stream(
+                    base_file_path,
+                    &options,
+                    known_base_file_size,
+                    base_file_range,
+                )
                 .await;
         }
 
@@ -793,8 +1057,16 @@ impl FileGroupReader {
         // file group reader, so anything reaching here has log files to merge.
         if self.serve_with_version_two(base_file_path, false)? {
             return self
-                .stream_via_v2(base_file_path, log_file_paths, &options)
+                .stream_via_v2(base_file_path, log_file_paths, &options, base_file_range)
                 .await;
+        }
+
+        // Version 1 merges by key and reads a slice whole, so the first range
+        // takes the slice and the others have nothing to add.
+        if let Some(range) = base_file_range
+            && !range.is_first()
+        {
+            return Ok(futures::stream::empty().boxed());
         }
 
         // Version 1's merge sorts and dedups whole batches at once, so it has
@@ -817,6 +1089,7 @@ impl FileGroupReader {
         base_file_path: &str,
         log_file_paths: Vec<String>,
         options: &ReadOptions,
+        base_file_range: Option<BaseFileRange>,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let data_schema = self.resolved_data_schema(base_file_path).await?;
         if let Some(reason) = crate::file_group::reader_v2::adapter::refuse_reason(
@@ -841,6 +1114,7 @@ impl FileGroupReader {
             partition_path,
             Some(data_schema),
             self.completion_gate_inputs.clone(),
+            base_file_range,
         )
         .await?;
 
@@ -869,6 +1143,7 @@ impl FileGroupReader {
         relative_path: &str,
         options: &ReadOptions,
         known_file_size: Option<u64>,
+        base_file_range: Option<BaseFileRange>,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
         let default_batch_size: usize = self
             .hudi_configs
@@ -878,6 +1153,15 @@ impl FileGroupReader {
         let mut read_options = BaseFileReadOptions::default().with_batch_size(batch_size);
         if let Some(size) = known_file_size {
             read_options = read_options.with_known_file_size(size);
+        }
+        if let Some(range) = base_file_range {
+            read_options = read_options.with_row_group_selector(Arc::new(
+                move |metadata: &parquet::file::metadata::ParquetMetaData| {
+                    let total = metadata.num_row_groups();
+                    let within = range.row_groups.start.min(total)..range.row_groups.end.min(total);
+                    Some(within.collect())
+                },
+            ));
         }
 
         // If projection is set, widen the base file read to also include any columns
@@ -2787,5 +3071,462 @@ mod file_group_reader_version_tests {
             FileGroupReaderVersion::One
         );
         Ok(())
+    }
+}
+
+/// Reading one file slice in base-file ranges, so that a slice can be merged on
+/// several cores, against a table written on the spot with many row groups and
+/// log blocks that carry record positions.
+#[cfg(test)]
+mod range_read_tests {
+    use super::*;
+    use crate::config::util::empty_options;
+    use crate::table::Table;
+    use arrow_array::{Array, Float64Array, StringArray};
+    use futures::StreamExt;
+    use hudi_test::synthetic::{self, LogFileSpec, MorTableSpec, SyntheticMorTable};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const POSITIONS_ON: [(&str, &str); 1] = [("hoodie.merge.use.record.positions", "true")];
+    const POSITIONS_OFF: [(&str, &str); 1] = [("hoodie.merge.use.record.positions", "false")];
+
+    fn every(step: u64, rows: u64) -> Vec<u64> {
+        (0..rows).step_by(step as usize).collect()
+    }
+
+    fn spec(log_files: Vec<LogFileSpec>) -> MorTableSpec {
+        MorTableSpec {
+            rows: 1_000,
+            row_group_rows: 100,
+            log_files,
+        }
+    }
+
+    async fn table_and_slice(
+        written: &SyntheticMorTable,
+        options: [(&str, &str); 1],
+    ) -> (Table, FileSlice) {
+        let table = Table::new_with_options(written.base_url().as_str(), options)
+            .await
+            .unwrap();
+        let slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
+        assert_eq!(slices.len(), 1, "the synthetic table has one file slice");
+        (table, slices.into_iter().next().unwrap())
+    }
+
+    async fn reader_for(table: &Table) -> FileGroupReader {
+        table
+            .create_file_group_reader_with_options(None, empty_options())
+            .await
+            .unwrap()
+    }
+
+    /// Merged rows as uuid to fare, failing on a duplicate key, plus the bytes
+    /// the read moved.
+    async fn collect(mut stream: BoxStream<'static, Result<RecordBatch>>) -> BTreeMap<String, f64> {
+        let mut rows = BTreeMap::new();
+        while let Some(batch) = stream.next().await {
+            let batch = batch.unwrap();
+            let uuids = batch
+                .column_by_name("uuid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let fares = batch
+                .column_by_name("fare")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            for i in 0..batch.num_rows() {
+                let previous = rows.insert(uuids.value(i).to_string(), fares.value(i));
+                assert!(previous.is_none(), "row {} returned twice", uuids.value(i));
+            }
+        }
+        rows
+    }
+
+    async fn whole_read(table: &Table, slice: &FileSlice) -> (BTreeMap<String, f64>, u64) {
+        let reader = reader_for(table).await;
+        let stream = reader
+            .read_file_slice_stream(slice, &ReadOptions::new())
+            .await
+            .unwrap();
+        let rows = collect(stream).await;
+        (rows, reader.storage.read_volume().bytes_read.load(Relaxed))
+    }
+
+    async fn range_reads(
+        table: &Table,
+        slice: &FileSlice,
+        parts: usize,
+    ) -> (Vec<BTreeMap<String, f64>>, Vec<u64>) {
+        let ranges = reader_for(table)
+            .await
+            .base_file_ranges(slice, parts)
+            .await
+            .unwrap();
+        assert_eq!(ranges.len(), parts, "{ranges:?}");
+        let mut per_range = Vec::new();
+        let mut bytes = Vec::new();
+        for range in &ranges {
+            let reader = reader_for(table).await;
+            let stream = reader
+                .read_file_slice_range_stream(slice, &ReadOptions::new(), range)
+                .await
+                .unwrap();
+            per_range.push(collect(stream).await);
+            bytes.push(reader.storage.read_volume().bytes_read.load(Relaxed));
+        }
+        (per_range, bytes)
+    }
+
+    fn union(parts: &[BTreeMap<String, f64>]) -> BTreeMap<String, f64> {
+        let mut all = BTreeMap::new();
+        for part in parts {
+            for (key, fare) in part {
+                let previous = all.insert(key.clone(), *fare);
+                assert!(previous.is_none(), "row {key} returned by two ranges");
+            }
+        }
+        all
+    }
+
+    fn fares_of(batch: &RecordBatch) -> BTreeMap<String, f64> {
+        use arrow::array::AsArray;
+        let keys = batch
+            .column_by_name("_hoodie_record_key")
+            .unwrap()
+            .as_string::<i32>();
+        let fares = batch
+            .column_by_name("fare")
+            .unwrap()
+            .as_primitive::<arrow::datatypes::Float64Type>();
+        (0..batch.num_rows())
+            .map(|i| (keys.value(i).to_string(), fares.value(i)))
+            .collect()
+    }
+
+    fn base_file_size(written: &SyntheticMorTable) -> u64 {
+        std::fs::metadata(written.base_path.join(&written.base_file_name))
+            .unwrap()
+            .len()
+    }
+
+    async fn split_read(
+        reader: &FileGroupReader,
+        slice: &FileSlice,
+        start: u64,
+        length: u64,
+    ) -> Result<RecordBatch> {
+        split_read_with(reader, slice, &ReadOptions::new(), start, length).await
+    }
+
+    async fn split_read_with(
+        reader: &FileGroupReader,
+        slice: &FileSlice,
+        options: &ReadOptions,
+        start: u64,
+        length: u64,
+    ) -> Result<RecordBatch> {
+        let base = slice.base_file_relative_path().unwrap().unwrap_or_default();
+        let logs: Vec<String> = slice
+            .log_files
+            .iter()
+            .map(|log| slice.log_file_relative_path(log).unwrap())
+            .collect();
+        reader
+            .read_file_slice_from_paths_split(&base, logs, options, start, length)
+            .await
+    }
+
+    #[tokio::test]
+    async fn byte_splits_of_a_base_only_slice_union_to_the_whole_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(dir.path(), &spec(Vec::new()));
+        let (table, slice) = table_and_slice(&written, POSITIONS_OFF).await;
+        let reader = reader_for(&table).await;
+        let size = base_file_size(&written);
+
+        let whole = fares_of(&split_read(&reader, &slice, 0, size).await.unwrap());
+        assert_eq!(whole.len(), 1_000);
+
+        let half = size / 2;
+        let first = split_read(&reader, &slice, 0, half).await.unwrap();
+        let second = split_read(&reader, &slice, half, size - half)
+            .await
+            .unwrap();
+        assert!(first.num_rows() > 0 && second.num_rows() > 0);
+        assert_eq!(first.num_rows() % 100, 0, "a split takes whole row groups");
+        assert_eq!(union(&[fares_of(&first), fares_of(&second)]), whole);
+
+        // The stream reads the same rows as the eager read.
+        let base = slice.base_file_relative_path().unwrap().unwrap();
+        let mut stream = reader
+            .read_file_slice_from_paths_split_stream(
+                &base,
+                Vec::<String>::new(),
+                &ReadOptions::new(),
+                0,
+                half,
+            )
+            .await
+            .unwrap();
+        let mut streamed = 0;
+        while let Some(batch) = stream.next().await {
+            streamed += batch.unwrap().num_rows();
+        }
+        assert_eq!(streamed, first.num_rows());
+    }
+
+    #[tokio::test]
+    async fn a_byte_split_holding_no_row_group_returns_an_empty_batch_with_the_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(dir.path(), &spec(Vec::new()));
+        let (table, slice) = table_and_slice(&written, POSITIONS_OFF).await;
+        let reader = reader_for(&table).await;
+        let size = base_file_size(&written);
+
+        // The footer holds no row group midpoint.
+        let empty = split_read(&reader, &slice, size - 8, 8).await.unwrap();
+        assert_eq!(empty.num_rows(), 0);
+        let whole = split_read(&reader, &slice, 0, size).await.unwrap();
+        assert_eq!(
+            empty.schema().fields().len(),
+            whole.schema().fields().len(),
+            "an empty split still carries the slice's columns"
+        );
+
+        // A projected read narrows the empty split like it narrows a split with rows.
+        let projected = ReadOptions::new().with_projection(["fare"]);
+        let empty = split_read_with(&reader, &slice, &projected, size - 8, 8)
+            .await
+            .unwrap();
+        let half = split_read_with(&reader, &slice, &projected, 0, size / 2)
+            .await
+            .unwrap();
+        assert_eq!(empty.schema().fields().len(), 1);
+        assert_eq!(empty.schema(), half.schema());
+    }
+
+    #[tokio::test]
+    async fn a_byte_split_of_a_slice_with_log_files_must_cover_the_base_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(
+            dir.path(),
+            &spec(vec![LogFileSpec {
+                updates: every(7, 1_000),
+                deletes: every(50, 1_000),
+                with_positions: true,
+            }]),
+        );
+        let (table, slice) = table_and_slice(&written, POSITIONS_ON).await;
+        let reader = reader_for(&table).await;
+        let size = base_file_size(&written);
+
+        let err = split_read(&reader, &slice, 0, size / 2)
+            .await
+            .expect_err("a partial split of a slice with log files must fail");
+        assert!(
+            err.to_string().contains("must cover the whole base file"),
+            "unexpected error: {err}"
+        );
+
+        let (expected, _) = whole_read(&table, &slice).await;
+        let covered = fares_of(&split_read(&reader, &slice, 0, size).await.unwrap());
+        assert_eq!(covered, expected);
+        assert_eq!(covered.len(), 980);
+        assert_eq!(covered[&synthetic::key_for(7)], synthetic::updated_fare(7));
+    }
+
+    #[tokio::test]
+    async fn range_reads_of_a_position_merged_slice_union_to_the_whole_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(
+            dir.path(),
+            &spec(vec![
+                LogFileSpec {
+                    updates: every(7, 1_000),
+                    deletes: Vec::new(),
+                    with_positions: true,
+                },
+                LogFileSpec {
+                    updates: every(13, 1_000),
+                    deletes: every(50, 1_000),
+                    with_positions: true,
+                },
+            ]),
+        );
+        let (by_position, slice) = table_and_slice(&written, POSITIONS_ON).await;
+        let (by_key, _) = table_and_slice(&written, POSITIONS_OFF).await;
+
+        let (whole, whole_bytes) = whole_read(&by_position, &slice).await;
+        let (keyed, _) = whole_read(&by_key, &slice).await;
+        assert_eq!(whole, keyed, "position and key merges agree on this table");
+        assert_eq!(whole.len(), 980, "every 50th row is deleted");
+        assert_eq!(whole[&synthetic::key_for(7)], synthetic::updated_fare(7));
+        assert_eq!(whole[&synthetic::key_for(8)], synthetic::base_fare(8));
+        assert!(!whole.contains_key(&synthetic::key_for(50)));
+
+        let (parts, bytes) = range_reads(&by_position, &slice, 4).await;
+        assert_eq!(union(&parts), whole);
+        for (index, part) in parts.iter().enumerate() {
+            assert!(!part.is_empty(), "range {index} must return its rows");
+            assert!(
+                bytes[index] < whole_bytes,
+                "range {index} must move fewer bytes than the whole read: {} vs {whole_bytes}",
+                bytes[index]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_block_without_positions_hands_the_whole_slice_to_the_first_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(
+            dir.path(),
+            &spec(vec![
+                LogFileSpec {
+                    updates: every(7, 1_000),
+                    deletes: Vec::new(),
+                    with_positions: true,
+                },
+                LogFileSpec {
+                    updates: every(11, 1_000),
+                    deletes: Vec::new(),
+                    with_positions: false,
+                },
+            ]),
+        );
+        let (table, slice) = table_and_slice(&written, POSITIONS_ON).await;
+        let (whole, _) = whole_read(&table, &slice).await;
+        assert_eq!(whole.len(), 1_000);
+        assert_eq!(whole[&synthetic::key_for(7)], synthetic::updated_fare(7));
+        assert_eq!(whole[&synthetic::key_for(11)], synthetic::updated_fare(11));
+
+        let (parts, _) = range_reads(&table, &slice, 3).await;
+        assert_eq!(parts[0], whole, "the first range reads the whole slice");
+        assert!(parts[1].is_empty() && parts[2].is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_positions_off_the_first_range_reads_the_whole_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(
+            dir.path(),
+            &spec(vec![LogFileSpec {
+                updates: every(7, 1_000),
+                deletes: every(100, 1_000),
+                with_positions: true,
+            }]),
+        );
+        let (table, slice) = table_and_slice(&written, POSITIONS_OFF).await;
+        let (whole, _) = whole_read(&table, &slice).await;
+        assert_eq!(whole.len(), 990);
+
+        let (parts, _) = range_reads(&table, &slice, 2).await;
+        assert_eq!(parts[0], whole);
+        assert!(parts[1].is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_slice_without_log_files_is_read_one_range_of_row_groups_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(dir.path(), &spec(Vec::new()));
+        let (table, slice) = table_and_slice(&written, POSITIONS_OFF).await;
+        let (whole, _) = whole_read(&table, &slice).await;
+        assert_eq!(whole.len(), 1_000);
+
+        let (parts, _) = range_reads(&table, &slice, 4).await;
+        assert_eq!(union(&parts), whole);
+        for part in &parts {
+            assert!(
+                (200..=300).contains(&part.len()),
+                "ranges of ten equal row groups split four ways: {}",
+                part.len()
+            );
+        }
+    }
+
+    /// The log scan of a range ingests only the records at its positions, which
+    /// shows the other ranges' records were stepped over at decode: the first
+    /// range would otherwise ingest every record and prune them later.
+    #[tokio::test]
+    async fn a_range_scan_ingests_only_the_log_records_at_its_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(
+            dir.path(),
+            &spec(vec![LogFileSpec {
+                updates: every(7, 1_000),
+                deletes: Vec::new(),
+                with_positions: true,
+            }]),
+        );
+        let (table, slice) = table_and_slice(&written, POSITIONS_ON).await;
+        let reader = reader_for(&table).await;
+        let base_path = slice.base_file_relative_path().unwrap().unwrap();
+        let log_paths: Vec<String> = slice
+            .log_files
+            .iter()
+            .map(|log| slice.log_file_relative_path(log).unwrap())
+            .collect();
+        let data_schema = reader.resolved_data_schema(&base_path).await.unwrap();
+        let ranges = reader.base_file_ranges(&slice, 4).await.unwrap();
+        assert_eq!(ranges[0].positions, 0..300);
+
+        let ingested = |range: Option<BaseFileRange>| {
+            let configs = reader.hudi_configs.clone();
+            let storage = reader.storage.clone();
+            let base_path = base_path.clone();
+            let log_paths = log_paths.clone();
+            let data_schema = data_schema.clone();
+            async move {
+                let mut engine = crate::file_group::reader_v2::adapter::build_reader(
+                    configs,
+                    storage,
+                    &base_path,
+                    log_paths,
+                    String::new(),
+                    Some(data_schema),
+                    None,
+                    range,
+                )
+                .unwrap();
+                let rows = engine.read().await.unwrap().num_rows();
+                (engine.read_stats().total_log_records, rows)
+            }
+        };
+        assert_eq!(ingested(None).await, (143, 1_000));
+        assert_eq!(
+            ingested(Some(ranges[0].clone())).await,
+            (43, 300),
+            "positions 0, 7, ..., 294 are the first range's; the rest are never decoded"
+        );
+        assert_eq!(ingested(Some(ranges[3].clone())).await.1, 200);
+    }
+
+    #[tokio::test]
+    async fn base_file_ranges_follow_the_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let written = synthetic::write_mor_table(dir.path(), &spec(Vec::new()));
+        let (table, slice) = table_and_slice(&written, POSITIONS_OFF).await;
+        let reader = reader_for(&table).await;
+
+        let four = reader.base_file_ranges(&slice, 4).await.unwrap();
+        assert_eq!(four.len(), 4);
+        assert_eq!(four[0].row_groups.start, 0);
+        assert_eq!(four[3].row_groups.end, 10);
+        assert_eq!(four[3].positions.end, u64::MAX);
+        for pair in four.windows(2) {
+            assert_eq!(pair[0].row_groups.end, pair[1].row_groups.start);
+            assert_eq!(pair[0].positions.end, pair[1].positions.start);
+            assert_eq!(pair[0].positions.end, pair[0].row_groups.end as u64 * 100);
+        }
+
+        let capped = reader.base_file_ranges(&slice, 20).await.unwrap();
+        assert_eq!(capped.len(), 10, "no more ranges than row groups");
+        assert!(reader.base_file_ranges(&slice, 1).await.unwrap().is_empty());
     }
 }
