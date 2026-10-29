@@ -22,7 +22,7 @@ use std::sync::Arc;
 use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use hudi_core::config::table::TableTypeValue;
+use hudi_core::config::table::{HudiTableConfig, TableTypeValue};
 use hudi_core::error::CoreError;
 use hudi_core::index::{HoodieIndex, HoodieKey, SimpleIndex};
 use hudi_core::table::partition::PartitionPruner;
@@ -216,6 +216,61 @@ async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
         completed.is_empty(),
         "failed MDT update must not leave a completed data commit: {completed:?}"
     );
+}
+
+/// hoodie.properties is written and read with the Java `Properties` escapes,
+/// so names and a pretty-printed create schema survive a reopen.
+#[tokio::test]
+async fn test_properties_preserve_names_and_formatted_schema() {
+    for (name, escaped) in [
+        ("café", r"caf\u00E9"),
+        (r"review\table", r"review\\table"),
+        (" review", r"\ review"),
+        ("a=b:c", r"a\=b\:c"),
+        ("table😀", r"table\uD83D\uDE00"),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let schema = r#"{
+  "type": "record",
+  "name": "record",
+  "fields": [{"name": "id", "type": "string"}, {"name": "value", "type": "long"}]
+}"#;
+        Table::create(path)
+            .with_table_name(name)
+            .with_record_key_fields(["id"])
+            .with_option(HudiTableConfig::CreateSchema, schema)
+            .create()
+            .await
+            .unwrap();
+        let reopened = Table::new(path).await.unwrap();
+        let actual: String = reopened
+            .hudi_configs
+            .get(HudiTableConfig::TableName)
+            .unwrap()
+            .into();
+        assert_eq!(actual, name);
+        assert_eq!(
+            reopened.get_schema().await.unwrap().fields().len(),
+            2,
+            "{name}"
+        );
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        assert!(props.is_ascii(), "{props}");
+        assert!(
+            props.contains(&format!("hoodie.table.name={escaped}\n")),
+            "{props}"
+        );
+        let metadata = std::fs::read_to_string(
+            dir.path()
+                .join(".hoodie/metadata/.hoodie/hoodie.properties"),
+        )
+        .unwrap();
+        assert!(
+            metadata.contains(&format!("hoodie.table.name={escaped}_metadata\n")),
+            "{metadata}"
+        );
+    }
 }
 
 #[tokio::test]

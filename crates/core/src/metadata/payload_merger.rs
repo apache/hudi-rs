@@ -72,12 +72,10 @@ impl MetadataPayloadMerger {
             // function exists to perform.
             Err(error) => return Err(error.into()),
         };
-        let text = String::from_utf8_lossy(&bytes);
-        let props: HashMap<&str, &str> = text
-            .lines()
-            .filter(|line| !line.trim_start().starts_with('#'))
-            .filter_map(|line| line.split_once('='))
-            .map(|(k, v)| (k.trim(), v.trim()))
+        let props = crate::config::properties::parse_properties(&bytes)?;
+        let props: HashMap<&str, &str> = props
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         Self::from_properties(&props)
     }

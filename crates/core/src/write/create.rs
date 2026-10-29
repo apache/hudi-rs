@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::properties::escape_property;
 use crate::config::table::{HudiTableConfig, TableTypeValue};
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
@@ -205,12 +206,8 @@ impl TableCreateBuilder {
         let table_name = self.table_name.ok_or_else(|| {
             CoreError::Write("Table name is required to create a Hudi table".to_string())
         })?;
-        // Property files are line-oriented; control characters in the name
-        // would corrupt hoodie.properties.
-        if table_name.is_empty() || table_name.chars().any(|c| c.is_control() || c == '=') {
-            return Err(CoreError::Write(format!(
-                "invalid table name '{table_name}': must be non-empty without control characters or '='"
-            )));
+        if table_name.is_empty() {
+            return Err(CoreError::Write("table name must be non-empty".to_string()));
         }
 
         if self.record_index_enabled && !self.metadata_enabled {
@@ -503,7 +500,11 @@ impl TableCreateBuilder {
         keys.retain(|k| k != HudiTableConfig::Checksum.as_ref());
         for key in keys {
             let value = &props[&key];
-            body.push_str(&format!("{key}={value}\n"));
+            body.push_str(&format!(
+                "{}={}\n",
+                escape_property(&key, true),
+                escape_property(value, false)
+            ));
         }
         body.push_str(&format!(
             "{}={}\n",
