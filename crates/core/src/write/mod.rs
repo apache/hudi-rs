@@ -491,7 +491,7 @@ pub(crate) async fn complete_write(
     action: Action,
     commit_bytes: Vec<u8>,
     schema: &arrow_schema::Schema,
-    updates: MetadataTableUpdates,
+    mut updates: MetadataTableUpdates,
     written_paths: &[String],
 ) -> Result<String> {
     let storage = table.file_system_view.storage.clone();
@@ -510,9 +510,12 @@ pub(crate) async fn complete_write(
                 );
             }
             if crate::index::is_record_index_enabled(table) && !updates.record_index.is_empty() {
-                let stats =
-                    metadata::update_record_index(storage.as_ref(), instant, &updates.record_index)
-                        .await?;
+                let stats = metadata::update_record_index(
+                    storage.as_ref(),
+                    instant,
+                    std::mem::take(&mut updates.record_index),
+                )
+                .await?;
                 if !stats.is_empty() {
                     mdt_stats.insert("record_index".to_string(), stats);
                 }

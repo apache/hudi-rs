@@ -380,16 +380,19 @@ pub async fn update_files_partition_entries(
 pub async fn update_record_index(
     data_storage: &Storage,
     instant: &str,
-    entries: &[RecordIndexEntry],
+    entries: Vec<RecordIndexEntry>,
 ) -> Result<Vec<HoodieWriteStat>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
     let num_groups = detect_rli_num_file_groups(data_storage).await?;
     let schema_json = record_index_metadata_avro_schema_json()?.to_string();
-    let mut puts_by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
+    // Only the routing happens here; each shard encodes its own entries on
+    // the blocking pool below, so the entries are shared with those tasks by
+    // index rather than copied.
+    let mut puts_by_shard: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut deletes_by_shard: HashMap<usize, Vec<(String, String)>> = HashMap::new();
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         let shard = map_record_key_to_file_group_index(&entry.record_key, num_groups);
         if entry.is_deleted {
             // DeleteRecord.partitionPath is the MDT partition (Java HoodieKey for RLI deletes).
@@ -400,13 +403,10 @@ pub async fn update_record_index(
                     .to_string(),
             ));
         } else {
-            let bytes = encode_record_index_entry(entry)?;
-            puts_by_shard
-                .entry(shard)
-                .or_default()
-                .push((entry.record_key.clone(), bytes));
+            puts_by_shard.entry(shard).or_default().push(index);
         }
     }
+    let entries = std::sync::Arc::new(entries);
 
     let shards: std::collections::BTreeSet<usize> = puts_by_shard
         .keys()
@@ -420,11 +420,19 @@ pub async fn update_record_index(
     let parallelism = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
     let mut builds = futures::stream::iter(shards)
         .map(|shard| {
-            let puts = puts_by_shard.remove(&shard).unwrap_or_default();
+            let put_indices = puts_by_shard.remove(&shard).unwrap_or_default();
             let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
             let schema_json = schema_json.clone();
             let instant = instant.to_string();
+            let entries = entries.clone();
             tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>, i64)> {
+                let puts = put_indices
+                    .into_iter()
+                    .map(|index| {
+                        let entry = &entries[index];
+                        Ok((entry.record_key.clone(), encode_record_index_entry(entry)?))
+                    })
+                    .collect::<Result<Vec<(String, Vec<u8>)>>>()?;
                 let mut log_bytes = Vec::new();
                 let mut num_writes = 0i64;
                 if !puts.is_empty() {
