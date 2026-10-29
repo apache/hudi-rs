@@ -908,17 +908,13 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
         table,
         &instant,
         &replacement,
-        None,
         file_ids,
         old_paths,
         log_only,
         replaced_log_paths,
         "INSERT_OVERWRITE_TABLE",
-        0,
         replacement.num_rows(),
-        0,
         rli_deletes,
-        RewriteKind::Replace,
     )
     .await
 }
@@ -990,17 +986,13 @@ pub async fn dynamic_partition_overwrite_batches(
         table,
         &instant,
         &replacement,
-        None,
         file_ids,
         old_paths,
         log_only,
         replaced_log_paths,
         "INSERT_OVERWRITE",
-        0,
         replacement.num_rows(),
-        0,
         rli_deletes,
-        RewriteKind::Replace,
     )
     .await
 }

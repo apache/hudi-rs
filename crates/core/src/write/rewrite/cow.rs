@@ -22,28 +22,22 @@
 
 use super::*;
 
+/// Insert-overwrite: writes `batch` into new file groups that replace
+/// `replaced_file_ids` in one replacecommit.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn rewrite(
     table: &mut Table,
     instant: &str,
     batch: &RecordBatch,
-    row_targets: Option<Vec<String>>,
     replaced_file_ids: Vec<String>,
     mut old_paths: Vec<String>,
     log_only_replaced: Vec<(String, String)>,
     extra_replaced_paths: Vec<String>,
     operation: &str,
-    updates: usize,
     inserts: usize,
-    deletes: usize,
     mut rli_deletes: Vec<RecordIndexEntry>,
-    kind: RewriteKind,
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
-    let action = match kind {
-        RewriteKind::Commit => Action::Commit,
-        RewriteKind::Replace => Action::ReplaceCommit,
-    };
     // The instant was already requested (fenced) under critical section 1 by
     // request_rewrite_instant in the calling verb.
 
@@ -58,70 +52,37 @@ pub(super) async fn rewrite(
             .unwrap_or_default();
         prev_commit_by_file_id.insert(file_id.clone(), prev_commit_from_base_path(old_path));
         partition_by_file_id.insert(file_id.clone(), partition.clone());
-        if kind == RewriteKind::Replace {
-            partition_to_replace_file_ids
-                .entry(partition)
-                .or_default()
-                .push(file_id.clone());
-        }
+        partition_to_replace_file_ids
+            .entry(partition)
+            .or_default()
+            .push(file_id.clone());
     }
     // Safe only after the positional zip above.
     old_paths.extend(extra_replaced_paths);
-    if kind == RewriteKind::Replace {
-        for (partition, file_id) in &log_only_replaced {
-            partition_to_replace_file_ids
-                .entry(partition.clone())
-                .or_default()
-                .push(file_id.clone());
-        }
+    for (partition, file_id) in &log_only_replaced {
+        partition_to_replace_file_ids
+            .entry(partition.clone())
+            .or_default()
+            .push(file_id.clone());
     }
 
-    // Group planning: rows with a named target rewrite that file group (same
-    // fileId, MERGE marker); untargeted rows form NEW file groups, split into
-    // buckets of ~max.file.size records (Java UpsertPartitioner overflow /
-    // insert-overwrite sizing).
+    // Group planning: rows form new file groups, split into buckets of
+    // ~max.file.size records (Java insert-overwrite sizing).
     struct GroupPlan {
         partition: String,
         file_id: String,
         out_name: String,
-        existing: bool,
         rows: Vec<u32>,
     }
     let mut groups: Vec<GroupPlan> = Vec::new();
     if batch.num_rows() > 0 {
         let row_keys = hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?;
-        let mut existing_groups: HashMap<String, usize> = HashMap::new();
         let mut new_rows_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
         for (row, key) in row_keys.iter().enumerate() {
-            let target = if kind == RewriteKind::Replace {
-                ""
-            } else {
-                row_targets
-                    .as_ref()
-                    .and_then(|t| t.get(row).map(String::as_str))
-                    .unwrap_or("")
-            };
-            if target.is_empty() {
-                new_rows_by_partition
-                    .entry(key.partition_path.clone())
-                    .or_default()
-                    .push(row as u32);
-            } else {
-                let index = *existing_groups
-                    .entry(target.to_string())
-                    .or_insert_with(|| {
-                        let out_name = format!("{target}_0-0-0_{instant}.parquet");
-                        groups.push(GroupPlan {
-                            partition: key.partition_path.clone(),
-                            file_id: target.to_string(),
-                            out_name,
-                            existing: true,
-                            rows: Vec::new(),
-                        });
-                        groups.len() - 1
-                    });
-                groups[index].rows.push(row as u32);
-            }
+            new_rows_by_partition
+                .entry(key.partition_path.clone())
+                .or_default()
+                .push(row as u32);
         }
         // Untargeted rows: new file groups sized by the insert bucket size.
         let sizing = crate::write::sizing::SizingConfig::from_table(table);
@@ -137,53 +98,22 @@ pub(super) async fn rewrite(
                     partition: partition.clone(),
                     file_id,
                     out_name,
-                    existing: false,
                     rows: chunk.to_vec(),
                 });
             }
         }
     }
-    if kind == RewriteKind::Commit {
-        // Any affected file group left with zero surviving rows (a delete
-        // emptied it) still needs an empty base file: without a new slice
-        // the old base stays the group's latest version and deleted rows
-        // resurface — especially once the deleting commit is archived.
-        let planned: HashSet<String> = groups.iter().map(|g| g.file_id.clone()).collect();
-        for file_id in &replaced_file_ids {
-            if planned.contains(file_id) {
-                continue;
-            }
-            let partition = partition_by_file_id
-                .get(file_id)
-                .cloned()
-                .unwrap_or_default();
-            let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
-            groups.push(GroupPlan {
-                partition,
-                file_id: file_id.clone(),
-                out_name,
-                existing: true,
-                rows: Vec::new(),
-            });
-        }
-    }
-
     let mut additions = Vec::new();
     let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
     let mut written_paths = Vec::new();
     let mut row_group_file_ids: HashMap<u32, String> = HashMap::new();
     let mut stats_updates = Vec::new();
 
-    // Markers before any data file is put: MERGE for same-file-group rewrites,
-    // CREATE for new groups.
-    let mut planned_markers = Vec::new();
-    for group in &groups {
-        planned_markers.push(if group.existing {
-            crate::write::markers::Marker::merge(&group.partition, &group.out_name)
-        } else {
-            crate::write::markers::Marker::create(&group.partition, &group.out_name)
-        });
-    }
+    // Markers before any data file is put.
+    let planned_markers: Vec<_> = groups
+        .iter()
+        .map(|group| crate::write::markers::Marker::create(&group.partition, &group.out_name))
+        .collect();
     crate::write::markers::write_markers(storage.as_ref(), instant, &planned_markers).await?;
 
     // Phase 1 (sequential): slice + prepare each group.
@@ -322,8 +252,8 @@ pub(super) async fn rewrite(
     finalize_rewrite_commit(
         table,
         instant,
-        kind,
-        action,
+        RewriteKind::Replace,
+        Action::ReplaceCommit,
         operation,
         batch.schema(),
         partition_to_write_stats,
@@ -334,9 +264,9 @@ pub(super) async fn rewrite(
         &old_paths,
         rli_entries,
         batch.num_rows(),
-        updates,
+        0,
         inserts,
-        deletes,
+        0,
     )
     .await
 }
