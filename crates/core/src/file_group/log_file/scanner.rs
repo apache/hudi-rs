@@ -24,6 +24,7 @@ use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
+use arrow_array::Array;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -247,7 +248,10 @@ impl LogFileScanner {
     }
 
     /// Collect HFile records from blocks.
-    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<ScanResult> {
+    ///
+    /// Delete blocks may appear alongside HFile data (MDT RLI tombstones). Apply them
+    /// as empty-value records so callers treat the key as deleted.
+    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<Vec<HFileRecord>> {
         // Pre-count records for capacity
         let mut total_records = 0;
         for blocks in &collected.all_blocks {
@@ -260,15 +264,62 @@ impl LogFileScanner {
             }
         }
 
-        // Collect valid HFile records
+        // Collect valid HFile records, then apply delete-block keys as tombstones.
         let mut records = Vec::with_capacity(total_records);
         for block in collected.iter_valid_blocks() {
-            if let LogBlockContent::HFileRecords(hfile_records) = block.content {
-                records.extend(hfile_records);
+            match block.content {
+                LogBlockContent::HFileRecords(hfile_records) => {
+                    records.extend(hfile_records);
+                }
+                LogBlockContent::Records(batches) => {
+                    if block.block_type == BlockType::Delete {
+                        for (batch, _) in &batches.delete_batches {
+                            if let Some(keys) = batch
+                                .column_by_name("recordKey")
+                                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+                            {
+                                for i in 0..keys.len() {
+                                    if !keys.is_null(i) {
+                                        records.push(crate::hfile::HFileRecord::from_str_key(
+                                            keys.value(i),
+                                            Vec::new(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
-        Ok(ScanResult::HFileRecords(records))
+        Ok(records)
+    }
+
+    /// Scan metadata-table log files, whose data blocks are HFile blocks.
+    ///
+    /// Delete blocks become tombstones even when no HFile block is in range: after an
+    /// MDT compaction, a write that only deletes leaves delete-only logs, which the
+    /// content detection of [`Self::scan`] would classify as Arrow records.
+    pub async fn scan_hfile_records(
+        &self,
+        relative_paths: Vec<String>,
+        instant_range: &InstantRange,
+    ) -> Result<Vec<HFileRecord>> {
+        let collected = self.collect_blocks(relative_paths, instant_range).await?;
+        if collected.all_blocks.iter().flatten().any(|block| {
+            matches!(
+                block.block_type,
+                BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData
+            )
+        }) {
+            return Err(crate::error::CoreError::LogBlockError(
+                "metadata table log files must not contain Avro, Parquet, or CDC data blocks"
+                    .into(),
+            ));
+        }
+        self.collect_hfile_records(collected)
     }
 
     /// Scan log files and return the appropriate content type.
@@ -294,7 +345,9 @@ impl LogFileScanner {
 
         match content_type {
             ContentType::Records => self.collect_record_batches(collected),
-            ContentType::HFile => self.collect_hfile_records(collected),
+            ContentType::HFile => self
+                .collect_hfile_records(collected)
+                .map(ScanResult::HFileRecords),
             ContentType::Empty => Ok(ScanResult::Empty),
         }
     }

@@ -22,6 +22,9 @@
 //! This module provides methods for interacting with Hudi's metadata table,
 //! which stores file listings and other metadata for efficient table operations.
 
+pub mod column_stats;
+pub mod encode;
+pub mod hash;
 pub mod records;
 
 // The reader the metadata read used before `v2_reader` replaced it. Kept, and kept
@@ -264,6 +267,8 @@ impl Table {
     ///
     /// # Arguments
     /// * `partition_pruner` - Data table's partition pruner to filter partitions.
+    /// * `valid_instants` - Data-timeline-fenced MDT instants; `None` trusts all
+    ///   log blocks (only for callers without data-table access, e.g. tests).
     ///
     /// # Note
     /// Must be called on a METADATA table instance.
@@ -505,6 +510,12 @@ const SOLO_COMMIT_TIMESTAMP: &str = "00000000000000";
 const ROLLBACK_READ_CONCURRENCY: usize = 8;
 
 impl Table {
+    /// The valid-instant set for reading this data table's metadata partitions.
+    pub(crate) async fn valid_metadata_instants(&self) -> Result<HashSet<String>> {
+        let mdt = self.get_or_init_metadata_table().await?;
+        self.valid_instant_timestamps(mdt).await
+    }
+
     /// The instants whose metadata log blocks may be read.
     ///
     /// Mirrors Java's `HoodieTableMetadataUtil.getValidInstantTimestamps` (:2081).
@@ -579,6 +590,11 @@ impl Table {
 
     /// Source 2 — completed metadata delta commits with no *pending* data
     /// instant of the same name.
+    ///
+    /// This source is also what keeps a data instant archived off the data
+    /// timeline readable: an archived instant is never pending, and the
+    /// metadata table keeps its delta commits active until compaction folds
+    /// their log blocks into base files.
     ///
     /// An indexing delta commit has no data instant at all and is valid. One
     /// whose data instant is still pending is the case where the data write
