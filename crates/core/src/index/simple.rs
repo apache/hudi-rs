@@ -94,13 +94,18 @@ impl HoodieIndex for SimpleIndex {
         // A key stored in several partitions (a non-global Java index allows
         // it) resolves to the copy in the incoming record's partition. With no
         // copy there the lookup stays global, as for a single copy: the record
-        // moves from the last-listed copy and the others stay.
+        // moves from the copy with the greatest partition path (slice listing
+        // order varies between processes) and the others stay.
         for (hoodie_key, slot) in locations.iter_mut() {
             if let Some(candidates) = by_record_key.get(&hoodie_key.record_key) {
                 *slot = candidates
                     .iter()
                     .find(|location| location.partition_path == hoodie_key.partition_path)
-                    .or(candidates.last())
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .max_by(|a, b| a.partition_path.cmp(&b.partition_path))
+                    })
                     .cloned();
             }
         }

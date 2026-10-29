@@ -2070,7 +2070,12 @@ async fn test_cow_write_stats_count_per_file() {
 /// resolves to the copy in the incoming record's partition.
 #[tokio::test]
 async fn test_simple_index_prefers_the_incoming_partition() {
-    for (stored, incoming) in [(["sf", "nyc"], "sf"), (["sf", "nyc"], "nyc")] {
+    for (stored, incoming, resolved) in [
+        (["sf", "nyc"], "sf", "sf"),
+        (["sf", "nyc"], "nyc", "nyc"),
+        (["sf", "nyc"], "la", "sf"),
+        (["nyc", "sf"], "la", "sf"),
+    ] {
         let dir = tempdir().unwrap();
         let mut table = Table::create(dir.path().to_str().unwrap())
             .with_table_name("trips")
@@ -2096,7 +2101,7 @@ async fn test_simple_index_prefers_the_incoming_partition() {
             .unwrap();
         assert_eq!(
             locations[&key].as_ref().unwrap().partition_path,
-            format!("city={incoming}")
+            format!("city={resolved}")
         );
     }
 }
