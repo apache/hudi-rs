@@ -29,7 +29,7 @@ mod rewrite;
 pub(crate) mod rollback;
 pub(crate) mod sizing;
 
-pub use append::append_batches;
+pub(crate) use append::append_batches;
 pub(crate) use append::set_commit_timezone;
 pub use create::TableCreateBuilder;
 pub(crate) use keygen::{
@@ -38,9 +38,10 @@ pub(crate) use keygen::{
 };
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;
-pub use rewrite::{
-    UpsertOptions, WriteResult, delete_filter, delete_keys, dynamic_partition_overwrite_batches,
-    overwrite_batches, update_filter, upsert_batches,
+pub use rewrite::{UpsertOptions, WriteResult};
+pub(crate) use rewrite::{
+    delete_filter, delete_keys, dynamic_partition_overwrite_batches, overwrite_batches,
+    update_filter, upsert_batches,
 };
 
 use std::collections::HashMap;

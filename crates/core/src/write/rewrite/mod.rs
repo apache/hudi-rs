@@ -74,7 +74,9 @@ pub struct WriteResult {
     /// incremental read's start bound is compared against on that layout.
     /// `None` on layout v1 and when no commit was written.
     pub completion_time: Option<String>,
-    /// Number of rows written to replacement base files.
+    /// Rows in the data files this write produced: every row of each
+    /// rewritten copy-on-write base file, or each row appended to a
+    /// merge-on-read log (deletes append none).
     pub num_writes: usize,
     /// Number of input keys that replaced existing rows.
     pub num_updates: usize,
