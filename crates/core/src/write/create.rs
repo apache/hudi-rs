@@ -318,10 +318,6 @@ impl TableCreateBuilder {
             table_name.clone(),
         );
         props.insert(
-            HudiTableConfig::DatabaseName.as_ref().to_string(),
-            "default".to_string(),
-        );
-        props.insert(
             HudiTableConfig::TableType.as_ref().to_string(),
             self.table_type.as_ref().to_string(),
         );
@@ -711,6 +707,27 @@ mod lifecycle_tests {
         .unwrap();
         assert!(mdt_props.contains("hoodie.table.name=trips_metadata"));
         assert!(mdt_props.contains("hoodie.table.type=MERGE_ON_READ"));
+        // Like Java, the database name is persisted only when the caller sets
+        // one; Spark SQL rejects writes whose database differs from it.
+        assert!(!props.contains("hoodie.database.name"), "{props}");
+        assert!(props.contains(&format!(
+            "hoodie.table.checksum={}\n",
+            super::table_checksum("", "trips")
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_option("hoodie.database.name", "db")
+            .create()
+            .await
+            .unwrap();
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        assert!(props.contains("hoodie.database.name=db\n"), "{props}");
+        assert!(props.contains(&format!(
+            "hoodie.table.checksum={}\n",
+            super::table_checksum("db", "trips")
+        )));
     }
 
     /// `create` takes storage options from env vars like `TableBuilder` does.

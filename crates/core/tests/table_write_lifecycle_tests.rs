@@ -799,7 +799,6 @@ async fn test_create_props_match_spark_shape() {
     let props = std::fs::read_to_string(root.join(".hoodie/hoodie.properties")).unwrap();
     for key in [
         "hoodie.table.checksum=",
-        "hoodie.database.name=default",
         "hoodie.table.base.file.format=PARQUET",
         "hoodie.populate.meta.fields=true",
         "hoodie.timeline.path=timeline",
@@ -820,9 +819,11 @@ async fn test_create_props_match_spark_shape() {
         !props.contains("hoodie.metadata.record.index.enable="),
         "must not invent write-side hoodie.metadata.record.index.enable in table props:\n{props}"
     );
-    // Checksum must match Java CRC32("default.trips")
+    // Java persists no database name unless one is given, and its checksum
+    // is then CRC32(".trips").
+    assert!(!props.contains("hoodie.database.name"), "{props}");
     assert!(
-        props.contains("hoodie.table.checksum=2200697520"),
+        props.contains("hoodie.table.checksum=3761586722"),
         "{props}"
     );
 
