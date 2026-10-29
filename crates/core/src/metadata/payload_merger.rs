@@ -36,70 +36,14 @@
 
 use std::collections::HashMap;
 
-use crate::Result;
-use crate::error::CoreError;
 use crate::metadata::table::encode::{ColumnStatValue, ColumnStatsMetadata};
 use crate::metadata::table_record::HoodieMetadataFileInfo;
-use crate::storage::Storage;
-
-/// Java `HoodieRecordMerger.PAYLOAD_BASED_MERGE_STRATEGY_UUID`.
-pub const PAYLOAD_BASED_MERGE_STRATEGY_UUID: &str = "00000000-0000-0000-0000-000000000000";
-/// The only payload class valid for the metadata table.
-pub const METADATA_PAYLOAD_CLASS: &str = "org.apache.hudi.metadata.HoodieMetadataPayload";
 
 /// Merger implementing `HoodieMetadataPayload` combine semantics.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MetadataPayloadMerger;
 
 impl MetadataPayloadMerger {
-    /// Resolve the merger for a metadata table from its `hoodie.properties`
-    /// under the data table's base path (`storage` is rooted at the data
-    /// table). The declared merge strategy id must be the payload-based
-    /// strategy and the payload class must be `HoodieMetadataPayload`;
-    /// anything else is an error rather than a silently-wrong merge. A
-    /// missing properties file resolves to the default (this) merger.
-    pub async fn for_metadata_table(storage: &Storage) -> Result<Self> {
-        let props_path = format!(
-            "{}/metadata/.hoodie/hoodie.properties",
-            crate::metadata::HUDI_METADATA_DIR
-        );
-        let bytes = match storage.get_file_data(&props_path).await {
-            Ok(bytes) => bytes,
-            Err(crate::storage::error::StorageError::ObjectStoreError(
-                object_store::Error::NotFound { .. },
-            )) => return Ok(Self),
-            // Any other failure would silently skip the validation this
-            // function exists to perform.
-            Err(error) => return Err(error.into()),
-        };
-        let props = crate::config::properties::parse_properties(&bytes)?;
-        let props: HashMap<&str, &str> = props
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        Self::from_properties(&props)
-    }
-
-    fn from_properties(props: &HashMap<&str, &str>) -> Result<Self> {
-        if let Some(strategy) = props.get("hoodie.record.merge.strategy.id")
-            && *strategy != PAYLOAD_BASED_MERGE_STRATEGY_UUID
-        {
-            return Err(CoreError::MetadataTable(format!(
-                "Unsupported metadata table merge strategy id `{strategy}`; \
-                 only the payload-based strategy `{PAYLOAD_BASED_MERGE_STRATEGY_UUID}` is supported"
-            )));
-        }
-        if let Some(payload_class) = props.get("hoodie.compaction.payload.class")
-            && *payload_class != METADATA_PAYLOAD_CLASS
-        {
-            return Err(CoreError::MetadataTable(format!(
-                "Unsupported metadata table payload class `{payload_class}`; \
-                 expected `{METADATA_PAYLOAD_CLASS}`"
-            )));
-        }
-        Ok(Self)
-    }
-
     /// Merge a newer files-partition map into `existing`
     /// (`HoodieTableMetadataUtil#combineFileSystemMetadata`).
     pub fn merge_file_infos(
@@ -316,46 +260,6 @@ mod tests {
         assert_eq!(existing["a.parquet"].size, 200);
         assert!(!existing.contains_key("b.parquet"));
         assert!(existing["c.parquet"].is_deleted);
-    }
-
-    #[test]
-    fn test_from_properties_rejects_unknown_strategy() {
-        let props = HashMap::from([("hoodie.record.merge.strategy.id", "deadbeef")]);
-        assert!(MetadataPayloadMerger::from_properties(&props).is_err());
-    }
-
-    #[test]
-    fn test_from_properties_accepts_payload_based() {
-        let props = HashMap::from([
-            (
-                "hoodie.record.merge.strategy.id",
-                PAYLOAD_BASED_MERGE_STRATEGY_UUID,
-            ),
-            ("hoodie.compaction.payload.class", METADATA_PAYLOAD_CLASS),
-        ]);
-        assert!(MetadataPayloadMerger::from_properties(&props).is_ok());
-    }
-
-    #[test]
-    fn test_from_properties_rejects_foreign_strategy_and_payload() {
-        use std::collections::HashMap;
-        let mut props: HashMap<&str, &str> = HashMap::new();
-        props.insert(
-            "hoodie.record.merge.strategy.id",
-            "deadbeef-0000-0000-0000-000000000000",
-        );
-        assert!(MetadataPayloadMerger::from_properties(&props).is_err());
-
-        let mut props: HashMap<&str, &str> = HashMap::new();
-        props.insert(
-            "hoodie.compaction.payload.class",
-            "com.example.OtherPayload",
-        );
-        assert!(MetadataPayloadMerger::from_properties(&props).is_err());
-
-        // Missing keys resolve to the default merger.
-        let props: HashMap<&str, &str> = HashMap::new();
-        assert!(MetadataPayloadMerger::from_properties(&props).is_ok());
     }
 
     #[test]

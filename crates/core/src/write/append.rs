@@ -285,7 +285,6 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: plan.partition_path.clone(),
                         file_name: plan.file_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }

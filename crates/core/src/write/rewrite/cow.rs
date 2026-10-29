@@ -176,7 +176,6 @@ pub(super) async fn rewrite(
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: group.partition.clone(),
                         file_name: group.out_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
@@ -871,7 +870,6 @@ pub(super) async fn commit_merge_plans(
                         stats_updates.push(crate::write::metadata::StatsFileUpdate {
                             partition_path: partition.clone(),
                             file_name: out_name.clone(),
-                            is_deleted: false,
                             ranges: ranges.clone(),
                         });
                     }

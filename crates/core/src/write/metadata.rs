@@ -30,7 +30,7 @@ use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::table::column_stats::{
     COLUMN_STATS_COLUMN_LIST_KEY, COLUMN_STATS_MAX_COLUMNS_KEY, ColumnRangeStats,
     MAX_COLUMNS_TO_INDEX, aggregate_partition_stats, coerce_stat_value, column_stats_for_file,
-    column_stats_tombstones, columns_to_index,
+    columns_to_index,
 };
 use crate::metadata::table::encode::{
     ColumnStatValue, ColumnStatsMetadata, FilesMetadataEntry, RecordIndexEntry, StatsIndexVersion,
@@ -70,8 +70,7 @@ fn partition_stats_file_id(shard: usize) -> String {
 pub struct StatsFileUpdate {
     pub partition_path: String,
     pub file_name: String,
-    pub is_deleted: bool,
-    /// Footer-derived ranges for adds; ignored when `is_deleted`.
+    /// Footer-derived ranges of the written file.
     pub ranges: Vec<ColumnRangeStats>,
 }
 
@@ -882,11 +881,7 @@ pub async fn update_column_stats_partitions(
     let mut column_records: Vec<(String, ColumnStatsMetadata)> = Vec::new();
 
     for update in updates {
-        let payloads = if update.is_deleted {
-            column_stats_tombstones(&update.file_name, &indexed_columns)
-        } else {
-            column_stats_for_file(&update.file_name, &update.ranges, false)
-        };
+        let payloads = column_stats_for_file(&update.file_name, &update.ranges, false);
         for payload in payloads {
             let key = column_stats_index_key(
                 &update.partition_path,
@@ -968,11 +963,8 @@ async fn compute_partition_stats_records(
     indexed_columns: &[String],
     replaced_files: &[String],
 ) -> Result<Vec<(String, ColumnStatsMetadata)>> {
-    let touched: std::collections::BTreeSet<String> = updates
-        .iter()
-        .filter(|u| !u.is_deleted)
-        .map(|u| u.partition_path.clone())
-        .collect();
+    let touched: std::collections::BTreeSet<String> =
+        updates.iter().map(|u| u.partition_path.clone()).collect();
     if touched.is_empty() {
         return Ok(Vec::new());
     }
@@ -1034,7 +1026,7 @@ async fn compute_partition_stats_records(
     // Ranges per (partition, file): this commit's in-memory ranges + survivors.
     let mut ranges: BTreeMap<String, BTreeMap<String, Vec<ColumnRangeStats>>> = BTreeMap::new();
     for update in updates {
-        if update.is_deleted || update.ranges.is_empty() {
+        if update.ranges.is_empty() {
             continue;
         }
         ranges

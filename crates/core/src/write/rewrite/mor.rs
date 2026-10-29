@@ -397,7 +397,6 @@ pub(super) async fn mor_upsert_batches(
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: partition_path.clone(),
                         file_name: file_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
@@ -519,7 +518,6 @@ pub(super) async fn mor_upsert_batches(
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: plan.partition_path.clone(),
                         file_name: plan.log_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
