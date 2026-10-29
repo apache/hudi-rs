@@ -17,8 +17,10 @@
  * under the License.
  */
 
-//! Key generator implementations for transforming user filters to partition filters.
+//! Key generator implementations: record key encoding, and transforms of user
+//! filters to partition filters.
 
+pub(crate) mod record_key;
 pub mod timestamp_based;
 
 use crate::Result;

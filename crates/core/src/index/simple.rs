@@ -22,11 +22,11 @@ use std::collections::{HashMap, HashSet};
 use arrow::array::StringArray;
 
 use crate::Result;
-use crate::config::table::HudiTableConfig::RecordKeyFields;
 use crate::error::CoreError;
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
 use crate::metadata::meta_field::MetaField;
 use crate::table::{ReadOptions, Table};
+use crate::write::record_keys_for_batch;
 
 /// A single-node index that scans latest file slices to locate record keys.
 #[derive(Clone, Debug, Default)]
@@ -50,50 +50,38 @@ impl HoodieIndex for SimpleIndex {
         if requested.is_empty() {
             return Ok(locations);
         }
-        let record_key_fields: Vec<String> = table
-            .hudi_configs
-            .try_get(RecordKeyFields)?
-            .map(Into::into)
-            .unwrap_or_default();
-        if record_key_fields.len() != 1 {
-            return Err(CoreError::Unsupported(
-                "SimpleIndex currently requires exactly one record key field".to_string(),
-            ));
-        }
-        let fallback_key = &record_key_fields[0];
         let reader = table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
             .await?;
         let mut by_record_key: HashMap<String, RecordLocation> = HashMap::new();
         for slice in table.get_file_slices(&ReadOptions::new()).await? {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
-            let key_name = if batch
-                .column_by_name(MetaField::RecordKey.as_ref())
-                .is_some()
-            {
-                MetaField::RecordKey.as_ref()
-            } else {
-                fallback_key
-            };
-            let key_array = batch
-                .column_by_name(key_name)
-                .ok_or_else(|| {
-                    CoreError::Schema(format!("record key field '{key_name}' is missing"))
-                })?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| {
-                    CoreError::Unsupported(format!("record key field '{key_name}' must be Utf8"))
-                })?;
             let location = RecordLocation {
                 file_id: slice.file_id().to_string(),
                 instant_time: table.timeline.get_latest_commit_timestamp()?,
                 partition_path: slice.partition_path.clone(),
             };
-            for key in key_array.iter().flatten() {
+            let mut tag = |key: &str| {
                 if requested.contains(key) {
                     by_record_key.insert(key.to_string(), location.clone());
                 }
+            };
+            match batch.column_by_name(MetaField::RecordKey.as_ref()) {
+                Some(column) => column
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        CoreError::Unsupported(format!(
+                            "record key field '{}' must be Utf8",
+                            MetaField::RecordKey.as_ref()
+                        ))
+                    })?
+                    .iter()
+                    .flatten()
+                    .for_each(tag),
+                None => record_keys_for_batch(&table.hudi_configs, &batch)?
+                    .iter()
+                    .for_each(|key| tag(key)),
             }
         }
         for (hoodie_key, slot) in locations.iter_mut() {

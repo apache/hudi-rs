@@ -22,17 +22,19 @@ use std::str::FromStr;
 
 use arrow::array::{Array, ArrayRef, BooleanArray, StringArray, UInt32Array};
 use arrow::compute::concat_batches;
+use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use arrow_select::take::take;
 use arrow_select::zip::zip;
 
 use crate::Result;
-use crate::config::table::HudiTableConfig::{OrderingFields, RecordKeyFields, RecordMergeStrategy};
+use crate::config::table::HudiTableConfig::{OrderingFields, RecordMergeStrategy};
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
 use crate::expr::filter::{Filter, filters_to_row_mask, validate_fields_against_schemas};
 use crate::file_group::record_batches::RecordBatches;
 use crate::index::{HoodieIndex, HoodieKey, is_record_index_enabled};
+use crate::keygen::record_key::render_key_field;
 use crate::merge::RecordMergeStrategyValue;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::commit::HoodieWriteStat;
@@ -44,7 +46,9 @@ use crate::write::append::{
     ensure_copy_on_write, generate_instant_time, is_layout_two, prepare_batches_for_write,
     timeline_dir,
 };
-use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
+use crate::write::keygen::{
+    configured_record_key_fields, hoodie_keys_for_batch, relative_data_path,
+};
 use crate::write::metadata::{instant_to_epoch_millis, is_column_stats_enabled};
 
 mod cow;
@@ -186,8 +190,8 @@ pub async fn upsert_batches(
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
-    let key_name = record_key_name(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
+    let incoming_keys = batch_record_keys(table, &incoming)?;
+    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
     let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
     let delete_markers = delete_marker_rows(&incoming);
     let locations = crate::index::for_table_checked(table)
@@ -488,8 +492,9 @@ pub async fn upsert_batches(
 
 pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteResult> {
     table.reload_timeline_for_write().await?;
+    ensure_record_key_list_parsable(table, &filter)?;
     // Key equality / IN on the record key (or meta record key) → RLI/SimpleIndex path.
-    if let Some(keys) = keys_from_record_key_filter(table, &filter)?
+    if let Some(keys) = keys_from_record_key_filter(table, &filter).await?
         && !keys.is_empty()
     {
         return delete_keys(table, &keys).await;
@@ -501,13 +506,7 @@ pub async fn delete_filter(table: &mut Table, filter: Filter) -> Result<WriteRes
             return Ok(WriteResult::default());
         };
         let mask = filters_to_row_mask(&[filter], &old)?;
-        let key_name = record_key_name(table, &old).map_err(|_| {
-            CoreError::Unsupported(
-                "MOR expression delete requires record keys (or _hoodie_record_key) in the data"
-                    .to_string(),
-            )
-        })?;
-        let record_keys = keys(&old, &key_name)?;
+        let record_keys = batch_record_keys(table, &old)?;
         let partitions = partition_paths_for_batch(&old);
         let delete_key_list = mask
             .iter()
@@ -564,6 +563,7 @@ pub async fn update_filter(
     updates: RecordBatch,
 ) -> Result<WriteResult> {
     table.reload_timeline_for_write().await?;
+    ensure_record_key_list_parsable(table, &filter)?;
     let updates = crate::write::normalize_write_batch(&updates)?;
     if updates.num_rows() != 1 {
         return Err(CoreError::Write(

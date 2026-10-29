@@ -30,12 +30,14 @@
 //! struct.
 
 use crate::Result;
+use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::file_group::reader_v2::buffered_record::{BufferedRecord, OrderingValue};
 use crate::file_group::reader_v2::delete_context::DeleteContext;
+use crate::keygen::record_key::{construct_record_key, render_key_field};
 use crate::metadata::meta_field::MetaField;
-use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray, UnionArray};
+use arrow_array::{Array, ListArray, RecordBatch, StringArray, StructArray, UnionArray};
 use arrow_schema::{DataType, SchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -320,16 +322,6 @@ impl Default for RecordContext {
 }
 
 impl RecordContext {
-    /// Composite-record-key separators + placeholders, matching Java `KeyGenerator`
-    /// (`DEFAULT_COLUMN_VALUE_SEPARATOR` `:`, `DEFAULT_RECORD_KEY_PARTS_SEPARATOR` `,`,
-    /// `NULL_RECORDKEY_PLACEHOLDER`, `EMPTY_RECORDKEY_PLACEHOLDER`). These MUST stay in sync
-    /// with the writer's key generator so a key reconstructed at read time equals the one
-    /// the writer stored.
-    const COMPOSITE_KEY_COLUMN_VALUE_SEPARATOR: char = ':';
-    const COMPOSITE_KEY_PARTS_SEPARATOR: char = ',';
-    const NULL_RECORDKEY_PLACEHOLDER: &'static str = "__null__";
-    const EMPTY_RECORDKEY_PLACEHOLDER: &'static str = "__empty__";
-
     /// Canonical parse of the table's record-key field list — the single source of truth
     /// shared with [`ReaderContext::record_key_fields_from`] (which delegates here) so the
     /// reader can't disagree with the record context on what the key fields are.
@@ -422,25 +414,12 @@ impl RecordContext {
         }
     }
 
-    /// Table version at or above which a `ComplexKeyGenerator` ALWAYS encodes the
-    /// single record-key field name (Java `HoodieTableVersion.NINE`).
-    const COMPLEX_KEYGEN_ENCODE_MIN_TABLE_VERSION: i32 = 9;
-    /// Write config controlling single-field complex-keygen encoding for table
-    /// versions below NINE. Java `HoodieWriteConfig.COMPLEX_KEYGEN_NEW_ENCODING`
-    /// (default `false`). When absent/false, the field name IS encoded.
-    const COMPLEX_KEYGEN_NEW_ENCODING_KEY: &'static str =
-        "hoodie.write.complex.keygen.new.encoding";
-
     /// Whether a single-field VIRTUAL key is stored as `<field>:<value>` by the
     /// writer's key generator, so the reader must reconstruct the same shape.
-    ///
-    /// Mirrors Java: a `ComplexKeyGenerator`/`ComplexAvroKeyGenerator` over a SINGLE
-    /// record-key field prefixes the field name when
-    /// `KeyGenUtils.encodeSingleKeyFieldNameForComplexKeyGen` is true —
-    /// `tableVersion >= NINE || !COMPLEX_KEYGEN_NEW_ENCODING` (the config defaults to
-    /// `false`, so v9 always encodes and v6/v8 encode by default). Only applies to
-    /// virtual-key tables; meta-field tables read the already-encoded key from
-    /// `_hoodie_record_key`.
+    /// Resolved by the writer's own rule (key generator class, then type, then
+    /// inference, plus `KeyGenUtils.encodeSingleKeyFieldNameForComplexKeyGen`).
+    /// Only applies to virtual-key tables; meta-field tables read the
+    /// already-encoded key from `_hoodie_record_key`.
     fn should_encode_single_complex_key_field(
         table_config: &HashMap<String, String>,
         populate_meta_fields: bool,
@@ -449,25 +428,10 @@ impl RecordContext {
         if populate_meta_fields || num_record_key_fields != 1 {
             return false;
         }
-        let is_complex_keygen = table_config
-            .get(HudiTableConfig::KeyGeneratorClass.as_ref())
-            .map(|c| c.ends_with("ComplexKeyGenerator") || c.ends_with("ComplexAvroKeyGenerator"))
-            .unwrap_or(false);
-        if !is_complex_keygen {
-            return false;
-        }
-        // `tableVersion >= NINE || !COMPLEX_KEYGEN_NEW_ENCODING`. An unparseable /
-        // absent version falls back to the new-encoding config alone (which defaults
-        // to `false` → encode), matching the common default.
-        let table_version = table_config
-            .get(HudiTableConfig::TableVersion.as_ref())
-            .and_then(|v| v.trim().parse::<i32>().ok());
-        let new_encoding = table_config
-            .get(Self::COMPLEX_KEYGEN_NEW_ENCODING_KEY)
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        table_version.is_some_and(|v| v >= Self::COMPLEX_KEYGEN_ENCODE_MIN_TABLE_VERSION)
-            || !new_encoding
+        let configs = HudiConfigs::new(table_config.iter().map(|(k, v)| (k.as_str(), v.clone())));
+        // The generators the writer does not reproduce (timestamp, custom) store a
+        // single-field key as the bare value.
+        crate::write::encodes_single_key_field_name(&configs).unwrap_or(false)
     }
 
     // =========================================================================
@@ -494,10 +458,9 @@ impl RecordContext {
     /// allocation, preserving the vectorized base-merge kernel's hot path). With
     /// VIRTUAL KEYS (`hoodie.populate.meta.fields=false`) the key field is a real
     /// data column whose Arrow type is NOT necessarily `Utf8` — e.g. an
-    /// `id INT` primary key. Such a column is stringified via
-    /// [`Self::stringify_record_key_column`], mirroring Hudi's
-    /// `SimpleKeyGenerator`, which derives the record key from the field's string
-    /// value. Both the base-file side (here) and the log side
+    /// `id INT` primary key. Such a column is stringified the way the Java key
+    /// generator renders the field value (shared with the writer through
+    /// [`render_key_field`]). Both the base-file side (here) and the log side
     /// ([`Self::get_record_keys`] via `batch_to_buffered_records`) go through this
     /// method, so their merge keys are stringified identically and match by
     /// construction.
@@ -505,8 +468,7 @@ impl RecordContext {
     /// # Errors
     /// Returns [`CoreError::ReadFileSliceError`] if the key field is absent from
     /// `batch`, and [`CoreError::Unsupported`] if a virtual-key column has a type
-    /// hudi-rs does not derive record keys from (see
-    /// [`Self::stringify_record_key_column`]).
+    /// hudi-rs does not derive record keys from (see [`render_key_field`]).
     pub fn record_key_array(&self, batch: &RecordBatch) -> Result<StringArray> {
         // Composite virtual key (>1 record-key field): reconstruct `field:val,field:val`
         // per row, mirroring Java `KeyGenerator.constructRecordKey`. Both the base-file side
@@ -531,41 +493,15 @@ impl RecordContext {
                 ))
             })?;
 
-        Self::stringify_key_field_column(batch.column(col_idx), &self.record_key_field)
+        render_key_field(batch.column(col_idx).as_ref(), &self.record_key_field)
     }
 
-    /// Stringify one record-key field's column into a [`StringArray`], the shared building
-    /// block for both the single-field key and every field of a composite key. A `Utf8`
-    /// column is cloned (a cheap Arc-buffer bump, not a data copy); any other type goes
-    /// through [`Self::stringify_record_key_column`] (integral types supported, others
-    /// rejected loudly). Using one helper guarantees the single-field, composite, base, and
-    /// log sides all derive keys identically.
-    fn stringify_key_field_column(column: &ArrayRef, field: &str) -> Result<StringArray> {
-        match column.data_type() {
-            DataType::Utf8 => Ok(column
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("Utf8 column downcasts to StringArray")
-                .clone()),
-            _ => Self::stringify_record_key_column(column.as_ref(), field),
-        }
-    }
-
-    /// Build the merge key for a COMPOSITE virtual key (>1 record-key field), mirroring Java
-    /// `KeyGenerator.constructRecordKey`: for each field append `<field>:<value>`, join the
-    /// parts with `,`, substitute `__null__` / `__empty__` for null / empty values, and error
-    /// if every field is null/empty (matching Java's `HoodieKeyException`). Each field column
-    /// is stringified through the same path as the single-field key (`Utf8` clone or
-    /// [`Self::stringify_record_key_column`]), so a key over e.g. `id INT, name STRING` is
-    /// keyed identically on the base and log sides. All record-key fields are present in the
-    /// batch because the schema handler adds every one to the required schema.
-    ///
-    /// Note: `,` / `:` occurring INSIDE field values are NOT escaped, matching Java's
-    /// `KeyGenerator.constructRecordKey` bug-for-bug (e.g. `name = "a,b:c"` yields an
-    /// ambiguous key). That ambiguity is inherited by design: both the base and log sides
-    /// construct the key identically through this method, so base/log pairing is unaffected.
+    /// Build the merge key for a COMPOSITE virtual key (>1 record-key field), or a single
+    /// field the complex key generator encodes, through Java
+    /// `KeyGenerator.constructRecordKey` (shared with the writer). All record-key fields are
+    /// present in the batch because the schema handler adds every one to the required
+    /// schema.
     fn build_composite_record_key_array(&self, batch: &RecordBatch) -> Result<StringArray> {
-        // Stringify each key field's column once, preserving nulls.
         let mut per_field: Vec<StringArray> = Vec::with_capacity(self.record_key_fields.len());
         for field in &self.record_key_fields {
             let col_idx = batch.schema().index_of(field).map_err(|e| {
@@ -573,86 +509,15 @@ impl RecordContext {
                     "Composite key field '{field}' not found in schema: {e}"
                 ))
             })?;
-            per_field.push(Self::stringify_key_field_column(
-                batch.column(col_idx),
-                field,
-            )?);
+            per_field.push(render_key_field(batch.column(col_idx).as_ref(), field)?);
         }
-
-        let num_rows = batch.num_rows();
-        let mut keys: Vec<String> = Vec::with_capacity(num_rows);
-        for row in 0..num_rows {
-            let mut key = String::new();
-            let mut all_null_or_empty = true;
-            for (i, field) in self.record_key_fields.iter().enumerate() {
-                if i > 0 {
-                    key.push(Self::COMPOSITE_KEY_PARTS_SEPARATOR);
-                }
-                key.push_str(field);
-                key.push(Self::COMPOSITE_KEY_COLUMN_VALUE_SEPARATOR);
-                let col = &per_field[i];
-                if col.is_null(row) {
-                    key.push_str(Self::NULL_RECORDKEY_PLACEHOLDER);
-                } else {
-                    let value = col.value(row);
-                    if value.is_empty() {
-                        key.push_str(Self::EMPTY_RECORDKEY_PLACEHOLDER);
-                    } else {
-                        key.push_str(value);
-                        all_null_or_empty = false;
-                    }
-                }
-            }
-            if all_null_or_empty {
-                return Err(CoreError::ReadFileSliceError(format!(
-                    "composite record key is entirely null/empty for fields {:?}; a record \
-                     key cannot be null or empty (mirrors Java HoodieKeyException)",
-                    self.record_key_fields
-                )));
-            }
-            keys.push(key);
-        }
+        let keys = (0..batch.num_rows())
+            .map(|row| {
+                construct_record_key(&self.record_key_fields, &per_field, row)
+                    .map_err(CoreError::ReadFileSliceError)
+            })
+            .collect::<Result<Vec<String>>>()?;
         Ok(StringArray::from(keys))
-    }
-
-    /// Convert a non-`Utf8` virtual record-key column into a [`StringArray`],
-    /// mirroring Hudi's `SimpleKeyGenerator` (the key is the field value's string
-    /// form). Supports string and integral key fields — the types Hudi allows as
-    /// a simple record key in practice. Any other type is rejected LOUDLY with
-    /// [`CoreError::Unsupported`] rather than guessing a string form that might
-    /// not match the writer's key generator (which would silently mis-key the
-    /// merge). For a COMPOSITE virtual key, [`Self::build_composite_record_key_array`]
-    /// calls this per field, so the same per-column type handling is shared.
-    fn stringify_record_key_column(column: &dyn Array, field: &str) -> Result<StringArray> {
-        match column.data_type() {
-            DataType::LargeUtf8
-            | DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64 => {
-                let string_column = arrow_cast::cast(column, &DataType::Utf8).map_err(|e| {
-                    CoreError::ReadFileSliceError(format!(
-                        "failed to stringify virtual record-key column '{field}' of type {:?}: {e}",
-                        column.data_type()
-                    ))
-                })?;
-                Ok(string_column
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("cast to Utf8 yields a StringArray")
-                    .clone())
-            }
-            other => Err(CoreError::Unsupported(format!(
-                "virtual record-key column '{field}' has type {other:?}; hudi-rs \
-                 derives record keys only from string and integral key fields (matching \
-                 SimpleKeyGenerator). Refusing to guess a string form that may not match \
-                 the writer's key generator."
-            ))),
-        }
     }
 
     /// Extract ordering values from the first ordering field column.
@@ -1334,7 +1199,7 @@ impl RecordContext {
 mod tests {
     use super::*;
     use crate::file_group::reader_v2::delete_context::DeleteContext;
-    use arrow_array::{BooleanArray, Int32Array, Int64Array, StringArray};
+    use arrow_array::{ArrayRef, BooleanArray, Int32Array, Int64Array, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -1561,6 +1426,15 @@ mod tests {
             keys(&complex_avro),
             vec!["id:1".to_string(), "id:42".to_string()]
         );
+
+        // Only the type recorded, as hudi-rs and Java 1.x write tables.
+        let complex_type = make_ctx(&[(HudiTableConfig::KeyGeneratorType.as_ref(), "COMPLEX")]);
+        assert_eq!(
+            keys(&complex_type),
+            vec!["id:1".to_string(), "id:42".to_string()]
+        );
+        let simple_type = make_ctx(&[(HudiTableConfig::KeyGeneratorType.as_ref(), "SIMPLE")]);
+        assert_eq!(keys(&simple_type), vec!["1".to_string(), "42".to_string()]);
 
         // SimpleKeyGenerator → bare value (no field-name prefix).
         let simple = make_ctx(&[(

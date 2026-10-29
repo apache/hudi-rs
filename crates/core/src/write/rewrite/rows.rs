@@ -150,77 +150,100 @@ pub(super) fn concat(batches: &[RecordBatch]) -> Result<RecordBatch> {
     concat_batches(&first.schema(), batches).map_err(Into::into)
 }
 
-pub(super) fn record_key_name(table: &Table, batch: &RecordBatch) -> Result<String> {
+/// Record keys of `batch`: `_hoodie_record_key` when the batch carries it,
+/// otherwise derived from the configured record key fields.
+pub(super) fn batch_record_keys(table: &Table, batch: &RecordBatch) -> Result<Vec<String>> {
     if batch
         .column_by_name(MetaField::RecordKey.as_ref())
         .is_some()
     {
-        return Ok(MetaField::RecordKey.as_ref().to_string());
+        return keys(batch, MetaField::RecordKey.as_ref());
     }
-    let fields: Vec<String> = table
-        .hudi_configs
-        .try_get(RecordKeyFields)?
-        .map(Into::into)
-        .unwrap_or_default();
-    if fields.len() != 1 || fields[0].is_empty() {
+    if configured_record_key_fields(&table.hudi_configs)?.is_empty() {
         return Err(CoreError::Unsupported(
             "upsert/delete require a record key field (or _hoodie_record_key in the batch); auto-generated keys are insert-only"
                 .to_string(),
         ));
     }
-    Ok(fields[0].clone())
+    crate::write::record_keys_for_batch(&table.hudi_configs, batch)
 }
 
-pub(super) fn configured_record_key_field(table: &Table) -> Result<Option<String>> {
-    let fields: Vec<String> = table
-        .hudi_configs
-        .try_get(RecordKeyFields)?
-        .map(Into::into)
-        .unwrap_or_default();
-    if fields.len() == 1 && !fields[0].is_empty() {
-        Ok(Some(fields[0].clone()))
-    } else {
-        Ok(None)
+/// The write filter parser splits an `IN` list on every `,`, and every
+/// composite record key contains one, so the list would name key fragments.
+pub(super) fn ensure_record_key_list_parsable(table: &Table, filter: &Filter) -> Result<()> {
+    if filter.field == MetaField::RecordKey.as_ref()
+        && matches!(filter.operator, ExprOperator::In | ExprOperator::NotIn)
+        && configured_record_key_fields(&table.hudi_configs)?.len() > 1
+    {
+        return Err(CoreError::Unsupported(format!(
+            "an IN list on {} cannot hold composite record keys, which contain ','; \
+             use one `=` predicate per key or a predicate on a non-key column",
+            filter.field
+        )));
     }
+    Ok(())
 }
 
-/// If `filter` is `=` / `IN` on the configured record key or `_hoodie_record_key`,
-/// return keys for the RLI/SimpleIndex delete path.
-pub(super) fn keys_from_record_key_filter(
+/// If `filter` is `=` / `IN` on `_hoodie_record_key`, or on the record key
+/// field of a single-field key, return keys for the RLI/SimpleIndex delete
+/// path. A filter on one field of a composite key does not name whole keys.
+pub(super) async fn keys_from_record_key_filter(
     table: &Table,
     filter: &Filter,
 ) -> Result<Option<Vec<HoodieKey>>> {
-    let configured = configured_record_key_field(table)?;
-    let is_key_field = filter.field == MetaField::RecordKey.as_ref()
-        || configured.as_deref() == Some(filter.field.as_str());
-    if !is_key_field {
-        return Ok(None);
-    }
     if !matches!(filter.operator, ExprOperator::Eq | ExprOperator::In) {
         return Ok(None);
     }
-    // A filter on the key column holds column values, which the complex key
-    // generator stores as `field:value`. A generator the writer cannot
-    // reproduce falls back to the scan path.
-    let encode_field_name = filter.field != MetaField::RecordKey.as_ref()
-        && match crate::write::keygen::encodes_single_key_field_name(&table.hudi_configs) {
-            Ok(encodes) => encodes,
-            Err(_) => return Ok(None),
-        };
-    Ok(Some(
-        filter
-            .values
-            .iter()
-            .map(|value| HoodieKey {
-                record_key: if encode_field_name {
-                    format!("{}:{value}", filter.field)
-                } else {
-                    value.clone()
-                },
+    let to_keys = |record_keys: Vec<String>| {
+        record_keys
+            .into_iter()
+            .map(|record_key| HoodieKey {
+                record_key,
                 partition_path: String::new(),
             })
-            .collect(),
-    ))
+            .collect()
+    };
+    if filter.field == MetaField::RecordKey.as_ref() {
+        return Ok(Some(to_keys(filter.values.clone())));
+    }
+    if configured_record_key_fields(&table.hudi_configs)? != [filter.field.as_str()] {
+        return Ok(None);
+    }
+    let key_type = match table.get_schema().await {
+        Ok(schema) => schema
+            .field_with_name(&filter.field)
+            .map(|field| field.data_type().clone())
+            .unwrap_or(DataType::Utf8),
+        Err(_) => DataType::Utf8,
+    };
+    // The index matches stored key text, so a value names a key only when it
+    // renders back to itself: `id = 07` matches row 7, whose key is `7`.
+    let Ok(values) = arrow_cast::cast(&StringArray::from(filter.values.clone()), &key_type) else {
+        return Ok(None);
+    };
+    let renders_as_given = render_key_field(values.as_ref(), &filter.field).is_ok_and(|rendered| {
+        rendered
+            .iter()
+            .zip(&filter.values)
+            .all(|(rendered, given)| rendered == Some(given.as_str()))
+    });
+    if !renders_as_given {
+        return Ok(None);
+    }
+    let batch = RecordBatch::try_new(
+        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            filter.field.as_str(),
+            key_type,
+            true,
+        )])),
+        vec![values],
+    )?;
+    // A generator the writer cannot reproduce falls back to the scan path.
+    Ok(
+        crate::write::record_keys_for_batch(&table.hudi_configs, &batch)
+            .ok()
+            .map(to_keys),
+    )
 }
 
 pub(super) fn partition_paths_for_batch(batch: &RecordBatch) -> Vec<String> {
@@ -350,12 +373,7 @@ pub(super) fn apply_set_updates(
 
 /// Upsert/delete need a configured `hoodie.table.recordkey.fields` (Java auto keys are insert-only).
 pub(super) fn ensure_configured_record_key(table: &Table) -> Result<()> {
-    let fields: Vec<String> = table
-        .hudi_configs
-        .try_get(RecordKeyFields)?
-        .map(Into::into)
-        .unwrap_or_default();
-    if fields.len() != 1 || fields[0].is_empty() {
+    if configured_record_key_fields(&table.hudi_configs)?.is_empty() {
         return Err(CoreError::Unsupported(
             "upsert/delete require hoodie.table.recordkey.fields; auto-generated keys are insert-only"
                 .to_string(),
@@ -377,7 +395,7 @@ pub(super) fn keys(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
 /// arbitrary by design when no ordering field is configured.
 pub(super) fn deduplicate_last_by_key(
     batch: &RecordBatch,
-    field: &str,
+    keys: &[String],
     hudi_configs: &crate::config::HudiConfigs,
 ) -> Result<RecordBatch> {
     // Java routes in-batch dedupe through the merge-mode-derived merger
@@ -405,7 +423,6 @@ pub(super) fn deduplicate_last_by_key(
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut winners: HashMap<String, u32> = HashMap::with_capacity(batch.num_rows());
-    let keys = keys(batch, field)?;
     for (index, key) in keys.iter().enumerate() {
         let index = index as u32;
         match winners.get(key) {
