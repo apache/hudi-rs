@@ -127,12 +127,8 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     let mut write_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
-    let rli_instant_millis = crate::index::is_record_index_enabled(table).then(|| {
-        crate::write::metadata::instant_to_epoch_millis_in(
-            &request_instant,
-            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-        )
-    });
+    let rli_instant_millis = crate::index::is_record_index_enabled(table)
+        .then(|| crate::write::metadata::instant_millis(&table.hudi_configs, &request_instant));
     let mut stats_updates = Vec::new();
     let mut written_paths: Vec<String> = Vec::new();
     let mut primary_base_path = String::new();

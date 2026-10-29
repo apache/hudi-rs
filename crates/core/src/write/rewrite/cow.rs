@@ -222,10 +222,7 @@ pub(super) async fn rewrite(
         return Err(error);
     }
 
-    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-        instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, instant);
     let rli_entries = {
         let mut entries = if batch.num_rows() > 0 && is_record_index_enabled(table) {
             hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?
@@ -949,6 +946,8 @@ pub(super) async fn commit_merge_plans(
     // RLI tombstones from the workers (deleted rows' actual key/partition),
     // replacing the driver's entry for a key an upsert delete marker removed.
     if rli_enabled {
+        let instant_time_millis =
+            crate::write::metadata::instant_millis(&table.hudi_configs, instant);
         let removed: HashSet<&str> = outputs
             .iter()
             .flat_map(|output| output.rli_deletes.iter().map(|(key, _)| key.as_str()))
@@ -960,10 +959,7 @@ pub(super) async fn commit_merge_plans(
                     record_key: record_key.clone(),
                     partition_path: partition_path.clone(),
                     file_id: String::new(),
-                    instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                        instant,
-                        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                    ),
+                    instant_time_millis,
                     is_deleted: true,
                 });
             }

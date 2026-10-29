@@ -1460,6 +1460,11 @@ pub(crate) fn timeline_timezone(hudi_configs: &crate::config::HudiConfigs) -> St
     hudi_configs.get_or_default(TimelineTimezone).into()
 }
 
+/// Epoch millis of `instant` in the zone the table mints instants in.
+pub(crate) fn instant_millis(hudi_configs: &crate::config::HudiConfigs, instant: &str) -> i64 {
+    instant_to_epoch_millis_in(instant, &timeline_timezone(hudi_configs))
+}
+
 /// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`).
 pub fn epoch_millis_to_instant(millis: i64) -> String {
     use chrono::{TimeZone, Utc};

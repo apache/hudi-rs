@@ -476,10 +476,7 @@ pub async fn upsert_batches(
         }
     }
 
-    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-        &instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, &instant);
     // RLI adds: every input row's final location is known from the plan. A
     // REJECTED cross-partition move keeps the old row, so its index entry
     // must carry the old partition, not the losing incoming value.
@@ -514,10 +511,7 @@ pub async fn upsert_batches(
                     record_key,
                     partition_path,
                     file_id: String::new(),
-                    instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                        &instant,
-                        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                    ),
+                    instant_time_millis,
                     is_deleted: true,
                 }),
         )
@@ -825,10 +819,7 @@ async fn rli_deletes_for_replaced_groups(
     let reader = table
         .create_file_group_reader_with_options(Some(&options), std::iter::empty::<(&str, String)>())
         .await?;
-    let millis = crate::write::metadata::instant_to_epoch_millis_in(
-        instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
+    let millis = crate::write::metadata::instant_millis(&table.hudi_configs, instant);
     let mut entries = Vec::new();
     for slice in replaced {
         let batch = reader.read_file_slice(slice, &options).await?;
