@@ -271,32 +271,6 @@ pub(super) fn delete_marker_rows(batch: &RecordBatch) -> Vec<bool> {
         .unwrap_or_else(|| vec![false; batch.num_rows()])
 }
 
-pub(super) fn strip_meta_columns(batch: &RecordBatch) -> Result<RecordBatch> {
-    let meta: HashSet<&str> = MetaField::field_names_with_operation()
-        .into_iter()
-        .collect();
-    let fields: Vec<_> = batch
-        .schema()
-        .fields()
-        .iter()
-        .filter(|f| !meta.contains(f.name().as_str()))
-        .cloned()
-        .collect();
-    let columns: Vec<ArrayRef> = batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(batch.columns())
-        .filter(|(f, _)| !meta.contains(f.name().as_str()))
-        .map(|(_, c)| c.clone())
-        .collect();
-    RecordBatch::try_new(
-        std::sync::Arc::new(arrow_schema::Schema::new(fields)),
-        columns,
-    )
-    .map_err(Into::into)
-}
-
 /// Overlay single-row SET values onto rows where `matched` is true.
 pub(super) fn apply_set_updates(
     old: &RecordBatch,

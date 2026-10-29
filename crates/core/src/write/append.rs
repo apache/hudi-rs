@@ -837,6 +837,11 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
                 "{{\"type\":\"long\",\"logicalType\":\"{logical}\"}}"
             ))
         }
+        DataType::Decimal256(precision, _) if *precision > 38 => {
+            Err(CoreError::Unsupported(format!(
+                "decimal precision {precision} exceeds the maximum of 38 a table can read back"
+            )))
+        }
         DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
             Ok(format!(
                 "{{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":{precision},\"scale\":{scale}}}"

@@ -672,7 +672,7 @@ pub(super) async fn mor_update_filter(
         .collect::<Vec<_>>();
     let updated_rows = take_batch(&merged, &matched_indices)?;
     // Drop meta so prepare_batches_for_write stamps the new commit instant.
-    let data_only = strip_meta_columns(&updated_rows)?;
+    let data_only = crate::write::strip_meta_columns(&updated_rows)?;
     mor_upsert_batches(table, &[data_only], UpsertOptions::default()).await
 }
 

@@ -1366,6 +1366,223 @@ async fn test_first_upsert_through_simple_index() {
     }
 }
 
+/// Arrow types that the Avro commit schema stores as one type, each with a
+/// null value, and the type the table reads them back as.
+fn aliased_batch(id: &str) -> RecordBatch {
+    use arrow::array::{
+        Decimal256Array, Int8Array, Int16Array, LargeBinaryArray, LargeStringArray,
+        TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{TimeUnit, i256};
+    let columns: Vec<(Field, arrow::array::ArrayRef)> = vec![
+        (
+            Field::new("id", DataType::Utf8, false),
+            Arc::new(StringArray::from(vec![id])),
+        ),
+        (
+            Field::new("i8", DataType::Int8, true),
+            Arc::new(Int8Array::from(vec![Some(-7)])),
+        ),
+        (
+            Field::new("i16", DataType::Int16, true),
+            Arc::new(Int16Array::from(vec![None::<i16>])),
+        ),
+        (
+            Field::new("s", DataType::LargeUtf8, true),
+            Arc::new(LargeStringArray::from(vec![Some("text")])),
+        ),
+        (
+            Field::new("b", DataType::LargeBinary, true),
+            Arc::new(LargeBinaryArray::from(vec![Some(&b"\x00\x01"[..])])),
+        ),
+        (
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+05:00".into())),
+                true,
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![Some(1_000_000)]).with_timezone("+05:00"),
+            ),
+        ),
+        (
+            Field::new(
+                "l",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int16, false))),
+                true,
+            ),
+            Arc::new(arrow::array::LargeListArray::new(
+                Arc::new(Field::new("item", DataType::Int16, false)),
+                arrow::buffer::OffsetBuffer::from_lengths([2]),
+                Arc::new(Int16Array::from(vec![1, 2])),
+                None,
+            )),
+        ),
+        (
+            Field::new("d", DataType::Decimal256(10, 2), true),
+            Arc::new(
+                Decimal256Array::from(vec![Some(i256::from_i128(12345))])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+        ),
+    ];
+    let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+}
+
+#[tokio::test]
+async fn test_aliased_arrow_types_support_repeated_writes() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut table = Table::create(path)
+            .with_table_name("types")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([aliased_batch("a")]).await.unwrap();
+        table.append([aliased_batch("b")]).await.unwrap();
+        table.upsert([aliased_batch("a")]).await.unwrap();
+        table.overwrite([aliased_batch("c")]).await.unwrap();
+        table
+            .update("id = 'c'", aliased_batch("c").project(&[1]).unwrap())
+            .await
+            .unwrap();
+
+        let table = Table::new(path).await.unwrap();
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        let rows = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(rows.num_rows(), 1, "{table_type:?}");
+        let rendered: Vec<String> = ["i8", "i16", "s", "b", "ts", "l", "d"]
+            .iter()
+            .map(|name| {
+                let column = rows.column_by_name(name).unwrap();
+                let value = match column.data_type() {
+                    DataType::Timestamp(..) => {
+                        arrow::compute::cast(column, &DataType::Int64).unwrap()
+                    }
+                    _ => column.clone(),
+                };
+                format!(
+                    "{:?}={}",
+                    column.data_type(),
+                    arrow::util::display::array_value_to_string(&value, 0).unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "Int32=-7",
+                "Int32=",
+                "Utf8=text",
+                "Binary=0001",
+                "Timestamp(Microsecond, Some(\"UTC\"))=1000000",
+                "List(Field { name: \"element\", data_type: Int32 })=[1, 2]",
+                "Decimal128(10, 2)=123.45",
+            ],
+            "{table_type:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_decimal_beyond_avro_precision_rejected_before_commit() {
+    use arrow::array::Decimal256Array;
+    use arrow::datatypes::i256;
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("types")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("d", DataType::Decimal256(40, 0), false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(1)])
+                    .with_precision_and_scale(40, 0)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+    let error = table.append([batch]).await.unwrap_err();
+    assert!(error.to_string().contains("precision 40"), "{error}");
+    assert!(
+        std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with('2')),
+        "rejected write left an instant"
+    );
+}
+
+/// Like a non-prepped Java write, caller-supplied meta columns are dropped,
+/// so stale values cannot hide a write or change a row's key.
+#[tokio::test]
+async fn test_input_meta_columns_are_replaced() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([batch(vec![("a", 1)])]).await.unwrap();
+
+        let read_back = table.read(&ReadOptions::new()).await.unwrap();
+        let result = table.upsert(read_back).await.unwrap();
+        let rows = table.read(&ReadOptions::new()).await.unwrap();
+        let commit_times = rows[0]
+            .column_by_name("_hoodie_commit_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(commit_times.value(0), result.instant, "{table_type:?}");
+
+        let mut fields = vec![Field::new("_hoodie_record_key", DataType::Utf8, true)];
+        fields.extend(
+            batch(vec![])
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone()),
+        );
+        let mut columns: Vec<arrow::array::ArrayRef> =
+            vec![Arc::new(StringArray::from(vec!["stale"]))];
+        columns.extend(batch(vec![("b", 2)]).columns().iter().cloned());
+        let stale_key = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        table.append([stale_key]).await.unwrap();
+        table
+            .delete_keys([HoodieKey {
+                record_key: "b".to_string(),
+                partition_path: String::new(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), 1)],
+            "{table_type:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_upsert_rejects_schema_mismatch() {
     let dir = tempdir().unwrap();
