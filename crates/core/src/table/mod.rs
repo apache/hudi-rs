@@ -122,9 +122,10 @@ use crate::schema::resolver::{
 use crate::statistics::estimator::FileStatsEstimator;
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
-use crate::table::fs_view::FileSystemView;
+use crate::table::fs_view::{FileSystemView, MetadataListing};
 use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
+use crate::timeline::view::TimelineView;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
@@ -150,6 +151,35 @@ pub struct Table {
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
     /// populate the cache, allowing later calls with newer timestamps to retry.
     cached_estimator: Arc<OnceCell<FileStatsEstimator>>,
+}
+
+struct FileSlicePlan<'a> {
+    timeline_view: Arc<TimelineView>,
+    table_schema: Schema,
+    partition_pruner: PartitionPruner,
+    file_pruner: FilePruner,
+    metadata_table: Option<&'a Table>,
+}
+
+impl FileSlicePlan<'_> {
+    async fn valid_instants(&self, table: &Table) -> Result<Option<HashSet<String>>> {
+        match self.metadata_table {
+            Some(mdt) => Ok(Some(table.valid_instant_timestamps(mdt).await?)),
+            None => Ok(None),
+        }
+    }
+
+    fn metadata_listing<'a>(
+        &'a self,
+        valid_instants: &'a Option<HashSet<String>>,
+    ) -> Option<MetadataListing<'a>> {
+        self.metadata_table
+            .zip(valid_instants.as_ref())
+            .map(|(table, valid_instants)| MetadataListing {
+                table,
+                valid_instants,
+            })
+    }
 }
 
 impl Clone for Table {
@@ -642,36 +672,123 @@ impl Table {
         }
     }
 
-    async fn get_file_slices_inner(
+    /// Stream the [`FileSlice`]s targeted by a read.
+    ///
+    /// Snapshot queries list files with bounded partition concurrency and emit
+    /// slices as each partition completes instead of retaining the table-wide
+    /// file-group and slice collections. Metadata-table-backed snapshots still
+    /// fetch the metadata records eagerly because that reader does not yet
+    /// expose a row stream. Incremental planning retains its existing eager
+    /// touched-file-group lookup, then exposes the resulting slices as a stream.
+    ///
+    /// The stream has no stable global ordering; consumers that require one
+    /// should sort by partition path and file ID after collection. Listing work
+    /// is driven by polling the stream; dropping it drops the in-flight
+    /// partition futures. No detached planning tasks are spawned, but storage
+    /// backends may finish I/O that has already started.
+    ///
+    /// # Example
+    /// ```ignore
+    /// use futures::TryStreamExt;
+    /// use hudi::table::ReadOptions;
+    ///
+    /// let mut slices = table.get_file_slices_stream(&ReadOptions::new()).await?;
+    /// while let Some(slice) = slices.try_next().await? {
+    ///     schedule(slice);
+    /// }
+    /// ```
+    pub async fn get_file_slices_stream(
+        &self,
+        options: &ReadOptions,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::StreamExt;
+        use futures::stream;
+
+        let prepared = self.prepare_reader_options(options)?;
+        let base_file_only = self.is_base_file_only(&prepared)?;
+        match prepared.query_type()? {
+            QueryType::Snapshot => {
+                let Some(timestamp) = prepared.end_timestamp() else {
+                    return Ok(stream::empty().boxed());
+                };
+                self.get_file_slices_stream_inner(timestamp, &prepared.filters, base_file_only)
+                    .await
+            }
+            QueryType::Incremental => {
+                let (Some(start), Some(end)) =
+                    (prepared.start_timestamp(), prepared.end_timestamp())
+                else {
+                    return Ok(stream::empty().boxed());
+                };
+                self.get_file_slices_between_stream_inner(
+                    start,
+                    end,
+                    &prepared.filters,
+                    base_file_only,
+                )
+                .await
+            }
+        }
+    }
+
+    async fn get_file_slices_between_stream_inner(
+        &self,
+        start_timestamp: &str,
+        end_timestamp: &str,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::future;
+        use futures::{StreamExt, TryStreamExt};
+
+        let estimator = self.get_or_init_estimator(end_timestamp).await;
+        let file_groups = self
+            .timeline
+            .get_file_groups_between(Some(start_timestamp), Some(end_timestamp), estimator)
+            .await?;
+        let mut touched: HashMap<String, HashSet<String>> = HashMap::new();
+        for file_group in file_groups {
+            touched
+                .entry(file_group.partition_path)
+                .or_default()
+                .insert(file_group.file_id);
+        }
+
+        let stream = self
+            .get_file_slices_stream_inner(end_timestamp, filters, base_file_only)
+            .await?;
+        Ok(stream
+            .try_filter(move |slice| {
+                future::ready(
+                    touched
+                        .get(&slice.partition_path)
+                        .is_some_and(|file_ids| file_ids.contains(slice.file_id())),
+                )
+            })
+            .boxed())
+    }
+
+    async fn prepare_file_slice_plan(
         &self,
         timestamp: &str,
         filters: &[Filter],
         base_file_only: bool,
-    ) -> Result<Vec<FileSlice>> {
-        let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
-
+    ) -> Result<FileSlicePlan<'_>> {
+        let timeline_view = Arc::new(self.timeline.create_view_as_of(timestamp).await?);
         let partition_schema = self.get_partition_schema().await?;
-        // Validate against the meta-inclusive schema so filters on Hudi meta fields
-        // (e.g. `_hoodie_record_key`) are accepted — those columns are present in
-        // returned batches and the row-level mask applies them. The pruners are
-        // tolerant of meta-field filters: PartitionPruner ignores non-partition
-        // columns, and FilePruner skips columns without stats.
+        // Meta-field filters must be validated against the same schema as returned rows.
         let table_schema = self.get_schema_with_meta_fields().await?;
         validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
 
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
-
-        // File-level stats pruning using base file Parquet footers is only safe
-        // when log files cannot introduce records that contradict the base file's
-        // min/max stats — i.e., COW tables or MOR read-optimized mode.
+        // Base-file footer stats cannot exclude records introduced by MOR logs.
         let file_pruner = if base_file_only {
             FilePruner::new(filters, &table_schema, &partition_schema)?
         } else {
             FilePruner::empty()
         };
 
-        // Use cached metadata table instance if enabled
         let metadata_table = if self.is_metadata_table_enabled() {
             match self.get_or_init_metadata_table().await {
                 Ok(mdt) => Some(mdt),
@@ -685,34 +802,73 @@ impl Table {
         } else {
             None
         };
+        Ok(FileSlicePlan {
+            timeline_view,
+            table_schema,
+            partition_pruner,
+            file_pruner,
+            metadata_table,
+        })
+    }
 
+    async fn get_file_slices_stream_inner(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::{StreamExt, TryStreamExt};
+
+        let plan = self
+            .prepare_file_slice_plan(timestamp, filters, base_file_only)
+            .await?;
+        let valid_instants = plan.valid_instants(self).await?;
+        let estimator = self.get_or_init_estimator(timestamp).await.cloned();
+        let stream = self
+            .file_system_view
+            .get_file_slices_stream(
+                &plan.partition_pruner,
+                &plan.file_pruner,
+                &plan.table_schema,
+                plan.timeline_view.clone(),
+                plan.metadata_listing(&valid_instants),
+                estimator,
+            )
+            .await?;
+
+        Ok(stream
+            .map_ok(move |mut slice| {
+                if base_file_only {
+                    slice.log_files.clear();
+                }
+                slice
+            })
+            .boxed())
+    }
+
+    async fn get_file_slices_inner(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<Vec<FileSlice>> {
+        let plan = self
+            .prepare_file_slice_plan(timestamp, filters, base_file_only)
+            .await?;
         // Estimator-backed metadata enrichment is used by both MDT-backed loading
         // and fallback storage listing.
         let estimator = self.get_or_init_estimator(timestamp).await;
 
-        // Built here rather than inside the view: it needs the data table's
-        // timeline as well as the metadata table's, and only this scope holds
-        // both.
-        let valid_instants = match metadata_table {
-            Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
-            None => None,
-        };
-        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
-            (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
-                table,
-                valid_instants,
-            }),
-            _ => None,
-        };
+        let valid_instants = plan.valid_instants(self).await?;
 
         let mut file_slices = self
             .file_system_view
             .get_file_slices(
-                &partition_pruner,
-                &file_pruner,
-                &table_schema,
-                &timeline_view,
-                metadata_listing,
+                &plan.partition_pruner,
+                &plan.file_pruner,
+                &plan.table_schema,
+                &plan.timeline_view,
+                plan.metadata_listing(&valid_instants),
                 estimator,
             )
             .await?;
@@ -2216,7 +2372,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_hudi_table_read_apis_return_empty() {
-        use futures::StreamExt;
+        use futures::{StreamExt, TryStreamExt};
 
         let base_url = SampleTable::V6Empty.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
@@ -2236,6 +2392,15 @@ mod tests {
 
         let mut snapshot_stream = hudi_table.read_stream(&ReadOptions::new()).await.unwrap();
         assert!(snapshot_stream.next().await.is_none());
+
+        let file_slices = hudi_table
+            .get_file_slices_stream(&ReadOptions::new())
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert!(file_slices.is_empty());
     }
 
     #[tokio::test]
@@ -2399,6 +2564,117 @@ mod tests {
             .unwrap();
         assert!(!snapshot_slices.is_empty());
         assert!(!incremental_slices.is_empty());
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_snapshot() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let base_url = SampleTable::V6SimplekeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let options = ReadOptions::new().with_filters([("byteField", ">=", "20")])?;
+
+        let mut eager = hudi_table.get_file_slices(&options).await?;
+        let mut streamed = hudi_table
+            .get_file_slices_stream(&options)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let compare = |left: &FileSlice, right: &FileSlice| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+                .then_with(|| {
+                    left.creation_instant_time()
+                        .cmp(right.creation_instant_time())
+                })
+        };
+        eager.sort_by(compare);
+        streamed.sort_by(compare);
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_metadata_snapshot() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let base_url = SampleTable::V9TxnsSimpleMeta.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        assert!(hudi_table.is_metadata_table_enabled());
+
+        let mut eager = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        let mut streamed = hudi_table
+            .get_file_slices_stream(&ReadOptions::new())
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        eager.sort_by(|left, right| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+        });
+        streamed.sort_by(|left, right| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+        });
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_metadata_fallback() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let table_path = SampleTable::V9TxnsSimpleMeta.path_to_cow_fresh();
+        let root = std::path::Path::new(&table_path);
+        std::fs::rename(
+            root.join(".hoodie/metadata"),
+            root.join(".hoodie/metadata-unavailable"),
+        )
+        .unwrap();
+        let table = Table::new(&table_path).await?;
+        assert!(table.is_metadata_table_enabled());
+        assert!(table.get_or_init_metadata_table().await.is_err());
+        let options = ReadOptions::new();
+        let mut eager = table.get_file_slices(&options).await?;
+        let mut streamed = table
+            .get_file_slices_stream(&options)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert!(!eager.is_empty());
+        let compare = |left: &FileSlice, right: &FileSlice| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+        };
+        eager.sort_by(compare);
+        streamed.sort_by(compare);
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_incremental() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(EARLIEST_START_TIMESTAMP);
+
+        let eager = hudi_table.get_file_slices(&options).await?;
+        let streamed = hudi_table
+            .get_file_slices_stream(&options)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert_eq!(streamed, eager);
+        Ok(())
     }
 
     #[tokio::test]

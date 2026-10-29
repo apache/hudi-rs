@@ -18,6 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::error::ConfigError;
 use crate::config::plan::HudiPlanConfig::ListingParallelism;
 use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
@@ -32,8 +33,9 @@ use crate::table::partition::{
 };
 use crate::timeline::completion_time::CompletionTimeView;
 use dashmap::DashMap;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -200,6 +202,86 @@ impl FileLister {
             .collect())
     }
 
+    fn relevant_partition_paths_from_objects(
+        paths: BoxStream<'static, Result<String>>,
+        partition_pruner: PartitionPruner,
+    ) -> BoxStream<'static, Result<String>> {
+        stream::try_unfold((paths, HashSet::new()), move |(mut paths, mut seen)| {
+            let partition_pruner = partition_pruner.clone();
+            async move {
+                while let Some(relative_path) = paths.try_next().await? {
+                    let first_segment = relative_path.split('/').next().unwrap_or_default();
+                    if LAKE_FORMAT_METADATA_DIRS.contains(&first_segment) {
+                        continue;
+                    }
+
+                    let Some((partition_path, _)) = relative_path.rsplit_once('/') else {
+                        continue;
+                    };
+                    if (!partition_pruner.is_empty()
+                        && !partition_pruner.should_include(partition_path))
+                        || seen.contains(partition_path)
+                    {
+                        continue;
+                    }
+                    let partition_path = partition_path.to_string();
+                    seen.insert(partition_path.clone());
+                    return Ok(Some((partition_path, (paths, seen))));
+                }
+                Ok(None)
+            }
+        })
+        .boxed()
+    }
+
+    /// List root directories once to exclude metadata subtrees before starting
+    /// the object store's paginated recursive listing of each data subtree.
+    ///
+    /// Object order is not guaranteed, so exact-once emission retains previously
+    /// emitted partition paths for the lifetime of the stream.
+    fn list_relevant_partition_paths_stream(&self) -> Result<BoxStream<'static, Result<String>>> {
+        if !is_table_partitioned(&self.hudi_configs)? {
+            return Ok(stream::once(async { Ok(EMPTY_PARTITION_PATH.to_string()) }).boxed());
+        }
+
+        let storage = self.storage.clone();
+        let paths = stream::once(async move {
+            let dirs = storage.list_dirs(None).await?;
+            let paths = stream::iter(
+                dirs.into_iter()
+                    .filter(|dir| !LAKE_FORMAT_METADATA_DIRS.contains(&dir.as_str())),
+            )
+            .map(move |dir| {
+                storage
+                    .list_relative_paths_stream(Some(&dir))
+                    .map(|paths| paths.map_err(CoreError::from))
+                    .map_err(CoreError::from)
+            })
+            .try_flatten();
+            Ok::<_, CoreError>(paths)
+        })
+        .try_flatten()
+        .boxed();
+        let partition_pruner = self.partition_pruner.clone();
+        Ok(Self::relevant_partition_paths_from_objects(
+            paths,
+            partition_pruner,
+        ))
+    }
+
+    fn listing_parallelism(&self) -> Result<usize> {
+        self.hudi_configs
+            .try_get(ListingParallelism)?
+            .map(Into::into)
+            .ok_or_else(|| {
+                ConfigError::InvalidValue(format!(
+                    "{} must define a positive default",
+                    ListingParallelism.as_ref()
+                ))
+                .into()
+            })
+    }
+
     /// List file groups for all relevant partitions.
     ///
     /// # Arguments
@@ -224,7 +306,7 @@ impl FileLister {
 
         let pruned_partition_paths = self.list_relevant_partition_paths().await?;
         let file_groups_map = Arc::new(DashMap::with_capacity(pruned_partition_paths.len()));
-        let parallelism = self.hudi_configs.get_or_default(ListingParallelism).into();
+        let parallelism = self.listing_parallelism()?;
         stream::iter(pruned_partition_paths)
             .map(|p| async move {
                 let file_groups = self
@@ -244,12 +326,70 @@ impl FileLister {
 
         Ok(file_groups_map.as_ref().to_owned())
     }
+
+    /// Stream file groups one partition at a time.
+    ///
+    /// Partition discovery and per-partition file listing are both deferred
+    /// until the returned stream is polled. The recursive discovery listing
+    /// intentionally does not reuse its individual file entries: object stores
+    /// do not guarantee per-partition contiguity, so doing so correctly would
+    /// retain incomplete file groups for the whole table. Each newly discovered
+    /// partition therefore gets one delimiter listing to obtain its complete
+    /// file set. At most
+    /// `hoodie.plan.listing.parallelism` partition listings are in flight, so
+    /// callers can consume completed partitions without retaining every table
+    /// file group or slice in memory.
+    pub async fn list_file_groups_for_relevant_partitions_stream<
+        V: CompletionTimeView + Send + Sync + 'static,
+    >(
+        &self,
+        completion_time_view: Arc<V>,
+        estimator: Option<FileStatsEstimator>,
+    ) -> Result<BoxStream<'static, Result<(String, Vec<FileGroup>)>>> {
+        let parallelism = self.listing_parallelism()?;
+        let partition_paths = self.list_relevant_partition_paths_stream()?;
+        Ok(self.file_groups_from_partition_paths(
+            partition_paths,
+            completion_time_view,
+            estimator,
+            parallelism,
+        ))
+    }
+
+    fn file_groups_from_partition_paths<V: CompletionTimeView + Send + Sync + 'static>(
+        &self,
+        partition_paths: BoxStream<'static, Result<String>>,
+        completion_time_view: Arc<V>,
+        estimator: Option<FileStatsEstimator>,
+        parallelism: usize,
+    ) -> BoxStream<'static, Result<(String, Vec<FileGroup>)>> {
+        let lister = self.clone();
+
+        partition_paths
+            .map_ok(move |partition_path| {
+                let lister = lister.clone();
+                let completion_time_view = completion_time_view.clone();
+                let estimator = estimator.clone();
+                async move {
+                    let file_groups = lister
+                        .list_file_groups_for_partition(
+                            &partition_path,
+                            completion_time_view.as_ref(),
+                            estimator.as_ref(),
+                        )
+                        .await?;
+                    Ok::<_, CoreError>((partition_path, file_groups))
+                }
+            })
+            .try_buffer_unordered(parallelism)
+            .boxed()
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::config::table::HudiTableConfig::BasePath;
+    use crate::config::table::HudiTableConfig::{BasePath, PartitionFields};
     use crate::table::Table;
     use crate::timeline::view::TimelineView;
     use hudi_test::SampleTable;
@@ -309,6 +449,213 @@ mod test {
                 "byteField=30/shortField=100"
             ])
         )
+    }
+
+    #[tokio::test]
+    async fn streamed_discovery_skips_metadata_subtrees() {
+        use crate::storage::counting::CountingObjectStore;
+        use object_store::path::Path as ObjPath;
+
+        let temp_dir = tempdir().unwrap();
+        for dir in [
+            ".hoodie/metadata",
+            "_delta_log",
+            "metadata",
+            "year=2026/month=10",
+            "year=2025/month=12",
+        ] {
+            std::fs::create_dir_all(temp_dir.path().join(dir)).unwrap();
+            std::fs::write(temp_dir.path().join(dir).join("entry"), []).unwrap();
+        }
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let configs = Arc::new(HudiConfigs::new([
+            (BasePath.as_ref(), base_url.as_str()),
+            (PartitionFields.as_ref(), "year,month"),
+        ]));
+        let mut storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let (store, counts) = CountingObjectStore::new(storage.object_store.clone());
+        Arc::get_mut(&mut storage).unwrap().object_store = store;
+        let lister = FileLister::new(configs, storage, PartitionPruner::empty());
+        let mut paths = lister.list_relevant_partition_paths_stream().unwrap();
+        assert_eq!(counts.delimiter_lists(), 0);
+        assert!(counts.recursive_prefixes().is_empty());
+        let first = paths.try_next().await.unwrap().unwrap();
+        assert_eq!(
+            counts.recursive_prefixes().len(),
+            1,
+            "later subtrees stay lazy"
+        );
+        let mut partitions: HashSet<_> = paths.try_collect().await.unwrap();
+        partitions.insert(first);
+        assert_eq!(
+            partitions,
+            HashSet::from([
+                "year=2026/month=10".to_string(),
+                "year=2025/month=12".to_string()
+            ])
+        );
+        let prefixes = counts.recursive_prefixes();
+        assert_eq!(prefixes.len(), 2);
+        for dir in ["year=2026", "year=2025"] {
+            let expected = ObjPath::from_url_path(format!("{}{dir}", base_url.path())).unwrap();
+            assert!(prefixes.contains(&Some(expected)));
+        }
+        assert_eq!(counts.delimiter_lists(), 1);
+    }
+
+    #[tokio::test]
+    async fn streamed_discovery_handles_metadata_only_and_nonpartitioned_tables() {
+        use crate::storage::counting::CountingObjectStore;
+
+        let temp_dir = tempdir().unwrap();
+        std::fs::create_dir(temp_dir.path().join(".hoodie")).unwrap();
+        std::fs::write(temp_dir.path().join(".hoodie/entry"), []).unwrap();
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        for fields in ["partition", ""] {
+            let configs = Arc::new(HudiConfigs::new([
+                (BasePath.as_ref(), base_url.as_str()),
+                (PartitionFields.as_ref(), fields),
+            ]));
+            let mut storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+            let (store, counts) = CountingObjectStore::new(storage.object_store.clone());
+            Arc::get_mut(&mut storage).unwrap().object_store = store;
+            let lister = FileLister::new(configs, storage, PartitionPruner::empty());
+            let paths: Vec<_> = lister
+                .list_relevant_partition_paths_stream()
+                .unwrap()
+                .try_collect()
+                .await
+                .unwrap();
+            if fields.is_empty() {
+                assert_eq!(paths, [EMPTY_PARTITION_PATH]);
+                assert_eq!(counts.delimiter_lists(), 0);
+            } else {
+                assert!(paths.is_empty());
+                assert_eq!(counts.delimiter_lists(), 1);
+            }
+            assert!(counts.recursive_prefixes().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_partition_discovery_deduplicates_unordered_paths() {
+        let object_paths = stream::iter([
+            Ok(".hoodie/metadata/ignored".to_string()),
+            Ok("partition=0000/first.parquet".to_string()),
+            Ok("partition=0001/first.parquet".to_string()),
+            Ok("partition=0000/second.parquet".to_string()),
+            Ok("partition=0002/first.parquet".to_string()),
+        ])
+        .boxed();
+        let mut partitions = FileLister::relevant_partition_paths_from_objects(
+            object_paths,
+            PartitionPruner::empty(),
+        );
+
+        assert_eq!(
+            partitions.try_next().await.unwrap().as_deref(),
+            Some("partition=0000")
+        );
+        assert_eq!(
+            partitions.try_next().await.unwrap().as_deref(),
+            Some("partition=0001")
+        );
+        assert_eq!(
+            partitions.try_next().await.unwrap().as_deref(),
+            Some("partition=0002")
+        );
+        assert!(partitions.try_next().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_partition_discovery_propagates_later_errors() {
+        let objects = stream::iter([
+            Ok("partition=0000/first.parquet".to_string()),
+            Err(CoreError::FileGroup("discovery failed".to_string())),
+        ])
+        .boxed();
+        let mut partitions =
+            FileLister::relevant_partition_paths_from_objects(objects, PartitionPruner::empty());
+        assert_eq!(
+            partitions.try_next().await.unwrap().as_deref(),
+            Some("partition=0000")
+        );
+        assert!(
+            partitions
+                .try_next()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("discovery failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_listing_propagates_partition_errors_in_fixed_input_order() {
+        use crate::storage::counting::CountingObjectStore;
+
+        let temp_dir = tempdir().unwrap();
+        for (partition, file) in [
+            ("good", "file-id_0-7-24_20240418173200000.parquet"),
+            ("bad", "not-a-hudi-name.parquet"),
+        ] {
+            std::fs::create_dir(temp_dir.path().join(partition)).unwrap();
+            std::fs::write(temp_dir.path().join(partition).join(file), []).unwrap();
+        }
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let configs = Arc::new(HudiConfigs::new([(BasePath.as_ref(), base_url.as_str())]));
+        let mut storage = Storage::new(Arc::new(HashMap::new()), configs.clone()).unwrap();
+        let (store, counts) = CountingObjectStore::new(storage.object_store.clone());
+        Arc::get_mut(&mut storage).unwrap().object_store = store;
+        let lister = FileLister::new(configs, storage, PartitionPruner::empty());
+
+        for order in [["good", "bad"], ["bad", "good"]] {
+            let before = counts.delimiter_lists();
+            let paths = stream::iter(order.map(|p| Ok(p.to_string()))).boxed();
+            let mut groups =
+                lister.file_groups_from_partition_paths(paths, Arc::new(layout_v1_view()), None, 1);
+            assert_eq!(counts.delimiter_lists(), before, "listing must be lazy");
+            if order[0] == "good" {
+                let (partition, files) = groups.try_next().await.unwrap().unwrap();
+                assert_eq!(partition, "good");
+                assert_eq!(files.len(), 1);
+                assert_eq!(counts.delimiter_lists(), before + 1);
+            }
+            let error = groups.try_next().await.unwrap_err();
+            assert!(error.to_string().contains("not-a-hudi-name.parquet"));
+            drop(groups);
+            assert_eq!(
+                counts.delimiter_lists(),
+                before + if order[0] == "good" { 2 } else { 1 }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn streamed_listing_rejects_zero_parallelism_before_buffering() {
+        let temp_dir = tempdir().unwrap();
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let hudi_configs = Arc::new(HudiConfigs::new([
+            (BasePath.as_ref(), base_url.as_str()),
+            (PartitionFields.as_ref(), "partition"),
+            (ListingParallelism.as_ref(), "0"),
+        ]));
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
+        let lister = FileLister::new(hudi_configs, storage, PartitionPruner::empty());
+
+        let result = lister
+            .list_file_groups_for_relevant_partitions_stream(Arc::new(layout_v1_view()), None)
+            .await;
+        let error = match result {
+            Ok(_) => panic!("zero parallelism must fail before a stream is constructed"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            CoreError::Config(ConfigError::InvalidValue(message))
+                if message.contains("must be > 0")
+        ));
     }
 
     #[tokio::test]
