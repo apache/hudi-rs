@@ -1043,6 +1043,7 @@ impl HudiTable {
 #[pyclass(frozen, get_all)]
 pub struct HudiWriteResult {
     instant_time: Option<String>,
+    completion_time: Option<String>,
     num_writes: usize,
     num_updates: usize,
     num_inserts: usize,
@@ -1053,13 +1054,18 @@ pub struct HudiWriteResult {
 #[pymethods]
 impl HudiWriteResult {
     fn __repr__(&self) -> String {
-        let instant_time = self
-            .instant_time
-            .as_ref()
-            .map_or_else(|| "None".to_string(), |t| format!("'{t}'"));
+        let quoted = |t: &Option<String>| {
+            t.as_ref()
+                .map_or_else(|| "None".to_string(), |t| format!("'{t}'"))
+        };
         format!(
-            "HudiWriteResult(instant_time={instant_time}, num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
-            self.num_writes, self.num_updates, self.num_inserts, self.num_deletes,
+            "HudiWriteResult(instant_time={}, completion_time={}, num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
+            quoted(&self.instant_time),
+            quoted(&self.completion_time),
+            self.num_writes,
+            self.num_updates,
+            self.num_inserts,
+            self.num_deletes,
         )
     }
 }
@@ -1068,6 +1074,7 @@ impl From<WriteResult> for HudiWriteResult {
     fn from(r: WriteResult) -> Self {
         Self {
             instant_time: committed(r.instant),
+            completion_time: r.completion_time,
             num_writes: r.num_writes,
             num_updates: r.num_updates,
             num_inserts: r.num_inserts,
@@ -1080,6 +1087,7 @@ impl From<AppendResult> for HudiWriteResult {
     fn from(r: AppendResult) -> Self {
         Self {
             instant_time: committed(r.instant),
+            completion_time: r.completion_time,
             num_writes: r.num_rows,
             num_updates: 0,
             num_inserts: r.num_rows,

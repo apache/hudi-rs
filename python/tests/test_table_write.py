@@ -24,7 +24,7 @@ from decimal import Decimal
 import pyarrow as pa
 import pytest
 
-from hudi import HudiTable, HudiWriteResult
+from hudi import HudiQueryType, HudiReadOptions, HudiTable, HudiWriteResult
 
 SCHEMA = pa.schema(
     [
@@ -210,6 +210,7 @@ def test_append_then_read(tmp_path, table_type):
     )
     assert "num_inserts=2" in repr(res)
     assert f"instant_time='{res.instant_time}'" in repr(res)
+    assert f"completion_time='{res.completion_time}'" in repr(res)
     with pytest.raises(AttributeError):
         res.num_inserts = 0
     assert snapshot(table) == {"t1": ("sf", 1, 30.0), "t2": ("nyc", 1, 45.0)}
@@ -241,6 +242,34 @@ def test_upsert_update_columns(tmp_path):
     res = table.upsert(trips(("t1", "sf", 5, 31.0)), update_columns=["fare"])
     assert res.num_updates == 1
     assert snapshot(table)["t1"] == ("sf", 1, 31.0)
+
+
+def test_completion_time_bounds_incremental_reads(tmp_path):
+    table = HudiTable.create(str(tmp_path / "t"), record_key="id", ordering_fields="ts")
+    base = table.append(trips(("t1", "sf", 1, 30.0), ("t2", "sf", 1, 45.0)))
+    assert base.completion_time is not None
+    assert base.completion_time > base.instant_time
+    upsert = table.upsert(trips(("t2", "sf", 2, 50.0), ("t3", "nyc", 2, 15.0)))
+    assert upsert.completion_time > base.completion_time
+    no_op = table.delete_keys(["missing"])
+    assert (no_op.instant_time, no_op.completion_time) == (None, None)
+    assert "completion_time=None" in repr(no_op)
+
+    def changed_after(bound):
+        batches = table.read(
+            HudiReadOptions()
+            .with_query_type(HudiQueryType.Incremental)
+            .with_start_timestamp(bound)
+        )
+        return sorted(
+            id_ for batch in batches for id_ in batch.column("id").to_pylist()
+        )
+
+    # The bound is compared against completion times: the requested time of
+    # the base commit admits the base commit itself.
+    assert changed_after(base.completion_time) == ["t2", "t3"]
+    assert changed_after(base.instant_time) == ["t1", "t2", "t3"]
+    assert changed_after(upsert.completion_time) == []
 
 
 @pytest.mark.parametrize("table_type", ["cow", "mor"])

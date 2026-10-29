@@ -627,6 +627,11 @@ class HudiWriteResult:
     Attributes:
         instant_time (Optional[str]): Instant time of the completed commit, or ``None``
             when no commit was made.
+        completion_time (Optional[str]): When the commit completed, or ``None`` when no
+            commit was made or the table's timeline records no completion times (table
+            version 6). When set, incremental reads compare their start bound against
+            completion times, so ``with_start_timestamp(completion_time)`` returns the
+            commits after this one while passing ``instant_time`` would include this commit.
         num_writes (int): Rows written to data files.
         num_updates (int): Input rows that replaced existing records.
         num_inserts (int): Input rows that were new records.
@@ -634,6 +639,7 @@ class HudiWriteResult:
     """
 
     instant_time: Optional[str]
+    completion_time: Optional[str]
     num_writes: int
     num_updates: int
     num_inserts: int
