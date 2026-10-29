@@ -429,14 +429,10 @@ pub(crate) async fn post_complete_bookkeeping(
     // Not held behind the latest MDT compaction as Java's archiver is: an
     // archived instant's MDT log blocks stay valid through its MDT
     // deltacommit, which the MDT keeps active until a compaction covers it.
-    let history_path: String = table
-        .hudi_configs
-        .get_or_default(crate::config::table::HudiTableConfig::TimelineHistoryPath)
-        .into();
     archival::archive_timeline_if_needed(
         storage,
         &crate::write::append::timeline_dir(table),
-        &history_path,
+        &crate::timeline::loader::lsm_history_dir(&table.hudi_configs),
         min_keep,
         max_keep,
     )

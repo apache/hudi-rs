@@ -95,12 +95,12 @@ struct CompletedInstant {
     file_name: String,
 }
 
-/// Archive the timeline at `timeline_dir` if it exceeds `max_keep` completed
-/// commits, retaining the newest `min_keep`.
+/// Archive the timeline at `timeline_dir` into `history_dir` if it exceeds
+/// `max_keep` completed commits, retaining the newest `min_keep`.
 pub(crate) async fn archive_timeline_if_needed(
     storage: &Storage,
     timeline_dir: &str,
-    history_path: &str,
+    history_dir: &str,
     min_keep: usize,
     max_keep: usize,
 ) -> Result<()> {
@@ -259,11 +259,10 @@ pub(crate) async fn archive_timeline_if_needed(
 
     // A retry after the active files failed to go finds some of its instants
     // already in the history; publish only the rest, so none appears twice.
-    let history_dir = format!("{timeline_dir}/{history_path}");
-    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
+    let (current_version, mut manifest) = read_manifest(storage, history_dir).await?;
     let archived = archived_instant_times(
         storage,
-        &history_dir,
+        history_dir,
         &manifest,
         &to_archive[0].requested,
         &to_archive[to_archive.len() - 1].requested,
@@ -324,7 +323,7 @@ pub(crate) async fn archive_timeline_if_needed(
         let parquet_name = format!("{}_{}_0.parquet", first.requested, last.requested);
         publish_lsm_file(
             storage,
-            &history_dir,
+            history_dir,
             current_version,
             &mut manifest,
             parquet_name,
@@ -674,8 +673,14 @@ mod delete_failure_tests {
         let storage =
             Storage::new_with_object_store(base_url, store, Arc::new(HudiConfigs::empty()));
 
-        let result =
-            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
+        let result = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
 
         for ts in &instants {
             assert!(
@@ -760,9 +765,15 @@ mod delete_failure_tests {
             Arc::new(HudiConfigs::empty()),
         );
 
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 2, 3)
-            .await
-            .unwrap();
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            2,
+            3,
+        )
+        .await
+        .unwrap();
 
         let mut plans = Vec::new();
         for batch in archived_batches(&timeline) {
@@ -817,17 +828,29 @@ mod delete_failure_tests {
             failing,
             Arc::new(HudiConfigs::empty()),
         );
-        let _ =
-            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
+        let _ = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
 
         let storage = Storage::new_with_object_store(
             base_url,
             Arc::new(LocalFileSystem::new()),
             Arc::new(HudiConfigs::empty()),
         );
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2)
-            .await
-            .unwrap();
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
         for ts in &instants[..3] {
@@ -863,8 +886,14 @@ mod delete_failure_tests {
             faulty.clone(),
             Arc::new(HudiConfigs::empty()),
         );
-        let result =
-            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
+        let result = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
         assert!(result.is_err() && !faulty.is_armed());
 
         let storage = Storage::new_with_object_store(
@@ -872,9 +901,15 @@ mod delete_failure_tests {
             Arc::new(LocalFileSystem::new()),
             Arc::new(HudiConfigs::empty()),
         );
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2)
-            .await
-            .unwrap();
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
         assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
     }
 
@@ -898,8 +933,14 @@ mod delete_failure_tests {
             failing,
             Arc::new(HudiConfigs::empty()),
         );
-        let _ =
-            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
+        let _ = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
         assert!(
             !timeline
                 .join(format!("{0}_{0}.commit", instants[0]))
@@ -913,9 +954,15 @@ mod delete_failure_tests {
             Arc::new(LocalFileSystem::new()),
             Arc::new(HudiConfigs::empty()),
         );
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2)
-            .await
-            .unwrap();
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
         assert_eq!(archived_instants(&timeline), instants[..4].to_vec());
     }
 }
