@@ -274,6 +274,35 @@ async fn test_properties_preserve_names_and_formatted_schema() {
 }
 
 #[tokio::test]
+async fn test_create_rejects_managed_option_overrides_before_persisting() {
+    for (key, value) in [
+        ("hoodie.table.name", "renamed"),
+        ("hoodie.table.version", "6"),
+        ("hoodie.table.type", "MERGE_ON_READ"),
+        ("hoodie.table.metadata.partitions", "files"),
+        ("hoodie.table.recordkey.fields", "other"),
+        ("hoodie.table.partition.fields", "city"),
+        ("hoodie.populate.meta.fields", "false"),
+        ("hoodie.metadata.enable", "false"),
+    ] {
+        let dir = tempdir().unwrap();
+        let error = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("original")
+            .with_record_key_fields(["id"])
+            .with_option(key, value)
+            .create()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{key} override accepted"));
+        assert!(error.to_string().contains(key), "{key}: {error}");
+        assert!(
+            !dir.path().join(".hoodie").exists(),
+            "{key} left a partial table"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_create_rejects_existing_table() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();

@@ -30,6 +30,33 @@ use crate::storage::Storage;
 use crate::table::Table;
 use crate::write::metadata::bootstrap_metadata_table;
 
+const BUILDER_MANAGED_KEYS: &[&str] = &[
+    "hoodie.base.path",
+    "hoodie.table.name",
+    "hoodie.table.type",
+    "hoodie.table.version",
+    "hoodie.table.initial.version",
+    "hoodie.timeline.layout.version",
+    "hoodie.populate.meta.fields",
+    "hoodie.table.recordkey.fields",
+    "hoodie.table.partition.fields",
+    "hoodie.table.ordering.fields",
+    "hoodie.table.precombine.field",
+    "hoodie.table.keygenerator.type",
+    "hoodie.table.keygenerator.class",
+    "hoodie.table.base.file.format",
+    "hoodie.table.metadata.partitions",
+    "hoodie.table.metadata.partitions.inflight",
+    "hoodie.metadata.enable",
+    "hoodie.metadata.record.index.enable",
+    "hoodie.metadata.index.column.stats.enable",
+    "hoodie.metadata.index.partition.stats.enable",
+    "hoodie.datasource.write.hive_style_partitioning",
+    "hoodie.datasource.write.drop.partition.columns",
+    "hoodie.table.cdc.enabled",
+    "hoodie.table.multiple.base.file.formats.enable",
+];
+
 /// Builder for creating a new Hudi table on storage.
 ///
 /// Defaults: metadata table on, record index on, table version 9 (1.1.x/1.2
@@ -190,6 +217,10 @@ impl TableCreateBuilder {
         self
     }
 
+    /// Set an additional table property. A property that a dedicated builder
+    /// method sets, such as the table name, type, version, key and partition
+    /// fields or metadata layout, makes [`Self::create`] fail rather than
+    /// being overridden.
     pub fn with_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
         self.options.insert(key.as_ref().to_string(), value.into());
         self
@@ -203,6 +234,18 @@ impl TableCreateBuilder {
 
     /// Create the table layout on storage and open a [`Table`] handle.
     pub async fn create(self) -> Result<Table> {
+        // The builder derives the metadata table layout, key generator and
+        // checksum from these, so an override would persist a table that
+        // disagrees with what was initialized.
+        if let Some(key) = self
+            .options
+            .keys()
+            .find(|key| BUILDER_MANAGED_KEYS.contains(&key.as_str()))
+        {
+            return Err(CoreError::Write(format!(
+                "'{key}' is set by a dedicated table builder method and cannot be passed to with_option"
+            )));
+        }
         let table_name = self.table_name.ok_or_else(|| {
             CoreError::Write("Table name is required to create a Hudi table".to_string())
         })?;
