@@ -38,9 +38,9 @@ use crate::table::Table;
 use crate::timeline::selector::InstantRange;
 use crate::util::concurrency::bounded_in_order;
 use crate::write::metadata::{
-    DEFAULT_RLI_NUM_FILE_GROUPS, RECORD_INDEX_FILE_ID_PREFIX, epoch_millis_to_instant,
+    DEFAULT_RLI_NUM_FILE_GROUPS, RECORD_INDEX_FILE_ID_PREFIX, epoch_millis_to_instant_in,
     map_record_key_to_file_group_index, mdt_partition_latest_slices, record_index_file_id,
-    shard_count_from_slices,
+    shard_count_from_slices, timeline_timezone,
 };
 
 /// Metadata-table record-level index (global: key = record key).
@@ -65,13 +65,17 @@ impl HoodieIndex for RecordIndex {
         let storage = table.file_system_view.storage.clone();
         let record_keys: Vec<&str> = keys.iter().map(|key| key.record_key.as_str()).collect();
         let found = lookup_record_index(table, storage, &record_keys).await?;
+        let timezone = timeline_timezone(&table.hudi_configs);
         for key in keys {
             if let Some(entry) = found.get(&key.record_key) {
                 locations.insert(
                     key.clone(),
                     Some(RecordLocation {
                         file_id: entry.file_id.clone(),
-                        instant_time: epoch_millis_to_instant(entry.instant_time_millis),
+                        instant_time: epoch_millis_to_instant_in(
+                            entry.instant_time_millis,
+                            &timezone,
+                        ),
                         partition_path: entry.partition_path.clone(),
                     }),
                 );

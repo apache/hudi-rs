@@ -1465,18 +1465,40 @@ pub(crate) fn instant_millis(hudi_configs: &crate::config::HudiConfigs, instant:
     instant_to_epoch_millis_in(instant, &timeline_timezone(hudi_configs))
 }
 
-/// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`).
-pub fn epoch_millis_to_instant(millis: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    match Utc.timestamp_millis_opt(millis) {
-        chrono::LocalResult::Single(dt) => dt.format("%Y%m%d%H%M%S%3f").to_string(),
-        _ => format!("{millis:017}"),
-    }
+/// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`) in
+/// `timezone`, the inverse of [`instant_to_epoch_millis_in`].
+pub fn epoch_millis_to_instant_in(millis: i64, timezone: &str) -> String {
+    use crate::config::table::TimelineTimezoneValue;
+    use chrono::{Local, TimeZone, Utc};
+    use std::str::FromStr;
+    const FORMAT: &str = "%Y%m%d%H%M%S%3f";
+    let formatted = match TimelineTimezoneValue::from_str(timezone) {
+        Ok(TimelineTimezoneValue::Local) => Local
+            .timestamp_millis_opt(millis)
+            .single()
+            .map(|dt| dt.format(FORMAT).to_string()),
+        _ => Utc
+            .timestamp_millis_opt(millis)
+            .single()
+            .map(|dt| dt.format(FORMAT).to_string()),
+    };
+    formatted.unwrap_or_else(|| format!("{millis:017}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Record index instants encode and decode in the same zone.
+    #[test]
+    #[serial_test::serial(env_vars)]
+    fn test_record_index_instant_round_trips_in_each_zone() {
+        let instant = "20260102030405678";
+        for zone in ["UTC", "LOCAL"] {
+            let millis = instant_to_epoch_millis_in(instant, zone);
+            assert_eq!(epoch_millis_to_instant_in(millis, zone), instant, "{zone}");
+        }
+    }
 
     /// Fabricate an MDT partition dir plus a timeline whose completed
     /// instants are `committed`; base admission depends on the latter.
@@ -1799,7 +1821,7 @@ mod tests {
                 record_key: record_key.to_string(),
                 partition_path: location.partition_path,
                 file_id: location.file_id,
-                instant_time_millis: instant_to_epoch_millis_in(&location.instant_time, "UTC"),
+                instant_time_millis: instant_millis(&table.hudi_configs, &location.instant_time),
                 is_deleted: false,
             };
             let base = HFileWriter::write(
