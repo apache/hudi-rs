@@ -25,7 +25,7 @@ use crate::keygen::timestamp_based::TimestampBasedKeyGenerator;
 use crate::keygen::{DEFAULT_PARTITION_PATH, KeyGeneratorFilterTransformer};
 
 use arrow_array::{ArrayRef, Scalar};
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 
 use crate::config::table::HudiTableConfig::{KeyGeneratorClass, KeyGeneratorType, PartitionFields};
 use crate::keygen::is_timestamp_based_keygen;
@@ -163,12 +163,14 @@ impl PartitionPruner {
 
         self.and_filters.iter().all(|filter| {
             match segments.get(filter.field.name()) {
-                Some(segment_value) => {
+                Some(Some(segment_value)) => {
                     match filter.apply_comparison(segment_value) {
                         Ok(scalar) => scalar.value(0),
                         Err(_) => true, // Include the partition when comparison error occurs
                     }
                 }
+                // A null partition value satisfies no comparison.
+                Some(None) => false,
                 None => true, // Include the partition when filtering field does not match any field in the partition
             }
         })
@@ -210,7 +212,11 @@ impl PartitionPruner {
         Ok(transformed)
     }
 
-    fn parse_segments(&self, partition_path: &str) -> Result<HashMap<String, Scalar<ArrayRef>>> {
+    /// Partition values by field; `None` is a null value.
+    fn parse_segments(
+        &self,
+        partition_path: &str,
+    ) -> Result<HashMap<String, Option<Scalar<ArrayRef>>>> {
         let decode = |value: &str| -> Result<String> {
             Ok(if self.is_url_encoded {
                 percent_encoding::percent_decode(value.as_bytes())
@@ -231,7 +237,7 @@ impl PartitionPruner {
             )?;
             return Ok(HashMap::from([(
                 MetaField::PartitionPath.as_ref().to_string(),
-                scalar,
+                Some(scalar),
             )]));
         }
 
@@ -265,16 +271,22 @@ impl PartitionPruner {
                 } else {
                     part
                 };
-                // Java writes both null and empty values here, so the path
-                // cannot rule out a match on this field; filters on it pass.
+                // Java writes nulls here, and empty strings too for a string
+                // field, which a filter evaluates as `''`. The row mask cannot
+                // correct this decision when partition columns are dropped.
                 if value == DEFAULT_PARTITION_PATH {
-                    return Ok(None);
+                    let empty = matches!(
+                        field.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                    .then(|| SchemableFilter::cast_value(&[""], field.data_type()))
+                    .transpose()?;
+                    return Ok((field.name().to_string(), empty));
                 }
                 let value = decode(value)?;
                 let scalar = SchemableFilter::cast_value(&[value.as_str()], field.data_type())?;
-                Ok(Some((field.name().to_string(), scalar)))
+                Ok((field.name().to_string(), Some(scalar)))
             })
-            .filter_map(Result::transpose)
             .collect()
     }
 }
@@ -444,28 +456,33 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_pruner_keeps_default_partition() {
-        // Java writes both null and empty values to the default partition, so
-        // the path cannot rule out a match.
+    fn test_partition_pruner_default_partition_is_empty_or_null() {
+        // Java writes nulls to the default partition, and empty strings too
+        // for a string field.
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
-        let filter = Filter::try_from(("category", "=", "")).unwrap();
-        let pruner = PartitionPruner::new(&[filter], &schema, &configs).unwrap();
-        assert!(
-            pruner.should_include("date=2023-02-01/category=__HIVE_DEFAULT_PARTITION__/count=10")
-        );
-        assert!(!pruner.should_include("date=2023-02-01/category=A/count=10"));
-        let filter = Filter::try_from(("category", "=", "A")).unwrap();
-        let pruner = PartitionPruner::new(&[filter], &schema, &configs).unwrap();
-        assert!(
-            pruner.should_include("date=2023-02-01/category=__HIVE_DEFAULT_PARTITION__/count=10")
-        );
+        let default_category = "date=2023-02-01/category=__HIVE_DEFAULT_PARTITION__/count=10";
+        let default_count = "date=2023-02-01/category=A/count=__HIVE_DEFAULT_PARTITION__";
+        let includes = |filter: (&str, &str, &str), path: &str| {
+            let filter = Filter::try_from(filter).unwrap();
+            PartitionPruner::new(&[filter], &schema, &configs)
+                .unwrap()
+                .should_include(path)
+        };
+        assert!(includes(("category", "=", ""), default_category));
+        assert!(includes(("category", "<", "B"), default_category));
+        assert!(!includes(("category", "=", "A"), default_category));
+        assert!(!includes(
+            ("category", "=", ""),
+            "date=2023-02-01/category=A/count=10"
+        ));
+        // Only nulls fill a non-string default partition, and no comparison
+        // matches a null.
+        assert!(!includes(("count", "=", "10"), default_count));
+        assert!(!includes(("count", "!=", "10"), default_count));
+        assert!(includes(("category", "=", "A"), default_count));
         // Filters on the other fields still prune.
-        let filter = Filter::try_from(("date", ">", "2024-01-01")).unwrap();
-        let pruner = PartitionPruner::new(&[filter], &schema, &configs).unwrap();
-        assert!(
-            !pruner.should_include("date=2023-02-01/category=__HIVE_DEFAULT_PARTITION__/count=10")
-        );
+        assert!(!includes(("date", ">", "2024-01-01"), default_category));
     }
 
     #[test]
