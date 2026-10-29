@@ -145,12 +145,6 @@ pub enum HudiTableConfig {
     /// When creating a metadata table instance, this value should be passed as the
     /// PartitionFields option.
     MetadataTablePartitions,
-
-    /// Enable the metadata-table record-level index (RLI) used to tag upsert/delete keys.
-    ///
-    /// When false, writers fall back to [`crate::index::SimpleIndex`] (full table scan).
-    /// Requires [`Self::MetadataTableEnabled`].
-    RecordIndexEnabled,
 }
 
 impl AsRef<str> for HudiTableConfig {
@@ -181,7 +175,6 @@ impl AsRef<str> for HudiTableConfig {
             Self::TimelineHistoryPath => "hoodie.timeline.history.path",
             Self::MetadataTableEnabled => "hoodie.metadata.enable",
             Self::MetadataTablePartitions => "hoodie.table.metadata.partitions",
-            Self::RecordIndexEnabled => "hoodie.metadata.record.index.enable",
         }
     }
 }
@@ -214,7 +207,6 @@ impl ConfigParser for HudiTableConfig {
             Self::TimelineHistoryPath => Some(HudiConfigValue::String("history".to_string())),
             Self::MetadataTableEnabled => Some(HudiConfigValue::Boolean(false)),
             Self::MetadataTablePartitions => Some(HudiConfigValue::List(vec![])),
-            Self::RecordIndexEnabled => Some(HudiConfigValue::Boolean(false)),
             _ => None,
         }
     }
@@ -332,11 +324,6 @@ impl ConfigParser for HudiTableConfig {
                 .map(HudiConfigValue::Boolean),
             Self::MetadataTablePartitions => get_result
                 .map(|v| HudiConfigValue::List(v.split(',').map(str::to_string).collect())),
-            Self::RecordIndexEnabled => get_result
-                .and_then(|v| {
-                    bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
-                })
-                .map(HudiConfigValue::Boolean),
         }
     }
 

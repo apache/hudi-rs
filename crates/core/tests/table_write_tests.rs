@@ -287,6 +287,7 @@ async fn test_create_rejects_managed_option_overrides_before_persisting() {
         ("hoodie.table.name", "renamed"),
         ("hoodie.table.version", "6"),
         ("hoodie.metadata.enable", "false"),
+        ("hoodie.metadata.global.record.level.index.enable", "false"),
     ] {
         let dir = tempdir().unwrap();
         let error = Table::create(dir.path().to_str().unwrap())

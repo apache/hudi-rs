@@ -49,6 +49,7 @@ const BUILDER_MANAGED_KEYS: &[&str] = &[
     "hoodie.table.metadata.partitions.inflight",
     "hoodie.metadata.enable",
     "hoodie.metadata.record.index.enable",
+    "hoodie.metadata.global.record.level.index.enable",
     "hoodie.metadata.index.column.stats.enable",
     "hoodie.metadata.index.partition.stats.enable",
     "hoodie.datasource.write.hive_style_partitioning",
