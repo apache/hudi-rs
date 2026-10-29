@@ -96,6 +96,10 @@ pub mod partition;
 mod validation;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
+pub use crate::index::{HoodieKey, SimpleIndex};
+pub use crate::write::TableCreateBuilder;
+pub use crate::write::append::AppendResult;
+pub use crate::write::{UpsertOptions, WriteResult};
 
 use crate::Result;
 use crate::config::HudiConfigs;
@@ -137,8 +141,10 @@ pub struct Table {
     pub timeline: Timeline,
     pub file_system_view: FileSystemView,
     /// Cached metadata table instance, lazily initialized on first use.
-    /// Only populated when metadata table is enabled (v8+ with files partition).
-    /// Shared across clones via `Arc` so all scan() calls reuse the same instance.
+    /// Shared across clones via `Arc`; [`Table::clear_read_caches`] gives this
+    /// handle a fresh cell, so a handle that writes reopens the metadata table
+    /// and sees its own delta commits while clones keep the one that matches
+    /// their timeline.
     cached_metadata_table: Arc<OnceCell<Table>>,
     /// Cached file stats estimator. Materialized on first successful call to
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
@@ -204,7 +210,7 @@ impl Table {
     /// Get or initialize the cached metadata table instance.
     ///
     /// Returns `Ok(&Table)` if metadata table is successfully created or was already cached.
-    /// The instance is created once and reused across all subsequent calls.
+    /// The instance is created once and reused until [`Self::clear_read_caches`].
     pub(crate) async fn get_or_init_metadata_table(&self) -> Result<&Table> {
         self.cached_metadata_table
             .get_or_try_init(|| async {
@@ -212,6 +218,31 @@ impl Table {
                 self.new_metadata_table().await
             })
             .await
+    }
+
+    /// Drop the listing cache and the metadata-table handle, after the
+    /// timeline has been reloaded around a write.
+    pub(crate) fn clear_read_caches(&mut self) {
+        self.file_system_view.clear_cache();
+        self.cached_metadata_table = Arc::new(OnceCell::new());
+    }
+
+    /// Reload the active timeline and drop listing caches before a write plans.
+    pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
+        crate::write::ensure_writable_table_version(self)?;
+        crate::write::ensure_complex_keygen_validated(&self.hudi_configs)?;
+        crate::write::metadata::ensure_supported_metadata_layout(self).await?;
+        // Instants must be minted in the table's declared timeline timezone
+        // (Spark writers default to LOCAL); set before any instant is minted.
+        crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
+            &self.hudi_configs,
+        ));
+        // Eager rollback of crashed writes (Java rollbackFailedWrites) before
+        // any new instant is minted.
+        crate::write::rollback::rollback_failed_writes(self).await?;
+        self.timeline.reload_completed_commits().await?;
+        self.clear_read_caches();
+        Ok(())
     }
 
     /// Get or initialize the cached `FileStatsEstimator` for this **data table**.
@@ -319,6 +350,98 @@ impl Table {
             .with_options(options)
             .build()
             .await
+    }
+
+    /// Start creating a new Hudi table at `base_uri` (does not open until [`TableCreateBuilder::create`]).
+    ///
+    /// # Example
+    /// ```no_run
+    /// # async fn example() -> hudi_core::error::Result<()> {
+    /// use hudi_core::table::Table;
+    /// let table = Table::create("/tmp/hudi_table")
+    ///     .with_table_name("trips")
+    ///     .with_record_key_fields(["id"])
+    ///     .create()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create(base_uri: impl Into<String>) -> TableCreateBuilder {
+        TableCreateBuilder::new(base_uri)
+    }
+
+    /// Upsert complete records by their configured record key.
+    ///
+    /// If a key occurs more than once in an input batch, the row with the
+    /// highest ordering (precombine) value is retained when ordering fields
+    /// are configured; otherwise the final occurrence is retained.
+    pub async fn upsert(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        self.upsert_with(batches, UpsertOptions::default()).await
+    }
+
+    /// Upsert records, optionally updating only selected columns on matched rows.
+    pub async fn upsert_with(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+        options: UpsertOptions,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::upsert_batches(self, &batches, options).await
+    }
+
+    /// Replace all data in a copy-on-write table.
+    pub async fn overwrite(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::overwrite_batches(self, &batches).await
+    }
+
+    /// Replace only the partitions present in `batches` in a partitioned copy-on-write table.
+    pub async fn dynamic_partition_overwrite(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::dynamic_partition_overwrite_batches(self, &batches).await
+    }
+
+    /// Delete rows matching a single binary filter such as `id = 'a'` or `value = 2`.
+    ///
+    /// Equality / `IN` predicates on the configured record key field or
+    /// `_hoodie_record_key` are routed through [`Self::delete_keys`] (RLI when enabled).
+    /// Other predicates scan the snapshot and rewrite (COW) or write delete logs (MOR).
+    /// A filter that matches no rows succeeds without creating a commit and reports zero deletes.
+    pub async fn delete(&mut self, filter: &str) -> Result<WriteResult> {
+        let filter = parse_write_filter(filter)?;
+        crate::write::delete_filter(self, filter).await
+    }
+
+    /// Delete records identified by record key.
+    ///
+    /// Uses the table index (RLI when enabled, otherwise SimpleIndex) to locate
+    /// affected file groups. The input must contain at least one key. Unknown keys
+    /// succeed without creating a commit and report zero deletes.
+    pub async fn delete_keys(
+        &mut self,
+        keys: impl IntoIterator<Item = crate::index::HoodieKey>,
+    ) -> Result<WriteResult> {
+        let keys: Vec<crate::index::HoodieKey> = keys.into_iter().collect();
+        crate::write::delete_keys(self, &keys).await
+    }
+
+    /// UPDATE: set columns from a single-row batch on rows matching `filter`.
+    ///
+    /// `updates` must contain exactly one row. Every non-meta data column present in
+    /// `updates` is written onto matching target rows; other columns are preserved.
+    /// Predicates may target any column. Zero matches succeed without a commit.
+    pub async fn update(&mut self, filter: &str, updates: RecordBatch) -> Result<WriteResult> {
+        let filter = parse_write_filter(filter)?;
+        crate::write::update_filter(self, filter, updates).await
     }
 
     pub fn hudi_options(&self) -> HashMap<String, String> {
@@ -1397,6 +1520,26 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
+    /// Append record batches as one new INSERT commit, like Hudi's bulk insert:
+    /// new file groups without an index lookup. All batches must share one
+    /// schema matching the table's.
+    ///
+    /// Tables at version 8 and 9 take the native write path, for COW and MOR,
+    /// partitioned or not. Older tables take a narrow path that only supports
+    /// unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
+    /// and no metadata table, and writes one base file; see
+    /// `write::append::append_version_6` for what that path leaves out.
+    ///
+    /// After a successful write the in-memory timeline and file-system view
+    /// cache are refreshed so subsequent reads see the new data.
+    pub async fn append(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<AppendResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::append_batches(self, &batches).await
+    }
+
     /// Compute estimated table-level statistics for scan planning.
     ///
     /// Returns `(estimated_num_rows, estimated_total_byte_size)` derived from
@@ -1458,6 +1601,54 @@ impl Table {
     }
 }
 
+fn parse_write_filter(filter: &str) -> Result<Filter> {
+    // `NOT IN` must be tried before `IN`, which it contains as a substring.
+    const OPERATORS: [&str; 8] = ["!=", ">=", "<=", "=", ">", "<", " NOT IN ", " IN "];
+    let filter = filter.trim();
+    for operator in OPERATORS {
+        if let Some((field, value)) = filter.split_once(operator) {
+            let field = field.trim();
+            let raw = value.trim();
+            if field.is_empty() || raw.is_empty() {
+                break;
+            }
+            let operator = operator.trim();
+            if matches!(operator, "IN" | "NOT IN") {
+                // Accept both `IN ('a', 'b')` and `IN a,b`.
+                let inner = raw
+                    .strip_prefix('(')
+                    .and_then(|v| v.strip_suffix(')'))
+                    .unwrap_or(raw);
+                let values: Vec<String> = inner
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                if values.is_empty() {
+                    break;
+                }
+                use std::str::FromStr;
+                let operator = crate::expr::ExprOperator::from_str(operator)?;
+                return Filter::new(field.to_string(), operator, values);
+            }
+            let value = raw.trim_matches('\'').trim_matches('"');
+            // Leftover quotes mean the input was more than one comparison
+            // (e.g. `id = 'a' OR id = 'b'`); erroring beats silently matching
+            // nothing.
+            if value.contains('\'') || value.contains('"') {
+                return Err(CoreError::Write(format!(
+                    "write filter must be a single comparison (AND/OR are not supported; \
+                     use `IN` for multiple keys), got '{filter}'"
+                )));
+            }
+            return Filter::try_from((field, operator, value));
+        }
+    }
+    Err(CoreError::Write(format!(
+        "write filter must be a single comparison such as `id = 'a'`, got '{filter}'"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1510,6 +1701,39 @@ mod tests {
             "a window inside the active timeline must not warn"
         );
         Ok(())
+    }
+
+    mod test_parse_write_filter {
+        use super::super::parse_write_filter;
+        use crate::expr::ExprOperator;
+
+        #[test]
+        fn test_parse_write_filter_in_with_parens_strips_quotes() {
+            let filter = parse_write_filter("id IN ('a', 'b')").unwrap();
+            assert_eq!(filter.operator, ExprOperator::In);
+            assert_eq!(filter.values, vec!["a".to_string(), "b".to_string()]);
+        }
+
+        #[test]
+        fn test_parse_write_filter_not_in_parses_as_not_in() {
+            let filter = parse_write_filter("id NOT IN ('a')").unwrap();
+            assert_eq!(filter.operator, ExprOperator::NotIn);
+            assert_eq!(filter.field, "id");
+            assert_eq!(filter.values, vec!["a".to_string()]);
+        }
+
+        #[test]
+        fn test_parse_write_filter_or_clause_errors_instead_of_silent_no_match() {
+            let err = parse_write_filter("id = 'a' OR id = 'b'").unwrap_err();
+            assert!(err.to_string().contains("single comparison"), "{err}");
+        }
+
+        #[test]
+        fn test_parse_write_filter_simple_equality() {
+            let filter = parse_write_filter("id = 'a'").unwrap();
+            assert_eq!(filter.operator, ExprOperator::Eq);
+            assert_eq!(filter.values, vec!["a".to_string()]);
+        }
     }
     use crate::config::HUDI_CONF_DIR;
     use crate::config::internal::HudiInternalConfig;

@@ -90,7 +90,12 @@ impl HudiDataFusionDataSource {
     ) -> PyResult<Bound<'py, PyCapsule>> {
         let provider = Arc::new(self.table.clone());
         let codec = extract_codec(session)?;
-        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(provider, false, None, codec);
-        PyCapsule::new(py, ffi_provider, Some(cr"datafusion_table_provider".into()))
+        // datafusion-python polls the provider's stream on its own tokio runtime,
+        // which this extension's copy of tokio cannot see. Hand over the binding's
+        // runtime so datafusion-ffi enters it around execution and every poll;
+        // Lance's I/O scheduler spawns onto the current runtime and aborts without one.
+        let runtime = Some(rt().handle().clone());
+        let ffi_provider = FFI_TableProvider::new_with_ffi_codec(provider, false, runtime, codec);
+        PyCapsule::new_with_value(py, ffi_provider, c"datafusion_table_provider")
     }
 }

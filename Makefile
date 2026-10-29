@@ -50,7 +50,9 @@ COV_THRESHOLD ?= 60
 COV_EXCLUDE := \
 	--exclude-files 'cpp/src/*' \
 	--exclude-files 'crates/core/src/avro_to_arrow/*' \
-	--exclude-files 'benchmark/*'
+	--exclude-files 'benchmark/*' \
+	--exclude-files 'crates/*/tests/*' \
+	--exclude-files 'crates/*/examples/*'
 TARPAULIN_COMMON := --engine llvm --no-dead-code --no-fail-fast \
 	--all-features --workspace $(COV_EXCLUDE) --skip-clean
 
@@ -205,3 +207,7 @@ endif
 .PHONY: tpch-compare
 tpch-compare: ## Compare persisted TPC-H benchmark results (ENGINES=datafusion,spark SF=0.001)
 	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(ENGINES) --format $(FORMAT)
+
+.PHONY: parity
+parity: ## Run Spark-in-the-loop parity tests (needs SPARK_HOME; see scripts/parity/README.md)
+	HUDI_SPARK_PARITY=1 ./build-wrapper.sh cargo test -p hudi-core --test spark_parity_tests -- --ignored --test-threads=1 --nocapture

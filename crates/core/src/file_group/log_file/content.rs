@@ -138,6 +138,9 @@ pub struct Decoder {
     /// it is safe to evaluate before the merge. See
     /// [`Decoder::with_row_filter`].
     row_filter: Option<RowFilterBuilder>,
+    /// Schema a parquet block's columns are checked against before the row
+    /// filter is pushed. See [`Decoder::with_repair_table_schema`].
+    repair_table_schema: Option<arrow_schema::SchemaRef>,
     /// Schema an Avro block is resolved up to, as Avro JSON. See
     /// [`Decoder::with_reader_schema`].
     reader_schema_json: Option<String>,
@@ -172,6 +175,30 @@ impl Decoder {
     pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
         self.row_filter = row_filter;
         self
+    }
+
+    /// The schema a parquet block is read as, for deciding whether the row filter
+    /// may be pushed into it.
+    ///
+    /// A pushed predicate sees the block's physical values. A block whose footer
+    /// needs the logical timestamp repair against this schema stores values its
+    /// labels misdescribe, so the predicate would drop rows that match, and the
+    /// row filter is withheld for that block. With no schema set that cannot be
+    /// ruled out, so the row filter is withheld from every parquet block.
+    pub fn with_repair_table_schema(
+        mut self,
+        repair_table_schema: Option<arrow_schema::SchemaRef>,
+    ) -> Self {
+        self.repair_table_schema = repair_table_schema;
+        self
+    }
+
+    /// The schema installed by [`Self::with_repair_table_schema`]. Test-only,
+    /// because the decision to install one is made a layer up, in the log record
+    /// reader, and that is what its test asserts.
+    #[cfg(test)]
+    pub(crate) fn repair_table_schema(&self) -> Option<&arrow_schema::SchemaRef> {
+        self.repair_table_schema.as_ref()
     }
 
     /// Resolve Avro blocks up to this schema as they are read.
@@ -223,6 +250,7 @@ impl Decoder {
             batch_size: 1024,
             hudi_configs,
             row_filter: None,
+            repair_table_schema: None,
             reader_schema_json: None,
             hfile_as_records: false,
             key_predicate: None,
@@ -264,19 +292,24 @@ impl Decoder {
         }
     }
 
-    /// Validate the log block version (first 4 bytes of block content).
+    /// Read the log block version (first 4 bytes of block content) and check it
+    /// is one of `supported`.
     ///
     /// This is NOT the same as [`LogFormatVersion`] (read from the file header).
-    /// Modern Hudi tables use [`LogBlockVersion::V3`].
-    fn validate_log_block_version(mut reader: impl Read) -> Result<()> {
+    /// Modern Hudi tables use [`LogBlockVersion::V3`]; writers before table
+    /// version 6 (Hudi 0.13 and earlier) use [`LogBlockVersion::V2`], and a table
+    /// upgraded from them keeps those blocks until compaction rewrites them.
+    fn validate_log_block_version(
+        mut reader: impl Read,
+        supported: &[LogBlockVersion],
+        block: &str,
+    ) -> Result<()> {
         let mut version_buf = [0u8; 4];
         reader.read_exact(&mut version_buf)?;
         let version = LogBlockVersion::try_from(version_buf)?;
-        if version != LogBlockVersion::V3 {
+        if !supported.contains(&version) {
             return Err(CoreError::LogBlockError(format!(
-                "Only support log block version {} but got: {:?}",
-                LogBlockVersion::V3 as u32,
-                version
+                "Unsupported {block} block version {version:?}; supported: {supported:?}"
             )));
         }
         Ok(())
@@ -435,7 +468,14 @@ impl Decoder {
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<RecordBatches> {
-        Decoder::validate_log_block_version(&mut reader)?;
+        // V2 and V3 Avro data blocks share one layout (version, record count,
+        // records): Hudi's HoodieAvroDataBlockVersion reports a record count for
+        // every version.
+        Decoder::validate_log_block_version(
+            &mut reader,
+            &[LogBlockVersion::V2, LogBlockVersion::V3],
+            "Avro data",
+        )?;
 
         let writer_schema_json = header.get(&BlockMetadataKey::Schema).ok_or_else(|| {
             CoreError::LogBlockError("Schema not found in block header".to_string())
@@ -490,10 +530,31 @@ impl Decoder {
         // Resolved here rather than by the caller because the predicate has to
         // be matched against this block's own schema, which does not exist until
         // its footer is read. A builder that declines reads every row.
-        let row_filter = self
-            .row_filter
-            .as_ref()
-            .and_then(|build| build(builder.parquet_schema(), builder.schema().as_ref()));
+        // Withheld when the block needs the logical timestamp repair, as the base
+        // file read does (see `with_repair_table_schema`). That costs only the
+        // pushdown, the same as a predicate that is not `mor_pk_safe`.
+        let row_filter = match (&self.row_filter, &self.repair_table_schema) {
+            (Some(build), Some(table))
+                if !crate::schema::batch_evolution::schema_needs_logical_type_repair(
+                    builder.schema(),
+                    table,
+                ) =>
+            {
+                build(builder.parquet_schema(), builder.schema().as_ref())
+            }
+            (Some(_), table) => {
+                log::debug!(
+                    "parquet log block {}; not pushing its row filter",
+                    if table.is_some() {
+                        "needs the logical timestamp repair"
+                    } else {
+                        "has no table schema to check the logical timestamp repair against"
+                    }
+                );
+                None
+            }
+            (None, _) => None,
+        };
         if let Some(row_filter) = row_filter {
             builder = builder.with_row_filter(row_filter);
         }
@@ -511,7 +572,9 @@ impl Decoder {
         mut reader: impl Read,
         header: &HashMap<BlockMetadataKey, String>,
     ) -> Result<RecordBatches> {
-        Decoder::validate_log_block_version(&mut reader)?;
+        // A V2 delete block holds Kryo-serialized DeleteRecord objects rather than
+        // the Avro HoodieDeleteRecordList of V3, which this reader cannot decode.
+        Decoder::validate_log_block_version(&mut reader, &[LogBlockVersion::V3], "delete")?;
 
         let mut datum_len = [0u8; 4];
         reader.read_exact(&mut datum_len)?;
@@ -596,6 +659,13 @@ impl Decoder {
         let mut hfile_reader =
             HFileReader::new(hfile_bytes).map_err(|e| CoreError::HFile(e.to_string()))?;
 
+        // Records must carry the block's own writer schema: log blocks may be
+        // written by a different writer (e.g. Spark) than the base file they
+        // are later merged against.
+        let schema = hfile_reader
+            .get_avro_schema_arc()
+            .map_err(|e| CoreError::HFile(e.to_string()))?;
+
         let mut records = Vec::new();
 
         // With a predicate, walk only the blocks its keys can be in. The whole
@@ -624,10 +694,10 @@ impl Decoder {
 
         for kv_result in iter {
             let kv = kv_result.map_err(|e| CoreError::HFile(e.to_string()))?;
-            records.push(HFileRecord::new(
-                kv.key().content().to_vec(),
-                kv.value().to_vec(),
-            ));
+            records.push(
+                HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
+                    .with_avro_schema(schema.clone()),
+            );
         }
 
         Ok(records)
@@ -642,7 +712,7 @@ mod tests {
     use apache_avro::types::Record as AvroRecord;
     use apache_avro::types::Value as AvroValue;
     use arrow_array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
-    use arrow_schema::{DataType, Field, Schema};
+    use arrow_schema::{DataType, Field, Schema, TimeUnit};
     use parquet::arrow::ArrowWriter;
     use std::io::{BufReader, Cursor};
     use std::sync::Arc;
@@ -898,21 +968,67 @@ mod tests {
         );
     }
 
-    /// The block version is the first four bytes of a block's content, and only
-    /// V3 is understood. A block at another version is refused rather than
-    /// decoded as if it were V3, which would misread every byte after it.
+    /// The block version is the first four bytes of a block's content. An Avro
+    /// data block is understood at V2 and V3; any other version is refused rather
+    /// than decoded as if it were V3, which would misread every byte after it.
     #[test]
-    fn test_decode_content_rejects_a_non_v3_block_version() {
+    fn test_decode_content_rejects_an_unsupported_block_version() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&1u32.to_be_bytes());
         buf.extend_from_slice(&0u32.to_be_bytes());
         let header = HashMap::from([(BlockMetadataKey::Schema, "{}".to_string())]);
         let err = Decoder::new(Arc::new(HudiConfigs::empty()))
             .decode_avro_record_content(buf.as_slice(), &header)
-            .expect_err("a non-V3 block must be refused");
+            .expect_err("a V1 block must be refused");
         assert!(
-            err.to_string().contains("log block version"),
+            err.to_string().contains("Avro data block version V1"),
             "the error must name the version, got: {err}"
+        );
+    }
+
+    /// A table version 5 writer stamps its Avro data blocks V2, with the same
+    /// layout as V3 (version, record count, records), so they decode the same.
+    #[test]
+    fn test_decode_avro_content_at_block_version_2() -> Result<()> {
+        let schema_str = r#"{"type": "record", "name": "TestRecord",
+            "fields": [{"name": "id", "type": "long"}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(schema_str)?;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        for id in [7i64, 8] {
+            let mut record = AvroRecord::new(&writer_schema).unwrap();
+            record.put("id", id);
+            let bytes = to_avro_datum(&writer_schema, record)?;
+            buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&bytes);
+        }
+        let header = HashMap::from([(BlockMetadataKey::Schema, schema_str.to_string())]);
+        let batches = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_avro_record_content(Cursor::new(buf), &header)?;
+        assert_eq!(batches.num_data_rows(), 2);
+        let ids = batches.data_batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!((ids.value(0), ids.value(1)), (7, 8));
+        Ok(())
+    }
+
+    /// A V2 delete block holds Kryo-serialized records, not the Avro list of V3,
+    /// so it is refused by name rather than misread as Avro.
+    #[test]
+    fn test_decode_delete_content_rejects_block_version_2() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&2u32.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes());
+        let err = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_delete_record_content(buf.as_slice(), &HashMap::new())
+            .expect_err("a V2 delete block must be refused");
+        assert!(
+            err.to_string().contains("delete block version V2"),
+            "the error must name the block and version, got: {err}"
         );
     }
 
@@ -1302,5 +1418,127 @@ mod tests {
         ])
         .unwrap_err();
         assert!(err.to_string().contains("mixes"), "got: {err}");
+    }
+
+    /// A parquet log block holding one row: `key` = "k" and `ts` of `file_type`
+    /// storing `stored`.
+    fn one_ts_row_parquet_block(file_type: DataType, stored: i64) -> Bytes {
+        use arrow_array::TimestampMicrosecondArray;
+        let ts: ArrayRef = match &file_type {
+            DataType::Int64 => Arc::new(Int64Array::from(vec![stored])),
+            DataType::Timestamp(TimeUnit::Microsecond, tz) => Arc::new(
+                TimestampMicrosecondArray::from(vec![stored]).with_timezone_opt(tz.clone()),
+            ),
+            other => panic!("unsupported type {other:?}"),
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", file_type, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(StringArray::from(vec!["k"])) as ArrayRef, ts],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        Bytes::from(buf)
+    }
+
+    /// Keeps rows whose `ts` (column 1), read as the physical i64 the block's
+    /// footer describes, is at least `min`. This is how a pushed predicate sees
+    /// a column: on the block's values, before any repair relabels them.
+    struct TsAtLeast {
+        projection: parquet::arrow::ProjectionMask,
+        min: i64,
+    }
+
+    impl parquet::arrow::arrow_reader::ArrowPredicate for TsAtLeast {
+        fn projection(&self) -> &parquet::arrow::ProjectionMask {
+            &self.projection
+        }
+        fn evaluate(
+            &mut self,
+            batch: RecordBatch,
+        ) -> std::result::Result<arrow_array::BooleanArray, arrow_schema::ArrowError> {
+            let raw = arrow_cast::cast(batch.column(0), &DataType::Int64)?;
+            let raw = raw.as_any().downcast_ref::<Int64Array>().unwrap();
+            Ok((0..raw.len())
+                .map(|i| Some(raw.value(i) >= self.min))
+                .collect())
+        }
+    }
+
+    fn ts_at_least(min: i64) -> RowFilterBuilder {
+        Arc::new(move |parquet_schema, _projected| {
+            Some(parquet::arrow::arrow_reader::RowFilter::new(vec![
+                Box::new(TsAtLeast {
+                    projection: parquet::arrow::ProjectionMask::roots(parquet_schema, vec![1]),
+                    min,
+                }),
+            ]))
+        })
+    }
+
+    fn table_with_ts(ts_type: DataType) -> arrow_schema::SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("ts", ts_type, false),
+        ]))
+    }
+
+    /// A predicate pushed into a parquet log block that needs the logical
+    /// timestamp repair is evaluated on mislabelled values and drops a row that
+    /// matches. The gate must withhold it for that block, and only that block.
+    #[test]
+    fn parquet_log_block_withholds_the_row_filter_when_the_block_needs_timestamp_repair() {
+        // 2020-01-01T00:00:00.001Z as millis. The predicate asks for
+        // ts >= 2020-01-01T00:00:00Z in the unit the footer claims.
+        const STORED_MS: i64 = 1_577_836_800_001;
+        let cases = [
+            // Labelled tz-aware micros: the literal is 1_577_836_800_000_000.
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+                1_577_836_800_000_000,
+            ),
+            // A plain long the table reads as a local timestamp. Compared as a
+            // bare long against a micros-scaled literal it drops the row too.
+            (
+                DataType::Int64,
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+                1_577_836_800_000_000,
+            ),
+        ];
+        for (file_type, table_type, literal) in cases {
+            let content = one_ts_row_parquet_block(file_type.clone(), STORED_MS);
+            let decode = |table: Option<arrow_schema::SchemaRef>| {
+                Decoder::new(Arc::new(HudiConfigs::empty()))
+                    .with_row_filter(Some(ts_at_least(literal)))
+                    .with_repair_table_schema(table)
+                    .decode_parquet_record_content(content.as_ref())
+                    .unwrap()
+                    .num_data_rows()
+            };
+
+            // Pushed, the predicate drops the matching row: what the gate prevents.
+            assert_eq!(
+                decode(Some(table_with_ts(file_type.clone()))),
+                0,
+                "{file_type}: a table that agrees with the footer keeps the filter"
+            );
+            assert_eq!(
+                decode(Some(table_with_ts(table_type.clone()))),
+                1,
+                "{file_type} -> {table_type}: the filter must be withheld, not drop the row"
+            );
+            assert_eq!(
+                decode(None),
+                1,
+                "{file_type}: with no table schema the filter must be withheld"
+            );
+        }
     }
 }

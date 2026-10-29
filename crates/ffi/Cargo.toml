@@ -17,7 +17,7 @@
 
 
 [package]
-name = "hudi-jvm-ffi"
+name = "hudi-ffi"
 # Not published to crates.io yet; the release workflow's publish matrix
 # deliberately excludes it.
 publish = false
@@ -25,20 +25,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Plain C ABI over hudi-rs, so a JVM can call it through the Arrow C Data Interface."
+description = "Plain C ABI over hudi-rs, so a JVM or a C++ engine can call it through the Arrow C Data Interface."
 homepage.workspace = true
 repository.workspace = true
 
 [lib]
-name = "hudi_jvm_ffi"
+name = "hudi_ffi"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+default = ["spill-rocksdb"]
+# Forwarded so a consumer of this crate can drop the merge map's on-disk tier
+# (and with it RocksDB, bindgen and libclang). A consumer can only opt out of a
+# feature its direct dependency exposes, so taking hudi with its defaults here
+# would hand the tier to every consumer with no way to decline it.
+spill-rocksdb = ["hudi/spill-rocksdb"]
 # Exports a deliberately panicking function, so a caller can prove a panic does
 # not cross the C ABI. Off by default: it must not exist in a shipped library.
 ffi-test-hooks = []
 
 [dependencies]
-hudi = { path = "../hudi", version = "0.6.0-dev" }
+hudi = { path = "../hudi", version = "0.6.0-dev", default-features = false }
 arrow = { workspace = true, features = ["ffi"] }
 tokio = { workspace = true }

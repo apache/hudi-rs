@@ -27,6 +27,7 @@ import pytest
 
 datafusion = pytest.importorskip("datafusion")
 
+from hudi import HudiTable  # noqa: E402
 from hudi._internal import HudiDataFusionDataSource, get_test_table_path  # noqa: E402
 
 
@@ -75,3 +76,27 @@ def test_datafusion_ffi_plan_goes_through_the_ffi_boundary(v6_table):
                 plans.append(columns["plan"][i])
 
     assert any("FFI_ExecutionPlan" in plan for plan in plans), plans
+
+
+def test_datafusion_ffi_reads_a_lance_table():
+    # Lance's I/O scheduler spawns onto the current tokio runtime. The provider's
+    # stream is polled from datafusion-python's runtime, which the binding's copy
+    # of tokio cannot see, so without a handle on the FFI provider this read
+    # aborted the interpreter. A local Parquet table never asks for a runtime,
+    # which is why the tests above did not catch it.
+    lance_table = get_test_table_path("v9_lance_nonpartitioned", "cow")
+    expected = sorted(
+        (row["id"], row["name"])
+        for batch in HudiTable(lance_table).read()
+        for row in batch.to_pylist()
+    )
+    assert expected, "fixture should hold rows"
+
+    ctx = datafusion.SessionContext()
+    ctx.register_table("lance_t", HudiDataFusionDataSource(lance_table))
+    got = sorted(
+        (row["id"], row["name"])
+        for batch in ctx.sql("SELECT id, name FROM lance_t").collect()
+        for row in batch.to_pylist()
+    )
+    assert got == expected

@@ -63,7 +63,7 @@ on-disk tier, which a merge-on-read merge spills to when a file group's log reco
 and a C++ toolchain; `default-features = false` drops it, and a merge that would have spilled then
 fails instead.
 
-## Usage Examples
+## Reading Tables
 
 > [!NOTE]
 > These examples expect a Hudi table exists at `/tmp/trips_table`, created using
@@ -322,6 +322,109 @@ std::vector<std::string> log_file_paths{};
 ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path.parquet", log_file_paths);
 ```
 
+## Writing Tables (Rust)
+
+hudi-rs includes a native, single-node write path that is storage-compatible
+with the Apache Hudi Spark writer: tables written here are readable — and
+serviceable (compaction, clustering, cleaning) — by Spark, and vice versa.
+Writes target COPY_ON_WRITE and MERGE_ON_READ tables at table version 9
+(Hudi 1.1.x; version 8 via `with_table_version(8)`), and maintain the
+metadata table (file listings, column/partition stats, record-level index) on
+every commit. See [docs/writer-design.md](docs/writer-design.md) for the full
+design.
+
+> [!NOTE]
+> Write APIs are currently Rust-only; Python and C++ bindings expose the read
+> APIs shown above.
+
+### Create a Table
+
+```rust
+use hudi::table::Table;
+use hudi::config::table::TableTypeValue;
+
+let mut table = Table::create("/tmp/trips_table")
+    .with_table_name("trips")
+    .with_table_type(TableTypeValue::MergeOnRead)   // or CopyOnWrite
+    .with_record_key_fields(["uuid"])
+    .with_partition_fields(["city"])
+    .with_ordering_fields(["ts"])                   // event-time ordering
+    .create()
+    .await?;
+```
+
+### Append
+
+`append` behaves like Hudi's bulk insert: it writes new file groups without
+an index lookup, splitting input into files bounded by
+`hoodie.parquet.max.file.size`. On tables below version 8 it takes a narrow
+path: unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
+and no metadata table, one base file per call.
+
+```rust
+use arrow_array::RecordBatch;
+
+let batch: RecordBatch = /* columns: uuid, city, ts, fare, ... */
+# unimplemented!();
+table.append([batch]).await?;
+```
+
+### Upsert
+
+`upsert` tags incoming records against the record-level index: existing keys
+update their file group in place (a rewritten base file on COW, a log file on
+MOR); new keys pack into existing small files first and then form new file
+groups.
+
+```rust
+let result = table.upsert([batch]).await?;
+println!(
+    "instant={} updates={} inserts={}",
+    result.instant, result.num_updates, result.num_inserts
+);
+```
+
+### Update and Delete
+
+```rust
+use hudi::table::HoodieKey;
+
+// SQL-style update: set columns from a one-row batch on matching rows.
+table.update("city = 'san_francisco'", updates_batch).await?;
+
+// Delete by predicate (single comparison, or IN for multiple keys).
+table.delete("uuid = 'e96c4396-3fad-413a-a942-4cb36106d721'").await?;
+table.delete("uuid IN ('a', 'b')").await?;
+
+// Delete by key.
+table.delete_keys([HoodieKey {
+    record_key: "a".to_string(),
+    partition_path: "city=san_francisco".to_string(),
+}]).await?;
+```
+
+### Overwrite
+
+```rust
+// INSERT_OVERWRITE_TABLE: replace all file groups.
+table.overwrite([batch]).await?;
+
+// INSERT_OVERWRITE: replace only the partitions present in the input.
+table.dynamic_partition_overwrite([batch]).await?;
+```
+
+### Behavior Notes
+
+- Every write runs as a full Hudi transaction: instants are requested and
+  completed with completion times, marker files enable automatic rollback of
+  crashed writes, and the timeline is archived into the LSM history once it
+  grows past `hoodie.keep.max.commits`.
+- Writes update all metadata table partitions in the same transaction, so
+  Spark readers with `hoodie.metadata.enable=true` see consistent listings
+  and stats.
+- Write parallelism is configurable with `hoodie.write.task.parallelism`
+  (default `2 × cores`), passed via `with_option`.
+
 ## Query Engine Integration
 
 Hudi-rs provides APIs to support integration with query engines. The sections below highlight some commonly used APIs.
@@ -365,7 +468,7 @@ silently redirect every later read.
 | `hoodie.read.stream.batch_size`                                 | `1024`        | table or read | Rows per batch for streaming reads.                                                                                      |
 | `hoodie.read.file.slice.read.concurrency`                       | `4`           | table or read | File slices read concurrently.                                                                                           |
 | `hoodie.read.scan.max.memory.size`                              | unset         | table or read | Total bytes a whole scan may use for concurrent slice reads; when set, the concurrency is derived from it. Reaching the limit lowers throughput, it never fails the read. |
-| `hoodie.read.input.partitions`                                  | `0`           | table or read | How many partitions the DataFusion table provider buckets the file slices into. `0` defers to DataFusion's `target_partitions`. |
+| `hoodie.read.input.partitions`                                  | `0`           | table or read | How many partitions the DataFusion table provider buckets the file slices into. `0` defers to DataFusion's `target_partitions`. On the parquet-source path (copy-on-write, read-optimized merge-on-read) DataFusion may split a bucket further once it exceeds `datafusion.optimizer.repartition_file_min_size`, unless `datafusion.optimizer.repartition_file_scans` is off. |
 | `hoodie.merge.use.record.positions`                             | `false`       | table or read | Match a log record to the base row it updates by position rather than by record key. Honored by reader version 2 only; a log block written without positions is merged by key regardless. |
 
 A table whose `hoodie.record.merge.mode` is `CUSTOM` needs a merger for its payload class. When
@@ -393,12 +496,38 @@ Create a Hudi file group reader instance using its constructor or the Hudi table
 Enabling the `hudi` crate with `datafusion` feature will provide a [DataFusion](https://datafusion.apache.org/)
 extension to query Hudi tables.
 
+Each hudi-rs release targets one DataFusion major, and with it one arrow major. The Rust `hudi`
+crate's `TableProvider` and the Python `hudi[datafusion]` extra both have to match the DataFusion
+version of the application they plug into, so pick the hudi-rs release that pairs with yours.
+Readers that take Arrow data out through the C data interface (Python `read()`, the C++ and JVM
+bindings) are not tied to these versions. The `hudi[datafusion]` extra first shipped in 0.5.
+
+| hudi-rs | DataFusion | arrow | Python `datafusion` package |
+|---------|------------|-------|-----------------------------|
+| 0.6 (unreleased) | 55 | 59 | `>=55.0.0,<56` |
+| 0.5 | 54 | 58 | `>=54.0.0,<55` |
+| 0.4 | 46 | 54 | not available |
+| 0.3 | 43 | 53 | not available |
+
+On macOS arm64, a debug build of an application that links `hudi` with the `datafusion` feature
+can fail with `ld: B/BL out of range ... (max +/-128MB)`: unoptimized dependencies push the
+binary's code section past the arm64 branch range. Optimize dependencies in the dev profile:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 1
+```
+
+This workspace applies the same setting from `build-wrapper.sh` on macOS arm64 only, since it
+slows compilation noticeably. It goes away once a Lance release shares the workspace's arrow major
+([#844](https://github.com/apache/hudi-rs/issues/844)).
+
 <details>
 <summary>Add crate hudi with datafusion feature to your application to query a Hudi table.</summary>
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@54
+cargo add tokio@1 datafusion@55
 cargo add hudi --features datafusion
 ```
 
