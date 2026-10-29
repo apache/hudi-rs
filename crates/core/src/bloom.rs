@@ -230,6 +230,13 @@ fn murmur_hash(data: &[u8], seed: i32) -> i32 {
     h
 }
 
+/// Java `String.compareTo` order (UTF-16 code units), which Java's bloom index
+/// uses to test a key against a file's range; UTF-8 byte order differs above
+/// the BMP and would let the index skip a file holding the key.
+fn java_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    a.encode_utf16().cmp(b.encode_utf16())
+}
+
 /// The footer entries Java's `HoodieBloomFilterWriteSupport` writes for the
 /// record keys of one base file.
 pub(crate) struct RecordKeyFooter {
@@ -254,10 +261,18 @@ impl RecordKeyFooter {
             ));
         }
         self.filter.add(key.as_bytes());
-        if self.min_key.as_deref().is_none_or(|min| key < min) {
+        if self
+            .min_key
+            .as_deref()
+            .is_none_or(|min| java_cmp(key, min).is_lt())
+        {
             self.min_key = Some(key.to_string());
         }
-        if self.max_key.as_deref().is_none_or(|max| key > max) {
+        if self
+            .max_key
+            .as_deref()
+            .is_none_or(|max| java_cmp(key, max).is_gt())
+        {
             self.max_key = Some(key.to_string());
         }
         Ok(())
@@ -320,7 +335,7 @@ mod tests {
     /// Java's `MurmurHash.getInstance().hash(bytes, seed)` for every tail length
     /// and for bytes with the high bit set.
     #[test]
-    fn murmur_hash_matches_java() {
+    fn test_murmur_hash_matches_java() {
         let cases: [(&str, [i32; 3]); 8] = [
             ("a", [-1838653602, 713507990, -579949966]),
             ("ab", [1525573013, -1797532438, -1822173170]),
@@ -340,7 +355,7 @@ mod tests {
     /// 45 keys into rows of 10 capped at 30 entries: the filter adds two rows,
     /// then spreads the last 15 keys round-robin.
     #[test]
-    fn dynamic_filter_serializes_as_java() {
+    fn test_dynamic_filter_serializes_as_java() {
         let filter = filter_with(&small(BloomFilterType::DynamicV0), &keys(45));
         assert_eq!(
             filter.serialize_to_string(),
@@ -351,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_filter_serializes_as_java() {
+    fn test_simple_filter_serializes_as_java() {
         let filter = filter_with(&small(BloomFilterType::Simple), &keys(12));
         assert_eq!(
             filter.serialize_to_string(),
@@ -362,7 +377,7 @@ mod tests {
 
     /// Java's default sizing is too large to inline; pin its digest instead.
     #[test]
-    fn default_filter_serializes_as_java() {
+    fn test_default_filter_serializes_as_java() {
         let filter = filter_with(&BloomFilterConfig::default(), &keys(13));
         let serialized = filter.serialize_to_string();
         assert_eq!(serialized.len(), 431_380);
@@ -379,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_filter_contains_keys_in_every_row() {
+    fn test_dynamic_filter_contains_keys_in_every_row() {
         let keys = keys(45);
         let filter = filter_with(&small(BloomFilterType::DynamicV0), &keys);
         assert_eq!(filter.rows.len(), 3);
@@ -387,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_holds_filter_type_code_and_key_range() {
+    fn test_footer_holds_filter_type_code_and_key_range() {
         let mut footer = RecordKeyFooter::new(&BloomFilterConfig::default());
         for key in ["k2", "k10", "é", "k1"] {
             footer.add(key).unwrap();
@@ -408,20 +423,34 @@ mod tests {
     }
 
     #[test]
-    fn footer_without_keys_has_no_key_range() {
+    fn test_footer_key_range_uses_java_string_order() {
+        let mut footer = RecordKeyFooter::new(&BloomFilterConfig::default());
+        // U+FF21 sorts after U+1F600 in UTF-16 and before it in UTF-8.
+        for key in ["\u{FF21}", "\u{1F600}"] {
+            footer.add(key).unwrap();
+        }
+        let entries = footer.finish();
+        assert_eq!(
+            (entries[2].1.as_str(), entries[3].1.as_str()),
+            ("\u{1F600}", "\u{FF21}")
+        );
+    }
+
+    #[test]
+    fn test_footer_without_keys_has_no_key_range() {
         let entries = RecordKeyFooter::new(&small(BloomFilterType::Simple)).finish();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, BLOOM_FILTER_FOOTER_KEY);
     }
 
     #[test]
-    fn footer_rejects_an_empty_key() {
+    fn test_footer_rejects_an_empty_key() {
         let mut footer = RecordKeyFooter::new(&BloomFilterConfig::default());
         assert!(matches!(footer.add(""), Err(CoreError::Write(_))));
     }
 
     #[test]
-    fn filter_type_parses_case_insensitively() {
+    fn test_filter_type_parses_case_insensitively() {
         assert_eq!(
             BloomFilterType::parse("dynamic_v0"),
             Some(BloomFilterType::DynamicV0)
