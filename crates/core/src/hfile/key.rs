@@ -22,7 +22,7 @@ use std::cmp::Ordering;
 
 /// Size constants
 const SIZEOF_INT32: usize = 4;
-const SIZEOF_INT16: usize = 2;
+pub(crate) const SIZEOF_INT16: usize = 2;
 
 /// Key offset after key length (int32) and value length (int32)
 pub const KEY_VALUE_HEADER_SIZE: usize = SIZEOF_INT32 * 2;
