@@ -272,7 +272,9 @@ pub(crate) async fn archive_timeline_if_needed(
         .collect();
 
     // Build HoodieLSMTimelineInstant rows: metadata = completed file bytes;
-    // plan = inflight (fallback requested) bytes for replacecommits.
+    // plan = the plan of the action the instant was requested as, like Java's
+    // `createLSMTimelineInstant` (a replace takes its inflight metadata, else
+    // the requested one).
     let mut instant_times = Vec::new();
     let mut completion_times = Vec::new();
     let mut actions = Vec::new();
@@ -282,42 +284,32 @@ pub(crate) async fn archive_timeline_if_needed(
         let metadata = storage
             .get_file_data(&format!("{timeline_dir}/{}", instant.file_name))
             .await?;
-        let plan = if instant.action == "replacecommit" {
-            let mut plan = None;
-            for fencing in fencing_by_instant
-                .get(&instant.requested)
-                .into_iter()
-                .flatten()
-            {
-                if fencing.ends_with(".inflight")
-                    && let Ok(bytes) = storage
-                        .get_file_data(&format!("{timeline_dir}/{fencing}"))
-                        .await
-                    && !bytes.is_empty()
-                {
-                    plan = Some(bytes.to_vec());
-                }
-            }
-            if plan.is_none() {
-                for fencing in fencing_by_instant
-                    .get(&instant.requested)
-                    .into_iter()
-                    .flatten()
-                {
-                    if fencing.ends_with(".requested")
-                        && let Ok(bytes) = storage
-                            .get_file_data(&format!("{timeline_dir}/{fencing}"))
-                            .await
-                        && !bytes.is_empty()
-                    {
-                        plan = Some(bytes.to_vec());
-                    }
-                }
-            }
-            plan
-        } else {
-            None
+        let fencing = fencing_by_instant
+            .get(&instant.requested)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let requested = fencing.iter().find(|name| name.ends_with(".requested"));
+        let inflight = fencing.iter().find(|name| name.ends_with(".inflight"));
+        let pending_action = requested
+            .or(inflight)
+            .map(|name| action_from_fencing_name(name, &instant.requested))
+            .unwrap_or_default();
+        let plan_files = match pending_action.as_str() {
+            "replacecommit" | "clustering" => vec![inflight, requested],
+            "clean" | "compaction" | "logcompaction" => vec![requested],
+            _ => Vec::new(),
         };
+        let mut plan = None;
+        for name in plan_files.into_iter().flatten() {
+            if let Ok(bytes) = storage
+                .get_file_data(&format!("{timeline_dir}/{name}"))
+                .await
+                && !bytes.is_empty()
+            {
+                plan = Some(bytes.to_vec());
+                break;
+            }
+        }
         instant_times.push(instant.requested.clone());
         completion_times.push(instant.completion.clone());
         actions.push(instant.action.clone());
@@ -717,6 +709,90 @@ mod delete_failure_tests {
         }
         instants.sort();
         instants
+    }
+
+    /// Archived compaction, log-compaction and clean instants keep their
+    /// requested plans; a plain commit has none.
+    #[tokio::test]
+    async fn test_archival_keeps_table_service_plans() {
+        use arrow_array::{Array, BinaryArray, StringArray};
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let ts = |i: u32| format!("2026010100000000{i}");
+        let write =
+            |name: String, bytes: &[u8]| std::fs::write(timeline.join(name), bytes).unwrap();
+        for i in [1, 5, 6] {
+            write(format!("{}.commit.requested", ts(i)), b"");
+            write(format!("{}.inflight", ts(i)), b"");
+            write(format!("{0}_{0}.commit", ts(i)), b"{}");
+        }
+        write(
+            format!("{}.compaction.requested", ts(2)),
+            b"compaction plan",
+        );
+        write(format!("{}.compaction.inflight", ts(2)), b"");
+        write(format!("{0}_{0}.commit", ts(2)), b"{}");
+        write(format!("{}.clean.requested", ts(3)), b"clean plan");
+        write(format!("{}.clean.inflight", ts(3)), b"clean plan");
+        write(format!("{0}_{0}.clean", ts(3)), b"{}");
+        write(
+            format!("{}.logcompaction.requested", ts(4)),
+            b"log compaction plan",
+        );
+        write(format!("{}.logcompaction.inflight", ts(4)), b"");
+        write(format!("{0}_{0}.deltacommit", ts(4)), b"{}");
+        let storage = Storage::new_with_object_store(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 2, 3)
+            .await
+            .unwrap();
+
+        let history = timeline.join("history");
+        let version = std::fs::read_to_string(history.join("_version_")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(history.join(format!("manifest_{}", version.trim()))).unwrap(),
+        )
+        .unwrap();
+        let mut plans = Vec::new();
+        for entry in manifest["files"].as_array().unwrap() {
+            let bytes = std::fs::read(history.join(entry["fileName"].as_str().unwrap())).unwrap();
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                bytes::Bytes::from(bytes),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let instants = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let plan = batch.column_by_name("plan").unwrap();
+                let plan = plan.as_any().downcast_ref::<BinaryArray>().unwrap();
+                for row in 0..batch.num_rows() {
+                    let bytes = (!plan.is_null(row)).then(|| plan.value(row).to_vec());
+                    plans.push((instants.value(row).to_string(), bytes));
+                }
+            }
+        }
+        plans.sort();
+        let plan = |i: u32, bytes: Option<&[u8]>| (ts(i), bytes.map(<[u8]>::to_vec));
+        assert_eq!(
+            plans,
+            vec![
+                plan(1, None),
+                plan(2, Some(b"compaction plan")),
+                plan(3, Some(b"clean plan")),
+                plan(4, Some(b"log compaction plan")),
+            ]
+        );
     }
 
     /// Completed files are deleted in instant order and archival stops at the
