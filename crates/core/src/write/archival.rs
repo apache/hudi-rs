@@ -301,15 +301,23 @@ pub(crate) async fn archive_timeline_if_needed(
             "clean" | "compaction" | "logcompaction" => vec![requested],
             _ => Vec::new(),
         };
+        // The plan's file is deleted once archived, so only a missing file
+        // may archive without it; any other read error aborts for a retry.
         let mut plan = None;
         for name in plan_files.into_iter().flatten() {
-            if let Ok(bytes) = storage
+            match storage
                 .get_file_data(&format!("{timeline_dir}/{name}"))
                 .await
-                && !bytes.is_empty()
             {
-                plan = Some(bytes.to_vec());
-                break;
+                Ok(bytes) if !bytes.is_empty() => {
+                    plan = Some(bytes.to_vec());
+                    break;
+                }
+                Ok(_)
+                | Err(crate::storage::error::StorageError::ObjectStoreError(
+                    object_store::Error::NotFound { .. },
+                )) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         instant_times.push(instant.requested.clone());
@@ -652,7 +660,7 @@ mod delete_failure_tests {
     use super::archive_timeline_if_needed;
     use crate::config::HudiConfigs;
     use crate::storage::Storage;
-    use crate::storage::fault::DeleteFails;
+    use crate::storage::fault::{DeleteFails, GetFails};
     use object_store::local::LocalFileSystem;
     use std::sync::Arc;
 
@@ -805,6 +813,77 @@ mod delete_failure_tests {
                 plan(4, Some(b"log compaction plan")),
             ]
         );
+    }
+
+    /// A plan that cannot be read aborts archival with its file intact, so a
+    /// retry archives the plan instead of losing it.
+    #[tokio::test]
+    async fn test_archival_aborts_when_a_plan_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let ts = |i: u32| format!("2026010100000000{i}");
+        let write =
+            |name: String, bytes: &[u8]| std::fs::write(timeline.join(name), bytes).unwrap();
+        write(format!("{}.clean.requested", ts(1)), b"clean plan");
+        write(format!("{}.clean.inflight", ts(1)), b"");
+        write(format!("{0}_{0}.clean", ts(1)), b"{}");
+        for i in 2..=4 {
+            write(format!("{}.commit.requested", ts(i)), b"");
+            write(format!("{}.inflight", ts(i)), b"");
+            write(format!("{0}_{0}.commit", ts(i)), b"{}");
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let failing = Arc::new(GetFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with(".clean.requested")
+        }));
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            failing,
+            Arc::new(HudiConfigs::empty()),
+        );
+        let result = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(timeline.join(format!("{}.clean.requested", ts(1))).exists());
+
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        use arrow_array::Array;
+        let plans: Vec<Option<Vec<u8>>> = archived_batches(&timeline)
+            .iter()
+            .flat_map(|batch| {
+                let plan = batch
+                    .column_by_name("plan")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .unwrap()
+                    .clone();
+                (0..plan.len())
+                    .map(move |row| (!plan.is_null(row)).then(|| plan.value(row).to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(plans.contains(&Some(b"clean plan".to_vec())));
     }
 
     /// Completed files are deleted in instant order and archival stops at the

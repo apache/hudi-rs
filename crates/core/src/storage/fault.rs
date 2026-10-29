@@ -247,3 +247,62 @@ impl ObjectStore for DeleteFails {
         self.0.copy_opts(from, to, options).await
     }
 }
+
+/// Fails every read of a path the predicate matches.
+#[derive(Debug)]
+pub(crate) struct GetFails(pub(crate) Arc<dyn ObjectStore>, pub(crate) fn(&str) -> bool);
+
+impl std::fmt::Display for GetFails {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GetFails({})", self.0)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for GetFails {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult> {
+        self.0.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>> {
+        self.0.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        if (self.1)(location.as_ref()) {
+            return Err(object_store::Error::Generic {
+                store: "GetFails",
+                source: "get failed".into(),
+            });
+        }
+        self.0.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        self.0.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        self.0.copy_opts(from, to, options).await
+    }
+}
