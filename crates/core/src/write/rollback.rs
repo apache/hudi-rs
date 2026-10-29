@@ -21,10 +21,10 @@
 //! At write start, any pending data instant (fenced but never completed) is
 //! rolled back: a `rollback` plan listing its marker-listed base/log files is
 //! persisted, those files are deleted (tv8+ rollback is deletion-only), its
-//! MDT log files and any orphaned MDT deltacommit are removed, the
-//! rollback completes, and the failed instant's fencing files and marker dir
-//! are cleaned up. A rollback interrupted after its plan was persisted is
-//! resumed from that plan.
+//! MDT log files and any orphaned MDT deltacommit are removed, the failed
+//! instant's fencing files are deleted, the rollback completes, and the
+//! marker dir is cleaned up. A rollback interrupted after its plan was
+//! persisted is resumed from that plan.
 
 use std::collections::HashMap;
 
@@ -46,7 +46,8 @@ const METADATA_BASE: &str = ".hoodie/metadata";
 struct PendingInstant {
     timestamp: String,
     action: String,
-    /// Fencing file names present on the timeline (to delete after rollback).
+    /// Fencing file names present on the timeline, deleted before the
+    /// rollback completes.
     fencing_files: Vec<String>,
 }
 
@@ -446,6 +447,22 @@ async fn rollback_instant(
         rollback_orphan_mdt_writes(storage, failed_ts).await?;
     }
 
+    // Java order: inflight first, then requested, before the rollback
+    // completes (`finishRollback`). A failure leaves the rollback pending, so
+    // the next write resumes it instead of planning a second one.
+    let fencing_files = pending
+        .map(|p| p.fencing_files.as_slice())
+        .unwrap_or_default();
+    for fencing in fencing_files
+        .iter()
+        .filter(|n| n.ends_with(".inflight"))
+        .chain(fencing_files.iter().filter(|n| n.ends_with(".requested")))
+    {
+        storage
+            .delete_file(&format!("{timeline_dir}/{fencing}"))
+            .await?;
+    }
+
     let metadata = HoodieRollbackMetadata {
         start_rollback_time: rollback_ts.clone(),
         time_taken_in_millis: start_time.elapsed().as_millis() as i64,
@@ -467,21 +484,6 @@ async fn rollback_instant(
         )
         .await?;
 
-    // Java order: inflight first, then requested, then the marker dir.
-    let fencing_files = pending
-        .map(|p| p.fencing_files.as_slice())
-        .unwrap_or_default();
-    for fencing in fencing_files
-        .iter()
-        .filter(|n| n.ends_with(".inflight"))
-        .chain(fencing_files.iter().filter(|n| n.ends_with(".requested")))
-    {
-        // Java fails the rollback here too; the markers stay, so the next
-        // write plans the cleanup again.
-        storage
-            .delete_file(&format!("{timeline_dir}/{fencing}"))
-            .await?;
-    }
     delete_marker_dir(storage, failed_ts).await;
     Ok(())
 }

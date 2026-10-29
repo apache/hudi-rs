@@ -618,8 +618,8 @@ async fn test_rollback_deletes_orphan_mdt_logs_of_incomplete_mdt_commit() {
 }
 
 /// A rollback that cannot delete the failed instant's fencing files fails the
-/// write that triggered it, as Java's rollback does, leaving the instant
-/// pending; the next write finishes the cleanup.
+/// write that triggered it, as Java's rollback does, leaving the rollback
+/// pending; the next write resumes it rather than planning a second one.
 #[tokio::test]
 async fn test_rollback_fence_delete_failure_fails_the_write() {
     use crate::storage::fault::{DeleteFails, FaultyPutStore, PutFault};
@@ -680,11 +680,29 @@ async fn test_rollback_fence_delete_failure_fails_the_write() {
             "{name} must stay until cleanup succeeds"
         );
     }
+    let completed_rollbacks = |timeline: &std::path::Path| -> usize {
+        std::fs::read_dir(timeline)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".rollback")
+            })
+            .count()
+    };
+    assert_eq!(
+        completed_rollbacks(&timeline),
+        0,
+        "the rollback must stay pending"
+    );
 
     let mut table = Table::new(uri).await.unwrap();
     table.append([batch(&[("c", "sf", 3, 30)])]).await.unwrap();
     for name in &failed {
         assert!(!timeline.join(name).exists(), "{name} was not cleaned up");
     }
+    assert_eq!(completed_rollbacks(&timeline), 1);
     assert_eq!(rows(&Table::new(uri).await.unwrap()).await, 2);
 }
