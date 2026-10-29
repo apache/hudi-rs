@@ -246,7 +246,7 @@ async fn bootstrap_empty_hfile_partition(
     instant: &str,
     partition_name: &str,
     num_file_groups: usize,
-    file_id_fn: &dyn Fn(usize) -> String,
+    file_id_fn: &(dyn Fn(usize) -> String + Sync),
     schema_json: &str,
 ) -> Result<()> {
     crate::write::ensure_partition_metadata(
@@ -1327,7 +1327,7 @@ async fn write_stats_log_blocks(
     partition_name: &str,
     file_id_prefix: &str,
     default_groups: usize,
-    file_id_fn: &dyn Fn(usize) -> String,
+    file_id_fn: &(dyn Fn(usize) -> String + Sync),
     records: &[(String, ColumnStatsMetadata)],
     is_column_stats: bool,
     version: StatsIndexVersion,

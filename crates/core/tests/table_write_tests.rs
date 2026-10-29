@@ -3316,3 +3316,24 @@ async fn upserts_into_spark_written_table_read_through_metadata_table() {
         assert_eq!(after.num_rows(), rows.num_rows(), "{format:?}");
     }
 }
+
+fn assert_send<F: std::future::Future + Send>(_: F) {}
+
+/// Compile-time check that every public write future can be spawned on a
+/// multi-threaded runtime.
+#[allow(dead_code)]
+fn write_futures_are_send(table: &mut Table) {
+    let key = HoodieKey {
+        record_key: "a".to_string(),
+        partition_path: String::new(),
+    };
+    assert_send(Table::create("unused").create());
+    assert_send(table.append([sample_batch()]));
+    assert_send(table.upsert([sample_batch()]));
+    assert_send(table.upsert_with([sample_batch()], UpsertOptions::default()));
+    assert_send(table.overwrite([sample_batch()]));
+    assert_send(table.dynamic_partition_overwrite([sample_batch()]));
+    assert_send(table.delete("id = 'a'"));
+    assert_send(table.delete_keys([key]));
+    assert_send(table.update("id = 'a'", sample_batch()));
+}

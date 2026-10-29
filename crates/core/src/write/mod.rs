@@ -259,13 +259,14 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
     use futures::StreamExt;
     let count = tasks.len();
     let mut results: Vec<Option<Result<T>>> = std::iter::repeat_with(|| None).take(count).collect();
-    let mut stream = futures::stream::iter(
-        tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, task)| async move { (index, task.await) }),
-    )
-    .buffer_unordered(parallelism.max(1));
+    // Collected rather than mapped lazily: a stream that projects through the
+    // closure's output defeats the compiler's Send check on callers' futures.
+    let indexed: Vec<_> = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| async move { (index, task.await) })
+        .collect();
+    let mut stream = futures::stream::iter(indexed).buffer_unordered(parallelism.max(1));
     while let Some((index, result)) = stream.next().await {
         results[index] = Some(result);
     }
