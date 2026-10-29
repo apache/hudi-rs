@@ -505,6 +505,7 @@ async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<
         compacted: Some(false),
         // Spark reads a null extraMetadata as a null map and fails on it.
         extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
+        partition_to_replace_file_ids: None,
     };
     let commit_relative_path = Instant::new_completed(instant.clone(), Action::Commit, None)?
         .relative_path_with_base(HUDI_METADATA_DIR)?;

@@ -1420,6 +1420,7 @@ pub(crate) async fn write_metadata_commit(
         partition_to_write_stats: Some(partition_to_write_stats),
         compacted: Some(false),
         extra_metadata: Some(HashMap::new()),
+        partition_to_replace_file_ids: None,
     };
     // Completion time is minted at completion, after the requested time (Java
     // generates it through the same monotonic skew-adjusting time generator).

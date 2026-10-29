@@ -429,6 +429,7 @@ pub(crate) fn inflight_commit_metadata_bytes(operation: &str, layout_two: bool) 
         partition_to_write_stats: Some(std::collections::HashMap::new()),
         compacted: Some(false),
         extra_metadata: Some(std::collections::HashMap::new()),
+        partition_to_replace_file_ids: None,
     };
     if layout_two {
         metadata.to_avro_bytes()
@@ -577,6 +578,7 @@ pub(crate) fn commit_metadata_bytes(
                 partition_to_write_stats: Some(partition_to_write_stats),
                 compacted: Some(false),
                 extra_metadata,
+                partition_to_replace_file_ids: None,
             };
             if layout_two {
                 metadata.to_avro_bytes()
