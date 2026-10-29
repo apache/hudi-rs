@@ -15,11 +15,23 @@
 #  specific language governing permissions and limitations
 #  under the License.
 from dataclasses import dataclass
-from typing import ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Protocol, Tuple, Union
 
 import pyarrow  # type: ignore[import-untyped]
 
 __version__: str
+
+class _ArrowStreamExportable(Protocol):
+    def __arrow_c_stream__(self, requested_schema: Any = None) -> Any: ...
+
+WriteData = Union[
+    "pyarrow.Table",
+    "pyarrow.RecordBatch",
+    "pyarrow.RecordBatchReader",
+    List["pyarrow.RecordBatch"],
+    _ArrowStreamExportable,
+]
+"""Tabular input accepted by the :class:`HudiTable` write methods."""
 
 def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
 
@@ -255,6 +267,10 @@ class HudiTable:
     """
     Represents a Hudi table and provides methods to interact with it.
 
+    A ``HudiTable`` must not be shared across threads while a write is running:
+    each write method takes exclusive access to the instance, so a concurrent
+    call on it raises ``RuntimeError``. Use one instance per thread.
+
     Attributes:
         base_uri (str): The base URI of the Hudi table.
         options (Optional[Dict[str, str]]): Additional options for table operations.
@@ -436,6 +452,191 @@ class HudiTable:
         is not yet supported and raises ``HudiCoreError``.
         """
         ...
+    @staticmethod
+    def create(
+        base_uri: str,
+        *,
+        record_key: Union[str, List[str]],
+        partition_by: Optional[Union[str, List[str]]] = None,
+        ordering_field: Optional[Union[str, List[str]]] = None,
+        table_type: str = "cow",
+        table_name: Optional[str] = None,
+        table_version: Optional[int] = None,
+        record_index: Optional[bool] = None,
+        metadata: Optional[bool] = None,
+        column_stats: Optional[bool] = None,
+        partition_stats: Optional[bool] = None,
+        hive_style_partitioning: Optional[bool] = None,
+        options: Optional[Dict[str, str]] = None,
+        storage_options: Optional[Dict[str, str]] = None,
+    ) -> "HudiTable":
+        """
+        Create a new Hudi table at ``base_uri`` and open it for reads and writes.
+
+        Arguments left as ``None`` keep the native defaults: table version 9,
+        metadata table on with the record index, column stats and partition
+        stats, and hive-style partition paths. Turning ``metadata`` off also
+        turns off the indexes that live in it.
+
+        Parameters:
+            base_uri (str): Location of the new table.
+            record_key (Union[str, List[str]]): Record key field(s).
+            partition_by (Optional[Union[str, List[str]]]): Partition field(s); unpartitioned if omitted.
+            ordering_field (Optional[Union[str, List[str]]]): Field(s) that pick the winning
+                record when a key is written more than once; commit order if omitted.
+            table_type (str): ``"cow"``/``"COPY_ON_WRITE"`` or ``"mor"``/``"MERGE_ON_READ"``,
+                case-insensitive.
+            table_name (Optional[str]): Defaults to the last path segment of ``base_uri``.
+            table_version (Optional[int]): Table version to write, 8 or 9.
+            record_index (Optional[bool]): Record-level index in the metadata table.
+            metadata (Optional[bool]): Metadata table.
+            column_stats (Optional[bool]): Column stats index in the metadata table.
+            partition_stats (Optional[bool]): Partition stats index in the metadata table.
+            hive_style_partitioning (Optional[bool]): Use ``field=value`` partition paths.
+            options (Optional[Dict[str, str]]): Extra ``hoodie.*`` table configs, written into
+                ``hoodie.properties``. Read options belong on the reader, not here.
+            storage_options (Optional[Dict[str, str]]): Storage options such as cloud credentials.
+
+        Returns:
+            HudiTable: The new table.
+
+        Raises:
+            ValueError: If ``table_type`` is not recognized.
+            HudiCoreError: If a table already exists at ``base_uri`` or the
+                options are inconsistent.
+        """
+        ...
+    def append(self, data: WriteData) -> "HudiWriteResult":
+        """
+        Insert ``data`` as one commit without looking up existing keys.
+
+        Parameters:
+            data (WriteData): A pyarrow ``Table``, ``RecordBatch``, ``RecordBatchReader``,
+                a list of ``RecordBatch``, or any object implementing ``__arrow_c_stream__``
+                (for example a polars or pandas >= 2.2 DataFrame).
+
+        Returns:
+            HudiWriteResult: ``num_writes`` and ``num_inserts`` are the rows written.
+        """
+        ...
+    def upsert(
+        self,
+        data: WriteData,
+        update_columns: Optional[List[str]] = None,
+    ) -> "HudiWriteResult":
+        """
+        Update rows whose record key exists and insert the rest.
+
+        Parameters:
+            data (WriteData): Rows to upsert; see :meth:`append` for accepted types.
+            update_columns (Optional[List[str]]): When set, matched rows only take these
+                columns from ``data`` and keep their other values. Copy-on-write tables only.
+
+        Returns:
+            HudiWriteResult: The commit and its update/insert counts.
+        """
+        ...
+    def update(
+        self,
+        filter: str,
+        set: Union[
+            Dict[str, Any],
+            "pyarrow.RecordBatch",
+            "pyarrow.Table",
+            _ArrowStreamExportable,
+        ],
+    ) -> "HudiWriteResult":
+        """
+        Set columns on the rows matching ``filter``.
+
+        Parameters:
+            filter (str): A single binary predicate such as ``"city = 'nyc'"``.
+            set (Union[Dict[str, Any], pyarrow.RecordBatch, pyarrow.Table]): Column values to
+                set, either as a dict or as a one-row batch carrying only those columns.
+                Dict values must fit their column's type exactly, with two allowances: a
+                float32 column rounds to the nearest float32, and a bool may go into a float
+                column. Date columns take ``datetime.date`` and timestamp columns take
+                ``datetime.datetime``; a tz-aware datetime needs a timestamp column with a
+                time zone. Struct fields missing from a dict value are set to null.
+
+        Returns:
+            HudiWriteResult: No commit is created when nothing matches.
+
+        Raises:
+            ValueError: For dict input, if a key is not a str column of the table schema
+                or a value does not fit its column; for batch input, if it yields no record
+                batches (such as an empty ``pyarrow.Table``).
+            HudiCoreError: For batch input that does not match the table schema or does not
+                hold exactly one row.
+        """
+        ...
+    def delete(self, filter: str) -> "HudiWriteResult":
+        """
+        Delete the rows matching ``filter``.
+
+        Parameters:
+            filter (str): A single binary predicate such as ``"id IN ('t1', 't2')"``.
+                Predicates on the record key use the index; others scan the table.
+
+        Returns:
+            HudiWriteResult: No commit is created when nothing matches.
+        """
+        ...
+    def delete_keys(self, keys: List[Union[str, Tuple[str, str]]]) -> "HudiWriteResult":
+        """
+        Delete records by record key.
+
+        Parameters:
+            keys (List[Union[str, Tuple[str, str]]]): Record keys, or
+                ``(record_key, partition_path)`` tuples. ``partition_path`` is the
+                table-relative path as stored, e.g. ``city=nyc`` with hive-style
+                partitioning. A bare key is looked up in every partition.
+
+        Returns:
+            HudiWriteResult: No commit is created when no key exists.
+        """
+        ...
+    def overwrite(self, data: WriteData) -> "HudiWriteResult":
+        """
+        Replace all rows in the table with ``data``.
+
+        Parameters:
+            data (WriteData): Replacement rows; see :meth:`append` for accepted types.
+
+        Returns:
+            HudiWriteResult: The replace commit.
+        """
+        ...
+    def dynamic_partition_overwrite(self, data: WriteData) -> "HudiWriteResult":
+        """
+        Replace only the partitions present in ``data`` in a partitioned table.
+
+        Parameters:
+            data (WriteData): Replacement rows; see :meth:`append` for accepted types.
+
+        Returns:
+            HudiWriteResult: The replace commit.
+        """
+        ...
+
+@dataclass(init=False)
+class HudiWriteResult:
+    """
+    Outcome of a write on :class:`HudiTable`.
+
+    Attributes:
+        instant (str): Timestamp of the completed commit, or empty when no commit was made.
+        num_writes (int): Rows written to data files.
+        num_updates (int): Input rows that replaced existing records.
+        num_inserts (int): Input rows that were new records.
+        num_deletes (int): Records deleted.
+    """
+
+    instant: str
+    num_writes: int
+    num_updates: int
+    num_inserts: int
+    num_deletes: int
 
 @dataclass(init=False)
 class HudiTimeline:

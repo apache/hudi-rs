@@ -17,13 +17,18 @@
  * under the License.
  */
 
-use arrow::pyarrow::ToPyArrow;
-use arrow::record_batch::RecordBatch;
+use arrow::array::{ArrayData, make_array};
+use arrow::compute::{cast, concat_batches};
+use arrow::datatypes::{DataType, FieldRef, Schema, TimeUnit};
+use arrow::ffi_stream::ArrowArrayStreamReader;
+use arrow::pyarrow::{FromPyArrow, ToPyArrow};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::convert::From;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
 use tokio::sync::Mutex;
@@ -33,7 +38,7 @@ use datafusion::error::DataFusionError;
 
 use hudi::config::plan::HudiPlanConfig;
 use hudi::config::read::HudiReadConfig;
-use hudi::config::table::HudiTableConfig;
+use hudi::config::table::{HudiTableConfig, TableTypeValue};
 use hudi::error::CoreError;
 use hudi::error::Result as HudiResult;
 use hudi::file_group::FileGroup;
@@ -41,12 +46,15 @@ use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
 use hudi::table::builder::TableBuilder;
-use hudi::table::{QueryType, ReadOptions, Table};
+use hudi::table::{AppendResult, QueryType, ReadOptions, Table};
 use hudi::timeline::Timeline;
 use hudi::timeline::instant::Instant;
+use hudi::{HoodieKey, UpsertOptions, WriteResult};
 use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::{PyErr, PyResult, Python, create_exception, pyclass, pyfunction, pymethods};
+use pyo3::types::{PyBool, PyDict, PyList, PyString};
+use pyo3::{PyErr, PyResult, Python, create_exception, intern, pyclass, pyfunction, pymethods};
 use std::error::Error;
 
 type RecordBatchBoxStream = BoxStream<'static, HudiResult<RecordBatch>>;
@@ -849,6 +857,611 @@ impl HudiTable {
         })?;
         Ok(HudiRecordBatchStream::from_stream(stream))
     }
+
+    #[staticmethod]
+    #[pyo3(signature = (
+        base_uri,
+        *,
+        record_key,
+        partition_by=None,
+        ordering_field=None,
+        table_type="cow",
+        table_name=None,
+        table_version=None,
+        record_index=None,
+        metadata=None,
+        column_stats=None,
+        partition_stats=None,
+        hive_style_partitioning=None,
+        options=None,
+        storage_options=None,
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn create(
+        py: Python,
+        base_uri: &str,
+        record_key: OneOrMany,
+        partition_by: Option<OneOrMany>,
+        ordering_field: Option<OneOrMany>,
+        table_type: &str,
+        table_name: Option<String>,
+        table_version: Option<isize>,
+        record_index: Option<bool>,
+        metadata: Option<bool>,
+        column_stats: Option<bool>,
+        partition_stats: Option<bool>,
+        hive_style_partitioning: Option<bool>,
+        options: Option<HashMap<String, String>>,
+        storage_options: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let table_type = TableTypeValue::from_str(table_type).map_err(|_| {
+            PyValueError::new_err(format!(
+                "invalid table_type '{table_type}': expected 'cow' (COPY_ON_WRITE) or 'mor' (MERGE_ON_READ)"
+            ))
+        })?;
+        let table_name = table_name.unwrap_or_else(|| last_path_segment(base_uri));
+        let mut builder = Table::create(base_uri)
+            .with_table_name(table_name)
+            .with_table_type(table_type)
+            .with_record_key_fields(record_key.into_vec());
+        if let Some(fields) = partition_by {
+            builder = builder.with_partition_fields(fields.into_vec());
+        }
+        if let Some(fields) = ordering_field {
+            builder = builder.with_ordering_fields(fields.into_vec());
+        }
+        // Order matters: the version and metadata setters adjust the index
+        // flags that follow them, so explicit index choices must come last.
+        if let Some(version) = table_version {
+            builder = builder.with_table_version(version);
+        }
+        if let Some(enabled) = metadata {
+            builder = builder.with_metadata(enabled);
+        }
+        if let Some(enabled) = record_index {
+            builder = builder.with_record_index(enabled);
+        }
+        if let Some(enabled) = column_stats {
+            builder = builder.with_column_stats(enabled);
+        }
+        if let Some(enabled) = partition_stats {
+            builder = builder.with_partition_stats(enabled);
+        }
+        if let Some(enabled) = hive_style_partitioning {
+            builder = builder.with_hive_style_partitioning(enabled);
+        }
+        for (k, v) in options.unwrap_or_default() {
+            builder = builder.with_option(k, v);
+        }
+        for (k, v) in storage_options.unwrap_or_default() {
+            builder = builder.with_storage_option(k, v);
+        }
+        let inner = py.detach(|| rt().block_on(builder.create()).map_err(PythonError::from))?;
+        Ok(HudiTable { inner })
+    }
+
+    fn append(&mut self, data: &Bound<'_, PyAny>, py: Python) -> PyResult<HudiWriteResult> {
+        let batches = to_batches(data)?;
+        let result = py.detach(|| {
+            rt().block_on(self.inner.append(batches))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+
+    #[pyo3(signature = (data, update_columns=None))]
+    fn upsert(
+        &mut self,
+        data: &Bound<'_, PyAny>,
+        update_columns: Option<Vec<String>>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        let batches = to_batches(data)?;
+        let options = UpsertOptions { update_columns };
+        let result = py.detach(|| {
+            rt().block_on(self.inner.upsert_with(batches, options))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+
+    fn update(
+        &mut self,
+        filter: &str,
+        set: &Bound<'_, PyAny>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        let updates = if let Ok(dict) = set.cast::<PyDict>() {
+            let schema = py.detach(|| {
+                rt().block_on(self.inner.get_schema())
+                    .map_err(PythonError::from)
+            })?;
+            one_row_batch_from_dict(py, &schema, dict)?
+        } else {
+            let batches = to_batches(set)?;
+            let Some(first) = batches.first() else {
+                return Err(PyValueError::new_err(
+                    "update `set` must contain exactly one row, got no batches",
+                ));
+            };
+            concat_batches(&first.schema(), &batches).map_err(|e| {
+                PyValueError::new_err(format!("failed to combine update `set` batches: {e}"))
+            })?
+        };
+        let result = py.detach(|| {
+            rt().block_on(self.inner.update(filter, updates))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+
+    fn delete(&mut self, filter: &str, py: Python) -> PyResult<HudiWriteResult> {
+        let result = py.detach(|| {
+            rt().block_on(self.inner.delete(filter))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+
+    fn delete_keys(&mut self, keys: &Bound<'_, PyAny>, py: Python) -> PyResult<HudiWriteResult> {
+        let keys = to_hoodie_keys(keys)?;
+        let result = py.detach(|| {
+            rt().block_on(self.inner.delete_keys(keys))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+
+    fn overwrite(&mut self, data: &Bound<'_, PyAny>, py: Python) -> PyResult<HudiWriteResult> {
+        let batches = to_batches(data)?;
+        let result = py.detach(|| {
+            rt().block_on(self.inner.overwrite(batches))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+
+    fn dynamic_partition_overwrite(
+        &mut self,
+        data: &Bound<'_, PyAny>,
+        py: Python,
+    ) -> PyResult<HudiWriteResult> {
+        let batches = to_batches(data)?;
+        let result = py.detach(|| {
+            rt().block_on(self.inner.dynamic_partition_overwrite(batches))
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiWriteResult::from(result))
+    }
+}
+
+/// Result of a table write, shared by every write verb.
+#[cfg(not(tarpaulin_include))]
+#[pyclass(frozen, get_all)]
+pub struct HudiWriteResult {
+    instant: String,
+    num_writes: usize,
+    num_updates: usize,
+    num_inserts: usize,
+    num_deletes: usize,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiWriteResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "HudiWriteResult(instant='{}', num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
+            self.instant, self.num_writes, self.num_updates, self.num_inserts, self.num_deletes,
+        )
+    }
+}
+
+impl From<WriteResult> for HudiWriteResult {
+    fn from(r: WriteResult) -> Self {
+        Self {
+            instant: r.instant,
+            num_writes: r.num_writes,
+            num_updates: r.num_updates,
+            num_inserts: r.num_inserts,
+            num_deletes: r.num_deletes,
+        }
+    }
+}
+
+impl From<AppendResult> for HudiWriteResult {
+    fn from(r: AppendResult) -> Self {
+        Self {
+            instant: r.instant,
+            num_writes: r.num_rows,
+            num_updates: 0,
+            num_inserts: r.num_rows,
+            num_deletes: 0,
+        }
+    }
+}
+
+/// A Python argument that is either one string or a list of strings.
+#[derive(FromPyObject)]
+enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            OneOrMany::One(s) => vec![s],
+            OneOrMany::Many(v) => v,
+        }
+    }
+}
+
+fn last_path_segment(base_uri: &str) -> String {
+    base_uri
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Convert any supported Python tabular object into record batches.
+///
+/// Objects implementing the Arrow PyCapsule interface (`__arrow_c_stream__`,
+/// `__arrow_c_array__`) are imported zero-copy, which covers pyarrow, polars
+/// and pandas >= 2.2. The pyarrow class checks serve pyarrow releases that
+/// predate the PyCapsule interface.
+fn to_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    collect_batches(data)?
+        .into_iter()
+        .map(normalize_batch)
+        .collect()
+}
+
+/// Rewrite a batch into types the writer accepts: drop the columns pandas
+/// adds for an unnamed index, and cast view and large string, binary and
+/// list types (Polars exports `Utf8View`, pandas exports `LargeUtf8`) and
+/// dictionaries to their plain forms at any nesting depth.
+fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
+    let schema = batch.schema();
+    let from_pandas = schema.metadata().contains_key("pandas");
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        if from_pandas && is_unnamed_pandas_index(field.name()) {
+            changed = true;
+            continue;
+        }
+        match writable_field(field) {
+            Some(target) => {
+                let casted = cast(column.as_ref(), target.data_type()).map_err(|e| {
+                    PyValueError::new_err(format!(
+                        "failed to cast column '{}' from {} to {}: {e}",
+                        field.name(),
+                        field.data_type(),
+                        target.data_type()
+                    ))
+                })?;
+                fields.push(target);
+                columns.push(casted);
+                changed = true;
+            }
+            None => {
+                fields.push(field.clone());
+                columns.push(column.clone());
+            }
+        }
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    let options = RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    RecordBatch::try_new_with_options(
+        Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone())),
+        columns,
+        &options,
+    )
+    .map_err(|e| PyValueError::new_err(format!("failed to rebuild record batch: {e}")))
+}
+
+/// pandas exports an unnamed index as `__index_level_N__`; a named index
+/// keeps its name and may be the record key.
+fn is_unnamed_pandas_index(name: &str) -> bool {
+    name.strip_prefix("__index_level_")
+        .and_then(|rest| rest.strip_suffix("__"))
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The writable form of `field`, or `None` when it is already writable.
+/// Names, nullability and metadata are kept, including list item names.
+fn writable_field(field: &FieldRef) -> Option<FieldRef> {
+    writable_type(field.data_type()).map(|dt| Arc::new(field.as_ref().clone().with_data_type(dt)))
+}
+
+fn writable_type(dt: &DataType) -> Option<DataType> {
+    match dt {
+        DataType::Utf8View | DataType::LargeUtf8 => Some(DataType::Utf8),
+        DataType::BinaryView | DataType::LargeBinary => Some(DataType::Binary),
+        DataType::Dictionary(_, value) => {
+            Some(writable_type(value).unwrap_or_else(|| value.as_ref().clone()))
+        }
+        DataType::List(item) => writable_field(item).map(DataType::List),
+        DataType::LargeList(item) => Some(DataType::List(
+            writable_field(item).unwrap_or_else(|| item.clone()),
+        )),
+        DataType::Struct(children) => {
+            let mapped: Vec<Option<FieldRef>> = children.iter().map(writable_field).collect();
+            if mapped.iter().all(Option::is_none) {
+                return None;
+            }
+            Some(DataType::Struct(
+                children
+                    .iter()
+                    .zip(mapped)
+                    .map(|(child, m)| m.unwrap_or_else(|| child.clone()))
+                    .collect(),
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn collect_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    let py = data.py();
+    if let Ok(list) = data.cast::<PyList>() {
+        return list
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                RecordBatch::from_pyarrow_bound(&item).map_err(|e| {
+                    PyTypeError::new_err(format!(
+                        "data[{i}] is not a pyarrow.RecordBatch or an Arrow array-capsule object: {e}"
+                    ))
+                })
+            })
+            .collect();
+    }
+    if data.hasattr(intern!(py, "__arrow_c_stream__"))? {
+        return collect_stream(data);
+    }
+    if data.hasattr(intern!(py, "__arrow_c_array__"))? {
+        return Ok(vec![RecordBatch::from_pyarrow_bound(data)?]);
+    }
+    let pa = py.import(intern!(py, "pyarrow"))?;
+    if data.is_instance(&pa.getattr(intern!(py, "RecordBatchReader"))?)? {
+        return collect_stream(data);
+    }
+    if data.is_instance(&pa.getattr(intern!(py, "RecordBatch"))?)? {
+        return Ok(vec![RecordBatch::from_pyarrow_bound(data)?]);
+    }
+    if data.is_instance(&pa.getattr(intern!(py, "Table"))?)? {
+        return collect_batches(&data.call_method0(intern!(py, "to_batches"))?);
+    }
+    Err(PyTypeError::new_err(format!(
+        "unsupported data type '{}': expected a pyarrow Table, RecordBatch, RecordBatchReader, \
+         a list of RecordBatch, or an object implementing __arrow_c_stream__",
+        data.get_type().name()?
+    )))
+}
+
+fn collect_stream(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    ArrowArrayStreamReader::from_pyarrow_bound(data)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| PyValueError::new_err(format!("failed to read Arrow stream: {e}")))
+}
+
+/// Build the one-row `SET` batch for `update`, typing each value by the
+/// table schema so that e.g. a Python int lands in a float64 column.
+fn one_row_batch_from_dict(
+    py: Python,
+    schema: &Schema,
+    set: &Bound<'_, PyDict>,
+) -> PyResult<RecordBatch> {
+    if set.is_empty() {
+        return Err(PyValueError::new_err(
+            "update `set` must name at least one column",
+        ));
+    }
+    let pa = py.import(intern!(py, "pyarrow"))?;
+    let mut fields = Vec::with_capacity(set.len());
+    let mut columns = Vec::with_capacity(set.len());
+    for (key, value) in set.iter() {
+        let name: String = key.extract().map_err(|_| {
+            PyValueError::new_err(format!(
+                "update column names must be str, got {}",
+                key.repr().map(|r| r.to_string()).unwrap_or_default()
+            ))
+        })?;
+        let field = schema.field_with_name(&name).map_err(|_| {
+            PyValueError::new_err(format!("update column '{name}' is not in the table schema"))
+        })?;
+        let value = if value.is_instance(&pa.getattr(intern!(py, "Scalar"))?)? {
+            value.call_method0(intern!(py, "as_py"))?
+        } else {
+            value
+        };
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "type"), field.data_type().to_pyarrow(py)?)?;
+        let array = pa
+            .call_method(
+                intern!(py, "array"),
+                (PyList::new(py, [&value])?,),
+                Some(&kwargs),
+            )
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "cannot convert update value for column '{name}' to {}: {e}",
+                    field.data_type()
+                ))
+            })?;
+        let stored = array
+            .get_item(0)
+            .and_then(|v| v.call_method0(intern!(py, "as_py")))
+            .map_err(|e| {
+                PyValueError::new_err(format!(
+                    "cannot read back update value for column '{name}' as {}: {e}",
+                    field.data_type()
+                ))
+            })?;
+        if let Some(reason) = misfit(field.data_type(), &value, &stored)? {
+            return Err(PyValueError::new_err(format!(
+                "update value {} for column '{name}' does not fit {} exactly: {reason} \
+                 (stored as {})",
+                value.repr()?,
+                field.data_type(),
+                stored.repr()?
+            )));
+        }
+        columns.push(make_array(ArrayData::from_pyarrow_bound(&array)?));
+        fields.push(field.clone());
+    }
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| PyValueError::new_err(format!("invalid update `set`: {e}")))
+}
+
+/// Why `value` does not survive the typed `pa.array` constructor for `dt`,
+/// given `stored`, the `as_py()` of what it produced; `None` when it fits.
+///
+/// The constructor coerces silently: 1.5 into int64 stores 1, a numpy bool
+/// into int64 stores 1, a datetime into date32 drops the time, a number into
+/// a timestamp is read as epoch units, a coarser timestamp unit drops
+/// sub-unit digits, and unknown struct keys are dropped. Python equality
+/// accepts exact conversions (3 == 3.0, `Decimal("1.50") == 1.5`);
+/// timestamps are not compared whole because a naive input never equals its
+/// UTC-aware stored form.
+fn misfit(
+    dt: &DataType,
+    value: &Bound<'_, PyAny>,
+    stored: &Bound<'_, PyAny>,
+) -> PyResult<Option<String>> {
+    if value.is_none() || stored.is_none() {
+        return Ok(None);
+    }
+    let py = value.py();
+    match dt {
+        DataType::Struct(children) => {
+            let by_name = value.cast::<PyDict>().ok();
+            if let Some(d) = &by_name {
+                for key in d.keys() {
+                    let known = key
+                        .extract::<String>()
+                        .is_ok_and(|k| children.iter().any(|c| c.name() == &k));
+                    if !known {
+                        return Ok(Some(format!("unknown struct field {}", key.repr()?)));
+                    }
+                }
+            }
+            let mut positional = match by_name {
+                Some(_) => None,
+                None => Some(value.try_iter()?),
+            };
+            for child in children {
+                let v = match (&by_name, positional.as_mut()) {
+                    (Some(d), _) => d.get_item(child.name())?,
+                    (None, Some(it)) => it.next().transpose()?,
+                    (None, None) => None,
+                };
+                if let Some(v) = v {
+                    let s = stored.get_item(child.name())?;
+                    if let Some(reason) = misfit(child.data_type(), &v, &s)? {
+                        return Ok(Some(reason));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        DataType::List(item) | DataType::LargeList(item) => {
+            for (v, s) in value.try_iter()?.zip(stored.try_iter()?) {
+                if let Some(reason) = misfit(item.data_type(), &v?, &s?)? {
+                    return Ok(Some(reason));
+                }
+            }
+            Ok(None)
+        }
+        dt if dt.is_integer() && is_bool(value)? => Ok(Some("a bool is not an integer".into())),
+        DataType::Float16 | DataType::Float32 => {
+            let (v, s): (f64, f64) = (value.extract()?, stored.extract()?);
+            Ok((v.is_finite() && !s.is_finite())
+                .then(|| "the value overflows the float type".into()))
+        }
+        dt if dt.is_numeric() => {
+            let both_nan = stored.ne(stored)? && value.ne(value)?;
+            Ok((!(stored.eq(value)? || both_nan)).then(|| "the value would change".into()))
+        }
+        DataType::Date32 | DataType::Date64 => {
+            let datetime = py.import(intern!(py, "datetime"))?;
+            let is_date = value.is_instance(&datetime.getattr(intern!(py, "date"))?)?;
+            let is_datetime = value.is_instance(&datetime.getattr(intern!(py, "datetime"))?)?;
+            Ok((!is_date || is_datetime).then(|| "expected a datetime.date".into()))
+        }
+        DataType::Timestamp(unit, tz) => {
+            let datetime = py
+                .import(intern!(py, "datetime"))?
+                .getattr(intern!(py, "datetime"))?;
+            if !value.is_instance(&datetime)? {
+                return Ok(Some("expected a datetime.datetime".into()));
+            }
+            if tz.is_none() && !value.getattr(intern!(py, "tzinfo"))?.is_none() {
+                return Ok(Some(
+                    "a tz-aware datetime is ambiguous for a timestamp without a time zone".into(),
+                ));
+            }
+            let nanos = intern!(py, "nanosecond");
+            let micros = intern!(py, "microsecond");
+            let truncated = (*unit != TimeUnit::Nanosecond
+                && value.hasattr(nanos)?
+                && !value.getattr(nanos)?.eq(0)?)
+                || !stored.getattr(micros)?.eq(value.getattr(micros)?)?;
+            Ok(truncated.then(|| "the timestamp unit would truncate the value".into()))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn is_bool(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if value.is_instance_of::<PyBool>() {
+        return Ok(true);
+    }
+    let ty = value.get_type();
+    let module: String = ty.getattr(intern!(value.py(), "__module__"))?.extract()?;
+    let name = ty.name()?;
+    Ok(module == "numpy" && (name == "bool" || name == "bool_"))
+}
+
+/// Accept record keys as `str` (empty partition path) or `(record_key, partition_path)`.
+fn to_hoodie_keys(keys: &Bound<'_, PyAny>) -> PyResult<Vec<HoodieKey>> {
+    if keys.is_instance_of::<PyString>() {
+        return Err(PyTypeError::new_err(
+            "keys must be a list of record keys, not a single str",
+        ));
+    }
+    keys.try_iter()?
+        .map(|item| {
+            let item = item?;
+            if let Ok(record_key) = item.extract::<String>() {
+                return Ok(HoodieKey {
+                    record_key,
+                    partition_path: String::new(),
+                });
+            }
+            let (record_key, partition_path) =
+                item.extract::<(String, String)>().map_err(|_| {
+                    PyTypeError::new_err(format!(
+                        "each key must be a str or a (record_key, partition_path) tuple, got {}",
+                        item.get_type()
+                            .name()
+                            .map(|n| n.to_string())
+                            .unwrap_or_default()
+                    ))
+                })?;
+            Ok(HoodieKey {
+                record_key,
+                partition_path,
+            })
+        })
+        .collect()
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -1030,7 +1643,68 @@ pub fn rt() -> &'static Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::pascal_to_screaming_snake;
+    use super::{is_unnamed_pandas_index, pascal_to_screaming_snake, writable_field};
+    use arrow::datatypes::{DataType, Field, Fields};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    #[test]
+    fn writable_field_rewrites_nested_types_and_keeps_names_and_metadata() {
+        let metadata = HashMap::from([("k".to_string(), "v".to_string())]);
+        let item =
+            Arc::new(Field::new("item", DataType::Utf8View, true).with_metadata(metadata.clone()));
+        let field = Arc::new(
+            Field::new(
+                "f",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("tags", DataType::LargeList(item), true),
+                    Field::new(
+                        "kind",
+                        DataType::Dictionary(
+                            Box::new(DataType::Int8),
+                            Box::new(DataType::LargeUtf8),
+                        ),
+                        true,
+                    ),
+                    Field::new("n", DataType::Int64, true),
+                ])),
+                false,
+            )
+            .with_metadata(metadata.clone()),
+        );
+
+        let written = writable_field(&field).unwrap();
+        assert_eq!(written.name(), "f");
+        assert!(!written.is_nullable());
+        assert_eq!(written.metadata(), &metadata);
+        let DataType::Struct(children) = written.data_type() else {
+            panic!("expected struct, got {}", written.data_type());
+        };
+        let DataType::List(item) = children[0].data_type() else {
+            panic!("expected list, got {}", children[0].data_type());
+        };
+        assert_eq!(item.name(), "item");
+        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.metadata(), &metadata);
+        assert_eq!(children[1].data_type(), &DataType::Utf8);
+        assert_eq!(children[2].data_type(), &DataType::Int64);
+
+        let plain = Arc::new(Field::new(
+            "n",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        ));
+        assert!(writable_field(&plain).is_none());
+    }
+
+    #[test]
+    fn unnamed_pandas_index_detection() {
+        assert!(is_unnamed_pandas_index("__index_level_0__"));
+        assert!(is_unnamed_pandas_index("__index_level_12__"));
+        assert!(!is_unnamed_pandas_index("__index_level___"));
+        assert!(!is_unnamed_pandas_index("__index_level_x__"));
+        assert!(!is_unnamed_pandas_index("id"));
+    }
 
     #[test]
     fn pascal_to_screaming_snake_basic() {
