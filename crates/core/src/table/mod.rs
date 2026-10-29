@@ -129,7 +129,7 @@ use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -721,12 +721,196 @@ impl Table {
             )
             .await?;
 
+        if let Some(located) = self
+            .file_groups_for_record_keys(filters, timestamp, &table_schema)
+            .await
+        {
+            let planned: HashSet<(&str, &str)> = file_slices
+                .iter()
+                .map(|fs| (fs.partition_path.as_str(), fs.file_id()))
+                .collect();
+            // A file group the index names but this snapshot does not know
+            // (clustered or compacted after the table was opened) means the
+            // index is ahead of the reader, so the scan stays complete.
+            if located.iter().all(|(partition, file_id)| {
+                planned.contains(&(partition.as_str(), file_id.as_str()))
+            }) {
+                file_slices.retain(|fs| {
+                    located.contains(&(fs.partition_path.clone(), fs.file_id().to_string()))
+                });
+            }
+        }
+
         if base_file_only {
             for fs in &mut file_slices {
                 fs.log_files.clear();
             }
         }
         Ok(file_slices)
+    }
+
+    /// The file groups the record-level index names for the record keys
+    /// `filters` ask for, or `None` when the index cannot answer.
+    ///
+    /// Only an equality or `IN` filter on the table's single string record key
+    /// field (or on `_hoodie_record_key`) is a key lookup, and only on table
+    /// version 8 or later, whose metadata table this reader can list. The index
+    /// describes the latest commit, so a read as of an earlier instant does not
+    /// use it. Anything the lookup cannot handle, including an error, leaves
+    /// the full scan in place; the row-level mask still applies the filter to
+    /// whatever is read.
+    async fn file_groups_for_record_keys(
+        &self,
+        filters: &[Filter],
+        timestamp: &str,
+        table_schema: &Schema,
+    ) -> Option<HashSet<(String, String)>> {
+        use crate::expr::ExprOperator;
+        use crate::index::{HoodieIndex, HoodieKey, RecordIndex, is_record_index_enabled};
+
+        let metadata_off = self
+            .hudi_configs
+            .get_raw(HudiTableConfig::MetadataTableEnabled.as_ref())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
+        if filters.is_empty()
+            || metadata_off
+            || !self.is_metadata_table_enabled()
+            || !is_record_index_enabled(self)
+            || self.timeline.get_latest_commit_timestamp_as_option() != Some(timestamp)
+        {
+            return None;
+        }
+        let version: isize = self
+            .hudi_configs
+            .try_get(HudiTableConfig::TableVersion)
+            .ok()
+            .flatten()
+            .map(Into::into)?;
+        if version < 8 {
+            return None;
+        }
+        let key_fields: Vec<String> = self
+            .hudi_configs
+            .try_get(HudiTableConfig::RecordKeyFields)
+            .ok()
+            .flatten()
+            .map(Into::into)?;
+        let [key_field] = key_fields.as_slice() else {
+            return None;
+        };
+        // The index stores the key as a string; only a string column's filter
+        // value is that same text.
+        let key_is_string = matches!(
+            table_schema.field_with_name(key_field).ok()?.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
+        let prefixed = match crate::write::keygen::encodes_single_key_field_name(&self.hudi_configs)
+        {
+            Ok(prefixed) => prefixed,
+            Err(e) => {
+                log::warn!("record index lookup skipped: {e}");
+                return None;
+            }
+        };
+        // Below table version 9 a complex key generator may have stored the
+        // key with or without the field name (see
+        // `ensure_complex_keygen_validated`), so only the bare form is looked up.
+        if prefixed && version < 9 {
+            return None;
+        }
+        let mut keys: Option<HashSet<String>> = None;
+        for filter in filters {
+            if !matches!(filter.operator, ExprOperator::Eq | ExprOperator::In) {
+                continue;
+            }
+            let values: HashSet<String> = if filter.field == *key_field {
+                if !key_is_string {
+                    return None;
+                }
+                filter
+                    .values
+                    .iter()
+                    .map(|v| {
+                        if prefixed {
+                            format!("{key_field}:{v}")
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect()
+            } else if filter.field == MetaField::RecordKey.as_ref() {
+                filter.values.iter().cloned().collect()
+            } else {
+                continue;
+            };
+            keys = Some(match keys {
+                Some(prior) => prior.intersection(&values).cloned().collect(),
+                None => values,
+            });
+        }
+        let keys = keys?;
+        if !crate::index::record_index_has_file_groups(self).await {
+            return None;
+        }
+        // The index is read at its current state while this reader holds an
+        // older snapshot: a key deleted or moved since would come back absent
+        // or elsewhere. Only an index whose latest commit is this snapshot's
+        // can answer for it.
+        match self.get_or_init_metadata_table().await {
+            Ok(metadata_table)
+                if metadata_table
+                    .timeline
+                    .get_latest_commit_timestamp_as_option()
+                    == Some(timestamp) => {}
+            Ok(_) => return None,
+            Err(e) => {
+                log::warn!("record index lookup skipped: {e}");
+                return None;
+            }
+        }
+        // The lookup lists the index's files as they are now, so a base file
+        // compacted after this snapshot would be read as if it belonged to it.
+        let slices = match crate::write::metadata::mdt_partition_latest_slices(
+            self.file_system_view.storage.as_ref(),
+            crate::metadata::table::records::MetadataPartitionType::RecordIndex.partition_name(),
+        )
+        .await
+        {
+            Ok(slices) => slices,
+            Err(e) => {
+                log::warn!("record index lookup skipped: {e}");
+                return None;
+            }
+        };
+        let newer_base = slices.iter().any(|(_, base, _)| {
+            base.as_deref()
+                .and_then(|path| path.rsplit('/').next())
+                .and_then(|name| name.parse::<crate::file_group::base_file::BaseFile>().ok())
+                .is_some_and(|base| base.commit_timestamp.as_str() > timestamp)
+        });
+        if newer_base {
+            return None;
+        }
+        let hoodie_keys: Vec<HoodieKey> = keys
+            .into_iter()
+            .map(|record_key| HoodieKey {
+                record_key,
+                partition_path: String::new(),
+            })
+            .collect();
+        match RecordIndex.tag_location(self, &hoodie_keys).await {
+            Ok(located) => Some(
+                located
+                    .into_values()
+                    .flatten()
+                    .map(|location| (location.partition_path, location.file_id))
+                    .collect(),
+            ),
+            Err(e) => {
+                log::warn!("record index lookup failed, reading every file slice: {e}");
+                None
+            }
+        }
     }
 
     async fn get_file_slices_between_inner(

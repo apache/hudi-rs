@@ -21,6 +21,7 @@
 mod record;
 mod simple;
 
+pub(crate) use record::record_index_has_file_groups;
 pub use record::{RecordIndex, is_record_index_enabled};
 pub use simple::SimpleIndex;
 
