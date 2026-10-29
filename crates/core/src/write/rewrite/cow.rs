@@ -441,7 +441,7 @@ pub(super) fn restamp_matched_rows(
     let new_ct: ArrayRef = std::sync::Arc::new(StringArray::from(vec![instant; batch.num_rows()]));
     let new_sq: ArrayRef = std::sync::Arc::new(StringArray::from(
         (0..batch.num_rows())
-            .map(|row| format!("{instant}_0-{row}-0"))
+            .map(|row| format!("{instant}_0_{row}"))
             .collect::<Vec<_>>(),
     ));
     let mut columns = batch.columns().to_vec();

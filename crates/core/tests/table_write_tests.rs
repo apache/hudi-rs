@@ -4419,3 +4419,54 @@ async fn test_create_normalizes_and_validates_options_before_persisting() {
     assert!(error.to_string().contains("ordering"), "{error}");
     assert!(!dir.path().join(".hoodie").exists());
 }
+
+/// Sequence numbers take Java's `{instant}_{partition}_{row}` form on both
+/// newly written and updated rows.
+#[tokio::test]
+async fn test_commit_seqno_uses_java_form() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    table
+        .update("id = 'b'", batch(vec![("b", 20)]).project(&[1]).unwrap())
+        .await
+        .unwrap();
+
+    let mut seqnos = Vec::new();
+    for batch in table.read(&ReadOptions::new()).await.unwrap() {
+        let column = |name| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (times, seqs, ids) = (
+            column("_hoodie_commit_time"),
+            column("_hoodie_commit_seqno"),
+            column("id"),
+        );
+        for row in 0..batch.num_rows() {
+            let suffix = seqs.value(row).strip_prefix(times.value(row)).unwrap();
+            seqnos.push((ids.value(row).to_string(), suffix.to_string()));
+        }
+    }
+    seqnos.sort();
+    assert_eq!(
+        seqnos,
+        vec![
+            ("a".to_string(), "_0_0".to_string()),
+            ("b".to_string(), "_0_1".to_string()),
+        ]
+    );
+}

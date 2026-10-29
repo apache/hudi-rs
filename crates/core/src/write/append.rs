@@ -1117,9 +1117,10 @@ pub(crate) fn prepare_batches_for_write_with_offset(
             fields.extend(batch.schema().fields().iter().cloned());
             let mut columns: Vec<ArrayRef> = vec![
                 Arc::new(StringArray::from(vec![instant; rows])),
+                // Java `HoodieRecord.generateSequenceId`.
                 Arc::new(StringArray::from(
                     (0..rows)
-                        .map(|row| format!("{instant}_{partition_id}-{}-0", row_id_offset + row))
+                        .map(|row| format!("{instant}_{partition_id}_{}", row_id_offset + row))
                         .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(key_strs)),
