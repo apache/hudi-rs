@@ -219,7 +219,8 @@ returns:
   with `start_timestamp` set to the instant the write returned. On table
   version 9 that bound is a completion time and the write returns the
   requested time, so this selects exactly the new commit. After an upsert the
-  result must be exactly the upserted keys, one row each. A Hudi incremental
+  result must equal the upsert's input, compared like the read-back oracle
+  (same keys, one row each, same columns, types and values). A Hudi incremental
   read does not return deletes (the leg declares this with
   `incremental_emits_deletes: false`), so after a delete it must return no
   rows; a leg that declares it returns deletes must return exactly the deleted
@@ -354,7 +355,8 @@ single repetition produces the same shape.
 
 **Headroom gate.** Timings from a busy machine say more about the machine
 than about the writer, so before each leg and before every timed call (the
-load, each commit, the read-back) the harness reads the 1-minute load average,
+load, each commit, the read-back, and in `training-set` each incremental and
+time-travel read) the harness reads the 1-minute load average,
 available memory and free disk on the work dir's volume, and refuses to go on
 when load1 is above `--max-load1` (default 2.0), available memory is below
 `--min-mem-gib` (default 16), or free disk is below 3x the base dataset. Since
@@ -368,7 +370,9 @@ refuses even then, because a copy-on-write commit can rewrite the whole table
 and running the disk out mid-commit is worse than not running. `summarize.py`
 refuses to render a file with any violated reading unless given
 `--allow-loaded`. A `--smoke` run turns load and memory refusals into warnings
-by default, since it is a setup check and not a timed result. Nothing else
+and does not wait for load to settle (`--settle-timeout` defaults to 0 there),
+since it is a setup check and not a timed result; under `--force` the gate
+never waits. Nothing else
 should run on the machine while a leg is being timed, and legs are best run
 one per invocation.
 

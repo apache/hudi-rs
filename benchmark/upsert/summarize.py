@@ -107,7 +107,14 @@ def readings(leg):
         for ph in rep.get("phases", {}).values():
             if ph.get("headroom"):
                 out.append(ph["headroom"])
-            out += [c["headroom"] for c in ph.get("commits", []) if c.get("headroom")]
+            for c in ph.get("commits", []):
+                if c.get("headroom"):
+                    out.append(c["headroom"])
+                out += [
+                    r["headroom"]
+                    for r in c.get("reads", {}).values()
+                    if r.get("headroom")
+                ]
     return out
 
 

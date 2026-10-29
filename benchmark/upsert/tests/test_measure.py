@@ -141,6 +141,39 @@ def test_force_downgrades_load_but_not_disk(monkeypatch):
         bench.gate(".", 1, limits(force=True, settle_timeout=0), "x")
 
 
+def test_forced_gate_does_not_wait_for_load_to_settle(monkeypatch):
+    calls = []
+
+    def headroom(work_dir, base_bytes, lim):
+        calls.append(1)
+        return {
+            "load1": 9.0,
+            "mem_available_bytes": 1,
+            "disk_free_bytes": 1,
+            "violations": {"load1": "busy"},
+        }
+
+    monkeypatch.setattr(bench, "headroom", headroom)
+    monkeypatch.setattr(bench.time, "sleep", lambda s: pytest.fail("gate slept"))
+    r = bench.gate(".", 1, limits(force=True, settle_timeout=180), "x")
+    assert r["headroom_violated"] and len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "smoke, given, force, settle",
+    [
+        (True, None, True, 0.0),
+        (True, 30.0, True, 30.0),
+        (False, None, False, 180.0),
+        (False, 5.0, False, 5.0),
+    ],
+)
+def test_smoke_defaults(smoke, given, force, settle):
+    a = argparse.Namespace(smoke=smoke, settle_timeout=given, force=False)
+    bench.apply_smoke_defaults(a)
+    assert (a.force, a.settle_timeout) == (force, settle)
+
+
 def test_run_lock_refuses_a_second_run_and_releases(tmp_path):
     with bench.RunLock(tmp_path, "s"):
         with pytest.raises(SystemExit, match="holds"):

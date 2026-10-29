@@ -67,6 +67,50 @@ def test_upsert_returning_anything_else_fails(changed):
         reads(FakeLeg(changed=changed), "upsert", UPSERT)
 
 
+def test_upsert_input_in_any_order_matches_sorted_changed_rows():
+    unsorted = UPSERT.take(pa.array([1, 0]))
+    out = reads(FakeLeg(changed=UPSERT), "upsert", unsorted)
+    assert out["incremental"]["changed_rows"] == 2
+
+
+def test_upsert_with_the_right_keys_but_stale_values_fails():
+    stale = UPSERT.set_column(1, "updated_at", pa.array([10, 2], pa.int64()))
+    with pytest.raises(bench.CheckFailed, match="updated_at"):
+        reads(FakeLeg(changed=stale), "upsert", UPSERT)
+
+
+def test_upsert_returning_only_the_key_column_fails():
+    with pytest.raises(bench.CheckFailed, match="columns_missing"):
+        reads(FakeLeg(changed=UPSERT.select(["id"])), "upsert", UPSERT)
+
+
+def test_reads_are_gated_and_the_readings_recorded():
+    seen = []
+
+    def gate_before(what):
+        seen.append(what)
+        return {"load1": 0.5}
+
+    out = bench.measure_reads(
+        FakeLeg(changed=UPSERT),
+        PLAN,
+        0,
+        1,
+        0,
+        "upsert",
+        UPSERT,
+        BASE,
+        False,
+        gate_before,
+    )
+    assert seen == ["incremental read after upsert", "time travel read"]
+    assert (
+        out["incremental"]["headroom"]
+        == out["time_travel"]["headroom"]
+        == {"load1": 0.5}
+    )
+
+
 def test_delete_for_a_leg_without_delete_rows_must_return_nothing():
     reads(FakeLeg(), "delete", DELETE)
     with pytest.raises(bench.CheckFailed, match="does not return deletes"):

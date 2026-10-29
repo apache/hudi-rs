@@ -195,6 +195,11 @@ def load_extra_legs(paths):
         module.register(api)
 
 
+# What hudi-core's key generator raises for a multi-field record key before
+# apache/hudi-rs#871 (crates/core/src/write/keygen.rs).
+COMPOSITE_KEY_REJECTION = "writes currently require exactly one record key field"
+
+
 class HudiLeg(Leg):
     def __init__(self, name, table_type, record_index):
         self.name = name
@@ -249,6 +254,11 @@ class HudiLeg(Leg):
                 pa.table({"k1": ["a"], "k2": ["b"], "v": [1]})
             )
         except Exception as e:
+            # Only the writer's own rejection of a multi-field key means the
+            # capability is missing; anything else is a real failure.
+            rejected = type(e).__name__ == "HudiCoreError"
+            if not rejected or COMPOSITE_KEY_REJECTION not in str(e):
+                raise
             raise LegUnavailable(
                 "hudi rejected a one-row write with a two-field record key "
                 f"({type(e).__name__}: {e}); composite keys need apache/hudi-rs#871"
@@ -441,7 +451,8 @@ def gate(work_dir, base_bytes, limits, what):
     load1 is a one-minute moving average that the benchmark itself raises, so
     when it is the only violation the gate polls for up to --settle-timeout,
     letting the previous commit's own load decay instead of counting it against
-    the next. Memory and disk shortfalls do not settle, so they are judged at
+    the next; under --force, where a load violation only warns, it does not
+    wait. Memory and disk shortfalls do not settle, so they are judged at
     once. A disk shortfall refuses even under --force: a copy-on-write commit
     can rewrite the whole table, and running out of disk mid-commit hurts more
     than the run.
@@ -450,7 +461,7 @@ def gate(work_dir, base_bytes, limits, what):
     while True:
         r = headroom(work_dir, base_bytes, limits)
         v = r["violations"]
-        settling = list(v) == ["load1"]
+        settling = list(v) == ["load1"] and not limits.force
         if not settling or time.monotonic() - start >= limits.settle_timeout:
             break
         time.sleep(2)
@@ -546,20 +557,32 @@ def _key_set(table, key_cols):
     return set(key_strings(table, key_cols).to_pylist())
 
 
-def measure_reads(leg, plan, prev, cur, first, kind, arg, base, emits_deletes):
+def measure_reads(
+    leg, plan, prev, cur, first, kind, arg, base, emits_deletes, gate_before=None
+):
     """The two reads a training-data consumer makes after a commit: what changed,
-    and the table as it was when first loaded. Neither is in the commit time."""
+    and the table as it was when first loaded. Neither is in the commit time;
+    ``gate_before(what)`` is the headroom gate, run before each timed read."""
     keys = plan["key_cols"]
+    room = gate_before(f"incremental read after {kind}") if gate_before else None
     t0 = time.perf_counter()
     rows, changed, deleted = leg.incremental(prev, cur)
     inc = {"wall_s": time.perf_counter() - t0, "rows": rows}
+    if room is not None:
+        inc["headroom"] = room
     n_changed = 0 if changed is None else changed.num_rows
     n_deleted = 0 if deleted is None else deleted.num_rows
     want = _key_set(arg, keys)
     if kind == "upsert":
-        expected = f"exactly the {arg.num_rows} upserted keys as changed rows"
-        ok = n_changed == arg.num_rows and _key_set(changed, keys) == want
-        ok = ok and n_deleted == 0
+        expected = f"exactly the {arg.num_rows} upserted rows, values included"
+        got = changed if changed is not None else arg.schema.empty_table()
+        # compare_tables expects the expected side sorted by key, as the
+        # oracle files are; the commit's input is in generation order.
+        same = compare_tables(got, sorted_by_key(arg, keys), keys)
+        if not same["passed"]:
+            inc["mismatches"] = same["mismatches"]
+            expected += ": " + json.dumps(same["mismatches"], default=str)[:1500]
+        ok = same["passed"] and n_deleted == 0
     elif emits_deletes:
         expected = f"no changed rows and exactly the {arg.num_rows} deleted keys"
         ok = n_changed == 0 and n_deleted == arg.num_rows
@@ -573,6 +596,7 @@ def measure_reads(leg, plan, prev, cur, first, kind, arg, base, emits_deletes):
             f"incremental read after {kind} returned {n_changed} changed and "
             f"{n_deleted} deleted rows; expected {expected}"
         )
+    room = gate_before("time travel read") if gate_before else None
     t0 = time.perf_counter()
     tt = leg.time_travel(first)
     wall = time.perf_counter() - t0
@@ -585,6 +609,8 @@ def measure_reads(leg, plan, prev, cur, first, kind, arg, base, emits_deletes):
         "rows": tt.num_rows,
         "matches_load": res["passed"],
     }
+    if room is not None:
+        out["time_travel"]["headroom"] = room
     if not res["passed"]:
         raise CheckFailed(
             "time travel to the load does not return the loaded table: "
@@ -646,6 +672,7 @@ def run_commits(leg, root, wd, plan, kind, w, a):
                 arg,
                 base,
                 emits_deletes,
+                lambda what: gate(root, a.base_bytes, a, f"{what} (commit {c})"),
             )
             w.flush()
         if a.reclaim:
@@ -896,7 +923,14 @@ def all_readings(leg):
         for ph in rep.get("phases", {}).values():
             if ph.get("headroom"):
                 out.append(ph["headroom"])
-            out += [c["headroom"] for c in ph.get("commits", []) if c.get("headroom")]
+            for c in ph.get("commits", []):
+                if c.get("headroom"):
+                    out.append(c["headroom"])
+                out += [
+                    r["headroom"]
+                    for r in c.get("reads", {}).values()
+                    if r.get("headroom")
+                ]
     return out
 
 
@@ -1276,8 +1310,9 @@ def add_headroom_args(p):
     p.add_argument(
         "--settle-timeout",
         type=float,
-        default=180.0,
-        help="seconds the gate waits for the machine to become idle before refusing",
+        default=None,
+        help="seconds the gate waits for the machine to become idle before refusing "
+        "(default 180; 0 with --smoke)",
     )
     p.add_argument(
         "--force",
@@ -1285,6 +1320,15 @@ def add_headroom_args(p):
         help="downgrade a headroom refusal to a warning; the results are tagged "
         "headroom_violated and summarize.py will not render them by default",
     )
+
+
+def apply_smoke_defaults(a):
+    """A smoke run checks the setup rather than timing anything, so a busy
+    machine only warns and the gate does not wait for load to settle."""
+    if a.smoke:
+        a.force = True
+    if a.settle_timeout is None:
+        a.settle_timeout = 0.0 if a.smoke else 180.0
 
 
 def fmt_s(v):
@@ -1391,8 +1435,7 @@ def main():
         # Time travel and incremental reads need the superseded files.
         a.reclaim = False
 
-    if a.smoke:
-        a.force = True
+    apply_smoke_defaults(a)
     work = Path(a.work_dir).resolve()
     work.mkdir(parents=True, exist_ok=True)
     a.work_dir = work

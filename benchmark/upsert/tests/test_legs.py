@@ -99,10 +99,28 @@ class FakeHudi:
 COMPOSITE = {"key_cols": ["a", "b"], "ordering": None}
 
 
+class HudiCoreError(Exception):
+    """Stands in for hudi's exception class, which the binding does not export."""
+
+
 def test_hudi_composite_key_probe_rejection_is_unavailable(tmp_path):
     leg = bench.HudiLeg("hudi-cow", "cow", True)
+    rejection = HudiCoreError(
+        "writes currently require exactly one record key field (or none for auto keys)"
+    )
     with pytest.raises(bench.LegUnavailable, match=r"apache/hudi-rs#871"):
-        leg._check_capabilities(FakeHudi(ValueError("no")), tmp_path / "t", COMPOSITE)
+        leg._check_capabilities(FakeHudi(rejection), tmp_path / "t", COMPOSITE)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError("disk full"), HudiCoreError("some other write error")],
+    ids=["os error", "other hudi error"],
+)
+def test_hudi_composite_key_probe_other_errors_fail_the_leg(tmp_path, error):
+    leg = bench.HudiLeg("hudi-cow", "cow", True)
+    with pytest.raises(type(error)):
+        leg._check_capabilities(FakeHudi(error), tmp_path / "t", COMPOSITE)
 
 
 def test_hudi_composite_key_probe_success_writes_a_two_field_key_and_cleans_up(
