@@ -1855,6 +1855,67 @@ async fn test_mor_log_rows_name_their_file_group() {
     }
 }
 
+/// Copy-on-write write stats count each file's own updates, inserts and
+/// deletes, as Java's handles do, not the commit totals.
+#[tokio::test]
+async fn test_cow_write_stats_count_per_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let mut table = Table::create(path)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([city_batch(vec![("a", "sf", 1), ("b", "nyc", 2)])])
+        .await
+        .unwrap();
+    table
+        .upsert([city_batch(vec![("a", "sf", 10), ("c", "la", 3)])])
+        .await
+        .unwrap();
+    let counts = |table: &Table| {
+        let table = table.clone();
+        async move {
+            let instant = table.timeline.completed_commits.last().unwrap().clone();
+            let json = table
+                .timeline
+                .get_instant_metadata_in_json(&instant)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let mut counts: Vec<(String, i64, i64, i64)> = json["partitionToWriteStats"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .flat_map(|(partition, stats)| {
+                    stats.as_array().unwrap().iter().map(move |stat| {
+                        let n = |k: &str| stat[k].as_i64().unwrap_or(0);
+                        (
+                            partition.clone(),
+                            n("numUpdateWrites"),
+                            n("numInserts"),
+                            n("numDeletes"),
+                        )
+                    })
+                })
+                .collect();
+            counts.sort();
+            counts
+        }
+    };
+    let table = Table::new(path).await.unwrap();
+    assert_eq!(
+        counts(&table).await,
+        vec![
+            ("city=la".to_string(), 0, 1, 0),
+            ("city=sf".to_string(), 1, 0, 0)
+        ]
+    );
+}
+
 #[tokio::test]
 async fn test_upsert_rejects_schema_mismatch() {
     let dir = tempdir().unwrap();

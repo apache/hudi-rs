@@ -270,9 +270,9 @@ pub(super) async fn rewrite(
                         base_file: Some(group.out_name.clone()),
                         prev_commit: Some(prev_commit),
                         num_writes: Some(num_rows as i64),
-                        num_deletes: Some(deletes as i64),
-                        num_update_writes: Some(updates as i64),
-                        num_inserts: Some(inserts as i64),
+                        num_deletes: Some(0),
+                        num_update_writes: Some(0),
+                        num_inserts: Some(num_rows as i64),
                         total_write_bytes: Some(output.size),
                         file_size_in_bytes: Some(output.size),
                         partition_path: Some(group.partition.clone()),
@@ -459,6 +459,8 @@ pub(super) struct MergeOutput {
     pub(super) num_rows: usize,
     /// Rows the op affected in this group (updated or deleted).
     pub(super) matched: usize,
+    /// Input rows this group gained as inserts.
+    pub(super) inserted: usize,
     pub(super) ranges: Option<Vec<crate::metadata::table::column_stats::ColumnRangeStats>>,
     /// (record key, partition) tombstones for removed rows.
     pub(super) rli_deletes: Vec<(String, String)>,
@@ -519,6 +521,7 @@ pub(super) fn merge_file_group_task(
             .await?;
         let key_field = MetaField::RecordKey.as_ref();
         let mut rli_deletes = Vec::new();
+        let mut inserted = 0;
         let (merged, matched) = match plan.op {
             GroupOp::Upsert {
                 incoming,
@@ -629,6 +632,7 @@ pub(super) fn merge_file_group_task(
                 } else {
                     merged
                 };
+                inserted = incoming.num_rows() - matched;
                 (merged, matched)
             }
             GroupOp::DeleteKeys { exact, keys_only } => {
@@ -674,6 +678,7 @@ pub(super) fn merge_file_group_task(
                         size: 0,
                         num_rows: 0,
                         matched: 0,
+                        inserted: 0,
                         ranges: None,
                         rli_deletes,
                     });
@@ -689,6 +694,7 @@ pub(super) fn merge_file_group_task(
                         size: 0,
                         num_rows: 0,
                         matched: 0,
+                        inserted: 0,
                         ranges: None,
                         rli_deletes,
                     });
@@ -744,6 +750,7 @@ pub(super) fn merge_file_group_task(
             size,
             num_rows,
             matched,
+            inserted,
             ranges,
             rli_deletes,
         })
@@ -885,11 +892,13 @@ pub(super) async fn commit_merge_plans(
                 collect_ranges,
             )
             .await?;
+            let num_rows = prepared.iter().map(RecordBatch::num_rows).sum();
             Ok(MergeOutput {
                 wrote: true,
                 size: output.size,
-                num_rows: prepared.iter().map(RecordBatch::num_rows).sum(),
+                num_rows,
                 matched: 0,
+                inserted: num_rows,
                 ranges: output.ranges,
                 rli_deletes: Vec::new(),
             })
@@ -949,6 +958,15 @@ pub(super) async fn commit_merge_plans(
                             base_file: Some(out_name.clone()),
                             prev_commit: Some(prev_commit.clone()),
                             num_writes: Some(output.num_rows as i64),
+                            num_update_writes: Some(match matched_slot {
+                                MatchedSlot::Deletes => 0,
+                                _ => output.matched as i64,
+                            }),
+                            num_deletes: Some(match matched_slot {
+                                MatchedSlot::Deletes => output.matched as i64,
+                                _ => 0,
+                            }),
+                            num_inserts: Some(output.inserted as i64),
                             partition_path: Some(partition.clone()),
                             total_write_bytes: Some(output.size),
                             file_size_in_bytes: Some(output.size),
@@ -987,16 +1005,6 @@ pub(super) async fn commit_merge_plans(
         MatchedSlot::Updates => (matched_total, 0),
         MatchedSlot::Deletes => (updates, matched_total),
     };
-
-    // Fill the per-stat operation counters the way the previous driver did
-    // (totals on each stat).
-    for stats in partition_to_write_stats.values_mut() {
-        for stat in stats.iter_mut() {
-            stat.num_deletes = Some(deletes as i64);
-            stat.num_update_writes = Some(updates as i64);
-            stat.num_inserts = Some(inserts as i64);
-        }
-    }
 
     // Zero effect anywhere: abort the fenced instant, leave no commit.
     if abort_on_noop && written_paths.is_empty() {
