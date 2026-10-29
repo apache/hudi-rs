@@ -18,12 +18,13 @@
  */
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::properties::escape_property;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::config::table::{HudiTableConfig, TableTypeValue, TimelineTimezoneValue};
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
@@ -234,7 +235,7 @@ impl TableCreateBuilder {
     }
 
     /// Create the table layout on storage and open a [`Table`] handle.
-    pub async fn create(self) -> Result<Table> {
+    pub async fn create(mut self) -> Result<Table> {
         // The builder derives the metadata table layout, key generator and
         // checksum from these, so an override would persist a table that
         // disagrees with what was initialized.
@@ -375,15 +376,20 @@ impl TableCreateBuilder {
         // LOCAL like the Spark writer default: Spark table services mint
         // LOCAL-time instants regardless of the table property, so declaring
         // (and minting) LOCAL keeps mixed-writer timelines ordered.
-        let timeline_timezone = self
+        // Java reads the zone with the case-sensitive `HoodieTimelineTimeZone.valueOf`.
+        let timeline_timezone = match self
             .options
-            .get(HudiTableConfig::TimelineTimezone.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "LOCAL".to_string());
-        crate::write::set_commit_timezone(&timeline_timezone);
+            .remove(HudiTableConfig::TimelineTimezone.as_ref())
+            .map(|zone| TimelineTimezoneValue::from_str(&zone))
+            .transpose()?
+        {
+            Some(TimelineTimezoneValue::UTC) => "UTC",
+            Some(TimelineTimezoneValue::Local) | None => "LOCAL",
+        };
+        crate::write::set_commit_timezone(timeline_timezone);
         props.insert(
             HudiTableConfig::TimelineTimezone.as_ref().to_string(),
-            timeline_timezone,
+            timeline_timezone.to_string(),
         );
         props.insert("hoodie.table.cdc.enabled".to_string(), "false".to_string());
         props.insert(
@@ -516,12 +522,12 @@ impl TableCreateBuilder {
             HudiTableConfig::BasePath.as_ref().to_string(),
             self.base_uri.clone(),
         );
+        let configs = HudiConfigs::new(hudi_for_storage);
+        // Refuse what opening the table would reject before any file is written.
+        crate::table::validation::validate_configs(&configs)?;
         let mut storage_options = self.storage_options.clone();
         crate::table::builder::resolve_storage_env_vars(&mut storage_options);
-        let storage = Storage::new(
-            Arc::new(storage_options),
-            Arc::new(HudiConfigs::new(hudi_for_storage)),
-        )?;
+        let storage = Storage::new(Arc::new(storage_options), Arc::new(configs))?;
 
         let properties_path = format!("{HUDI_METADATA_DIR}/hoodie.properties");
         if storage.exists(&properties_path).await? {

@@ -4341,3 +4341,32 @@ async fn test_delete_keys_in_wrong_partition_is_noop() {
     assert!(result.instant.is_empty());
     assert_eq!(timeline_files(), before);
 }
+
+/// The timeline zone is persisted in the case Java parses, and options that
+/// opening the table rejects fail before anything is written.
+#[tokio::test]
+async fn test_create_normalizes_and_validates_options_before_persisting() {
+    let dir = tempdir().unwrap();
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_option("hoodie.table.timeline.timezone", "local")
+        .create()
+        .await
+        .unwrap();
+    let properties = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+    assert!(
+        properties.contains("hoodie.table.timeline.timezone=LOCAL\n"),
+        "{properties}"
+    );
+
+    let dir = tempdir().unwrap();
+    let error = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["a", "b"])
+        .create()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ordering"), "{error}");
+    assert!(!dir.path().join(".hoodie").exists());
+}

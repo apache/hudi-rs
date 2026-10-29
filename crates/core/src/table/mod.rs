@@ -93,7 +93,7 @@ pub mod file_pruner;
 pub(crate) mod fs_view;
 mod listing;
 pub mod partition;
-mod validation;
+pub(crate) mod validation;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
 pub use crate::index::{HoodieKey, SimpleIndex};
