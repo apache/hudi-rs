@@ -413,36 +413,53 @@ pub async fn update_record_index(
         .chain(deletes_by_shard.keys())
         .copied()
         .collect();
+    // Building a shard's blocks (sorting its keys, encoding the HFile) is
+    // CPU-only, so up to one shard per core is built on the blocking pool while
+    // finished shards are written, in shard order, and released.
+    use futures::StreamExt;
+    let parallelism = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let mut builds = futures::stream::iter(shards)
+        .map(|shard| {
+            let puts = puts_by_shard.remove(&shard).unwrap_or_default();
+            let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
+            let schema_json = schema_json.clone();
+            let instant = instant.to_string();
+            tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>, i64)> {
+                let mut log_bytes = Vec::new();
+                let mut num_writes = 0i64;
+                if !puts.is_empty() {
+                    num_writes += puts.len() as i64;
+                    let hfile = HFileWriter::write(
+                        &puts,
+                        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+                    )
+                    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+                    log_bytes.extend(LogFileWriter::write_log_block(
+                        BlockType::HfileData,
+                        HashMap::from([
+                            (BlockMetadataKey::InstantTime, instant.clone()),
+                            (BlockMetadataKey::Schema, schema_json),
+                        ]),
+                        &hfile,
+                    ));
+                }
+                if !deletes.is_empty() {
+                    num_writes += deletes.len() as i64;
+                    log_bytes.extend(crate::write::build_delete_log_block(&instant, &deletes, 0)?);
+                }
+                Ok((shard, log_bytes, num_writes))
+            })
+        })
+        .buffered(parallelism);
     let mut stats = Vec::new();
-    for shard in shards {
-        let file_id = record_index_file_id(shard);
-        let puts = puts_by_shard.remove(&shard).unwrap_or_default();
-        let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
-        let mut log_bytes = Vec::new();
-        let mut num_writes = 0i64;
-        if !puts.is_empty() {
-            num_writes += puts.len() as i64;
-            let hfile = HFileWriter::write(
-                &puts,
-                BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
-            )
-            .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
-            log_bytes.extend(LogFileWriter::write_log_block(
-                BlockType::HfileData,
-                HashMap::from([
-                    (BlockMetadataKey::InstantTime, instant.to_string()),
-                    (BlockMetadataKey::Schema, schema_json.clone()),
-                ]),
-                &hfile,
-            ));
-        }
-        if !deletes.is_empty() {
-            num_writes += deletes.len() as i64;
-            log_bytes.extend(crate::write::build_delete_log_block(instant, &deletes, 0)?);
-        }
+    while let Some(shard_build) = builds.next().await {
+        let (shard, log_bytes, num_writes) = shard_build.map_err(|e| {
+            crate::error::CoreError::Write(format!("record index shard build failed: {e}"))
+        })??;
         if log_bytes.is_empty() {
             continue;
         }
+        let file_id = record_index_file_id(shard);
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
         let log_rel = format!("record_index/{log_name}");
         let log_size = log_bytes.len() as i64;
