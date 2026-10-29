@@ -63,8 +63,12 @@ use validate::*;
 /// Result of an upsert, delete, or overwrite write.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WriteResult {
-    /// Completed instant timestamp.
+    /// Completed instant timestamp (the requested time).
     pub instant: String,
+    /// Completion time of the instant on timeline layout v2, which is what an
+    /// incremental read's start bound is compared against on that layout.
+    /// `None` on layout v1 and when no commit was written.
+    pub completion_time: Option<String>,
     /// Number of rows written to replacement base files.
     pub num_writes: usize,
     /// Number of input keys that replaced existing rows.

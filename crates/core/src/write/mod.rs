@@ -484,7 +484,8 @@ pub(crate) fn commit_metadata_bytes(
 /// effort: a transient failure must not turn a committed write into an error
 /// the caller would retry.
 ///
-/// Returns the completed instant's path relative to the table base.
+/// Returns the completed instant's path relative to the table base and its
+/// completion time (timeline layout v2 only).
 pub(crate) async fn complete_write(
     table: &mut crate::table::Table,
     instant: &str,
@@ -493,7 +494,7 @@ pub(crate) async fn complete_write(
     schema: &arrow_schema::Schema,
     updates: MetadataTableUpdates,
     written_paths: &[String],
-) -> Result<String> {
+) -> Result<CompletedWrite> {
     let storage = table.file_system_view.storage.clone();
     let mut mdt_stats = HashMap::new();
     if table.is_metadata_table_enabled() {
@@ -555,7 +556,7 @@ pub(crate) async fn complete_write(
     } else {
         None
     };
-    let completed = Instant::new_completed(instant.to_string(), action, completion)?;
+    let completed = Instant::new_completed(instant.to_string(), action, completion.clone())?;
     let commit_relative_path = completed.relative_path_with_base(&append::timeline_dir(table))?;
     storage
         .put_file_if_absent(&commit_relative_path, commit_bytes)
@@ -565,7 +566,19 @@ pub(crate) async fn complete_write(
 
     let _ = table.timeline.reload_completed_commits().await;
     table.clear_read_caches();
-    Ok(commit_relative_path)
+    Ok(CompletedWrite {
+        commit_relative_path,
+        completion_time: completion,
+    })
+}
+
+/// What [`complete_write`] stored on the timeline.
+pub(crate) struct CompletedWrite {
+    /// Path of the completed instant, relative to the table base.
+    pub commit_relative_path: String,
+    /// Completion time of the instant on timeline layout v2; `None` on v1,
+    /// which records none.
+    pub completion_time: Option<String>,
 }
 
 #[cfg(test)]

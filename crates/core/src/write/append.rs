@@ -53,8 +53,10 @@ static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 /// What an append wrote.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppendResult {
-    /// Timestamp of the completed instant.
+    /// Timestamp of the completed instant (the requested time).
     pub instant: String,
+    /// Completion time of the instant on timeline layout v2; `None` on v1.
+    pub completion_time: Option<String>,
     /// Path of the completed instant, relative to the table base.
     pub commit_relative_path: String,
     /// Path of the first base file written, relative to the table base.
@@ -327,7 +329,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 
     let commit_bytes =
         crate::write::commit_metadata_bytes(table, "INSERT", write_stats, None, schema.as_ref())?;
-    let commit_relative_path = crate::write::complete_write(
+    let completed = crate::write::complete_write(
         table,
         &request_instant,
         action,
@@ -348,7 +350,8 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 
     Ok(AppendResult {
         instant: request_instant,
-        commit_relative_path,
+        completion_time: completed.completion_time,
+        commit_relative_path: completed.commit_relative_path,
         base_file_path: primary_base_path,
         num_rows,
     })
@@ -502,6 +505,7 @@ async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<
     table.clear_read_caches();
     Ok(AppendResult {
         instant,
+        completion_time: None,
         commit_relative_path,
         base_file_path,
         num_rows,

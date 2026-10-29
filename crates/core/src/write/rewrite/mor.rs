@@ -626,7 +626,7 @@ pub(super) async fn mor_upsert_batches(
         None,
         incoming.schema().as_ref(),
     )?;
-    crate::write::complete_write(
+    let completed = crate::write::complete_write(
         table,
         &instant,
         Action::DeltaCommit,
@@ -643,6 +643,7 @@ pub(super) async fn mor_upsert_batches(
     .await?;
     Ok(WriteResult {
         instant,
+        completion_time: completed.completion_time,
         num_writes: incoming.num_rows(),
         num_updates: updates,
         num_inserts: inserts,
@@ -805,7 +806,7 @@ pub(super) async fn mor_delete_keys(
         None,
         &schema,
     )?;
-    crate::write::complete_write(
+    let completed = crate::write::complete_write(
         table,
         &instant,
         Action::DeltaCommit,
@@ -822,6 +823,7 @@ pub(super) async fn mor_delete_keys(
     .await?;
     Ok(WriteResult {
         instant,
+        completion_time: completed.completion_time,
         num_writes: 0,
         num_updates: 0,
         num_inserts: 0,
