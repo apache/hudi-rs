@@ -419,7 +419,7 @@ fn table_version(table: &Table) -> isize {
     table.hudi_configs.get(TableVersion).map_or(0, isize::from)
 }
 
-fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<arrow_schema::SchemaRef> {
+fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<()> {
     let Some(first) = batches.first() else {
         return Err(CoreError::Write(
             "append requires at least one RecordBatch".to_string(),
@@ -435,7 +435,7 @@ fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<arrow_schema::
             "All RecordBatches in append must share the same schema".to_string(),
         ));
     }
-    Ok(schema)
+    Ok(())
 }
 
 fn ensure_rows_present(batches: &[RecordBatch]) -> Result<usize> {
@@ -967,7 +967,8 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
     }
 }
 
-/// Checks the batches against the table schema, widened to its nullability.
+/// Checks the batches against the table schema and returns them with every
+/// column the table declares nullable made nullable.
 async fn match_table_schema(table: &Table, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     if table.timeline.completed_commits.is_empty() {
         return Ok(batches.to_vec());
@@ -1063,6 +1064,11 @@ fn schemas_equal_by_fields(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -
         .all(|(fa, fb)| fa.name() == fb.name() && fa.data_type() == fb.data_type())
 }
 
+/// `_hoodie_commit_seqno`, in Java's `HoodieRecord.generateSequenceId` form.
+pub(crate) fn commit_seqno(instant: &str, partition_id: u32, row: usize) -> String {
+    format!("{instant}_{partition_id}_{row}")
+}
+
 pub(crate) fn prepare_batches_for_write(
     hudi_configs: &crate::config::HudiConfigs,
     batches: &[RecordBatch],
@@ -1117,10 +1123,9 @@ pub(crate) fn prepare_batches_for_write_with_offset(
             fields.extend(batch.schema().fields().iter().cloned());
             let mut columns: Vec<ArrayRef> = vec![
                 Arc::new(StringArray::from(vec![instant; rows])),
-                // Java `HoodieRecord.generateSequenceId`.
                 Arc::new(StringArray::from(
                     (0..rows)
-                        .map(|row| format!("{instant}_{partition_id}_{}", row_id_offset + row))
+                        .map(|row| commit_seqno(instant, partition_id, row_id_offset + row))
                         .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(key_strs)),

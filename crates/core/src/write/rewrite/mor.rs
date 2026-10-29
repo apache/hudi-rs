@@ -784,14 +784,10 @@ pub(super) async fn moved_keys_rejected_by_event_time(
     slices: &HashMap<String, crate::file_group::file_slice::FileSlice>,
 ) -> Result<HashSet<String>> {
     let mut rejected = HashSet::new();
-    if moved.is_empty() || !uses_event_time_merge(&table.hudi_configs)? {
+    if moved.is_empty() {
         return Ok(rejected);
     }
-    let ordering_fields: Vec<String> = table
-        .hudi_configs
-        .try_get(OrderingFields)?
-        .map(Into::into)
-        .unwrap_or_default();
+    let ordering_fields = event_time_ordering_fields(&table.hudi_configs)?;
     let Some(ordering_field) = ordering_fields.first() else {
         return Ok(rejected);
     };

@@ -46,10 +46,13 @@ use crate::write::rollback::action_from_fencing_name;
 const DEFAULT_KEEP_MIN_COMMITS: usize = 20;
 /// Java `hoodie.keep.max.commits` default.
 const DEFAULT_KEEP_MAX_COMMITS: usize = 30;
+
 /// `hoodie.keep.min.commits` and `hoodie.keep.max.commits`. Min must be at
 /// least 1, or archival would take the commit that just completed and leave no
 /// active commit for readers to admit files by, and max must not be below min.
-pub(crate) fn keep_commits(hudi_configs: &crate::config::HudiConfigs) -> Result<(usize, usize)> {
+pub(crate) fn validated_keep_range(
+    hudi_configs: &crate::config::HudiConfigs,
+) -> Result<(usize, usize)> {
     let options = hudi_configs.as_options();
     let parse = |key: &str, default: usize| -> Result<usize> {
         options.get(key).map_or(Ok(default), |value| {
@@ -684,15 +687,14 @@ mod delete_failure_tests {
         assert!(result.is_err());
     }
 
-    fn archived_instants(timeline: &std::path::Path) -> Vec<String> {
-        use arrow_array::{Array, StringArray};
+    fn archived_batches(timeline: &std::path::Path) -> Vec<arrow_array::RecordBatch> {
         let history = timeline.join("history");
         let version = std::fs::read_to_string(history.join("_version_")).unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(
             &std::fs::read(history.join(format!("manifest_{}", version.trim()))).unwrap(),
         )
         .unwrap();
-        let mut instants = Vec::new();
+        let mut batches = Vec::new();
         for entry in manifest["files"].as_array().unwrap() {
             let bytes = std::fs::read(history.join(entry["fileName"].as_str().unwrap())).unwrap();
             let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
@@ -701,11 +703,21 @@ mod delete_failure_tests {
             .unwrap()
             .build()
             .unwrap();
-            for batch in reader {
-                let column = batch.unwrap().column(0).clone();
-                let column = column.as_any().downcast_ref::<StringArray>().unwrap();
-                instants.extend((0..column.len()).map(|i| column.value(i).to_string()));
-            }
+            batches.extend(reader.map(Result::unwrap));
+        }
+        batches
+    }
+
+    fn archived_instants(timeline: &std::path::Path) -> Vec<String> {
+        use arrow_array::{Array, StringArray};
+        let mut instants = Vec::new();
+        for batch in archived_batches(timeline) {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            instants.extend((0..column.len()).map(|i| column.value(i).to_string()));
         }
         instants.sort();
         instants
@@ -752,34 +764,18 @@ mod delete_failure_tests {
             .await
             .unwrap();
 
-        let history = timeline.join("history");
-        let version = std::fs::read_to_string(history.join("_version_")).unwrap();
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(history.join(format!("manifest_{}", version.trim()))).unwrap(),
-        )
-        .unwrap();
         let mut plans = Vec::new();
-        for entry in manifest["files"].as_array().unwrap() {
-            let bytes = std::fs::read(history.join(entry["fileName"].as_str().unwrap())).unwrap();
-            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
-                bytes::Bytes::from(bytes),
-            )
-            .unwrap()
-            .build()
-            .unwrap();
-            for batch in reader {
-                let batch = batch.unwrap();
-                let instants = batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .unwrap();
-                let plan = batch.column_by_name("plan").unwrap();
-                let plan = plan.as_any().downcast_ref::<BinaryArray>().unwrap();
-                for row in 0..batch.num_rows() {
-                    let bytes = (!plan.is_null(row)).then(|| plan.value(row).to_vec());
-                    plans.push((instants.value(row).to_string(), bytes));
-                }
+        for batch in archived_batches(&timeline) {
+            let instants = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let plan = batch.column_by_name("plan").unwrap();
+            let plan = plan.as_any().downcast_ref::<BinaryArray>().unwrap();
+            for row in 0..batch.num_rows() {
+                let bytes = (!plan.is_null(row)).then(|| plan.value(row).to_vec());
+                plans.push((instants.value(row).to_string(), bytes));
             }
         }
         plans.sort();

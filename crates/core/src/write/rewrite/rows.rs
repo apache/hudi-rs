@@ -351,14 +351,7 @@ pub(super) fn deduplicate_last_by_key(
     // Java routes in-batch dedupe through the merge-mode-derived merger
     // (BaseWriteHelper.reduceRecords), so a COMMIT_TIME_ORDERING table never
     // consults the ordering value here either — last occurrence wins.
-    let ordering_fields: Vec<String> = if uses_event_time_merge(hudi_configs)? {
-        hudi_configs
-            .try_get(OrderingFields)?
-            .map(Into::into)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
+    let ordering_fields = event_time_ordering_fields(hudi_configs)?;
     // One comparator per ordering field, hoisted out of the duplicate loop;
     // fields compare lexicographically (first field breaks ties via the next).
     let comparators = ordering_fields

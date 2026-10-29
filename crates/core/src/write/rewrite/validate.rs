@@ -203,3 +203,34 @@ pub(super) fn uses_event_time_merge(hudi_configs: &crate::config::HudiConfigs) -
             .map(|v| -> Vec<String> { v.into() })
             .is_some_and(|fields| fields.iter().any(|f| !f.trim().is_empty())))
 }
+
+/// The ordering fields a write compares, empty unless it merges by event time.
+pub(super) fn event_time_ordering_fields(
+    hudi_configs: &crate::config::HudiConfigs,
+) -> Result<Vec<String>> {
+    if !uses_event_time_merge(hudi_configs)? {
+        return Ok(Vec::new());
+    }
+    Ok(hudi_configs
+        .try_get(OrderingFields)?
+        .map(Into::into)
+        .unwrap_or_default())
+}
+
+/// A partial update under event-time ordering must set every ordering field:
+/// the merged row carries the winner's ordering value, or a later write
+/// ordered between the two would beat the newer data.
+pub(super) fn ensure_partial_update_sets_ordering(
+    hudi_configs: &crate::config::HudiConfigs,
+    update_columns: &[String],
+) -> Result<()> {
+    if let Some(field) = event_time_ordering_fields(hudi_configs)?
+        .into_iter()
+        .find(|field| !update_columns.contains(field))
+    {
+        return Err(CoreError::Write(format!(
+            "a partial update under event-time ordering must include the ordering field '{field}' in its update columns"
+        )));
+    }
+    Ok(())
+}

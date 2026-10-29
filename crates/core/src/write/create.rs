@@ -376,16 +376,15 @@ impl TableCreateBuilder {
         // LOCAL like the Spark writer default: Spark table services mint
         // LOCAL-time instants regardless of the table property, so declaring
         // (and minting) LOCAL keeps mixed-writer timelines ordered.
-        // Java reads the zone with the case-sensitive `HoodieTimelineTimeZone.valueOf`.
-        let timeline_timezone = match self
+        // Taken out of the options so the copy loop below cannot put back a
+        // spelling Java's case-sensitive parse rejects.
+        let timeline_timezone = self
             .options
             .remove(HudiTableConfig::TimelineTimezone.as_ref())
             .map(|zone| TimelineTimezoneValue::from_str(&zone))
             .transpose()?
-        {
-            Some(TimelineTimezoneValue::UTC) => "UTC",
-            Some(TimelineTimezoneValue::Local) | None => "LOCAL",
-        };
+            .unwrap_or(TimelineTimezoneValue::Local)
+            .java_name();
         crate::write::set_commit_timezone(timeline_timezone);
         props.insert(
             HudiTableConfig::TimelineTimezone.as_ref().to_string(),
@@ -525,7 +524,7 @@ impl TableCreateBuilder {
         let configs = HudiConfigs::new(hudi_for_storage);
         // Refuse what opening the table would reject before any file is written.
         crate::table::validation::validate_configs(&configs)?;
-        crate::write::archival::keep_commits(&configs)?;
+        crate::write::archival::validated_keep_range(&configs)?;
         let mut storage_options = self.storage_options.clone();
         crate::table::builder::resolve_storage_env_vars(&mut storage_options);
         let storage = Storage::new(Arc::new(storage_options), Arc::new(configs))?;

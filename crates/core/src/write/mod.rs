@@ -111,9 +111,9 @@ pub(crate) fn align_batch_to_schema(
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
 }
 
-/// Keeps every column the table declares nullable nullable: older files may
-/// hold nulls, and a commit schema that tightened the column would fail every
-/// later read of them (Java's `canonicalizeSchema` widens the same way).
+/// Never tightens a column the table declares nullable: older files may hold
+/// nulls, and a commit schema that tightened the column would fail every later
+/// read of them (Java's `canonicalizeSchema` widens the same way).
 /// Callers have already matched the batches to `table_schema` by name and type.
 pub(crate) fn widen_to_table_nullability(
     batches: &[arrow_array::RecordBatch],
@@ -425,7 +425,7 @@ pub(crate) async fn post_complete_bookkeeping(
     instant: &str,
 ) -> Result<()> {
     markers::delete_marker_dir(storage, instant).await;
-    let (min_keep, max_keep) = archival::keep_commits(&table.hudi_configs)?;
+    let (min_keep, max_keep) = archival::validated_keep_range(&table.hudi_configs)?;
     // Not held behind the latest MDT compaction as Java's archiver is: an
     // archived instant's MDT log blocks stay valid through its MDT
     // deltacommit, which the MDT keeps active until a compaction covers it.

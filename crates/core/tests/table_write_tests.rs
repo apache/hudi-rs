@@ -220,6 +220,26 @@ async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
 }
 
 /// A rejected write must leave no instant on the data timeline.
+fn timeline_file_count(base: &std::path::Path) -> usize {
+    std::fs::read_dir(base.join(".hoodie/timeline"))
+        .unwrap()
+        .count()
+}
+
+fn nullable_value_batch(nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, nullable),
+        ])),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
 fn assert_no_instant(base: &std::path::Path) {
     let names: Vec<String> = std::fs::read_dir(base.join(".hoodie/timeline"))
         .unwrap()
@@ -665,12 +685,7 @@ async fn test_partial_upsert_under_event_time_carries_ordering_value() {
         .upsert([ordered_batch(vec![("a", 1, 10)])])
         .await
         .unwrap();
-    let timeline_files = || {
-        std::fs::read_dir(dir.path().join(".hoodie/timeline"))
-            .unwrap()
-            .count()
-    };
-    let before = timeline_files();
+    let before = timeline_file_count(dir.path());
 
     let partial = |columns: &[&str]| UpsertOptions {
         update_columns: Some(columns.iter().map(|c| c.to_string()).collect()),
@@ -680,7 +695,7 @@ async fn test_partial_upsert_under_event_time_carries_ordering_value() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("event_time"), "{error}");
-    assert_eq!(timeline_files(), before);
+    assert_eq!(timeline_file_count(dir.path()), before);
 
     table
         .upsert_with(
@@ -4286,25 +4301,16 @@ async fn test_append_keeps_nullable_table_column_nullable() {
         .create()
         .await
         .unwrap();
-    let value_batch = |nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>| {
-        RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("value", DataType::Int64, nullable),
-            ])),
-            vec![
-                Arc::new(StringArray::from(ids)),
-                Arc::new(Int64Array::from(values)),
-            ],
-        )
-        .unwrap()
-    };
     table
-        .append([value_batch(true, vec!["a", "b"], vec![Some(1), None])])
+        .append([nullable_value_batch(
+            true,
+            vec!["a", "b"],
+            vec![Some(1), None],
+        )])
         .await
         .unwrap();
     table
-        .append([value_batch(false, vec!["c"], vec![Some(3)])])
+        .append([nullable_value_batch(false, vec!["c"], vec![Some(3)])])
         .await
         .unwrap();
 
@@ -4326,25 +4332,16 @@ async fn test_upsert_keeps_nullable_table_column_nullable() {
             .create()
             .await
             .unwrap();
-        let value_batch = |nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>| {
-            RecordBatch::try_new(
-                Arc::new(Schema::new(vec![
-                    Field::new("id", DataType::Utf8, false),
-                    Field::new("value", DataType::Int64, nullable),
-                ])),
-                vec![
-                    Arc::new(StringArray::from(ids)),
-                    Arc::new(Int64Array::from(values)),
-                ],
-            )
-            .unwrap()
-        };
         table
-            .upsert([value_batch(true, vec!["a", "b"], vec![Some(1), None])])
+            .upsert([nullable_value_batch(
+                true,
+                vec!["a", "b"],
+                vec![Some(1), None],
+            )])
             .await
             .unwrap();
         table
-            .upsert([value_batch(false, vec!["c"], vec![Some(3)])])
+            .upsert([nullable_value_batch(false, vec!["c"], vec![Some(3)])])
             .await
             .unwrap();
 
@@ -4374,12 +4371,7 @@ async fn test_delete_keys_in_wrong_partition_is_noop() {
         .append([partitioned_batch(vec![("a", "sf", 1)])])
         .await
         .unwrap();
-    let timeline_files = || {
-        std::fs::read_dir(dir.path().join(".hoodie/timeline"))
-            .unwrap()
-            .count()
-    };
-    let before = timeline_files();
+    let before = timeline_file_count(dir.path());
 
     let result = table
         .delete_keys([HoodieKey {
@@ -4390,7 +4382,7 @@ async fn test_delete_keys_in_wrong_partition_is_noop() {
         .unwrap();
     assert_eq!(result.num_deletes, 0);
     assert!(result.instant.is_empty());
-    assert_eq!(timeline_files(), before);
+    assert_eq!(timeline_file_count(dir.path()), before);
 }
 
 /// Archival must keep at least one commit and trigger at or above the count
@@ -4442,10 +4434,9 @@ async fn test_invalid_archival_keep_range_is_rejected() {
     }
 }
 
-/// The timeline zone is persisted in the case Java parses, and options that
-/// opening the table rejects fail before anything is written.
+/// The timeline zone is persisted in the case Java parses.
 #[tokio::test]
-async fn test_create_normalizes_and_validates_options_before_persisting() {
+async fn test_create_persists_timeline_zone_in_java_case() {
     let dir = tempdir().unwrap();
     Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
@@ -4458,7 +4449,12 @@ async fn test_create_normalizes_and_validates_options_before_persisting() {
         properties.contains("hoodie.table.timeline.timezone=LOCAL\n"),
         "{properties}"
     );
+}
 
+/// Options that opening the table rejects fail create before anything is
+/// written.
+#[tokio::test]
+async fn test_create_rejects_unopenable_options_before_persisting() {
     let dir = tempdir().unwrap();
     let error = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")

@@ -478,6 +478,16 @@ pub enum TimelineTimezoneValue {
     Local,
 }
 
+impl TimelineTimezoneValue {
+    /// The name Java's case-sensitive `HoodieTimelineTimeZone.valueOf` reads.
+    pub(crate) fn java_name(&self) -> &'static str {
+        match self {
+            Self::UTC => "UTC",
+            Self::Local => "LOCAL",
+        }
+    }
+}
+
 impl FromStr for TimelineTimezoneValue {
     type Err = ConfigError;
 

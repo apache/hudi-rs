@@ -188,23 +188,7 @@ pub async fn upsert_batches(
                 )));
             }
         }
-        // The merged row must carry the winner's ordering value, or a later
-        // write ordered between the two would beat the newer data.
-        if uses_event_time_merge(&table.hudi_configs)? {
-            let ordering_fields: Vec<String> = table
-                .hudi_configs
-                .try_get(OrderingFields)?
-                .map(Into::into)
-                .unwrap_or_default();
-            if let Some(field) = ordering_fields
-                .iter()
-                .find(|field| !columns.contains(field))
-            {
-                return Err(CoreError::Write(format!(
-                    "a partial update under event-time ordering must include the ordering field '{field}' in its update columns"
-                )));
-            }
-        }
+        ensure_partial_update_sets_ordering(&table.hudi_configs, columns)?;
     }
     // The input row's delete marker applies whatever columns a partial upsert
     // selects; Java checks the incoming record for a delete before merging.
