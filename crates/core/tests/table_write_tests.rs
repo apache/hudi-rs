@@ -4342,6 +4342,55 @@ async fn test_delete_keys_in_wrong_partition_is_noop() {
     assert_eq!(timeline_files(), before);
 }
 
+/// Archival must keep at least one commit and trigger at or above the count
+/// it trims to. Create refuses any other range before writing, and a write
+/// opened with one fails before it starts.
+#[tokio::test]
+async fn test_invalid_archival_keep_range_is_rejected() {
+    for (min, max) in [("0", "2"), ("4", "3"), ("x", "30")] {
+        let dir = tempdir().unwrap();
+        let error = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.keep.min.commits", min)
+            .with_option("hoodie.keep.max.commits", max)
+            .create()
+            .await
+            .expect_err("invalid keep range accepted");
+        assert!(
+            error.to_string().contains("hoodie.keep.min.commits"),
+            "{error}"
+        );
+        assert!(!dir.path().join(".hoodie").exists());
+
+        let base_uri = dir.path().to_str().unwrap();
+        Table::create(base_uri)
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        let mut table = Table::new_with_options(
+            base_uri,
+            [
+                ("hoodie.keep.min.commits", min),
+                ("hoodie.keep.max.commits", max),
+            ],
+        )
+        .await
+        .unwrap();
+        let error = table
+            .append([batch(vec![("a", 1)])])
+            .await
+            .expect_err("invalid keep range accepted");
+        assert!(
+            error.to_string().contains("hoodie.keep.min.commits"),
+            "{error}"
+        );
+        assert_no_instant(dir.path());
+    }
+}
+
 /// The timeline zone is persisted in the case Java parses, and options that
 /// opening the table rejects fail before anything is written.
 #[tokio::test]

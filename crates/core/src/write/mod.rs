@@ -425,15 +425,7 @@ pub(crate) async fn post_complete_bookkeeping(
     instant: &str,
 ) -> Result<()> {
     markers::delete_marker_dir(storage, instant).await;
-    let options = table.hudi_configs.as_options();
-    let min_keep = options
-        .get("hoodie.keep.min.commits")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(archival::DEFAULT_KEEP_MIN_COMMITS);
-    let max_keep = options
-        .get("hoodie.keep.max.commits")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(archival::DEFAULT_KEEP_MAX_COMMITS);
+    let (min_keep, max_keep) = archival::keep_commits(&table.hudi_configs)?;
     let history_path: String = table
         .hudi_configs
         .get_or_default(crate::config::table::HudiTableConfig::TimelineHistoryPath)

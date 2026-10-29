@@ -525,6 +525,7 @@ impl TableCreateBuilder {
         let configs = HudiConfigs::new(hudi_for_storage);
         // Refuse what opening the table would reject before any file is written.
         crate::table::validation::validate_configs(&configs)?;
+        crate::write::archival::keep_commits(&configs)?;
         let mut storage_options = self.storage_options.clone();
         crate::table::builder::resolve_storage_env_vars(&mut storage_options);
         let storage = Storage::new(Arc::new(storage_options), Arc::new(configs))?;

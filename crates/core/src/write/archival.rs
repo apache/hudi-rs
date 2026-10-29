@@ -43,9 +43,31 @@ use crate::storage::Storage;
 use crate::write::rollback::action_from_fencing_name;
 
 /// Java `hoodie.keep.min.commits` default.
-pub(crate) const DEFAULT_KEEP_MIN_COMMITS: usize = 20;
+const DEFAULT_KEEP_MIN_COMMITS: usize = 20;
 /// Java `hoodie.keep.max.commits` default.
-pub(crate) const DEFAULT_KEEP_MAX_COMMITS: usize = 30;
+const DEFAULT_KEEP_MAX_COMMITS: usize = 30;
+/// `hoodie.keep.min.commits` and `hoodie.keep.max.commits`. Min must be at
+/// least 1, or archival would take the commit that just completed and leave no
+/// active commit for readers to admit files by, and max must not be below min.
+pub(crate) fn keep_commits(hudi_configs: &crate::config::HudiConfigs) -> Result<(usize, usize)> {
+    let options = hudi_configs.as_options();
+    let parse = |key: &str, default: usize| -> Result<usize> {
+        options.get(key).map_or(Ok(default), |value| {
+            value
+                .parse()
+                .map_err(|_| CoreError::Write(format!("{key}={value} is not a commit count")))
+        })
+    };
+    let min_keep = parse("hoodie.keep.min.commits", DEFAULT_KEEP_MIN_COMMITS)?;
+    let max_keep = parse("hoodie.keep.max.commits", DEFAULT_KEEP_MAX_COMMITS)?;
+    if min_keep == 0 || max_keep < min_keep {
+        return Err(CoreError::Write(format!(
+            "hoodie.keep.min.commits={min_keep} must be at least 1 and at most hoodie.keep.max.commits={max_keep}"
+        )));
+    }
+    Ok((min_keep, max_keep))
+}
+
 /// Java `hoodie.timeline.manifest.retained.versions` default.
 const RETAINED_MANIFEST_VERSIONS: i64 = 3;
 
@@ -190,9 +212,6 @@ pub(crate) async fn archive_timeline_if_needed(
         .iter()
         .filter(|c| is_commit_action(&c.action))
         .count();
-    // Misconfigured min > max would underflow below and archive the whole
-    // timeline; treat min as the effective floor.
-    let min_keep = min_keep.min(max_keep);
     if commit_count <= max_keep {
         return Ok(());
     }
