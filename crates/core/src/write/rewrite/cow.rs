@@ -395,6 +395,21 @@ pub(super) struct MergeOutput {
     pub(super) rli_deletes: Vec<(String, String)>,
 }
 
+impl MergeOutput {
+    /// The op matched nothing in the group, which keeps its current file.
+    fn unchanged() -> Self {
+        Self {
+            wrote: false,
+            size: 0,
+            num_rows: 0,
+            matched: 0,
+            inserted: 0,
+            ranges: None,
+            rli_deletes: Vec::new(),
+        }
+    }
+}
+
 /// Replace `_hoodie_file_name` with `out_name` for every row.
 pub(super) fn restamp_file_name(batch: &RecordBatch, out_name: &str) -> Result<RecordBatch> {
     let Some((index, _)) = batch
@@ -582,6 +597,9 @@ pub(super) fn merge_file_group_task(
                     }
                 }
                 let matched = old.num_rows() - selected.len();
+                if matched == 0 {
+                    return Ok(MergeOutput::unchanged());
+                }
                 (take_batch(&old, &selected)?, matched)
             }
             GroupOp::DeleteWhere { filter } => {
@@ -602,15 +620,7 @@ pub(super) fn merge_file_group_task(
                     }
                 }
                 if matched == 0 {
-                    return Ok(MergeOutput {
-                        wrote: false,
-                        size: 0,
-                        num_rows: 0,
-                        matched: 0,
-                        inserted: 0,
-                        ranges: None,
-                        rli_deletes,
-                    });
+                    return Ok(MergeOutput::unchanged());
                 }
                 (take_batch(&old, &selected)?, matched)
             }
@@ -618,15 +628,7 @@ pub(super) fn merge_file_group_task(
                 let mask = filters_to_row_mask(std::slice::from_ref(&filter), &old)?;
                 let (updated, matched) = apply_set_updates(&old, &mask, &set)?;
                 if matched == 0 {
-                    return Ok(MergeOutput {
-                        wrote: false,
-                        size: 0,
-                        num_rows: 0,
-                        matched: 0,
-                        inserted: 0,
-                        ranges: None,
-                        rli_deletes,
-                    });
+                    return Ok(MergeOutput::unchanged());
                 }
                 let updated = restamp_matched_rows(&updated, &mask, &ctx.instant)?;
                 // Setting the delete marker deletes the row, as an upsert does.

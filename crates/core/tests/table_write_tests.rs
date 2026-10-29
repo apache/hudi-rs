@@ -4306,3 +4306,38 @@ async fn test_upsert_keeps_nullable_table_column_nullable() {
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
     }
 }
+
+/// A key whose requested partition is not where it is stored matches nothing,
+/// so the delete commits nothing.
+#[tokio::test]
+async fn test_delete_keys_in_wrong_partition_is_noop() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([partitioned_batch(vec![("a", "sf", 1)])])
+        .await
+        .unwrap();
+    let timeline_files = || {
+        std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+            .unwrap()
+            .count()
+    };
+    let before = timeline_files();
+
+    let result = table
+        .delete_keys([HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: "city=nope".to_string(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(result.num_deletes, 0);
+    assert!(result.instant.is_empty());
+    assert_eq!(timeline_files(), before);
+}
