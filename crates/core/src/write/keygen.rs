@@ -29,7 +29,9 @@ use crate::config::table::HudiTableConfig::{
 use crate::error::CoreError;
 use crate::index::HoodieKey;
 use crate::keygen::record_key::{configured_record_key_fields, encode_record_keys};
-use crate::keygen::{declares_complex_key_generator, encodes_single_key_field_name};
+use crate::keygen::{
+    DEFAULT_PARTITION_PATH, declares_complex_key_generator, encodes_single_key_field_name,
+};
 
 /// Build per-row [`HoodieKey`]s from a write batch.
 ///
@@ -51,9 +53,6 @@ use crate::keygen::{declares_complex_key_generator, encodes_single_key_field_nam
 /// error (missing/null/wrong-type key or partition columns) before an instant
 /// is requested.
 pub(crate) const VALIDATION_INSTANT: &str = "00000000000000000";
-
-/// Java `PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH`.
-const DEFAULT_PARTITION_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// Java `HoodieWriteConfig.ENABLE_COMPLEX_KEYGEN_VALIDATION`.
 pub(crate) const COMPLEX_KEYGEN_VALIDATION: &str = "hoodie.write.complex.keygen.validation.enable";
