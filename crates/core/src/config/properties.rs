@@ -135,7 +135,7 @@ mod tests {
     #[test]
     fn test_parse_java_store_output() {
         let props = parse_properties(include_bytes!(
-            "../../tests/fixtures/properties/java-v9.properties"
+            "../../tests/data/properties/java-v9.properties"
         ))
         .unwrap();
         assert_eq!(props["hoodie.table.name"], "café");
@@ -153,7 +153,7 @@ mod tests {
     #[test]
     fn test_parse_java_load_grammar() {
         let props = parse_properties(include_bytes!(
-            "../../tests/fixtures/properties/java-byte-stream.properties"
+            "../../tests/data/properties/java-byte-stream.properties"
         ))
         .unwrap();
         assert_eq!(props["hoodie.test.iso"], "é");
