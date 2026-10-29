@@ -288,24 +288,71 @@ pub(crate) async fn archive_timeline_if_needed(
         plan_bytes.push(plan);
     }
 
-    let parquet = write_lsm_parquet(
-        &instant_times,
-        &completion_times,
-        &actions,
-        &metadata_bytes,
-        &plan_bytes,
-    )?;
     let history_dir = format!("{timeline_dir}/history");
     let min_instant = &to_archive[0].requested;
     let max_instant = &to_archive[to_archive.len() - 1].requested;
     let parquet_name = format!("{min_instant}_{max_instant}_0.parquet");
+    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
+    // A retry after the active files failed to go finds its file already
+    // published (Java LSMTimelineWriter skips it too); only the deletes remain.
+    if !manifest.files.iter().any(|f| f.file_name == parquet_name) {
+        publish_lsm_file(
+            storage,
+            &history_dir,
+            current_version,
+            &mut manifest,
+            parquet_name,
+            write_lsm_parquet(
+                &instant_times,
+                &completion_times,
+                &actions,
+                &metadata_bytes,
+                &plan_bytes,
+            )?,
+        )
+        .await?;
+    }
+
+    // Remove archived instants from the active timeline: fencing files first
+    // (ascending), completed files after. A fencing file that survives stops
+    // archival before any completed file goes, since an instant with fencing
+    // files and no completed file reads as a failed write to roll back.
+    for instant in &to_archive {
+        for fencing in fencing_by_instant
+            .get(&instant.requested)
+            .into_iter()
+            .flatten()
+        {
+            storage
+                .delete_file(&format!("{timeline_dir}/{fencing}"))
+                .await?;
+        }
+    }
+    // Completed files go in ascending order and stop at the first failure
+    // (Java TimelineArchiverV2), so the survivors are the newest instants and
+    // a retry never archives a set that skips a published instant.
+    for instant in &to_archive {
+        storage
+            .delete_file(&format!("{timeline_dir}/{}", instant.file_name))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Writes one level-0 file, then publishes it: manifest_{N+1}, then
+/// `_version_` (Java order).
+async fn publish_lsm_file(
+    storage: &Storage,
+    history_dir: &str,
+    current_version: i64,
+    manifest: &mut LsmManifest,
+    parquet_name: String,
+    parquet: Vec<u8>,
+) -> Result<()> {
     let parquet_len = parquet.len() as i64;
     storage
         .put_file(&format!("{history_dir}/{parquet_name}"), parquet)
         .await?;
-
-    // Manifest protocol: parquet → manifest_{N+1} → _version_ (Java order).
-    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
     manifest.files.push(LsmFileEntry {
         file_name: parquet_name,
         file_len: parquet_len,
@@ -334,27 +381,6 @@ pub(crate) async fn archive_timeline_if_needed(
             break;
         }
         stale -= 1;
-    }
-
-    // Remove archived instants from the active timeline: fencing files first
-    // (ascending), completed files after. A fencing file that survives stops
-    // archival before any completed file goes, since an instant with fencing
-    // files and no completed file reads as a failed write to roll back.
-    for instant in &to_archive {
-        for fencing in fencing_by_instant
-            .get(&instant.requested)
-            .into_iter()
-            .flatten()
-        {
-            storage
-                .delete_file(&format!("{timeline_dir}/{fencing}"))
-                .await?;
-        }
-    }
-    for instant in &to_archive {
-        let _ = storage
-            .delete_file(&format!("{timeline_dir}/{}", instant.file_name))
-            .await;
     }
     Ok(())
 }
@@ -569,18 +595,18 @@ mod delete_failure_tests {
     };
     use std::sync::Arc;
 
-    /// Fails every delete of an `.inflight` file.
+    /// Fails every delete of a path the predicate matches.
     #[derive(Debug)]
-    struct InflightDeleteFails(Arc<dyn ObjectStore>);
+    struct DeleteFails(Arc<dyn ObjectStore>, fn(&str) -> bool);
 
-    impl std::fmt::Display for InflightDeleteFails {
+    impl std::fmt::Display for DeleteFails {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "InflightDeleteFails({})", self.0)
+            write!(f, "DeleteFails({})", self.0)
         }
     }
 
     #[async_trait]
-    impl ObjectStore for InflightDeleteFails {
+    impl ObjectStore for DeleteFails {
         async fn put_opts(
             &self,
             location: &Path,
@@ -607,14 +633,15 @@ mod delete_failure_tests {
             locations: BoxStream<'static, Result<Path>>,
         ) -> BoxStream<'static, Result<Path>> {
             let inner = self.0.clone();
+            let fails = self.1;
             locations
                 .then(move |location| {
                     let inner = inner.clone();
                     async move {
                         let location = location?;
-                        if location.as_ref().ends_with(".inflight") {
+                        if fails(location.as_ref()) {
                             return Err(object_store::Error::Generic {
-                                store: "InflightDeleteFails",
+                                store: "DeleteFails",
                                 source: "delete failed".into(),
                             });
                         }
@@ -657,7 +684,9 @@ mod delete_failure_tests {
             std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
         }
         let base_url = url::Url::from_directory_path(dir.path()).unwrap();
-        let store = Arc::new(InflightDeleteFails(Arc::new(LocalFileSystem::new())));
+        let store = Arc::new(DeleteFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with(".inflight")
+        }));
         let storage =
             Storage::new_with_object_store(base_url, store, Arc::new(HudiConfigs::empty()));
 
@@ -671,5 +700,117 @@ mod delete_failure_tests {
             );
         }
         assert!(result.is_err());
+    }
+
+    fn archived_instants(timeline: &std::path::Path) -> Vec<String> {
+        use arrow_array::{Array, StringArray};
+        let history = timeline.join("history");
+        let version = std::fs::read_to_string(history.join("_version_")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(history.join(format!("manifest_{}", version.trim()))).unwrap(),
+        )
+        .unwrap();
+        let mut instants = Vec::new();
+        for entry in manifest["files"].as_array().unwrap() {
+            let bytes = std::fs::read(history.join(entry["fileName"].as_str().unwrap())).unwrap();
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                bytes::Bytes::from(bytes),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            for batch in reader {
+                let column = batch.unwrap().column(0).clone();
+                let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+                instants.extend((0..column.len()).map(|i| column.value(i).to_string()));
+            }
+        }
+        instants.sort();
+        instants
+    }
+
+    /// Completed files are deleted in instant order and archival stops at the
+    /// first failure, as in Java, and a retry does not rewrite a level-0 file
+    /// the manifest already lists. Otherwise a retry that archives only the
+    /// survivors can replace a published file and lose the instants deleted
+    /// in between.
+    #[tokio::test]
+    async fn test_archival_retry_after_completed_delete_failure_keeps_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=4).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants {
+            std::fs::write(timeline.join(format!("{ts}.commit.requested")), b"").unwrap();
+            std::fs::write(timeline.join(format!("{ts}.inflight")), b"").unwrap();
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let failing = Arc::new(DeleteFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with("20260101000000001_20260101000000001.commit")
+                || path.ends_with("20260101000000003_20260101000000003.commit")
+        }));
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            failing,
+            Arc::new(HudiConfigs::empty()),
+        );
+        let _ = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
+        for ts in &instants[..3] {
+            assert!(!timeline.join(format!("{ts}_{ts}.commit")).exists(), "{ts}");
+        }
+        assert!(
+            timeline
+                .join(format!("{0}_{0}.commit", instants[3]))
+                .exists()
+        );
+    }
+
+    /// A `_version_` write that lands and then errors leaves the active files
+    /// in place; the retry must not publish the same file a second time.
+    #[tokio::test]
+    async fn test_archival_retry_after_version_put_error_publishes_once() {
+        use crate::storage::fault::{FaultyPutStore, PutFault};
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=4).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants {
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let faulty = FaultyPutStore::new_for_any_put(
+            Arc::new(LocalFileSystem::new()),
+            PutFault::LandedThenError,
+            |path| path.as_ref().ends_with("history/_version_"),
+        );
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            faulty.clone(),
+            Arc::new(HudiConfigs::empty()),
+        );
+        let result = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        assert!(result.is_err() && !faulty.is_armed());
+
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
     }
 }
