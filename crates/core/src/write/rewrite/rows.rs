@@ -470,6 +470,116 @@ pub(super) fn partial_merge(
     RecordBatch::try_new(combined.schema(), columns).map_err(Into::into)
 }
 
+/// Merges each partial-upsert row that would change partition with its stored
+/// row before routing, as Java merges before deciding a partition move:
+/// unselected columns come from the stored row and the key is derived again
+/// from the merged values. A row whose merged partition is its stored one
+/// keeps its input values and is keyed to that partition, so the group merge
+/// resolves it as an in-place update. Keys in `rejected` are left as input.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn resolve_partial_moves(
+    table: &Table,
+    incoming: &RecordBatch,
+    tagged_keys: &[HoodieKey],
+    moved: &HashMap<String, Vec<String>>,
+    slices: &HashMap<String, crate::file_group::file_slice::FileSlice>,
+    rejected: &HashSet<String>,
+    update_columns: &[String],
+) -> Result<(RecordBatch, Vec<HoodieKey>)> {
+    let wanted: HashSet<&str> = moved
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .filter(|key| !rejected.contains(*key))
+        .collect();
+    let mut route_keys = tagged_keys.to_vec();
+    if wanted.is_empty() {
+        return Ok((incoming.clone(), route_keys));
+    }
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
+    let mut stored = Vec::new();
+    for file_id in moved.keys() {
+        let Some(slice) = slices.get(file_id) else {
+            continue;
+        };
+        let old = reader.read_file_slice(slice, &ReadOptions::new()).await?;
+        let rows: Vec<u32> = keys(&old, MetaField::RecordKey.as_ref())?
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| wanted.contains(key.as_str()))
+            .map(|(row, _)| row as u32)
+            .collect();
+        stored.push(take_batch(&old, &rows)?);
+    }
+    let stored = concat(&stored)?;
+    let stored = deduplicate_last_by_key(
+        &stored,
+        &keys(&stored, MetaField::RecordKey.as_ref())?,
+        &table.hudi_configs,
+    )?;
+    let stored_keys = keys(&stored, MetaField::RecordKey.as_ref())?;
+    let stored_partitions = string_values(&stored, MetaField::PartitionPath.as_ref())?;
+    let stored_partition: HashMap<&str, &str> = stored_keys
+        .iter()
+        .map(String::as_str)
+        .zip(stored_partitions.iter().map(String::as_str))
+        .collect();
+    let old_by_key: HashMap<String, u32> = stored_keys
+        .iter()
+        .enumerate()
+        .map(|(row, key)| (key.clone(), row as u32))
+        .collect();
+
+    let combined = concat_batches(&incoming.schema(), [&stored, incoming])?;
+    let selected: Vec<u32> = (0..incoming.num_rows())
+        .map(|row| (stored.num_rows() + row) as u32)
+        .collect();
+    let mut merge_columns = update_columns.to_vec();
+    merge_columns.extend(
+        MetaField::field_names_with_operation()
+            .into_iter()
+            .map(String::from),
+    );
+    let merged = partial_merge(&combined, &old_by_key, &selected, &merge_columns)?;
+    let merged_keys = hoodie_keys_for_batch(&table.hudi_configs, &merged, None)?;
+
+    let mut take = Vec::with_capacity(incoming.num_rows());
+    for (row, merged_key) in merged_keys.into_iter().enumerate() {
+        match stored_partition.get(merged_key.record_key.as_str()) {
+            Some(&partition) if merged_key.partition_path == partition => {
+                route_keys[row].partition_path = partition.to_string();
+                take.push(row as u32);
+            }
+            Some(_) => {
+                route_keys[row] = merged_key;
+                take.push((incoming.num_rows() + row) as u32);
+            }
+            None => take.push(row as u32),
+        }
+    }
+    let resolved = take_batch(
+        &concat_batches(&incoming.schema(), [incoming, &merged])?,
+        &take,
+    )?;
+    let (index, _) = resolved
+        .schema()
+        .column_with_name(MetaField::PartitionPath.as_ref())
+        .ok_or_else(|| CoreError::Write("partial upsert requires meta fields".to_string()))?;
+    let mut columns = resolved.columns().to_vec();
+    columns[index] = std::sync::Arc::new(StringArray::from_iter_values(
+        route_keys.iter().map(|key| key.partition_path.as_str()),
+    ));
+    Ok((
+        RecordBatch::try_new(resolved.schema(), columns)?,
+        route_keys,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

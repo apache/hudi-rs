@@ -292,8 +292,24 @@ pub async fn upsert_batches(
     let rejected_moves =
         moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices)
             .await?;
+    let (incoming, route_keys) = match &options.update_columns {
+        Some(columns) if !moved_candidates.is_empty() => {
+            resolve_partial_moves(
+                table,
+                &incoming,
+                &incoming_hoodie_keys,
+                &moved_candidates,
+                &move_slices,
+                &rejected_moves,
+                columns,
+            )
+            .await?
+        }
+        _ => (incoming, incoming_hoodie_keys.clone()),
+    };
     let mut moved_deletes = Vec::new();
-    for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
+    for (index, (hoodie_key, route_key)) in incoming_hoodie_keys.iter().zip(&route_keys).enumerate()
+    {
         // A location whose file group has no live slice is a stale index
         // entry (its group was replaced); the row no longer exists, so the
         // incoming record is an insert (Java re-validates tags the same way).
@@ -306,7 +322,7 @@ pub async fn upsert_batches(
         // stored row. In-place markers are resolved by the group merge.
         if delete_markers[index]
             && !located.is_some_and(|location| {
-                location.partition_path == hoodie_key.partition_path
+                location.partition_path == route_key.partition_path
                     || rejected_moves.contains(&hoodie_key.record_key)
             })
         {
@@ -324,7 +340,7 @@ pub async fn upsert_batches(
             continue;
         }
         let target = match located {
-            Some(location) if location.partition_path == hoodie_key.partition_path => {
+            Some(location) if location.partition_path == route_key.partition_path => {
                 updates += 1;
                 Some(location.file_id.clone())
             }
@@ -353,7 +369,7 @@ pub async fn upsert_batches(
                 .or_default()
                 .push(index as u32),
             None => new_rows_by_partition
-                .entry(hoodie_key.partition_path.clone())
+                .entry(route_key.partition_path.clone())
                 .or_default()
                 .push(index as u32),
         }
@@ -452,7 +468,7 @@ pub async fn upsert_batches(
                     .map(|location| location.partition_path.clone())
                     .unwrap_or_else(|| key.partition_path.clone())
             } else {
-                key.partition_path.clone()
+                route_keys[row].partition_path.clone()
             };
             Some(RecordIndexEntry {
                 record_key: key.record_key.clone(),

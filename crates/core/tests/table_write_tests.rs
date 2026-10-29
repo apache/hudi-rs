@@ -644,6 +644,120 @@ async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
     );
 }
 
+fn zoned_batch(rows: &[(&str, &str, &str, i64, i64)]) -> RecordBatch {
+    let column =
+        |index: usize| -> Vec<&str> { rows.iter().map(|r| [r.0, r.1, r.2][index]).collect() };
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("zone", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(column(0))),
+            Arc::new(StringArray::from(column(1))),
+            Arc::new(StringArray::from(column(2))),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// A partial upsert merges with the stored row before routing: the merged
+/// partition decides whether the row moves, and a moved row keeps the
+/// stored values of the columns it does not update.
+#[tokio::test]
+async fn test_partial_upsert_routes_by_merged_partition() {
+    for (update_columns, expected) in [
+        (vec!["value"], ("sf", "z1", "city=sf/zone=z1")),
+        (vec!["city", "value"], ("ny", "z1", "city=ny/zone=z1")),
+        (
+            vec!["city", "zone", "value"],
+            ("ny", "z9", "city=ny/zone=z9"),
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut table = Table::create(path)
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city", "zone"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([zoned_batch(&[("a", "sf", "z1", 1, 10)])])
+            .await
+            .unwrap();
+        table
+            .upsert_with(
+                [zoned_batch(&[("a", "ny", "z9", 2, 20)])],
+                UpsertOptions {
+                    update_columns: Some(update_columns.iter().map(|c| c.to_string()).collect()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let batches = Table::new(path)
+            .await
+            .unwrap()
+            .read(&ReadOptions::new())
+            .await
+            .unwrap();
+        let rows = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let text = |name: &str| {
+            let column =
+                arrow::compute::cast(rows.column_by_name(name).unwrap(), &DataType::Utf8).unwrap();
+            let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..column.len())
+                .map(|i| column.value(i).to_string())
+                .collect::<Vec<_>>()
+        };
+        let (city, zone, partition_path) = expected;
+        assert_eq!(
+            [
+                text("id"),
+                text("city"),
+                text("zone"),
+                text("ts"),
+                text("value"),
+                text("_hoodie_partition_path")
+            ],
+            [
+                vec!["a".to_string()],
+                vec![city.to_string()],
+                vec![zone.to_string()],
+                vec!["1".to_string()],
+                vec!["20".to_string()],
+                vec![partition_path.to_string()]
+            ],
+            "{update_columns:?}"
+        );
+
+        // The index must point at the row's final location.
+        table
+            .upsert([zoned_batch(&[("a", city, zone, 3, 30)])])
+            .await
+            .unwrap();
+        let rows: usize = table
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 1, "{update_columns:?}");
+    }
+}
+
 #[tokio::test]
 async fn test_partial_upsert_stale_event_time_keeps_lineage() {
     // A partial update whose ordering value LOSES the event-time merge must
