@@ -222,11 +222,12 @@ impl Table {
             .await
     }
 
-    /// Drop the listing cache and the metadata-table handle, after the
-    /// timeline has been reloaded around a write.
+    /// Drop the listing cache, the metadata-table handle and the file-stats
+    /// sample, after the timeline has been reloaded around a write.
     pub(crate) fn clear_read_caches(&mut self) {
         self.file_system_view.clear_cache();
         self.cached_metadata_table = Arc::new(OnceCell::new());
+        self.cached_estimator = Arc::new(OnceCell::new());
     }
 
     /// Reload the active timeline and drop listing caches before a write plans.
@@ -2971,6 +2972,40 @@ mod tests {
         let initialized = table.get_or_init_estimator(&latest_ts).await.unwrap();
         let cached = table.get_or_init_estimator(early_ts).await.unwrap();
         assert!(std::ptr::eq(initialized, cached));
+    }
+
+    /// A write on the handle drops the footer sample taken before it.
+    #[tokio::test]
+    async fn test_write_drops_cached_estimator() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let batch = |id: &str| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec![id])),
+                    Arc::new(Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([batch("a")]).await.unwrap();
+        let latest_ts = table.timeline.get_latest_commit_timestamp().unwrap();
+        assert!(table.get_or_init_estimator(&latest_ts).await.is_some());
+
+        table.append([batch("b")]).await.unwrap();
+        assert!(table.cached_estimator.get().is_none());
     }
 
     /// Regression test: the slice fan-out honours
