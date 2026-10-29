@@ -109,6 +109,154 @@ pub(crate) fn align_batch_to_schema(
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
 }
 
+/// The write's batches in the shape the rest of the write path compares exactly;
+/// see [`normalize_write_batch`].
+///
+/// Call after the timeline reload, so the schema is the table's current one.
+/// The schema is read only when a batch carries a list column, which is the
+/// only shape this changes.
+pub(crate) async fn normalize_for_write(
+    table: &crate::table::Table,
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    let has_list = batches.iter().any(|b| {
+        b.schema()
+            .fields()
+            .iter()
+            .any(|f| contains_list(f.data_type()))
+    });
+    let table_schema = if has_list
+        && table
+            .timeline
+            .get_latest_commit_timestamp_as_option()
+            .is_some()
+    {
+        Some(table.get_schema().await?)
+    } else {
+        None
+    };
+    batches
+        .iter()
+        .cloned()
+        .map(|batch| normalize_write_batch(batch, table_schema.as_ref()))
+        .collect()
+}
+
+fn contains_list(dt: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    match dt {
+        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => true,
+        DataType::Struct(fields) => fields.iter().any(|f| contains_list(f.data_type())),
+        DataType::Map(entries, _) => contains_list(entries.data_type()),
+        _ => false,
+    }
+}
+
+/// Bring a batch to the shape the rest of the write path compares exactly.
+///
+/// Fixed-size lists become lists at every nesting level, since Avro has only
+/// `array` and the readers hand lists back as `List`. Then, when the table
+/// already has a schema, a column whose type matches the table's up to list
+/// item names is cast to the table's type: a list read back from Avro names
+/// its item `element` while PyArrow names it `item`, and the cast only
+/// relabels. Columns that differ in any other way are left as they are, so
+/// the schema checks downstream reject them with their usual messages.
+fn normalize_write_batch(
+    batch: arrow_array::RecordBatch,
+    table_schema: Option<&arrow_schema::Schema>,
+) -> Result<arrow_array::RecordBatch> {
+    use arrow_schema::Field;
+    let mut changed = false;
+    let mut fields = Vec::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
+        let widened = widen_fixed_size_lists(field.data_type());
+        let target = match table_schema.and_then(|s| s.field_with_name(field.name()).ok()) {
+            Some(table_field) if same_up_to_list_item_names(&widened, table_field.data_type()) => {
+                table_field.data_type().clone()
+            }
+            _ => widened,
+        };
+        if &target == field.data_type() {
+            fields.push(field.clone());
+            columns.push(column.clone());
+            continue;
+        }
+        changed = true;
+        let casted = arrow::compute::cast(column.as_ref(), &target).map_err(|e| {
+            CoreError::Schema(format!(
+                "cannot convert column '{}' from {} to {target} for writing: {e}",
+                field.name(),
+                field.data_type()
+            ))
+        })?;
+        fields.push(std::sync::Arc::new(
+            Field::new(field.name(), target, field.is_nullable())
+                .with_metadata(field.metadata().clone()),
+        ));
+        columns.push(casted);
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    let schema = std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
+        fields,
+        batch.schema().metadata().clone(),
+    ));
+    arrow_array::RecordBatch::try_new(schema, columns)
+        .map_err(|e| CoreError::Schema(format!("cannot rebuild batch for writing: {e}")))
+}
+
+/// `dt` with every `FixedSizeList`, at any depth, replaced by a `List` of the
+/// same item.
+fn widen_fixed_size_lists(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
+    use arrow_schema::{DataType, Field};
+    let widen_field = |f: &std::sync::Arc<Field>| {
+        std::sync::Arc::new(
+            Field::new(
+                f.name(),
+                widen_fixed_size_lists(f.data_type()),
+                f.is_nullable(),
+            )
+            .with_metadata(f.metadata().clone()),
+        )
+    };
+    match dt {
+        DataType::FixedSizeList(item, _) | DataType::List(item) => {
+            DataType::List(widen_field(item))
+        }
+        DataType::LargeList(item) => DataType::LargeList(widen_field(item)),
+        DataType::Struct(fields) => DataType::Struct(fields.iter().map(widen_field).collect()),
+        DataType::Map(entries, sorted) => DataType::Map(widen_field(entries), *sorted),
+        other => other.clone(),
+    }
+}
+
+/// Whether two types are equal except for the names of list item fields.
+///
+/// Struct children must match by name as well as type: a positional cast
+/// between differently named children would silently reinterpret data.
+fn same_up_to_list_item_names(a: &arrow_schema::DataType, b: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    let same_item = |x: &arrow_schema::Field, y: &arrow_schema::Field| {
+        x.is_nullable() == y.is_nullable()
+            && same_up_to_list_item_names(x.data_type(), y.data_type())
+    };
+    match (a, b) {
+        (DataType::List(x), DataType::List(y))
+        | (DataType::LargeList(x), DataType::LargeList(y)) => same_item(x, y),
+        (DataType::Struct(xs), DataType::Struct(ys)) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(ys.iter())
+                    .all(|(x, y)| x.name() == y.name() && same_item(x, y))
+        }
+        (DataType::Map(x, xs), DataType::Map(y, ys)) => xs == ys && same_item(x, y),
+        _ => a == b,
+    }
+}
+
 pub(crate) fn new_file_id() -> String {
     format!("{}-0", uuid::Uuid::new_v4())
 }

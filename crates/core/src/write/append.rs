@@ -70,6 +70,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     }
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
+    let batches = &crate::write::normalize_for_write(table, batches).await?;
     if !table.is_mor() {
         ensure_insert_allowed(table)?;
     }
