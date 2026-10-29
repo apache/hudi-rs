@@ -652,7 +652,7 @@ async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
         .upsert_with(
             [ordered_batch(vec![("b", 999, 20)])],
             UpsertOptions {
-                update_columns: Some(vec!["event_time".to_string()]),
+                update_columns: Some(vec!["value".to_string()]),
             },
         )
         .await
@@ -662,17 +662,17 @@ async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
         vec![
             row("a", 1, 1),
             row("a", 2, 2),
-            row("b", 100, 20),
+            row("b", 999, 10),
             row("c", 3, 3)
         ]
     );
 }
 
-/// Under event-time ordering a partial update must set the ordering field, so
-/// the merged row carries the winner's ordering value and a later write
-/// ordered between the two loses to it.
+/// On an event-time ordered table a partial update that sets the ordering
+/// field merges by it; one that does not wins as under commit-time ordering
+/// and keeps the stored ordering value.
 #[tokio::test]
-async fn test_partial_upsert_under_event_time_carries_ordering_value() {
+async fn test_partial_upsert_orders_by_event_time_only_when_setting_it() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
@@ -685,32 +685,75 @@ async fn test_partial_upsert_under_event_time_carries_ordering_value() {
         .upsert([ordered_batch(vec![("a", 1, 10)])])
         .await
         .unwrap();
-    let before = timeline_file_count(dir.path());
-
     let partial = |columns: &[&str]| UpsertOptions {
         update_columns: Some(columns.iter().map(|c| c.to_string()).collect()),
     };
-    let error = table
-        .upsert_with([ordered_batch(vec![("a", 2, 20)])], partial(&["value"]))
-        .await
-        .unwrap_err();
-    assert!(error.to_string().contains("event_time"), "{error}");
-    assert_eq!(timeline_file_count(dir.path()), before);
+    let rows = |batches: Vec<RecordBatch>| rows_with_event_time(&batches);
 
     table
-        .upsert_with(
-            [ordered_batch(vec![("a", 2, 20)])],
-            partial(&["value", "event_time"]),
-        )
-        .await
-        .unwrap();
-    table
-        .upsert([ordered_batch(vec![("a", 3, 15)])])
+        .upsert_with([ordered_batch(vec![("a", 2, 5)])], partial(&["value"]))
         .await
         .unwrap();
     assert_eq!(
-        rows_with_event_time(&table.read(&ReadOptions::new()).await.unwrap()),
-        vec![("a".to_string(), 2, 20)]
+        rows(table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 2, 10)]
+    );
+
+    for (value, event_time, expected) in [(3, 1, (2, 10)), (4, 20, (4, 20))] {
+        table
+            .upsert_with(
+                [ordered_batch(vec![("a", value, event_time)])],
+                partial(&["value", "event_time"]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), expected.0, expected.1)]
+        );
+    }
+}
+
+/// A partial update that leaves the ordering field out also dedupes its batch
+/// and moves partitions by commit time: the last duplicate wins, and a lower
+/// ordering value does not keep the row in its old partition.
+#[tokio::test]
+async fn test_partial_upsert_without_ordering_field_dedupes_and_moves_by_commit_time() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city", "zone"])
+        .with_ordering_fields(["ts"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([zoned_batch(&[("a", "sf", "z1", 10, 1)])])
+        .await
+        .unwrap();
+    table
+        .upsert_with(
+            [zoned_batch(&[
+                ("a", "ny", "z1", 1, 7),
+                ("a", "ny", "z1", 0, 8),
+            ])],
+            UpsertOptions {
+                update_columns: Some(vec!["city".to_string(), "value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let rows = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let column = |name: &str| {
+        arrow::util::display::array_value_to_string(rows.column_by_name(name).unwrap(), 0).unwrap()
+    };
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(
+        [column("city"), column("ts"), column("value")],
+        ["ny", "10", "8"].map(String::from)
     );
 }
 
@@ -1279,7 +1322,8 @@ fn ordered_flagged_rows(batches: &[RecordBatch]) -> Vec<(String, i64, i64, bool)
 /// Copy-on-write event-time upserts into a group where most stored rows are
 /// untouched: each touched key resolves by ordering value (ties go to the
 /// incoming row), a winning delete marker removes the row, in-batch duplicates
-/// keep the highest ordering value, and untouched rows pass through.
+/// keep the highest ordering value, untouched rows pass through, and a partial
+/// update without the ordering field wins as under commit-time ordering.
 #[tokio::test]
 async fn test_cow_event_time_upsert_merges_only_touched_keys() {
     let dir = tempdir().unwrap();
@@ -1331,7 +1375,7 @@ async fn test_cow_event_time_upsert_merges_only_touched_keys() {
         ("c", 30, 150),
         ("e", 5, 100),
         ("f", 6, 100),
-        ("g", 7, 100),
+        ("g", 70, 100),
         ("h", 80, 100),
         ("i", 90, 10),
         ("j", 101, 20),

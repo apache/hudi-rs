@@ -339,19 +339,14 @@ pub(super) fn keys(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
 /// Keep the final occurrence of each key, in original relative order.
 /// Deduplicate a write batch by record key.
 ///
-/// With an ordering (precombine) field configured, the row with the highest
-/// ordering value wins (ties: later occurrence), matching Java precombine.
-/// Without one, the LAST occurrence wins — the pick among duplicates is
-/// arbitrary by design when no ordering field is configured.
+/// The row with the highest value across `ordering_fields` wins (ties: later
+/// occurrence), matching Java precombine; with no ordering fields the last
+/// occurrence wins.
 pub(super) fn deduplicate_last_by_key(
     batch: &RecordBatch,
     keys: &[String],
-    hudi_configs: &crate::config::HudiConfigs,
+    ordering_fields: &[String],
 ) -> Result<RecordBatch> {
-    // Java routes in-batch dedupe through the merge-mode-derived merger
-    // (BaseWriteHelper.reduceRecords), so a COMMIT_TIME_ORDERING table never
-    // consults the ordering value here either — last occurrence wins.
-    let ordering_fields = event_time_ordering_fields(hudi_configs)?;
     // One comparator per ordering field, hoisted out of the duplicate loop;
     // fields compare lexicographically (first field breaks ties via the next).
     let comparators = ordering_fields
@@ -513,7 +508,7 @@ pub(super) async fn resolve_partial_moves(
     let stored = deduplicate_last_by_key(
         &stored,
         &keys(&stored, MetaField::RecordKey.as_ref())?,
-        &table.hudi_configs,
+        &event_time_ordering_fields(&table.hudi_configs)?,
     )?;
     let stored_keys = keys(&stored, MetaField::RecordKey.as_ref())?;
     let stored_partitions = string_values(&stored, MetaField::PartitionPath.as_ref())?;

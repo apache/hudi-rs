@@ -217,20 +217,16 @@ pub(super) fn event_time_ordering_fields(
         .unwrap_or_default())
 }
 
-/// A partial update under event-time ordering must set every ordering field:
-/// the merged row carries the winner's ordering value, or a later write
-/// ordered between the two would beat the newer data.
-pub(super) fn ensure_partial_update_sets_ordering(
+/// The ordering fields an upsert compares. A partial update that does not set
+/// every ordering field merges by commit time, since the merged row takes its
+/// ordering value from the stored row, not the update.
+pub(super) fn upsert_ordering_fields(
     hudi_configs: &crate::config::HudiConfigs,
-    update_columns: &[String],
-) -> Result<()> {
-    if let Some(field) = event_time_ordering_fields(hudi_configs)?
-        .into_iter()
-        .find(|field| !update_columns.contains(field))
-    {
-        return Err(CoreError::Write(format!(
-            "a partial update under event-time ordering must include the ordering field '{field}' in its update columns"
-        )));
+    update_columns: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let fields = event_time_ordering_fields(hudi_configs)?;
+    if update_columns.is_some_and(|columns| fields.iter().any(|field| !columns.contains(field))) {
+        return Ok(Vec::new());
     }
-    Ok(())
+    Ok(fields)
 }

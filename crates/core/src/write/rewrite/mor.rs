@@ -95,7 +95,8 @@ pub(super) async fn mor_upsert_batches(
     let batches = &validate_write_input(table, batches, "upsert").await?;
     let incoming = concat(batches)?;
     let incoming_keys = batch_record_keys(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
+    let ordering_fields = event_time_ordering_fields(&table.hudi_configs)?;
+    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &ordering_fields)?;
     crate::write::keygen::validate_keygen_inputs(
         &table.hudi_configs,
         std::slice::from_ref(&incoming),
@@ -144,6 +145,7 @@ pub(super) async fn mor_upsert_batches(
         &incoming,
         &moved_candidates,
         &mor_slice_by_file_id,
+        &ordering_fields,
     )
     .await?;
     // Delete markers follow Java's append handle: one that would land as a
@@ -211,6 +213,7 @@ pub(super) async fn mor_upsert_batches(
         &incoming,
         &in_place_deletes,
         &mor_slice_by_file_id,
+        &ordering_fields,
     )
     .await?;
     for (key, location) in in_place_deletes
@@ -782,12 +785,12 @@ pub(super) async fn moved_keys_rejected_by_event_time(
     incoming: &RecordBatch,
     moved: &HashMap<String, Vec<String>>, // file_id -> record keys moved from it
     slices: &HashMap<String, crate::file_group::file_slice::FileSlice>,
+    ordering_fields: &[String],
 ) -> Result<HashSet<String>> {
     let mut rejected = HashSet::new();
     if moved.is_empty() {
         return Ok(rejected);
     }
-    let ordering_fields = event_time_ordering_fields(&table.hudi_configs)?;
     let Some(ordering_field) = ordering_fields.first() else {
         return Ok(rejected);
     };

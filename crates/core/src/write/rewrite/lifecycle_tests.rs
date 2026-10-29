@@ -368,7 +368,7 @@ async fn test_cow_verb_lifecycle_in_crate() {
         .upsert_with(
             [batch(&[("b", "sf", 3, 999)])],
             UpsertOptions {
-                update_columns: Some(vec!["v".to_string(), "ts".to_string()]),
+                update_columns: Some(vec!["v".to_string()]),
             },
         )
         .await

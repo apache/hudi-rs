@@ -90,6 +90,11 @@ pub struct WriteResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpsertOptions {
     /// Data columns to overwrite for matched rows. `None` replaces complete rows.
+    ///
+    /// On an event-time ordered table, matched rows merge by ordering value
+    /// only when these columns include every ordering field. Otherwise the
+    /// update wins as under commit-time ordering and the row keeps its stored
+    /// ordering value.
     pub update_columns: Option<Vec<String>>,
 }
 
@@ -188,7 +193,6 @@ pub async fn upsert_batches(
                 )));
             }
         }
-        ensure_partial_update_sets_ordering(&table.hudi_configs, columns)?;
     }
     // The input row's delete marker applies whatever columns a partial upsert
     // selects; Java checks the incoming record for a delete before merging.
@@ -206,7 +210,12 @@ pub async fn upsert_batches(
     let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
     let incoming_keys = batch_record_keys(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
+    // Java dedupes the batch through the merge-mode merger
+    // (BaseWriteHelper.reduceRecords), so commit-time ordering keeps the last
+    // occurrence here too.
+    let ordering_fields =
+        upsert_ordering_fields(&table.hudi_configs, options.update_columns.as_deref())?;
+    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &ordering_fields)?;
     let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
     let delete_markers = delete_marker_rows(&incoming);
     let locations = crate::index::for_table_checked(table)
@@ -303,9 +312,14 @@ pub async fn upsert_batches(
         .iter()
         .map(|(id, (_, slice))| (id.clone(), slice.clone()))
         .collect();
-    let rejected_moves =
-        moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices)
-            .await?;
+    let rejected_moves = moved_keys_rejected_by_event_time(
+        table,
+        &incoming,
+        &moved_candidates,
+        &move_slices,
+        &ordering_fields,
+    )
+    .await?;
     let (incoming, route_keys) = match &options.update_columns {
         Some(columns) if !moved_candidates.is_empty() => {
             resolve_partial_moves(
@@ -412,6 +426,7 @@ pub async fn upsert_batches(
                 incoming: take_batch(&incoming, &rows)?,
                 partial_columns: options.update_columns.clone(),
                 evict_keys,
+                by_event_time: !ordering_fields.is_empty(),
             },
         });
     }

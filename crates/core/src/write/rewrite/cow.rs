@@ -358,6 +358,9 @@ pub(super) enum GroupOp {
         incoming: RecordBatch,
         partial_columns: Option<Vec<String>>,
         evict_keys: std::sync::Arc<HashSet<String>>,
+        /// Whether incoming rows merge with stored ones by ordering value
+        /// rather than by commit time.
+        by_event_time: bool,
     },
     /// Remove rows by record key ((key, partition) exact or key-only).
     DeleteKeys {
@@ -471,6 +474,7 @@ pub(super) fn merge_file_group_task(
                 incoming,
                 partial_columns,
                 evict_keys,
+                by_event_time,
             } => {
                 let incoming = if old.num_rows() > 0 {
                     crate::write::align_batch_to_schema(&incoming, &old.schema()).ok_or_else(
@@ -530,7 +534,7 @@ pub(super) fn merge_file_group_task(
                     .filter(|key| old_by_key.contains_key(*key))
                     .count();
                 let incoming_rows = old.num_rows() as u32..combined.num_rows() as u32;
-                if merges {
+                if by_event_time && !matched_old.is_empty() {
                     let candidates = matched_old.into_iter().chain(incoming_rows).collect();
                     selected.extend(merge_with_event_time(
                         ctx.hudi_configs.clone(),
