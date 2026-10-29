@@ -316,12 +316,77 @@ pub struct RecordIndexEntry {
 ///
 /// Deletes must not use this path — emit a delete log block instead. Null
 /// `recordIndexMetadata` NPEs Java's RLI reader.
+///
+/// Written straight into Avro binary rather than through a generic `Value`
+/// tree, since the record's shape is fixed and a write encodes one entry per
+/// row. The tests hold this encoding to the generic `Value` encoding.
 pub fn encode_record_index_entry(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
     if entry.is_deleted {
         return Err(CoreError::MetadataTable(
             "RLI deletes must be written as delete log blocks, not null payloads".to_string(),
         ));
     }
+    let (high, low, file_index, file_id_str, encoding) =
+        encode_file_id_for_record_index(&entry.file_id);
+    // Field order and union branches follow HoodieMetadata.avsc: a union is
+    // its branch index then the value, `null` encodes as nothing.
+    let mut out = Vec::with_capacity(56 + entry.partition_path.len() + file_id_str.len());
+    for _ in MetaField::field_names() {
+        put_int(&mut out, 0); // _hoodie_* meta fields: null
+    }
+    put_string(&mut out, ""); // key: lives on the HFile key only
+    put_int(&mut out, MetadataRecordType::RecordIndex as i32);
+    put_int(&mut out, 0); // filesystemMetadata: null
+    put_int(&mut out, 0); // BloomFilterMetadata: null
+    put_int(&mut out, 0); // ColumnStatsMetadata: null
+    put_int(&mut out, 1); // recordIndexMetadata: HoodieRecordIndexInfo
+    put_int(&mut out, 1);
+    put_string(&mut out, &entry.partition_path);
+    put_int(&mut out, 1);
+    put_long(&mut out, high);
+    put_int(&mut out, 1);
+    put_long(&mut out, low);
+    put_int(&mut out, 1);
+    put_int(&mut out, file_index);
+    put_int(&mut out, 1);
+    put_string(&mut out, &file_id_str);
+    put_int(&mut out, 1);
+    put_long(&mut out, entry.instant_time_millis);
+    put_int(&mut out, encoding);
+    put_int(&mut out, 0); // position: null
+    put_int(&mut out, 0); // SecondaryIndexMetadata: null
+    Ok(out)
+}
+
+/// Avro zig-zag varint for a `long`.
+fn put_long(out: &mut Vec<u8>, value: i64) {
+    let mut zigzag = ((value << 1) ^ (value >> 63)) as u64;
+    loop {
+        let byte = (zigzag & 0x7f) as u8;
+        zigzag >>= 7;
+        if zigzag == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Avro zig-zag varint for an `int`.
+fn put_int(out: &mut Vec<u8>, value: i32) {
+    put_long(out, i64::from(value));
+}
+
+/// Avro `string`: byte length as a varint, then the UTF-8 bytes.
+fn put_string(out: &mut Vec<u8>, value: &str) {
+    put_long(out, value.len() as i64);
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// The same record through the generic Avro encoder; the reference for
+/// [`encode_record_index_entry`].
+#[cfg(test)]
+fn encode_record_index_entry_generic(entry: &RecordIndexEntry) -> Result<Vec<u8>> {
     let (high, low, file_index, file_id_str, encoding) =
         encode_file_id_for_record_index(&entry.file_id);
     let rli_payload = Value::Union(
@@ -1030,6 +1095,51 @@ mod tests {
         )
         .unwrap();
         assert_eq!(avro_key_field(&bytes), "");
+    }
+
+    #[test]
+    fn encode_record_index_matches_generic_avro_encoding() {
+        let entries = [
+            RecordIndexEntry {
+                record_key: "k".to_string(),
+                partition_path: String::new(),
+                file_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301-0".to_string(),
+                instant_time_millis: 1_700_000_000_123,
+                is_deleted: false,
+            },
+            RecordIndexEntry {
+                record_key: "k".to_string(),
+                partition_path: "city=san_francisco".to_string(),
+                file_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".to_string(),
+                instant_time_millis: 0,
+                is_deleted: false,
+            },
+            RecordIndexEntry {
+                record_key: "k".to_string(),
+                partition_path: format!("city={}", "x".repeat(200)),
+                file_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301-7".to_string(),
+                instant_time_millis: i64::MIN,
+                is_deleted: false,
+            },
+            RecordIndexEntry {
+                record_key: "k".to_string(),
+                partition_path: "p=\u{e9}t\u{e9}".to_string(),
+                file_id: "not-a-uuid-file-id".to_string(),
+                instant_time_millis: -1,
+                is_deleted: false,
+            },
+        ];
+        for entry in &entries {
+            let fast = encode_record_index_entry(entry).unwrap();
+            let generic = encode_record_index_entry_generic(entry).unwrap();
+            assert_eq!(fast, generic, "entry {entry:?}");
+            let decoded = decode_record_index_entry("k", &fast, None)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded.file_id, entry.file_id);
+            assert_eq!(decoded.partition_path, entry.partition_path);
+            assert_eq!(decoded.instant_time_millis, entry.instant_time_millis);
+        }
     }
 
     #[test]
