@@ -1244,6 +1244,44 @@ async fn test_simple_index_tags_existing_and_missing_keys() {
     assert!(locations[&keys[1]].is_none());
 }
 
+/// Without the metadata table the simple index tags keys; on a table with no
+/// commits every key is an insert and no table schema is needed.
+#[tokio::test]
+async fn test_first_upsert_through_simple_index() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_metadata(false)
+            .create()
+            .await
+            .unwrap();
+
+        let first = table
+            .upsert([batch(vec![("a", 1), ("b", 2)])])
+            .await
+            .unwrap();
+        assert_eq!(
+            (first.num_inserts, first.num_updates),
+            (2, 0),
+            "{table_type:?}"
+        );
+        let second = table.upsert([batch(vec![("a", 10)])]).await.unwrap();
+        assert_eq!(
+            (second.num_inserts, second.num_updates),
+            (0, 1),
+            "{table_type:?}"
+        );
+        assert_eq!(
+            rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), 10), ("b".to_string(), 2)],
+            "{table_type:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_upsert_rejects_schema_mismatch() {
     let dir = tempdir().unwrap();

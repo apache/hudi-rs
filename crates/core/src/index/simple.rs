@@ -50,11 +50,15 @@ impl HoodieIndex for SimpleIndex {
         if requested.is_empty() {
             return Ok(locations);
         }
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        if slices.is_empty() {
+            return Ok(locations);
+        }
         let reader = table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
             .await?;
         let mut by_record_key: HashMap<String, RecordLocation> = HashMap::new();
-        for slice in table.get_file_slices(&ReadOptions::new()).await? {
+        for slice in slices {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
             let location = RecordLocation {
                 file_id: slice.file_id().to_string(),
