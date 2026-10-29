@@ -403,16 +403,20 @@ impl Storage {
         Ok(file_metadata)
     }
 
-    /// Recursively stream files below the table base path.
+    /// Recursively stream files below a table subdirectory.
     ///
     /// Each item is a table-relative object path. Cloud object stores paginate
     /// this stream internally, while local storage walks directory entries
     /// incrementally. Unlike [`Self::list_files`], this does not materialize a
     /// delimiter result containing every sibling prefix.
-    pub(crate) fn list_relative_paths_stream(&self) -> Result<BoxStream<'static, Result<String>>> {
-        let prefix_url = join_url_segments(&self.base_url, &[""])?;
+    pub(crate) fn list_relative_paths_stream(
+        &self,
+        subdir: Option<&str>,
+    ) -> Result<BoxStream<'static, Result<String>>> {
+        let prefix_url = join_url_segments(&self.base_url, &[subdir.unwrap_or_default()])?;
         let prefix_path = ObjPath::from_url_path(prefix_url.path())?;
-        let prefix = prefix_path.as_ref().trim_end_matches('/').to_string();
+        let base_path = ObjPath::from_url_path(self.base_url.path())?;
+        let prefix = base_path.as_ref().trim_end_matches('/').to_string();
 
         Ok(self
             .object_store
@@ -689,7 +693,7 @@ mod tests {
         .unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let paths: HashSet<String> = storage
-            .list_relative_paths_stream()
+            .list_relative_paths_stream(None)
             .unwrap()
             .try_collect()
             .await
@@ -700,6 +704,14 @@ mod tests {
         assert!(paths.contains("part2/part22/c.parquet"));
         assert!(paths.contains("part3/part32/part33/d.parquet"));
         assert!(paths.iter().all(|path| !path.starts_with('/')));
+
+        let subtree_paths: Vec<_> = storage
+            .list_relative_paths_stream(Some("part2"))
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(subtree_paths, ["part2/part22/c.parquet"]);
     }
 
     #[tokio::test]
@@ -717,7 +729,7 @@ mod tests {
         let base_url = Url::from_directory_path(&table_dir).unwrap();
         let storage = Storage::new_with_base_url(base_url).unwrap();
         let paths = storage
-            .list_relative_paths_stream()
+            .list_relative_paths_stream(None)
             .unwrap()
             .try_collect::<Vec<_>>()
             .await

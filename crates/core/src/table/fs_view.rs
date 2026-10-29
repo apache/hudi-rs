@@ -522,10 +522,10 @@ impl FileSystemView {
 
     /// Stream file slices as each partition's file groups become available.
     ///
-    /// Storage-backed listing retains only the bounded set of partition
-    /// listings in flight plus the current partition's file groups. Metadata
-    /// table records are still fetched eagerly because that reader does not yet
-    /// expose a row stream.
+    /// Storage-backed listing bounds in-flight partition listings and keeps
+    /// the current partition's file groups, root directories, and emitted
+    /// partition paths. Metadata table records are still fetched eagerly
+    /// because that reader does not yet expose a row stream.
     pub(crate) async fn get_file_slices_stream(
         &self,
         partition_pruner: &PartitionPruner,

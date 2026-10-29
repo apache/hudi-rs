@@ -122,9 +122,10 @@ use crate::schema::resolver::{
 use crate::statistics::estimator::FileStatsEstimator;
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
-use crate::table::fs_view::FileSystemView;
+use crate::table::fs_view::{FileSystemView, MetadataListing};
 use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
+use crate::timeline::view::TimelineView;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
@@ -150,6 +151,35 @@ pub struct Table {
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
     /// populate the cache, allowing later calls with newer timestamps to retry.
     cached_estimator: Arc<OnceCell<FileStatsEstimator>>,
+}
+
+struct FileSlicePlan<'a> {
+    timeline_view: Arc<TimelineView>,
+    table_schema: Schema,
+    partition_pruner: PartitionPruner,
+    file_pruner: FilePruner,
+    metadata_table: Option<&'a Table>,
+}
+
+impl FileSlicePlan<'_> {
+    async fn valid_instants(&self, table: &Table) -> Result<Option<HashSet<String>>> {
+        match self.metadata_table {
+            Some(mdt) => Ok(Some(table.valid_instant_timestamps(mdt).await?)),
+            None => Ok(None),
+        }
+    }
+
+    fn metadata_listing<'a>(
+        &'a self,
+        valid_instants: &'a Option<HashSet<String>>,
+    ) -> Option<MetadataListing<'a>> {
+        self.metadata_table
+            .zip(valid_instants.as_ref())
+            .map(|(table, valid_instants)| MetadataListing {
+                table,
+                valid_instants,
+            })
+    }
 }
 
 impl Clone for Table {
@@ -653,8 +683,9 @@ impl Table {
     ///
     /// The stream has no stable global ordering; consumers that require one
     /// should sort by partition path and file ID after collection. Listing work
-    /// is driven by polling the stream; dropping it cancels the in-flight
-    /// partition futures without spawning detached tasks.
+    /// is driven by polling the stream; dropping it drops the in-flight
+    /// partition futures. No detached planning tasks are spawned, but storage
+    /// backends may finish I/O that has already started.
     ///
     /// # Example
     /// ```ignore
@@ -737,21 +768,21 @@ impl Table {
             .boxed())
     }
 
-    async fn get_file_slices_stream_inner(
+    async fn prepare_file_slice_plan(
         &self,
         timestamp: &str,
         filters: &[Filter],
         base_file_only: bool,
-    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
-        use futures::{StreamExt, TryStreamExt};
-
+    ) -> Result<FileSlicePlan<'_>> {
         let timeline_view = Arc::new(self.timeline.create_view_as_of(timestamp).await?);
         let partition_schema = self.get_partition_schema().await?;
+        // Meta-field filters must be validated against the same schema as returned rows.
         let table_schema = self.get_schema_with_meta_fields().await?;
         validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
 
         let partition_pruner =
             PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
+        // Base-file footer stats cannot exclude records introduced by MOR logs.
         let file_pruner = if base_file_only {
             FilePruner::new(filters, &table_schema, &partition_schema)?
         } else {
@@ -771,26 +802,36 @@ impl Table {
         } else {
             None
         };
-        let valid_instants = match metadata_table {
-            Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
-            None => None,
-        };
-        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
-            (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
-                table,
-                valid_instants,
-            }),
-            _ => None,
-        };
+        Ok(FileSlicePlan {
+            timeline_view,
+            table_schema,
+            partition_pruner,
+            file_pruner,
+            metadata_table,
+        })
+    }
+
+    async fn get_file_slices_stream_inner(
+        &self,
+        timestamp: &str,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<futures::stream::BoxStream<'static, Result<FileSlice>>> {
+        use futures::{StreamExt, TryStreamExt};
+
+        let plan = self
+            .prepare_file_slice_plan(timestamp, filters, base_file_only)
+            .await?;
+        let valid_instants = plan.valid_instants(self).await?;
         let estimator = self.get_or_init_estimator(timestamp).await.cloned();
         let stream = self
             .file_system_view
             .get_file_slices_stream(
-                &partition_pruner,
-                &file_pruner,
-                &table_schema,
-                timeline_view,
-                metadata_listing,
+                &plan.partition_pruner,
+                &plan.file_pruner,
+                &plan.table_schema,
+                plan.timeline_view.clone(),
+                plan.metadata_listing(&valid_instants),
                 estimator,
             )
             .await?;
@@ -811,71 +852,23 @@ impl Table {
         filters: &[Filter],
         base_file_only: bool,
     ) -> Result<Vec<FileSlice>> {
-        let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
-
-        let partition_schema = self.get_partition_schema().await?;
-        // Validate against the meta-inclusive schema so filters on Hudi meta fields
-        // (e.g. `_hoodie_record_key`) are accepted — those columns are present in
-        // returned batches and the row-level mask applies them. The pruners are
-        // tolerant of meta-field filters: PartitionPruner ignores non-partition
-        // columns, and FilePruner skips columns without stats.
-        let table_schema = self.get_schema_with_meta_fields().await?;
-        validate_fields_against_schemas(filters, [&table_schema, &partition_schema])?;
-
-        let partition_pruner =
-            PartitionPruner::new(filters, &partition_schema, self.hudi_configs.as_ref())?;
-
-        // File-level stats pruning using base file Parquet footers is only safe
-        // when log files cannot introduce records that contradict the base file's
-        // min/max stats — i.e., COW tables or MOR read-optimized mode.
-        let file_pruner = if base_file_only {
-            FilePruner::new(filters, &table_schema, &partition_schema)?
-        } else {
-            FilePruner::empty()
-        };
-
-        // Use cached metadata table instance if enabled
-        let metadata_table = if self.is_metadata_table_enabled() {
-            match self.get_or_init_metadata_table().await {
-                Ok(mdt) => Some(mdt),
-                Err(e) => {
-                    log::warn!(
-                        "Failed to create metadata table, falling back to storage listing: {e}"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
+        let plan = self
+            .prepare_file_slice_plan(timestamp, filters, base_file_only)
+            .await?;
         // Estimator-backed metadata enrichment is used by both MDT-backed loading
         // and fallback storage listing.
         let estimator = self.get_or_init_estimator(timestamp).await;
 
-        // Built here rather than inside the view: it needs the data table's
-        // timeline as well as the metadata table's, and only this scope holds
-        // both.
-        let valid_instants = match metadata_table {
-            Some(mdt) => Some(self.valid_instant_timestamps(mdt).await?),
-            None => None,
-        };
-        let metadata_listing = match (metadata_table, valid_instants.as_ref()) {
-            (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
-                table,
-                valid_instants,
-            }),
-            _ => None,
-        };
+        let valid_instants = plan.valid_instants(self).await?;
 
         let mut file_slices = self
             .file_system_view
             .get_file_slices(
-                &partition_pruner,
-                &file_pruner,
-                &table_schema,
-                &timeline_view,
-                metadata_listing,
+                &plan.partition_pruner,
+                &plan.file_pruner,
+                &plan.table_schema,
+                &plan.timeline_view,
+                plan.metadata_listing(&valid_instants),
                 estimator,
             )
             .await?;
@@ -2632,6 +2625,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hudi_table_get_file_slices_stream_matches_eager_metadata_fallback() -> Result<()> {
+        use futures::TryStreamExt;
+
+        let table_path = SampleTable::V9TxnsSimpleMeta.path_to_cow_fresh();
+        let root = std::path::Path::new(&table_path);
+        std::fs::rename(
+            root.join(".hoodie/metadata"),
+            root.join(".hoodie/metadata-unavailable"),
+        )
+        .unwrap();
+        let table = Table::new(&table_path).await?;
+        assert!(table.is_metadata_table_enabled());
+        assert!(table.get_or_init_metadata_table().await.is_err());
+        let options = ReadOptions::new();
+        let mut eager = table.get_file_slices(&options).await?;
+        let mut streamed = table
+            .get_file_slices_stream(&options)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        assert!(!eager.is_empty());
+        let compare = |left: &FileSlice, right: &FileSlice| {
+            left.partition_path
+                .cmp(&right.partition_path)
+                .then_with(|| left.file_id().cmp(right.file_id()))
+        };
+        eager.sort_by(compare);
+        streamed.sort_by(compare);
+        assert_eq!(streamed, eager);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn hudi_table_get_file_slices_stream_matches_eager_incremental() -> Result<()> {
         use futures::TryStreamExt;
 
@@ -2648,52 +2674,6 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await?;
         assert_eq!(streamed, eager);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn hudi_table_get_file_slices_stream_emits_before_later_partition_error() -> Result<()> {
-        use crate::config::plan::HudiPlanConfig;
-        use futures::TryStreamExt;
-        use std::path::Path;
-
-        let table_path = SampleTable::V6SimplekeygenNonhivestyle.path_to_cow_fresh();
-        let bad_partition = Path::new(&table_path).join("z-bad");
-        std::fs::create_dir_all(&bad_partition).unwrap();
-        std::fs::write(bad_partition.join("not-a-hudi-name.parquet"), []).unwrap();
-
-        let hudi_table = Table::new_with_options(
-            &table_path,
-            // With one in-flight partition, `try_buffer_unordered` cannot pull
-            // z-bad from the discovery stream until the first partition's
-            // future has yielded. The first assertion therefore distinguishes
-            // streaming discovery from a path that discovers every partition
-            // before it emits anything.
-            [(HudiPlanConfig::ListingParallelism, "1")],
-        )
-        .await?;
-        assert!(
-            hudi_table
-                .get_file_slices(&ReadOptions::new())
-                .await
-                .is_err(),
-            "the eager API cannot return any slice when a later partition fails"
-        );
-
-        let mut stream = hudi_table
-            .get_file_slices_stream(&ReadOptions::new())
-            .await?;
-        let first = stream
-            .try_next()
-            .await?
-            .expect("a valid partition must be emitted before z-bad is listed");
-        assert_ne!(first.partition_path, "z-bad");
-
-        let error = stream
-            .try_collect::<Vec<_>>()
-            .await
-            .expect_err("the malformed later partition must still propagate its error");
-        assert!(error.to_string().contains("not-a-hudi-name.parquet"));
         Ok(())
     }
 

@@ -1631,6 +1631,16 @@ mod tests {
             err.to_string().contains(ROLLBACK_TS),
             "the error must name the instant that could not be read, got {err}"
         );
+        let options = crate::table::ReadOptions::new();
+        let eager_error = table.get_file_slices(&options).await.unwrap_err();
+        let stream_error = match table.get_file_slices_stream(&options).await {
+            Ok(_) => panic!("invalid metadata instants must not fall back to storage listing"),
+            Err(error) => error,
+        };
+        for error in [eager_error, stream_error] {
+            assert!(matches!(error, CoreError::MetadataTable(_)));
+            assert!(error.to_string().contains(ROLLBACK_TS));
+        }
         Ok(())
     }
 

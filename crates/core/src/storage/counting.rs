@@ -25,8 +25,8 @@
 //! cannot tell them apart.
 
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -43,6 +43,8 @@ pub(crate) struct RequestCounts {
     gets: AtomicUsize,
     /// Metadata-only lookups.
     heads: AtomicUsize,
+    recursive_prefixes: Mutex<Vec<Option<Path>>>,
+    delimiter_lists: AtomicUsize,
 }
 
 impl RequestCounts {
@@ -52,6 +54,14 @@ impl RequestCounts {
 
     pub(crate) fn heads(&self) -> usize {
         self.heads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn recursive_prefixes(&self) -> Vec<Option<Path>> {
+        self.recursive_prefixes.lock().unwrap().clone()
+    }
+
+    pub(crate) fn delimiter_lists(&self) -> usize {
+        self.delimiter_lists.load(Ordering::Relaxed)
     }
 }
 
@@ -120,10 +130,16 @@ impl ObjectStore for CountingObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.counts
+            .recursive_prefixes
+            .lock()
+            .unwrap()
+            .push(prefix.cloned());
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.counts.delimiter_lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list_with_delimiter(prefix).await
     }
 
