@@ -54,6 +54,7 @@ const BUILDER_MANAGED_KEYS: &[&str] = &[
     "hoodie.table.base.file.format",
     "hoodie.table.metadata.partitions",
     "hoodie.table.metadata.partitions.inflight",
+    "hoodie.table.index.defs.path",
     "hoodie.metadata.enable",
     "hoodie.metadata.index.column.stats.enable",
     "hoodie.metadata.index.partition.stats.enable",
