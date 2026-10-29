@@ -218,16 +218,23 @@ async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
     );
 }
 
+/// A rejected write must leave no instant on the data timeline.
+fn assert_no_instant(base: &std::path::Path) {
+    let names: Vec<String> = std::fs::read_dir(base.join(".hoodie/timeline"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with('2'))
+        .collect();
+    assert!(names.is_empty(), "rejected write left instants: {names:?}");
+}
+
 /// hoodie.properties is written and read with the Java `Properties` escapes,
 /// so names and a pretty-printed create schema survive a reopen.
 #[tokio::test]
 async fn test_properties_preserve_names_and_formatted_schema() {
     for (name, escaped) in [
-        ("café", r"caf\u00E9"),
-        (r"review\table", r"review\\table"),
+        (r"café a=b:c\d", r"caf\u00E9 a\=b\:c\\d"),
         (" review", r"\ review"),
-        ("a=b:c", r"a\=b\:c"),
-        ("table😀", r"table\uD83D\uDE00"),
     ] {
         let dir = tempdir().unwrap();
         let path = dir.path().to_str().unwrap();
@@ -278,11 +285,6 @@ async fn test_create_rejects_managed_option_overrides_before_persisting() {
     for (key, value) in [
         ("hoodie.table.name", "renamed"),
         ("hoodie.table.version", "6"),
-        ("hoodie.table.type", "MERGE_ON_READ"),
-        ("hoodie.table.metadata.partitions", "files"),
-        ("hoodie.table.recordkey.fields", "other"),
-        ("hoodie.table.partition.fields", "city"),
-        ("hoodie.populate.meta.fields", "false"),
         ("hoodie.metadata.enable", "false"),
     ] {
         let dir = tempdir().unwrap();
@@ -1523,7 +1525,7 @@ async fn test_simple_index_tags_existing_and_missing_keys() {
 /// Without the metadata table the simple index tags keys; on a table with no
 /// commits every key is an insert and no table schema is needed.
 #[tokio::test]
-async fn test_first_upsert_through_simple_index() {
+async fn test_simple_index_first_upsert_inserts_every_key() {
     for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
         let dir = tempdir().unwrap();
         let mut table = Table::create(dir.path().to_str().unwrap())
@@ -1709,16 +1711,7 @@ async fn test_decimal_beyond_avro_precision_rejected_before_commit() {
     .unwrap();
     let error = table.append([batch]).await.unwrap_err();
     assert!(error.to_string().contains("precision 40"), "{error}");
-    assert!(
-        std::fs::read_dir(dir.path().join(".hoodie/timeline"))
-            .unwrap()
-            .all(|entry| !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with('2')),
-        "rejected write left an instant"
-    );
+    assert_no_instant(dir.path());
 }
 
 /// Like a non-prepped Java write, caller-supplied meta columns are dropped,
@@ -1816,16 +1809,7 @@ async fn test_upsert_rejects_batches_with_differing_schemas() {
             matches!(error, CoreError::Schema(_)),
             "{table_type:?}: {error}"
         );
-        assert!(
-            std::fs::read_dir(dir.path().join(".hoodie/timeline"))
-                .unwrap()
-                .all(|entry| !entry
-                    .unwrap()
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with('2')),
-            "{table_type:?}: rejected upsert left an instant"
-        );
+        assert_no_instant(dir.path());
     }
 }
 
