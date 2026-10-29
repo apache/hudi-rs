@@ -354,6 +354,7 @@ pub(super) async fn mor_upsert_batches(
         });
     }
     let props = crate::write::append::parquet_writer_props(table);
+    let bloom = crate::write::append::base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let parallelism = crate::write::write_task_parallelism(table);
 
@@ -375,6 +376,7 @@ pub(super) async fn mor_upsert_batches(
             crate::write::parquet_file_task(
                 storage.clone(),
                 props.clone(),
+                bloom,
                 prepared.clone(),
                 path.clone(),
                 collect_ranges,

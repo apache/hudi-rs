@@ -315,13 +315,15 @@ pub(crate) struct FileTaskOutput {
 pub(crate) fn parquet_file_task(
     storage: std::sync::Arc<Storage>,
     props: parquet::file::properties::WriterProperties,
+    bloom: Option<crate::bloom::BloomFilterConfig>,
     prepared: Vec<arrow_array::RecordBatch>,
     relative_path: String,
     collect_ranges: bool,
 ) -> futures::future::BoxFuture<'static, Result<FileTaskOutput>> {
     Box::pin(async move {
         let (bytes, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let bytes = crate::write::append::write_parquet_bytes_with_props(props, &prepared)?;
+            let bytes =
+                crate::write::append::write_parquet_bytes_with_props(props, bloom, &prepared)?;
             let ranges = if collect_ranges {
                 Some(
                     crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
@@ -352,7 +354,8 @@ pub(crate) fn log_file_task(
 ) -> futures::future::BoxFuture<'static, Result<FileTaskOutput>> {
     Box::pin(async move {
         let (block, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let parquet = crate::write::append::write_parquet_bytes_with_props(props, &prepared)?;
+            let parquet =
+                crate::write::append::write_parquet_bytes_with_props(props, None, &prepared)?;
             let ranges = if collect_ranges {
                 Some(
                     crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(

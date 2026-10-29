@@ -23,13 +23,15 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use arrow::array::{ArrayRef, StringArray, UInt32Array};
+use arrow::array::{ArrayRef, AsArray, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use arrow_select::take::take;
 use chrono::Utc;
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::KeyValue;
 
 use crate::Result;
+use crate::bloom::{BloomFilterConfig, BloomFilterType, RecordKeyFooter};
 use crate::config::table::HudiTableConfig::{
     MetadataTablePartitions, PartitionFields, PopulatesMetaFields, RecordMergeStrategy, TableType,
     TableVersion, TimelineLayoutVersion, TimelinePath,
@@ -255,6 +257,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 
     // Phase 2 (parallel): encode + put each file on the write task pool.
     let props = parquet_writer_props(table);
+    let bloom = base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let tasks = chunk_plans
         .iter()
@@ -262,6 +265,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
             crate::write::parquet_file_task(
                 storage.clone(),
                 props.clone(),
+                bloom,
                 plan.prepared.clone(),
                 plan.base_file_path.clone(),
                 collect_ranges,
@@ -473,7 +477,11 @@ async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<
     let file_id = format!("bulk-insert-{instant}");
     let base_file_path = format!("{file_id}_0-0-0_{instant}.parquet");
     let storage = table.file_system_view.storage.clone();
-    let bytes = write_parquet_bytes_with_props(parquet_writer_props(table), batches)?;
+    let bytes = write_parquet_bytes_with_props(
+        parquet_writer_props(table),
+        base_file_bloom_filter_config(table),
+        batches,
+    )?;
     let file_size = bytes.len() as i64;
     storage.put_file(&base_file_path, bytes).await?;
 
@@ -732,10 +740,55 @@ pub(crate) fn parquet_writer_props(table: &Table) -> parquet::file::properties::
         .build()
 }
 
+/// The record-key bloom filter a base file footer carries, resolved as Java's
+/// `HoodieFileWriterFactory#enableBloomFilter` and `#createBloomFilter` do.
+pub(crate) fn base_file_bloom_filter_config(table: &Table) -> Option<BloomFilterConfig> {
+    let populates_meta_fields: bool = table
+        .hudi_configs
+        .get_or_default(PopulatesMetaFields)
+        .into();
+    let options = table.hudi_configs.as_options();
+    let enabled = options
+        .get("hoodie.parquet.bloom.filter.enabled")
+        .is_none_or(|v| v.eq_ignore_ascii_case("true"))
+        || options
+            .get("hoodie.index.type")
+            .is_some_and(|v| v.contains("BLOOM"));
+    if !populates_meta_fields || !enabled {
+        return None;
+    }
+    let defaults = BloomFilterConfig::default();
+    let positive_int = |key: &str, default: i32| {
+        options
+            .get(key)
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    Some(BloomFilterConfig {
+        filter_type: options
+            .get("hoodie.bloom.index.filter.type")
+            .and_then(|v| BloomFilterType::parse(v))
+            .unwrap_or(defaults.filter_type),
+        num_entries: positive_int("hoodie.index.bloom.num_entries", defaults.num_entries),
+        fpp: options
+            .get("hoodie.index.bloom.fpp")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0 && *v < 1.0)
+            .unwrap_or(defaults.fpp),
+        max_entries: positive_int(
+            "hoodie.bloom.index.filter.dynamic.max.entries",
+            defaults.max_entries,
+        ),
+    })
+}
+
 /// Encode batches to parquet bytes with pre-resolved properties (safe to run
-/// on a blocking thread with owned inputs).
+/// on a blocking thread with owned inputs). With `bloom`, the footer also
+/// carries the bloom filter and range of the batches' `_hoodie_record_key`s.
 pub(crate) fn write_parquet_bytes_with_props(
     props: parquet::file::properties::WriterProperties,
+    bloom: Option<BloomFilterConfig>,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
@@ -743,8 +796,32 @@ pub(crate) fn write_parquet_bytes_with_props(
     for batch in batches {
         writer.write(batch)?;
     }
+    if let Some(config) = bloom {
+        for (key, value) in record_key_footer(&config, batches)? {
+            writer.append_key_value_metadata(KeyValue::new(key.to_string(), value));
+        }
+    }
     let cursor = writer.into_inner()?;
     Ok(cursor.into_inner())
+}
+
+fn record_key_footer(
+    config: &BloomFilterConfig,
+    batches: &[RecordBatch],
+) -> Result<Vec<(&'static str, String)>> {
+    let mut footer = RecordKeyFooter::new(config);
+    let field = MetaField::RecordKey.as_ref();
+    for batch in batches {
+        let keys = batch
+            .column_by_name(field)
+            .ok_or_else(|| CoreError::Write(format!("base file batch is missing '{field}'")))?;
+        let keys = arrow::compute::cast(keys, &arrow_schema::DataType::Utf8)?;
+        for key in keys.as_string::<i32>() {
+            footer
+                .add(key.ok_or_else(|| CoreError::Write(format!("'{field}' cannot be null")))?)?;
+        }
+    }
+    Ok(footer.finish())
 }
 
 /// Arrow→Avro schema JSON for `HoodieCommitMetadata.extraMetadata.schema`.
@@ -1320,6 +1397,43 @@ mod tests {
             .map(arrow_array::RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 64);
+    }
+
+    /// The base file bloom filter follows Java's enable rule and sizing configs.
+    #[tokio::test]
+    async fn test_base_file_bloom_filter_config_resolution() {
+        async fn config(options: &[(&str, &str)]) -> Option<BloomFilterConfig> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut builder = crate::table::Table::create(dir.path().to_str().unwrap())
+                .with_table_name("t")
+                .with_record_key_fields(["id"]);
+            for (key, value) in options {
+                builder = builder.with_option(key, *value);
+            }
+            base_file_bloom_filter_config(&builder.create().await.unwrap())
+        }
+        assert_eq!(config(&[]).await, Some(BloomFilterConfig::default()));
+        let disabled = ("hoodie.parquet.bloom.filter.enabled", "false");
+        assert_eq!(config(&[disabled]).await, None);
+        assert_eq!(
+            config(&[disabled, ("hoodie.index.type", "GLOBAL_BLOOM")]).await,
+            Some(BloomFilterConfig::default())
+        );
+        assert_eq!(
+            config(&[
+                ("hoodie.bloom.index.filter.type", "simple"),
+                ("hoodie.index.bloom.num_entries", "100"),
+                ("hoodie.index.bloom.fpp", "0.01"),
+                ("hoodie.bloom.index.filter.dynamic.max.entries", "500"),
+            ])
+            .await,
+            Some(BloomFilterConfig {
+                filter_type: BloomFilterType::Simple,
+                num_entries: 100,
+                fpp: 0.01,
+                max_entries: 500,
+            })
+        );
     }
 
     /// Append with a batch whose schema does not match the table's: rejected.

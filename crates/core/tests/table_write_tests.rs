@@ -17,6 +17,7 @@
  * under the License.
  */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
@@ -3983,4 +3984,145 @@ fn write_futures_are_send(table: &mut Table) {
     assert_send(table.delete("id = 'a'"));
     assert_send(table.delete_keys([key]));
     assert_send(table.update("id = 'a'", sample_batch()));
+}
+
+/// Footer key-value metadata and record keys of every base file under `dir`.
+fn base_file_footers(dir: &std::path::Path) -> Vec<(HashMap<String, String>, Vec<String>)> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut footers = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap().map(Result::unwrap) {
+            let path = entry.path();
+            if path.is_dir() && entry.file_name() != ".hoodie" {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+                        .unwrap();
+                let footer = builder
+                    .metadata()
+                    .file_metadata()
+                    .key_value_metadata()
+                    .into_iter()
+                    .flatten()
+                    .map(|kv| (kv.key.clone(), kv.value.clone().unwrap_or_default()))
+                    .collect();
+                let keys = builder
+                    .build()
+                    .unwrap()
+                    .flat_map(|batch| {
+                        let batch = batch.unwrap();
+                        let keys = batch.column_by_name("_hoodie_record_key").map(|keys| {
+                            keys.as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .iter()
+                                .map(|key| key.unwrap().to_string())
+                                .collect::<Vec<_>>()
+                        });
+                        keys.unwrap_or_default()
+                    })
+                    .collect();
+                footers.push((footer, keys));
+            }
+        }
+    }
+    footers
+}
+
+/// Every base file carries the footer Java's bloom index reads: the bloom
+/// filter at Java's default sizing holding every record key, its type code,
+/// and the record key range, which an empty file leaves out.
+#[tokio::test]
+async fn test_base_file_footer_carries_bloom_filter_and_key_range() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_partition_fields(["city"])
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .upsert([partitioned_batch(vec![
+                ("k3", "sf", 1),
+                ("k1", "sf", 2),
+                ("k2", "nyc", 3),
+            ])])
+            .await
+            .unwrap();
+        table
+            .upsert([partitioned_batch(vec![
+                ("k1", "sf", 20),
+                ("k0", "sf", 5),
+                ("k4", "nyc", 6),
+            ])])
+            .await
+            .unwrap();
+        table.delete("id IN ('k2', 'k4')").await.unwrap();
+
+        let footers = base_file_footers(dir.path());
+        if table_type == TableTypeValue::CopyOnWrite {
+            // Insert, merge rewrite, and the delete's empty rewrite of nyc.
+            assert!(footers.len() >= 4, "saw {} base files", footers.len());
+            assert!(footers.iter().any(|(_, keys)| keys.is_empty()));
+        } else {
+            assert!(footers.len() >= 2, "saw {} base files", footers.len());
+        }
+        for (footer, keys) in &footers {
+            assert_record_key_footer(footer, keys);
+        }
+    }
+}
+
+fn assert_record_key_footer(footer: &HashMap<String, String>, keys: &[String]) {
+    use base64::Engine;
+    assert_eq!(
+        footer
+            .get("hoodie_bloom_filter_type_code")
+            .map(String::as_str),
+        Some("DYNAMIC_V0")
+    );
+    let bloom = base64::engine::general_purpose::STANDARD
+        .decode(&footer["org.apache.hudi.bloomfilter"])
+        .unwrap();
+    let int_at = |offset: usize| i32::from_be_bytes(bloom[offset..offset + 4].try_into().unwrap());
+    // Version, hash count, hash type, bit count: Java's 60000 entries at fpp 1e-9.
+    assert_eq!(
+        (int_at(0), int_at(4), bloom[8], int_at(9)),
+        (-1, 30, 1, 2_587_966)
+    );
+    // Entries per row, keys added, row count.
+    assert_eq!(
+        (int_at(13), int_at(17), int_at(21)),
+        (60_000, keys.len() as i32, 1)
+    );
+    assert_eq!(footer.get("hoodie_min_record_key"), keys.iter().min());
+    assert_eq!(footer.get("hoodie_max_record_key"), keys.iter().max());
+}
+
+/// A table without meta fields writes no bloom filter, as Java does.
+#[tokio::test]
+async fn test_base_file_footer_omits_bloom_filter_without_meta_fields() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_metadata(false)
+        .with_record_index(false)
+        .with_column_stats(false)
+        .with_populates_meta_fields(false)
+        .create()
+        .await
+        .unwrap();
+    table.append([sample_batch()]).await.unwrap();
+    let footers = base_file_footers(dir.path());
+    assert_eq!(footers.len(), 1);
+    assert!(
+        footers[0].0.keys().all(|key| key == "ARROW:schema"),
+        "{:?}",
+        footers[0].0.keys()
+    );
 }

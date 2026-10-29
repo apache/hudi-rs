@@ -217,6 +217,7 @@ pub(super) async fn rewrite(
 
     // Phase 2 (parallel): encode + put on the write task pool.
     let props = crate::write::append::parquet_writer_props(table);
+    let bloom = crate::write::append::base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let tasks = group_prepared
         .iter()
@@ -224,6 +225,7 @@ pub(super) async fn rewrite(
             crate::write::parquet_file_task(
                 storage.clone(),
                 props.clone(),
+                bloom,
                 prepared.clone(),
                 path.clone(),
                 collect_ranges,
@@ -410,6 +412,7 @@ pub(super) struct MergeCtx {
     pub(super) reader: Option<std::sync::Arc<crate::file_group::reader::FileGroupReader>>,
     pub(super) instant: String,
     pub(super) props: parquet::file::properties::WriterProperties,
+    pub(super) bloom: Option<crate::bloom::BloomFilterConfig>,
     pub(super) collect_ranges: bool,
     pub(super) event_time: bool,
     /// Collect (key, partition) of removed rows for RLI tombstones.
@@ -718,9 +721,11 @@ pub(super) fn merge_file_group_task(
         let path = relative_data_path(&plan.partition, &plan.out_name);
         let num_rows = merged.num_rows();
         let props = ctx.props.clone();
+        let bloom = ctx.bloom;
         let collect_ranges = ctx.collect_ranges;
         let (bytes, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let bytes = crate::write::append::write_parquet_bytes_with_props(props, &[merged])?;
+            let bytes =
+                crate::write::append::write_parquet_bytes_with_props(props, bloom, &[merged])?;
             let ranges = if collect_ranges {
                 Some(
                     crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
@@ -802,6 +807,7 @@ pub(super) async fn commit_merge_plans(
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
     let props = crate::write::append::parquet_writer_props(table);
+    let bloom = crate::write::append::base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let rli_enabled = table.is_metadata_table_enabled() && is_record_index_enabled(table);
     let ctx = MergeCtx {
@@ -821,6 +827,7 @@ pub(super) async fn commit_merge_plans(
         },
         instant: instant.to_string(),
         props: props.clone(),
+        bloom,
         collect_ranges,
         event_time: uses_event_time_merge(&table.hudi_configs)?,
         collect_rli_deletes: rli_enabled && matched_slot == MatchedSlot::Deletes,
@@ -872,6 +879,7 @@ pub(super) async fn commit_merge_plans(
             let output = crate::write::parquet_file_task(
                 storage,
                 props,
+                bloom,
                 prepared.clone(),
                 path,
                 collect_ranges,
