@@ -479,8 +479,10 @@ impl TableCreateBuilder {
             HudiTableConfig::BasePath.as_ref().to_string(),
             self.base_uri.clone(),
         );
+        let mut storage_options = self.storage_options.clone();
+        crate::table::builder::resolve_storage_env_vars(&mut storage_options);
         let storage = Storage::new(
-            Arc::new(self.storage_options.clone()),
+            Arc::new(storage_options),
             Arc::new(HudiConfigs::new(hudi_for_storage)),
         )?;
 
@@ -665,6 +667,34 @@ mod lifecycle_tests {
         .unwrap();
         assert!(mdt_props.contains("hoodie.table.name=trips_metadata"));
         assert!(mdt_props.contains("hoodie.table.type=MERGE_ON_READ"));
+    }
+
+    /// `create` takes storage options from env vars like `TableBuilder` does.
+    /// An invalid env-only option fails storage creation up front, before
+    /// any request, which proves the env var reached the store.
+    #[tokio::test]
+    #[serial_test::serial(env_vars)]
+    async fn test_create_resolves_storage_env_vars() {
+        const KEY: &str = "AWS_ALLOW_HTTP";
+        let saved = std::env::var(KEY).ok();
+        unsafe { std::env::set_var(KEY, "not-a-bool") };
+
+        let result = Table::create("s3://bucket/trips")
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .create()
+            .await;
+
+        unsafe {
+            match &saved {
+                Some(v) => std::env::set_var(KEY, v),
+                None => std::env::remove_var(KEY),
+            }
+        }
+        let Err(err) = result else {
+            panic!("create must fail on the invalid env option");
+        };
+        assert!(err.to_string().contains("not-a-bool"), "{err}");
     }
 
     /// tv8 MOR with commit-time ordering, no hive-style, no meta fields:
