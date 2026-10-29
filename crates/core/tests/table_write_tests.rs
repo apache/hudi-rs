@@ -1603,13 +1603,13 @@ fn aliased_batch(id: &str) -> RecordBatch {
         (
             Field::new(
                 "l",
-                DataType::LargeList(Arc::new(Field::new("item", DataType::Int16, false))),
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int16, true))),
                 true,
             ),
             Arc::new(arrow::array::LargeListArray::new(
-                Arc::new(Field::new("item", DataType::Int16, false)),
+                Arc::new(Field::new("item", DataType::Int16, true)),
                 arrow::buffer::OffsetBuffer::from_lengths([2]),
-                Arc::new(Int16Array::from(vec![1, 2])),
+                Arc::new(Int16Array::from(vec![Some(1), None])),
                 None,
             )),
         ),
@@ -1676,7 +1676,7 @@ async fn test_aliased_arrow_types_support_repeated_writes() {
                 "Utf8=text",
                 "Binary=0001",
                 "Timestamp(Microsecond, Some(\"UTC\"))=1000000",
-                "List(Field { name: \"element\", data_type: Int32 })=[1, 2]",
+                "List(Field { name: \"element\", data_type: Int32, nullable: true })=[1, ]",
                 "Decimal128(10, 2)=123.45",
             ],
             "{table_type:?}"

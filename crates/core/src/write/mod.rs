@@ -901,6 +901,15 @@ mod tests {
             Field::new("l", DataType::List(item(DataType::Int16)), false),
             Field::new("ll", DataType::LargeList(item(DataType::LargeUtf8)), false),
             Field::new(
+                "nl",
+                DataType::List(std::sync::Arc::new(Field::new(
+                    "item",
+                    DataType::Int16,
+                    true,
+                ))),
+                false,
+            ),
+            Field::new(
                 "st",
                 DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int8, false)])),
                 false,
