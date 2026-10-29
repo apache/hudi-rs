@@ -3101,6 +3101,43 @@ fn flagged_batch(rows: Vec<(&str, &str, i64, bool)>) -> RecordBatch {
     .unwrap()
 }
 
+/// A delete marker deletes the stored row even in a partial upsert that does
+/// not select it, whether or not the input names the stored partition.
+#[tokio::test]
+async fn test_partial_upsert_honors_delete_marker() {
+    for input_city in ["sf", "nyc"] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([flagged_batch(vec![
+                ("a", "sf", 1, false),
+                ("b", "nyc", 2, false),
+            ])])
+            .await
+            .unwrap();
+        table
+            .upsert_with(
+                [flagged_batch(vec![("a", input_city, 9, true)])],
+                UpsertOptions {
+                    update_columns: Some(vec!["value".to_string()]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("b".to_string(), 2)],
+            "input city {input_city}"
+        );
+    }
+}
+
 /// `_hoodie_is_deleted` is a data column (Hudi's delete marker), not one of
 /// the writer-managed meta fields: it stays in the table and commit schema.
 #[tokio::test]

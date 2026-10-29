@@ -156,7 +156,7 @@ async fn request_deltacommit(table: &Table, operation: &str) -> Result<String> {
 pub async fn upsert_batches(
     table: &mut Table,
     batches: &[RecordBatch],
-    options: UpsertOptions,
+    mut options: UpsertOptions,
 ) -> Result<WriteResult> {
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
@@ -186,6 +186,17 @@ pub async fn upsert_batches(
                 )));
             }
         }
+    }
+    // The input row's delete marker applies whatever columns a partial upsert
+    // selects; Java checks the incoming record for a delete before merging.
+    if let Some(columns) = options.update_columns.as_mut()
+        && batches[0]
+            .schema()
+            .field_with_name("_hoodie_is_deleted")
+            .is_ok()
+        && !columns.iter().any(|column| column == "_hoodie_is_deleted")
+    {
+        columns.push("_hoodie_is_deleted".to_string());
     }
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
