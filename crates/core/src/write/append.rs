@@ -920,7 +920,7 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
                 "{{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":{precision},\"scale\":{scale}}}"
             ))
         }
-        DataType::List(field) | DataType::LargeList(field) => {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
             let item =
                 arrow_type_to_avro_type_json_named(field.data_type(), &format!("{path}_item"))?;
             let item = if field.is_nullable() {
