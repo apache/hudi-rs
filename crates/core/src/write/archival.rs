@@ -234,6 +234,23 @@ pub(crate) async fn archive_timeline_if_needed(
         return Ok(());
     }
 
+    // A retry after the active files failed to go finds some of its instants
+    // already in the history; publish only the rest, so none appears twice.
+    let history_dir = format!("{timeline_dir}/history");
+    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
+    let archived = archived_instant_times(
+        storage,
+        &history_dir,
+        &manifest,
+        &to_archive[0].requested,
+        &to_archive[to_archive.len() - 1].requested,
+    )
+    .await?;
+    let to_publish: Vec<&CompletedInstant> = to_archive
+        .iter()
+        .filter(|instant| !archived.contains(&instant.requested))
+        .collect();
+
     // Build HoodieLSMTimelineInstant rows: metadata = completed file bytes;
     // plan = inflight (fallback requested) bytes for replacecommits.
     let mut instant_times = Vec::new();
@@ -241,7 +258,7 @@ pub(crate) async fn archive_timeline_if_needed(
     let mut actions = Vec::new();
     let mut metadata_bytes: Vec<Option<Vec<u8>>> = Vec::new();
     let mut plan_bytes: Vec<Option<Vec<u8>>> = Vec::new();
-    for instant in &to_archive {
+    for instant in &to_publish {
         let metadata = storage
             .get_file_data(&format!("{timeline_dir}/{}", instant.file_name))
             .await?;
@@ -288,14 +305,8 @@ pub(crate) async fn archive_timeline_if_needed(
         plan_bytes.push(plan);
     }
 
-    let history_dir = format!("{timeline_dir}/history");
-    let min_instant = &to_archive[0].requested;
-    let max_instant = &to_archive[to_archive.len() - 1].requested;
-    let parquet_name = format!("{min_instant}_{max_instant}_0.parquet");
-    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
-    // A retry after the active files failed to go finds its file already
-    // published (Java LSMTimelineWriter skips it too); only the deletes remain.
-    if !manifest.files.iter().any(|f| f.file_name == parquet_name) {
+    if let (Some(first), Some(last)) = (to_publish.first(), to_publish.last()) {
+        let parquet_name = format!("{}_{}_0.parquet", first.requested, last.requested);
         publish_lsm_file(
             storage,
             &history_dir,
@@ -337,6 +348,44 @@ pub(crate) async fn archive_timeline_if_needed(
             .await?;
     }
     Ok(())
+}
+
+/// Instant times held by the published history files whose name range
+/// (`{min}_{max}_{level}.parquet`) overlaps `[min, max]`.
+async fn archived_instant_times(
+    storage: &Storage,
+    history_dir: &str,
+    manifest: &LsmManifest,
+    min: &str,
+    max: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut archived = std::collections::HashSet::new();
+    for entry in &manifest.files {
+        let mut range = entry.file_name.splitn(3, '_');
+        let (Some(file_min), Some(file_max)) = (range.next(), range.next()) else {
+            continue;
+        };
+        if file_max < min || file_min > max {
+            continue;
+        }
+        let bytes = storage
+            .get_file_data(&format!("{history_dir}/{}", entry.file_name))
+            .await?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .and_then(|builder| builder.build())
+            .map_err(|e| CoreError::Timeline(format!("read LSM file {}: {e}", entry.file_name)))?;
+        for batch in reader {
+            let batch = batch.map_err(CoreError::ArrowError)?;
+            let Some(times) = batch
+                .column_by_name("instantTime")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+            else {
+                continue;
+            };
+            archived.extend(times.iter().flatten().map(str::to_string));
+        }
+    }
+    Ok(archived)
 }
 
 /// Writes one level-0 file, then publishes it: manifest_{N+1}, then
@@ -732,5 +781,45 @@ mod delete_failure_tests {
             .await
             .unwrap();
         assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
+    }
+
+    /// A retry whose range is wider than the published file's archives only
+    /// the instants the history does not already hold.
+    #[tokio::test]
+    async fn test_archival_retry_over_wider_range_archives_each_instant_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=5).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants[..4] {
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let failing = Arc::new(DeleteFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with("20260101000000002_20260101000000002.commit")
+        }));
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            failing,
+            Arc::new(HudiConfigs::empty()),
+        );
+        let _ = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        assert!(
+            !timeline
+                .join(format!("{0}_{0}.commit", instants[0]))
+                .exists()
+        );
+
+        let ts = &instants[4];
+        std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(archived_instants(&timeline), instants[..4].to_vec());
     }
 }
