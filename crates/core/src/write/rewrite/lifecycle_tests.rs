@@ -536,3 +536,83 @@ async fn test_failed_completion_put_keeps_written_files() {
         }
     }
 }
+
+fn mdt_log_files(base: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.to_string_lossy().contains(".log.") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&base.join(".hoodie/metadata"), &mut out);
+    out
+}
+
+/// A write that fails while updating the metadata table leaves log files
+/// named for its instant, whether or not the metadata commit was fenced or
+/// completed; rolling the write back must delete them.
+#[tokio::test]
+async fn test_rollback_deletes_orphan_mdt_logs_of_incomplete_mdt_commit() {
+    use crate::storage::fault::{FaultyPutStore, PutFault};
+    type Case = (&'static str, PutFault, fn(&str) -> bool);
+    let cases: [Case; 2] = [
+        ("log put", PutFault::LandedThenError, |path| {
+            path.contains(".hoodie/metadata/record_index/") && path.contains(".log.")
+        }),
+        ("metadata completion", PutFault::NotLanded, |path| {
+            path.contains(".hoodie/metadata/.hoodie/timeline/") && path.ends_with(".deltacommit")
+        }),
+    ];
+    for (case, fault, matches) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut table = Table::create(uri)
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([batch(&[("a", "sf", 1, 10), ("b", "ny", 1, 20)])])
+            .await
+            .unwrap();
+        let before = mdt_log_files(dir.path());
+
+        let storage = table.file_system_view.storage.clone();
+        let store =
+            FaultyPutStore::new_for_any_put(storage.object_store.clone(), fault, move |p| {
+                matches(p.as_ref())
+            });
+        table.file_system_view.storage = crate::storage::Storage::new_with_object_store(
+            storage.base_url.as_ref().clone(),
+            store.clone(),
+            storage.hudi_configs.clone(),
+        );
+        let result = table
+            .upsert([batch(&[("a", "sf", 2, 11), ("c", "ny", 2, 30)])])
+            .await;
+        assert!(result.is_err(), "{case}: the faulted PUT must surface");
+        assert!(!store.is_armed(), "{case}: the faulted PUT was not hit");
+        let orphans: Vec<_> = mdt_log_files(dir.path())
+            .into_iter()
+            .filter(|path| !before.contains(path))
+            .collect();
+        assert!(!orphans.is_empty(), "{case}: no metadata log was written");
+
+        let mut fresh = Table::new(uri).await.unwrap();
+        fresh.append([batch(&[("d", "ny", 3, 40)])]).await.unwrap();
+        let left: Vec<_> = orphans.iter().filter(|path| path.exists()).collect();
+        assert!(
+            left.is_empty(),
+            "{case}: orphan metadata logs survived: {left:?}"
+        );
+        assert_eq!(rows(&Table::new(uri).await.unwrap()).await, 3, "{case}");
+    }
+}
