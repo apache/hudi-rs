@@ -111,6 +111,38 @@ pub(crate) fn align_batch_to_schema(
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
 }
 
+/// Keeps every column the table declares nullable nullable: older files may
+/// hold nulls, and a commit schema that tightened the column would fail every
+/// later read of them (Java's `canonicalizeSchema` widens the same way).
+/// Callers have already matched the batches to `table_schema` by name and type.
+pub(crate) fn widen_to_table_nullability(
+    batches: &[arrow_array::RecordBatch],
+    table_schema: &arrow_schema::Schema,
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| {
+            let source = batch.schema();
+            let fields: Vec<arrow_schema::Field> = source
+                .fields()
+                .iter()
+                .map(|field| {
+                    let table_nullable = table_schema
+                        .field_with_name(field.name())
+                        .is_ok_and(|table_field| table_field.is_nullable());
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_nullable(field.is_nullable() || table_nullable)
+                })
+                .collect();
+            let schema = arrow_schema::Schema::new_with_metadata(fields, source.metadata().clone());
+            arrow_array::RecordBatch::try_new(std::sync::Arc::new(schema), batch.columns().to_vec())
+                .map_err(CoreError::ArrowError)
+        })
+        .collect()
+}
+
 /// Drops the writer-managed meta columns; `_hoodie_is_deleted` and other
 /// `_hoodie_`-prefixed data columns stay.
 pub(crate) fn strip_meta_columns(

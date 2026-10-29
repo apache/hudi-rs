@@ -80,8 +80,9 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     }
     ensure_supported_table_type(table)?;
 
-    let schema = ensure_batches_share_schema(batches)?;
-    ensure_append_schema_matches_table(table, schema.as_ref()).await?;
+    ensure_batches_share_schema(batches)?;
+    let batches = &match_table_schema(table, batches).await?;
+    let schema = batches[0].schema();
     // Must be expressible in commit metadata (Avro JSON) before fencing.
     arrow_schema_to_avro_json(&strip_meta_fields_from_schema(schema.as_ref()))?;
     let num_rows = ensure_rows_present(batches)?;
@@ -457,10 +458,9 @@ fn ensure_rows_present(batches: &[RecordBatch]) -> Result<usize> {
 /// `complete_write` with the version 8 path, and a crashed write leaves
 /// nothing on the timeline for a later writer to roll back.
 async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
-    let schema = ensure_batches_share_schema(batches)?;
-    if !table.timeline.completed_commits.is_empty() {
-        ensure_batch_schema_matches(&table.get_schema().await?, schema.as_ref())?;
-    }
+    ensure_batches_share_schema(batches)?;
+    let batches = &match_table_schema(table, batches).await?;
+    let schema = batches[0].schema();
     let num_rows = ensure_rows_present(batches)?;
     ensure_version_6_append_only(table)?;
     ensure_unpartitioned(table)?;
@@ -967,15 +967,17 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
     }
 }
 
-async fn ensure_append_schema_matches_table(
-    table: &Table,
-    batch_schema: &arrow_schema::Schema,
-) -> Result<()> {
+/// Checks the batches against the table schema, widened to its nullability.
+async fn match_table_schema(table: &Table, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     if table.timeline.completed_commits.is_empty() {
-        return Ok(());
+        return Ok(batches.to_vec());
     }
     let table_schema = table.get_schema().await?;
-    ensure_batch_schema_matches(&table_schema, &strip_meta_fields_from_schema(batch_schema))
+    ensure_batch_schema_matches(
+        &table_schema,
+        &strip_meta_fields_from_schema(batches[0].schema().as_ref()),
+    )?;
+    crate::write::widen_to_table_nullability(batches, &table_schema)
 }
 
 /// The table schema resolves from the Avro schema in commit metadata, and the

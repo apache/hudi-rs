@@ -173,7 +173,7 @@ pub async fn upsert_batches(
             "upsert requires at least one RecordBatch".to_string(),
         ));
     }
-    validate_write_input(table, batches, "upsert").await?;
+    let batches = &validate_write_input(table, batches, "upsert").await?;
     if let Some(columns) = &options.update_columns {
         let schema = batches[0].schema();
         for column in columns {
@@ -889,7 +889,7 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
             "overwrite requires at least one RecordBatch".to_string(),
         ));
     }
-    validate_write_input(table, batches, "overwrite").await?;
+    let batches = &validate_write_input(table, batches, "overwrite").await?;
     // Listing enumerates the replaced groups; their record keys are read
     // (key column only) afterwards to tombstone dropped index entries.
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
@@ -946,7 +946,7 @@ pub async fn dynamic_partition_overwrite_batches(
                 .to_string(),
         ));
     }
-    validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
+    let batches = &validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
     // Partition paths depend only on the input batches; derive and validate
     // them before fencing so bad input leaves no timeline trace.
     let raw = concat(batches)?;

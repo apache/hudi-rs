@@ -92,7 +92,7 @@ pub(super) async fn mor_upsert_batches(
         ));
     }
 
-    validate_write_input(table, batches, "upsert").await?;
+    let batches = &validate_write_input(table, batches, "upsert").await?;
     let incoming = concat(batches)?;
     let incoming_keys = batch_record_keys(table, &incoming)?;
     let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;

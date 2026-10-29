@@ -4223,3 +4223,86 @@ async fn test_base_file_footer_omits_bloom_filter_without_meta_fields() {
         footers[0].0.keys()
     );
 }
+
+/// An append whose batch declares a column non-nullable keeps the table's
+/// nullable declaration, so the file holding nulls stays readable.
+#[tokio::test]
+async fn test_append_keeps_nullable_table_column_nullable() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let value_batch = |nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("value", DataType::Int64, nullable),
+            ])),
+            vec![
+                Arc::new(StringArray::from(ids)),
+                Arc::new(Int64Array::from(values)),
+            ],
+        )
+        .unwrap()
+    };
+    table
+        .append([value_batch(true, vec!["a", "b"], vec![Some(1), None])])
+        .await
+        .unwrap();
+    table
+        .append([value_batch(false, vec!["c"], vec![Some(3)])])
+        .await
+        .unwrap();
+
+    let schema = table.get_schema().await.unwrap();
+    assert!(schema.field_with_name("value").unwrap().is_nullable());
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+}
+
+/// Upserts on both table types keep nullable table columns nullable too.
+#[tokio::test]
+async fn test_upsert_keeps_nullable_table_column_nullable() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        let value_batch = |nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, nullable),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .unwrap()
+        };
+        table
+            .upsert([value_batch(true, vec!["a", "b"], vec![Some(1), None])])
+            .await
+            .unwrap();
+        table
+            .upsert([value_batch(false, vec!["c"], vec![Some(3)])])
+            .await
+            .unwrap();
+
+        let schema = table.get_schema().await.unwrap();
+        assert!(
+            schema.field_with_name("value").unwrap().is_nullable(),
+            "{table_type:?}"
+        );
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    }
+}
