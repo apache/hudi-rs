@@ -355,6 +355,15 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 }
 
 fn take_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+    // A contiguous run is a view onto the batch; copying it would double the
+    // memory of every append, which splits its input into exactly such runs.
+    if let Some(first) = indices.first()
+        && indices
+            .windows(2)
+            .all(|w| w[0].checked_add(1) == Some(w[1]))
+    {
+        return Ok(batch.slice(*first as usize, indices.len()));
+    }
     let indices = UInt32Array::from(indices.to_vec());
     let columns = batch
         .columns()
@@ -1035,6 +1044,29 @@ pub(crate) fn prepare_batches_for_write_with_offset(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn test_take_rows_slices_a_contiguous_run_and_gathers_the_rest() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from_iter_values(0..10))],
+        )?;
+        let values = |b: &RecordBatch| -> Vec<i64> {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        assert_eq!(values(&take_rows(&batch, &[3, 4, 5])?), [3, 4, 5]);
+        assert_eq!(values(&take_rows(&batch, &[0])?), [0]);
+        assert_eq!(values(&take_rows(&batch, &[9, 2, 2])?), [9, 2, 2]);
+        assert_eq!(values(&take_rows(&batch, &[1, 3])?), [1, 3]);
+        assert_eq!(take_rows(&batch, &[])?.num_rows(), 0);
+        Ok(())
+    }
 
     #[test]
     fn test_arrow_schema_to_avro_json_type_matrix() {
