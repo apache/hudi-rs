@@ -57,7 +57,7 @@ impl HoodieIndex for SimpleIndex {
         let reader = table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
             .await?;
-        let mut by_record_key: HashMap<String, RecordLocation> = HashMap::new();
+        let mut by_record_key: HashMap<String, Vec<RecordLocation>> = HashMap::new();
         for slice in slices {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
             let location = RecordLocation {
@@ -67,7 +67,10 @@ impl HoodieIndex for SimpleIndex {
             };
             let mut tag = |key: &str| {
                 if requested.contains(key) {
-                    by_record_key.insert(key.to_string(), location.clone());
+                    by_record_key
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(location.clone());
                 }
             };
             match batch.column_by_name(MetaField::RecordKey.as_ref()) {
@@ -88,9 +91,15 @@ impl HoodieIndex for SimpleIndex {
                     .for_each(|key| tag(key)),
             }
         }
+        // A key stored in several partitions (a non-global Java index allows
+        // it) resolves to the copy in the incoming record's partition.
         for (hoodie_key, slot) in locations.iter_mut() {
-            if let Some(location) = by_record_key.get(&hoodie_key.record_key) {
-                *slot = Some(location.clone());
+            if let Some(candidates) = by_record_key.get(&hoodie_key.record_key) {
+                *slot = candidates
+                    .iter()
+                    .find(|location| location.partition_path == hoodie_key.partition_path)
+                    .or(candidates.last())
+                    .cloned();
             }
         }
         Ok(locations)

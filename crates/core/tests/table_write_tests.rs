@@ -1917,6 +1917,41 @@ async fn test_cow_write_stats_count_per_file() {
     );
 }
 
+/// A key stored in several partitions (as a non-global Java index allows)
+/// resolves to the copy in the incoming record's partition.
+#[tokio::test]
+async fn test_simple_index_prefers_the_incoming_partition() {
+    for (stored, incoming) in [(["sf", "nyc"], "sf"), (["sf", "nyc"], "nyc")] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_metadata(false)
+            .create()
+            .await
+            .unwrap();
+        for city in stored {
+            table
+                .append([city_batch(vec![("a", city, 1)])])
+                .await
+                .unwrap();
+        }
+        let key = HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: format!("city={incoming}"),
+        };
+        let locations = SimpleIndex
+            .tag_location(&table, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            locations[&key].as_ref().unwrap().partition_path,
+            format!("city={incoming}")
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_upsert_rejects_schema_mismatch() {
     let dir = tempdir().unwrap();
