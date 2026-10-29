@@ -22,6 +22,7 @@
 //! and log files for the metadata table's files partition.
 
 use crate::Result;
+use crate::file_group::log_file::scanner::HFileRecordGroup;
 use crate::hfile::HFileRecord;
 use crate::metadata::table_record::{
     FilesPartitionRecord, decode_files_partition_record_with_schema,
@@ -173,6 +174,36 @@ impl FilesPartitionMerger {
         }
 
         Ok(merged)
+    }
+
+    /// Merge log blocks into `merged` in log order, decoding each block with
+    /// its own writer schema (this merger's schema when it has none). A block
+    /// holds a key at most once. An empty `keys` merges every record.
+    pub fn merge_log_groups(
+        &self,
+        merged: &mut HashMap<String, FilesPartitionRecord>,
+        groups: &[HFileRecordGroup],
+        keys: &[&str],
+    ) -> Result<()> {
+        let key_set: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        for group in groups {
+            let schema = group.schema.as_deref().unwrap_or(&self.schema);
+            for record in &group.records {
+                if !key_set.is_empty()
+                    && !record.key_as_str().is_some_and(|key| key_set.contains(key))
+                {
+                    continue;
+                }
+                let decoded = decode_files_partition_record_with_schema(record, schema)?;
+                match merged.get_mut(&decoded.key) {
+                    Some(existing) => self.merge_files_partition_records(existing, &decoded),
+                    None => {
+                        merged.insert(decoded.key.clone(), decoded);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Decode an HFile record using the schema.
