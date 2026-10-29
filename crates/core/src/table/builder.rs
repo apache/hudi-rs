@@ -169,6 +169,32 @@ impl TableBuilder {
     }
 }
 
+/// Add storage options from env vars for keys starting with `HOODIE_ENV_` or cloud storage
+/// prefixes, without overriding options already present.
+///
+/// For example: `HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key` will be converted to `fs.s3a.access.key`.
+///
+/// Also supports standard cloud storage env vars like `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.
+///
+/// [note] All keys will be converted to lowercase.
+pub(crate) fn resolve_storage_env_vars(storage_options: &mut HashMap<String, String>) {
+    for (env_key, env_value) in std::env::vars() {
+        let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
+            Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
+        } else if Storage::CLOUD_STORAGE_PREFIXES
+            .iter()
+            .any(|prefix| env_key.starts_with(prefix))
+        {
+            Some(env_key.to_ascii_lowercase())
+        } else {
+            None
+        };
+        if let Some(key) = lower_option_key {
+            storage_options.entry(key).or_insert(env_value);
+        }
+    }
+}
+
 impl OptionResolver {
     /// Create a new [OptionResolver] with the given base URI.
     pub fn new(base_uri: &str) -> Self {
@@ -244,29 +270,8 @@ impl OptionResolver {
         extend_if_absent(&mut self.storage_options, &generic_other_opts)
     }
 
-    /// Resolve env vars for keys starting with `HOODIE_ENV_` or cloud storage options.
-    ///
-    /// For example: `HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key` will be converted to `fs.s3a.access.key`.
-    ///
-    /// Also supports standard cloud storage env vars like `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.
-    ///
-    /// [note] All keys will be converted to lowercase.
     fn resolve_env_vars(&mut self) {
-        for (env_key, env_value) in std::env::vars() {
-            let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
-                Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
-            } else if Storage::CLOUD_STORAGE_PREFIXES
-                .iter()
-                .any(|prefix| env_key.starts_with(prefix))
-            {
-                Some(env_key.to_ascii_lowercase())
-            } else {
-                None
-            };
-            if let Some(key) = lower_option_key {
-                self.storage_options.entry(key).or_insert(env_value);
-            }
-        }
+        resolve_storage_env_vars(&mut self.storage_options);
     }
 
     async fn resolve_hudi_options(&mut self) -> Result<()> {
