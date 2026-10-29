@@ -838,6 +838,117 @@ async fn test_upsert_uses_event_time_ordering() {
     assert_eq!(values.value(0), 4);
 }
 
+/// Rows are `(id, value, event_time, _hoodie_is_deleted)`.
+fn ordered_flagged_batch(rows: Vec<(&str, i64, i64, bool)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("event_time", DataType::Int64, false),
+        Field::new("_hoodie_is_deleted", DataType::Boolean, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(BooleanArray::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+fn ordered_flagged_rows(batches: &[RecordBatch]) -> Vec<(String, i64, i64, bool)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = |name: &str| batch.column_by_name(name).unwrap().as_any();
+        let ids = column("id").downcast_ref::<StringArray>().unwrap();
+        let values = column("value").downcast_ref::<Int64Array>().unwrap();
+        let times = column("event_time").downcast_ref::<Int64Array>().unwrap();
+        let deleted = column("_hoodie_is_deleted")
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row).to_string(),
+                values.value(row),
+                times.value(row),
+                deleted.value(row),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// Copy-on-write event-time upserts into a group where most stored rows are
+/// untouched: each touched key resolves by ordering value (ties go to the
+/// incoming row), a winning delete marker removes the row, in-batch duplicates
+/// keep the highest ordering value, and untouched rows pass through.
+#[tokio::test]
+async fn test_cow_event_time_upsert_merges_only_touched_keys() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    let stored: Vec<_> = ["a", "b", "c", "d", "e", "f", "g", "h"]
+        .into_iter()
+        .zip(1..)
+        .map(|(id, value)| (id, value, 100, false))
+        .collect();
+    table.upsert([ordered_flagged_batch(stored)]).await.unwrap();
+    table
+        .upsert([ordered_flagged_batch(vec![
+            ("a", 10, 50, false),
+            ("b", 20, 100, false),
+            ("c", 30, 150, false),
+            ("c", 31, 120, false),
+            ("d", 40, 150, true),
+            ("e", 50, 50, true),
+            ("i", 90, 10, false),
+            ("j", 100, 10, false),
+            ("j", 101, 20, false),
+        ])])
+        .await
+        .unwrap();
+    table
+        .upsert_with(
+            [ordered_flagged_batch(vec![
+                ("g", 70, 50, false),
+                ("h", 80, 200, false),
+            ])],
+            UpsertOptions {
+                update_columns: Some(vec!["value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let expected = [
+        ("a", 1, 100),
+        ("b", 20, 100),
+        ("c", 30, 150),
+        ("e", 5, 100),
+        ("f", 6, 100),
+        ("g", 7, 100),
+        ("h", 80, 100),
+        ("i", 90, 10),
+        ("j", 101, 20),
+    ]
+    .into_iter()
+    .map(|(id, value, event_time)| (id.to_string(), value, event_time, false))
+    .collect::<Vec<_>>();
+    assert_eq!(ordered_flagged_rows(&batches), expected);
+}
+
 #[tokio::test]
 async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
     let dir = tempdir().unwrap();
