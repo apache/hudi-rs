@@ -632,7 +632,7 @@ impl TableCreateBuilder {
 }
 
 /// Java `HoodieTableConfig.generateChecksum`: CRC32 of `{database}.{table}`.
-fn table_checksum(database: &str, table: &str) -> u32 {
+pub(crate) fn table_checksum(database: &str, table: &str) -> u32 {
     crc32(format!("{database}.{table}").as_bytes())
 }
 

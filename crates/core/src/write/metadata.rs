@@ -118,7 +118,7 @@ pub async fn bootstrap_metadata_table(
     partition_stats_enabled: bool,
 ) -> Result<()> {
     let mdt_name = format!("{table_name}_metadata");
-    let checksum = crc32(format!(".{mdt_name}").as_bytes());
+    let checksum = crate::write::create::table_checksum("", &mdt_name);
     // The MDT's table version follows the data table's (Java initializes the
     // MDT meta client with the data write config's version).
     let properties = format!(
@@ -1467,21 +1467,6 @@ pub fn epoch_millis_to_instant(millis: i64) -> String {
         chrono::LocalResult::Single(dt) => dt.format("%Y%m%d%H%M%S%3f").to_string(),
         _ => format!("{millis:017}"),
     }
-}
-
-fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffff_u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 {
-                (crc >> 1) ^ 0xedb8_8320
-            } else {
-                crc >> 1
-            };
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]
