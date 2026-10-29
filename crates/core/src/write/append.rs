@@ -977,19 +977,14 @@ async fn match_table_schema(table: &Table, batches: &[RecordBatch]) -> Result<Ve
     crate::write::widen_to_table_nullability(batches, &table_schema)
 }
 
-/// The table schema resolves from the Avro schema in commit metadata, and the
-/// Arrow to Avro mapping is lossy (Int16 becomes Int32, LargeUtf8 becomes
-/// Utf8), so a batch also matches when its Avro round trip equals the table.
-pub(crate) fn ensure_batch_schema_matches(
+/// The batch is already normalized to the types its commit schema reads back
+/// (see [`crate::write::normalize_for_write`]), so it matches only when its
+/// names and types equal the table's.
+fn ensure_batch_schema_matches(
     table_schema: &arrow_schema::Schema,
     batch_data: &arrow_schema::Schema,
 ) -> Result<()> {
     if schemas_equal_by_fields(table_schema, batch_data) {
-        return Ok(());
-    }
-    let round_trip = arrow_schema_to_avro_json(batch_data)
-        .and_then(|avro| crate::schema::resolver::avro_json_to_arrow_schema(&avro));
-    if round_trip.is_ok_and(|schema| schemas_equal_by_fields(table_schema, &schema)) {
         return Ok(());
     }
     Err(CoreError::Write(format!(
