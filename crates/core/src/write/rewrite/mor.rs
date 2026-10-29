@@ -313,7 +313,10 @@ pub(super) async fn mor_upsert_batches(
             record_key: key.record_key,
             partition_path: key.partition_path,
             file_id: String::new(),
-            instant_time_millis: instant_to_epoch_millis(&instant),
+            instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                &instant,
+                &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+            ),
             is_deleted: true,
         })
         .collect();

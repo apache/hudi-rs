@@ -1467,10 +1467,6 @@ pub(crate) fn timeline_timezone(hudi_configs: &crate::config::HudiConfigs) -> St
     hudi_configs.get_or_default(TimelineTimezone).into()
 }
 
-pub(crate) fn instant_to_epoch_millis(instant: &str) -> i64 {
-    instant_to_epoch_millis_in(instant, "UTC")
-}
-
 /// Format epoch millis as a Hudi timeline instant (`yyyyMMddHHmmssSSS`).
 pub fn epoch_millis_to_instant(millis: i64) -> String {
     use chrono::{TimeZone, Utc};
@@ -1820,7 +1816,7 @@ mod tests {
                 record_key: record_key.to_string(),
                 partition_path: location.partition_path,
                 file_id: location.file_id,
-                instant_time_millis: instant_to_epoch_millis(&location.instant_time),
+                instant_time_millis: instant_to_epoch_millis_in(&location.instant_time, "UTC"),
                 is_deleted: false,
             };
             let base = HFileWriter::write(

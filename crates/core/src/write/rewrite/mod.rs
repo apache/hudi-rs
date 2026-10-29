@@ -50,7 +50,7 @@ use crate::write::append::{
     timeline_dir,
 };
 use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
-use crate::write::metadata::{instant_to_epoch_millis, is_column_stats_enabled};
+use crate::write::metadata::is_column_stats_enabled;
 
 mod cow;
 #[cfg(test)]
@@ -496,7 +496,10 @@ pub async fn upsert_batches(
                     record_key,
                     partition_path,
                     file_id: String::new(),
-                    instant_time_millis: instant_to_epoch_millis(&instant),
+                    instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                        &instant,
+                        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                    ),
                     is_deleted: true,
                 }),
         )
@@ -804,7 +807,10 @@ async fn rli_deletes_for_replaced_groups(
     let reader = table
         .create_file_group_reader_with_options(Some(&options), std::iter::empty::<(&str, String)>())
         .await?;
-    let millis = instant_to_epoch_millis(instant);
+    let millis = crate::write::metadata::instant_to_epoch_millis_in(
+        instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     let mut entries = Vec::new();
     for slice in replaced {
         let batch = reader.read_file_slice(slice, &options).await?;

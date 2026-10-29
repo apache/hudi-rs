@@ -1018,7 +1018,10 @@ pub(super) async fn commit_merge_plans(
                     record_key: record_key.clone(),
                     partition_path: partition_path.clone(),
                     file_id: String::new(),
-                    instant_time_millis: instant_to_epoch_millis(instant),
+                    instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
+                        instant,
+                        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                    ),
                     is_deleted: true,
                 });
             }
