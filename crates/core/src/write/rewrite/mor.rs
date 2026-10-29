@@ -444,16 +444,17 @@ pub(super) async fn mor_upsert_batches(
                     output.size,
                     false,
                 ));
+                let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+                    &instant,
+                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                );
                 rli_entries.extend(insert_indices.iter().map(|row| {
                     let key = &tagged_keys[*row as usize];
                     RecordIndexEntry {
                         record_key: key.record_key.clone(),
                         partition_path: partition_path.clone(),
                         file_id: file_id.clone(),
-                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                            &instant,
-                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                        ),
+                        instant_time_millis,
                         is_deleted: false,
                     }
                 }));
@@ -516,6 +517,10 @@ pub(super) async fn mor_upsert_batches(
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
+        let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+            &instant,
+            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+        );
         // Packed inserts are written as log records into the small slice and
         // must be registered in the RLI under this file group.
         rli_entries.extend(packed_rows.iter().map(|index| {
@@ -524,10 +529,7 @@ pub(super) async fn mor_upsert_batches(
                 record_key: key.record_key.clone(),
                 partition_path: partition_path.clone(),
                 file_id: file_id.clone(),
-                instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                    &instant,
-                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                ),
+                instant_time_millis,
                 is_deleted: false,
             }
         }));
@@ -783,6 +785,10 @@ pub(super) async fn mor_delete_keys(
             ..Default::default()
         });
     }
+    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+        &instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     let record_index = delete_keys
         .iter()
         .filter(|key| locations.contains_key(&key.record_key))
@@ -790,10 +796,7 @@ pub(super) async fn mor_delete_keys(
             record_key: key.record_key.clone(),
             partition_path: key.partition_path.clone(),
             file_id: String::new(),
-            instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                &instant,
-                &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-            ),
+            instant_time_millis,
             is_deleted: true,
         })
         .collect::<Vec<_>>();

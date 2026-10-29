@@ -298,15 +298,16 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                     plan.file_name.clone(),
                     output.size,
                 ));
+                let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+                    &request_instant,
+                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+                );
                 for key in &plan.chunk_keys {
                     rli_entries.push(RecordIndexEntry {
                         record_key: key.record_key.clone(),
                         partition_path: plan.partition_path.clone(),
                         file_id: plan.file_id.clone(),
-                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                            &request_instant,
-                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                        ),
+                        instant_time_millis,
                         is_deleted: false,
                     });
                 }
