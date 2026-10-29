@@ -163,6 +163,10 @@ the earliest active instant counts as committed (Java's
 the same rule admits MDT base files whose instant the MDT timeline has
 archived. The MDT's own timeline is *not* archived: like the Java writer, MDT
 archival is bounded by MDT compaction, which is not implemented natively.
+Java's archiver also holds data archival behind the latest MDT compaction;
+this one does not, since without native MDT compaction that bound would stop
+archival altogether, and an archived instant's MDT log blocks stay readable
+through its active MDT deltacommit (§3.3).
 
 ## 4. Writing data
 

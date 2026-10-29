@@ -426,6 +426,9 @@ pub(crate) async fn post_complete_bookkeeping(
 ) -> Result<()> {
     markers::delete_marker_dir(storage, instant).await;
     let (min_keep, max_keep) = archival::keep_commits(&table.hudi_configs)?;
+    // Not held behind the latest MDT compaction as Java's archiver is: an
+    // archived instant's MDT log blocks stay valid through its MDT
+    // deltacommit, which the MDT keeps active until a compaction covers it.
     let history_path: String = table
         .hudi_configs
         .get_or_default(crate::config::table::HudiTableConfig::TimelineHistoryPath)
