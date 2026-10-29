@@ -196,29 +196,6 @@ pub fn column_stats_for_file(
         .collect()
 }
 
-/// Tombstone column_stats for a deleted file when footer ranges are unavailable.
-pub fn column_stats_tombstones(
-    file_name: &str,
-    column_names: &[String],
-) -> Vec<ColumnStatsMetadata> {
-    column_names
-        .iter()
-        .map(|column_name| ColumnStatsMetadata {
-            file_name: file_name.to_string(),
-            column_name: column_name.clone(),
-            min_value: None,
-            max_value: None,
-            value_count: 0,
-            null_count: 0,
-            total_size: 0,
-            total_uncompressed_size: 0,
-            is_deleted: true,
-            is_tight_bound: false,
-            decoded_value_type_ordinal: None,
-        })
-        .collect()
-}
-
 /// Aggregate file-level ranges into partition-level stats (same column name).
 ///
 /// Ranges must already be expressed in their column's type (see
