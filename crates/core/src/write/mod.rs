@@ -398,9 +398,14 @@ pub(crate) async fn post_complete_bookkeeping(
         .get("hoodie.keep.max.commits")
         .and_then(|v| v.parse().ok())
         .unwrap_or(archival::DEFAULT_KEEP_MAX_COMMITS);
+    let history_path: String = table
+        .hudi_configs
+        .get_or_default(crate::config::table::HudiTableConfig::TimelineHistoryPath)
+        .into();
     archival::archive_timeline_if_needed(
         storage,
         &crate::write::append::timeline_dir(table),
+        &history_path,
         min_keep,
         max_keep,
     )

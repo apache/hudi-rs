@@ -22,7 +22,7 @@
 //! When the active timeline holds more than `hoodie.keep.max.commits`
 //! completed commits, the oldest are archived down to `hoodie.keep.min.commits`:
 //! written as one level-0 parquet of `HoodieLSMTimelineInstant` rows under
-//! `{timeline}/history/`, registered in a new `manifest_{N}` (JSON) pointed at
+//! `{timeline}/{hoodie.timeline.history.path}/`, registered in a new `manifest_{N}` (JSON) pointed at
 //! by `_version_`, then removed from the active timeline (pending fencing
 //! files first, completed files after — Java's ordering). Runs inside the
 //! completion critical section (user design; Java runs it post-commit).
@@ -75,6 +75,7 @@ struct CompletedInstant {
 pub(crate) async fn archive_timeline_if_needed(
     storage: &Storage,
     timeline_dir: &str,
+    history_path: &str,
     min_keep: usize,
     max_keep: usize,
 ) -> Result<()> {
@@ -236,7 +237,7 @@ pub(crate) async fn archive_timeline_if_needed(
 
     // A retry after the active files failed to go finds some of its instants
     // already in the history; publish only the rest, so none appears twice.
-    let history_dir = format!("{timeline_dir}/history");
+    let history_dir = format!("{timeline_dir}/{history_path}");
     let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
     let archived = archived_instant_times(
         storage,
@@ -659,7 +660,8 @@ mod delete_failure_tests {
         let storage =
             Storage::new_with_object_store(base_url, store, Arc::new(HudiConfigs::empty()));
 
-        let result = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        let result =
+            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
 
         for ts in &instants {
             assert!(
@@ -724,14 +726,15 @@ mod delete_failure_tests {
             failing,
             Arc::new(HudiConfigs::empty()),
         );
-        let _ = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        let _ =
+            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
 
         let storage = Storage::new_with_object_store(
             base_url,
             Arc::new(LocalFileSystem::new()),
             Arc::new(HudiConfigs::empty()),
         );
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2)
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2)
             .await
             .unwrap();
 
@@ -769,7 +772,8 @@ mod delete_failure_tests {
             faulty.clone(),
             Arc::new(HudiConfigs::empty()),
         );
-        let result = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        let result =
+            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
         assert!(result.is_err() && !faulty.is_armed());
 
         let storage = Storage::new_with_object_store(
@@ -777,7 +781,7 @@ mod delete_failure_tests {
             Arc::new(LocalFileSystem::new()),
             Arc::new(HudiConfigs::empty()),
         );
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2)
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2)
             .await
             .unwrap();
         assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
@@ -803,7 +807,8 @@ mod delete_failure_tests {
             failing,
             Arc::new(HudiConfigs::empty()),
         );
-        let _ = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        let _ =
+            archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2).await;
         assert!(
             !timeline
                 .join(format!("{0}_{0}.commit", instants[0]))
@@ -817,7 +822,7 @@ mod delete_failure_tests {
             Arc::new(LocalFileSystem::new()),
             Arc::new(HudiConfigs::empty()),
         );
-        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2)
+        archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", "history", 1, 2)
             .await
             .unwrap();
         assert_eq!(archived_instants(&timeline), instants[..4].to_vec());
