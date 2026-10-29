@@ -632,7 +632,7 @@ async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
         .upsert_with(
             [ordered_batch(vec![("b", 999, 20)])],
             UpsertOptions {
-                update_columns: Some(vec!["value".to_string()]),
+                update_columns: Some(vec!["event_time".to_string()]),
             },
         )
         .await
@@ -642,9 +642,60 @@ async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
         vec![
             row("a", 1, 1),
             row("a", 2, 2),
-            row("b", 999, 10),
+            row("b", 100, 20),
             row("c", 3, 3)
         ]
+    );
+}
+
+/// Under event-time ordering a partial update must set the ordering field, so
+/// the merged row carries the winner's ordering value and a later write
+/// ordered between the two loses to it.
+#[tokio::test]
+async fn test_partial_upsert_under_event_time_carries_ordering_value() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 1, 10)])])
+        .await
+        .unwrap();
+    let timeline_files = || {
+        std::fs::read_dir(dir.path().join(".hoodie/timeline"))
+            .unwrap()
+            .count()
+    };
+    let before = timeline_files();
+
+    let partial = |columns: &[&str]| UpsertOptions {
+        update_columns: Some(columns.iter().map(|c| c.to_string()).collect()),
+    };
+    let error = table
+        .upsert_with([ordered_batch(vec![("a", 2, 20)])], partial(&["value"]))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("event_time"), "{error}");
+    assert_eq!(timeline_files(), before);
+
+    table
+        .upsert_with(
+            [ordered_batch(vec![("a", 2, 20)])],
+            partial(&["value", "event_time"]),
+        )
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 3, 15)])])
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_with_event_time(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 2, 20)]
     );
 }
 
@@ -797,7 +848,7 @@ async fn test_partial_upsert_stale_event_time_keeps_lineage() {
         .upsert_with(
             [ordered_batch(vec![("a", 2, 50)])],
             UpsertOptions {
-                update_columns: Some(vec!["value".to_string()]),
+                update_columns: Some(vec!["value".to_string(), "event_time".to_string()]),
             },
         )
         .await

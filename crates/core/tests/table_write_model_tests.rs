@@ -305,8 +305,9 @@ async fn run_sequence(table_type: TableTypeValue, metadata: bool, seed: u64, ops
                     oracle.insert(id, Row { city, ts, v });
                 }
             }
-            // Partial upsert of `v` only (COW; unsupported on MOR). Keys keep
-            // their current partition; missing keys insert as full rows.
+            // Partial upsert of `v` and the ordering field (COW; unsupported
+            // on MOR). Keys keep their current partition; missing keys insert
+            // as full rows.
             55..=64 if is_cow => {
                 let mut rows = rand_rows(&mut rng, true);
                 for row in &mut rows {
@@ -319,7 +320,7 @@ async fn run_sequence(table_type: TableTypeValue, metadata: bool, seed: u64, ops
                     .upsert_with(
                         [batch_of(&rows)],
                         UpsertOptions {
-                            update_columns: Some(vec!["v".to_string()]),
+                            update_columns: Some(vec!["v".to_string(), "ts".to_string()]),
                         },
                     )
                     .await
@@ -328,7 +329,8 @@ async fn run_sequence(table_type: TableTypeValue, metadata: bool, seed: u64, ops
                     match oracle.get_mut(&id) {
                         Some(old) => {
                             if ts >= old.ts {
-                                old.v = v; // ts is not an update column
+                                old.v = v;
+                                old.ts = ts;
                             }
                         }
                         None => {
