@@ -831,7 +831,7 @@ async fn parity_e_mixed_workload_archival_and_query_types() {
             }
             table.upsert([batch(&rows)]).await.unwrap();
 
-            // 3. insert: 5 new rows via upsert (small-file packing path).
+            // 3. insert: 5 new rows via upsert.
             let mut rows = Vec::new();
             for (i, part) in parts.iter().enumerate() {
                 clock += 1;

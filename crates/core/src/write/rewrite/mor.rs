@@ -18,7 +18,7 @@
  */
 
 //! Merge-on-read upsert, update and delete: log blocks appended to the file
-//! groups the index locates, with inserts packed into new groups.
+//! groups the index locates, with inserts written to new base file groups.
 
 use super::*;
 
@@ -226,57 +226,33 @@ pub(super) async fn mor_upsert_batches(
     }
 
     let storage = table.file_system_view.storage.clone();
-    // Small-file packing (Java SparkUpsertDeltaCommitPartitioner): inserts
-    // fill existing small file slices (base + logs at parquet-equivalent
-    // size) as log appends, then overflow into new base file groups of
-    // ~max.file.size records each.
+    // Inserts go to new base file groups of ~max.file.size records each, never
+    // to log files: Java's SIMPLE and BLOOM indexes read only base files, so a
+    // key inserted into a log would be inserted again by a Java writer.
     let sizing = crate::write::sizing::SizingConfig::from_table(table);
     let avg_record_size =
         crate::write::sizing::average_record_size(table, storage.as_ref(), &sizing).await;
     let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
-    let mut packed_inserts: HashMap<(String, String), Vec<u32>> = HashMap::new();
     let mut new_group_inserts: Vec<(String, String, String, Vec<u32>)> = Vec::new();
     for (partition, indices) in insert_indices_by_partition {
-        let slices: Vec<&crate::file_group::file_slice::FileSlice> = slices_by_partition
-            .get(&partition)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-        let small = crate::write::sizing::small_file_groups(&slices, true, &sizing);
         let assignments = crate::write::sizing::assign_insert_buckets(
             indices.len(),
-            &small,
+            &[],
             avg_record_size,
             &sizing,
         );
         let mut cursor = 0usize;
-        for (bucket, count) in assignments {
+        for (_, count) in assignments {
             let chunk = indices[cursor..cursor + count].to_vec();
             cursor += count;
-            match bucket {
-                crate::write::sizing::InsertBucket::Existing { file_id } => {
-                    packed_inserts
-                        .entry((partition.clone(), file_id))
-                        .or_default()
-                        .extend(chunk);
-                }
-                crate::write::sizing::InsertBucket::New => {
-                    let file_id = crate::write::new_file_id();
-                    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
-                    new_group_inserts.push((partition.clone(), file_id, file_name, chunk));
-                }
-            }
+            let file_id = crate::write::new_file_id();
+            let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
+            new_group_inserts.push((partition.clone(), file_id, file_name, chunk));
         }
     }
-    // Log-append targets: tagged updates plus packed inserts, per file group.
-    let mut log_tasks: HashMap<(String, String), (Vec<u32>, Vec<u32>)> = HashMap::new();
-    for (key, indices) in update_indices {
-        log_tasks.entry(key).or_default().0.extend(indices);
-    }
-    for (key, indices) in packed_inserts {
-        log_tasks.entry(key).or_default().1.extend(indices);
-    }
-    // (partition, file_id) -> (base file name, base instant) from latest slices,
-    // for groups reachable only via packed inserts.
+    // Log-append targets: tagged updates, per file group.
+    let log_tasks: HashMap<(String, String), Vec<u32>> = update_indices;
+    // (partition, file_id) -> (base file name, base instant) from latest slices.
     let mut base_by_group: HashMap<(String, String), (String, String)> = HashMap::new();
     for (partition, slices) in &slices_by_partition {
         for slice in slices {
@@ -473,11 +449,10 @@ pub(super) async fn mor_upsert_batches(
         base_basename: String,
         base_instant: String,
         update_count: usize,
-        packed_count: usize,
         prepared: Vec<RecordBatch>,
     }
     let mut log_plans: Vec<LogTaskPlan> = Vec::new();
-    for ((partition_path, file_id), (update_rows, packed_rows)) in log_tasks {
+    for ((partition_path, file_id), update_rows) in log_tasks {
         let (base_basename, base_instant) = base_by_group
             .get(&(partition_path.clone(), file_id.clone()))
             .cloned()
@@ -495,21 +470,7 @@ pub(super) async fn mor_upsert_batches(
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
-        // Packed inserts are written as log records into the small slice and
-        // must be registered in the RLI under this file group.
-        rli_entries.extend(packed_rows.iter().map(|index| {
-            let key = &tagged_keys[*index as usize];
-            RecordIndexEntry {
-                record_key: key.record_key.clone(),
-                partition_path: partition_path.clone(),
-                file_id: file_id.clone(),
-                instant_time_millis,
-                is_deleted: false,
-            }
-        }));
-        let mut indices = update_rows.clone();
-        indices.extend(&packed_rows);
-        let update_batch = take_batch(&incoming, &indices)?;
+        let update_batch = take_batch(&incoming, &update_rows)?;
         // Java's append handle stamps log records with the file group id.
         let prepared =
             prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &file_id)?;
@@ -521,7 +482,6 @@ pub(super) async fn mor_upsert_batches(
             base_basename,
             base_instant,
             update_count: update_rows.len(),
-            packed_count: packed_rows.len(),
             prepared,
         });
     }
@@ -564,7 +524,7 @@ pub(super) async fn mor_upsert_batches(
                     output.size,
                     false,
                 ));
-                let total = (plan.update_count + plan.packed_count) as i64;
+                let total = plan.update_count as i64;
                 stats.push(HoodieWriteStat {
                     file_id: Some(plan.file_id.clone()),
                     path: Some(plan.log_file.clone()),
@@ -573,7 +533,7 @@ pub(super) async fn mor_upsert_batches(
                     prev_commit: Some(plan.base_instant.clone()),
                     num_writes: Some(total),
                     num_update_writes: Some(plan.update_count as i64),
-                    num_inserts: Some(plan.packed_count as i64),
+                    num_inserts: Some(0),
                     total_write_bytes: Some(output.size),
                     file_size_in_bytes: Some(output.size),
                     total_log_records: Some(total),

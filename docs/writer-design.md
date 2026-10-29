@@ -196,8 +196,9 @@ Upsert inserts follow the Java `UpsertPartitioner` model: file groups under
 `hoodie.parquet.small.file.limit` (default 100 MB) absorb new inserts up to
 `hoodie.parquet.max.file.size` (default 120 MB), using the average record
 size estimated from commit history; the remainder splits into new file groups
-of `hoodie.copyonwrite.insert.split.size` records (or auto-computed). MOR log
-files count at `hoodie.logfile.to.parquet.compression.ratio` of their size.
+of `hoodie.copyonwrite.insert.split.size` records (or auto-computed). On MOR,
+inserts always go to new base file groups, never to log files, since Java's
+SIMPLE and BLOOM indexes do not read log files.
 
 ### 4.4 Parallel write tasks
 

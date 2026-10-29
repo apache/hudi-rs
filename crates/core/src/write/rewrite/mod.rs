@@ -236,7 +236,7 @@ pub async fn upsert_batches(
             .get(partition)
             .map(|v| v.iter().collect())
             .unwrap_or_default();
-        let small = crate::write::sizing::small_file_groups(&slices, false, &sizing);
+        let small = crate::write::sizing::small_file_groups(&slices, &sizing);
         let assignments = crate::write::sizing::assign_insert_buckets(
             rows.len(),
             &small,

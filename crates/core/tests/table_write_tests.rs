@@ -1338,13 +1338,14 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
         .read(&ReadOptions::new().with_hudi_option("hoodie.read.use.read_optimized.mode", "true"))
         .await
         .unwrap();
-    // `c` was a packed insert (small-file routing) living only in log files,
-    // so read-optimized mode cannot see it until compaction — Java parity.
+    // Inserts land in base files, so read-optimized mode sees `c`; the
+    // logged updates stay invisible until compaction.
     assert_eq!(
         rows_by_id(&read_optimized),
         vec![
             ("a".to_string(), 1),
             ("b".to_string(), 2),
+            ("c".to_string(), 3),
             ("d".to_string(), 4),
         ]
     );
