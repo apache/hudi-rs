@@ -17,8 +17,9 @@
  * under the License.
  */
 
-use arrow::array::{ArrayData, make_array};
+use arrow::array::{Array, ArrayData, AsArray, make_array};
 use arrow::compute::{cast, concat_batches};
+use arrow::datatypes::TimestampNanosecondType;
 use arrow::datatypes::{DataType, FieldRef, Schema, TimeUnit};
 use arrow::ffi_stream::ArrowArrayStreamReader;
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
@@ -53,7 +54,7 @@ use hudi::{HoodieKey, UpsertOptions, WriteResult};
 use pyo3::exceptions::PyException;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBool, PyDict, PyList, PyString};
+use pyo3::types::{PyBool, PyDict, PyList, PyString, PyTuple};
 use pyo3::{PyErr, PyResult, Python, create_exception, intern, pyclass, pyfunction, pymethods};
 use std::error::Error;
 
@@ -1136,6 +1137,14 @@ fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
         }
         match writable_field(field) {
             Some(target) => {
+                // The cast to microseconds truncates silently.
+                if has_sub_microsecond(column.as_ref()) {
+                    return Err(PyValueError::new_err(format!(
+                        "column '{}' has timestamps with sub-microsecond precision, \
+                         which Hudi tables cannot store",
+                        field.name()
+                    )));
+                }
                 let casted = cast(column.as_ref(), target.data_type()).map_err(|e| {
                     PyValueError::new_err(format!(
                         "failed to cast column '{}' from {} to {}: {e}",
@@ -1166,6 +1175,28 @@ fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
     .map_err(|e| PyValueError::new_err(format!("failed to rebuild record batch: {e}")))
 }
 
+/// Whether a nanosecond timestamp anywhere in `array` is not a whole microsecond.
+fn has_sub_microsecond(array: &dyn Array) -> bool {
+    match array.data_type() {
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => array
+            .as_primitive::<TimestampNanosecondType>()
+            .iter()
+            .flatten()
+            .any(|v| v % 1000 != 0),
+        DataType::List(_) => has_sub_microsecond(array.as_list::<i32>().values().as_ref()),
+        DataType::LargeList(_) => has_sub_microsecond(array.as_list::<i64>().values().as_ref()),
+        DataType::Struct(_) => array
+            .as_struct()
+            .columns()
+            .iter()
+            .any(|c| has_sub_microsecond(c.as_ref())),
+        DataType::Dictionary(_, _) => array
+            .as_any_dictionary_opt()
+            .is_some_and(|d| has_sub_microsecond(d.values().as_ref())),
+        _ => false,
+    }
+}
+
 /// pandas exports an unnamed index as `__index_level_N__`; a named index
 /// keeps its name and may be the record key.
 fn is_unnamed_pandas_index(name: &str) -> bool {
@@ -1184,6 +1215,9 @@ fn writable_type(dt: &DataType) -> Option<DataType> {
     match dt {
         DataType::Utf8View | DataType::LargeUtf8 => Some(DataType::Utf8),
         DataType::BinaryView | DataType::LargeBinary => Some(DataType::Binary),
+        DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
+            Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
+        }
         DataType::Dictionary(_, value) => {
             Some(writable_type(value).unwrap_or_else(|| value.as_ref().clone()))
         }
@@ -1277,11 +1311,7 @@ fn one_row_batch_from_dict(
         let field = schema.field_with_name(&name).map_err(|_| {
             PyValueError::new_err(format!("update column '{name}' is not in the table schema"))
         })?;
-        let value = if value.is_instance(&pa.getattr(intern!(py, "Scalar"))?)? {
-            value.call_method0(intern!(py, "as_py"))?
-        } else {
-            value
-        };
+        let value = unwrap_scalars(&value, &pa.getattr(intern!(py, "Scalar"))?)?;
         let kwargs = PyDict::new(py);
         kwargs.set_item(intern!(py, "type"), field.data_type().to_pyarrow(py)?)?;
         let array = pa
@@ -1321,6 +1351,38 @@ fn one_row_batch_from_dict(
         .map_err(|e| PyValueError::new_err(format!("invalid update `set`: {e}")))
 }
 
+/// `value` with every `pyarrow.Scalar`, at any depth of dicts, lists and
+/// tuples, replaced by its `as_py()`.
+fn unwrap_scalars<'py>(
+    value: &Bound<'py, PyAny>,
+    scalar: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let py = value.py();
+    if value.is_instance(scalar)? {
+        return value.call_method0(intern!(py, "as_py"));
+    }
+    if let Ok(dict) = value.cast::<PyDict>() {
+        let out = PyDict::new(py);
+        for (k, v) in dict.iter() {
+            out.set_item(k, unwrap_scalars(&v, scalar)?)?;
+        }
+        return Ok(out.into_any());
+    }
+    let is_tuple = value.is_instance_of::<PyTuple>();
+    if is_tuple || value.is_instance_of::<PyList>() {
+        let items = value
+            .try_iter()?
+            .map(|v| unwrap_scalars(&v?, scalar))
+            .collect::<PyResult<Vec<_>>>()?;
+        return Ok(if is_tuple {
+            PyTuple::new(py, items)?.into_any()
+        } else {
+            PyList::new(py, items)?.into_any()
+        });
+    }
+    Ok(value.clone())
+}
+
 /// Why `value` does not survive the typed `pa.array` constructor for `dt`,
 /// given `stored`, the `as_py()` of what it produced; `None` when it fits.
 ///
@@ -1328,7 +1390,7 @@ fn one_row_batch_from_dict(
 /// into int64 stores 1, a datetime into date32 drops the time, a number into
 /// a timestamp is read as epoch units, a coarser timestamp unit drops
 /// sub-unit digits, and unknown struct keys are dropped. Python equality
-/// accepts exact conversions (3 == 3.0, `Decimal("1.50") == 1.5`);
+/// accepts exact conversions (3 == 3.0);
 /// timestamps are not compared whole because a naive input never equals its
 /// UTC-aware stored form.
 fn misfit(
@@ -1380,7 +1442,7 @@ fn misfit(
             }
             Ok(None)
         }
-        dt if dt.is_integer() && is_bool(value)? => Ok(Some("a bool is not an integer".into())),
+        dt if dt.is_numeric() && is_bool(value)? => Ok(Some("a bool is not a number".into())),
         DataType::Float16 | DataType::Float32 => {
             let (v, s): (f64, f64) = (value.extract()?, stored.extract()?);
             Ok((v.is_finite() && !s.is_finite())

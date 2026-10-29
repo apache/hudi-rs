@@ -553,9 +553,9 @@ class HudiTable:
             filter (str): A single binary predicate such as ``"city = 'nyc'"``.
             set (Union[Dict[str, Any], pyarrow.RecordBatch, pyarrow.Table]): Column values to
                 set, either as a dict or as a one-row batch carrying only those columns.
-                Dict values must fit their column's type exactly, with two allowances: a
-                float32 column rounds to the nearest float32, and a bool may go into a float
-                column. Date columns take ``datetime.date`` and timestamp columns take
+                Dict values must fit their column's type exactly, except that a float32
+                column rounds to the nearest float32; a bool fits only a bool column. Date
+                columns take ``datetime.date`` and timestamp columns take
                 ``datetime.datetime``; a tz-aware datetime needs a timestamp column with a
                 time zone. Struct fields missing from a dict value are set to null.
 

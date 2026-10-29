@@ -253,6 +253,7 @@ def test_update_dict_values_must_fit_column_type(tmp_path):
         ({"amount": Decimal("1.234")}, "amount"),
         ({"n": "7"}, "n"),
         ({"f": 1e300}, "f"),
+        ({"x": True}, "x"),
     ]:
         with pytest.raises(ValueError, match=f"column '{column}'"):
             table.update("id = 't1'", set_)
@@ -278,6 +279,7 @@ def test_update_dict_nested_and_numpy_values_must_fit(tmp_path):
         ({"st": {"k": 2.5}}, "st"),
         ({"xs": [np.float64(7.9)]}, "xs"),
         ({"n": np.True_}, "n"),
+        ({"xs": [np.True_]}, "xs"),
     ]:
         with pytest.raises(ValueError, match=f"column '{column}'"):
             table.update("id = 't1'", set_)
@@ -307,6 +309,13 @@ _AWARE = datetime.datetime(
         (lambda: {"utc": datetime.datetime(2024, 1, 2)}, None),
         (lambda: {"utc": _AWARE}, None),
         (lambda: {"n": pa.scalar(5)}, None),
+        (lambda: {"st": {"k": pa.scalar(3), "inner": {"j": pa.scalar(2)}}}, None),
+        (
+            lambda: {
+                "tl": [pa.scalar(datetime.datetime(2024, 1, 1), pa.timestamp("ms"))]
+            },
+            None,
+        ),
         (lambda: {"st": {"k": 3}}, None),
         # Temporal columns take only dates and datetimes, at any depth.
         (lambda: {"d": datetime.datetime(2024, 3, 3, 12)}, "column 'd'"),
@@ -331,6 +340,8 @@ _AWARE = datetime.datetime(
         (lambda: {"st": {"inner": {"j": 1, "y": 2}}}, "column 'st'.*'y'"),
         # pyarrow scalars are unwrapped before the check.
         (lambda: {"n": pa.scalar(1.5)}, "column 'n'"),
+        (lambda: {"st": {"k": pa.scalar(2.5)}}, "column 'st'"),
+        (lambda: {"tl": [pa.scalar(5)]}, "column 'tl'"),
         # A value pyarrow stores but cannot read back.
         (lambda: {"ms": 10**15}, "read back .*column 'ms'"),
         (lambda: {1: 2}, "must be str"),
@@ -518,6 +529,34 @@ def test_polars_nested_columns_upsert(tmp_path):
     read = pa.Table.from_batches(table.read()).sort_by("id")
     assert read.column("tags").to_pylist() == [["a", "b"], ["d"]]
     assert [a["city"] for a in read.column("addr").to_pylist()] == ["sf", "la"]
+
+
+@pytest.mark.parametrize("source", ["pandas", "polars"])
+def test_nanosecond_timestamps_are_checked(tmp_path, source):
+    # 2024-01-02 03:04:05 plus `nanos`, as a naive nanosecond timestamp.
+    def frame(nanos):
+        epoch_ns = 1_704_164_645 * 10**9 + nanos
+        if source == "pandas":
+            pd = pandas()
+            ts = pd.Series(pd.to_datetime([epoch_ns], unit="ns")).astype(
+                "datetime64[ns]"
+            )
+            return pd.DataFrame({"id": ["t1"], "ts": ts})
+        pl = polars()
+        ts = pl.Series([epoch_ns]).cast(pl.Datetime("ns"))
+        return pl.DataFrame({"id": ["t1"], "ts": ts})
+
+    assert pa.table(frame(1)).schema.field("ts").type == pa.timestamp("ns")
+    table = HudiTable.create(str(tmp_path / "t"), record_key="id")
+    table.append(frame(123_456_000))
+    read = pa.Table.from_batches(table.read())
+    assert read.column("ts").to_pylist() == [
+        datetime.datetime(2024, 1, 2, 3, 4, 5, 123456)
+    ]
+    with pytest.raises(
+        ValueError, match="column 'ts' has timestamps with sub-microsecond"
+    ):
+        table.upsert(frame(1))
 
 
 def test_pandas_category_and_index_columns(tmp_path):
