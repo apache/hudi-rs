@@ -31,10 +31,24 @@ pub(super) struct MorFileLocation {
     pub(super) base_instant: String,
 }
 
+/// Locations by record key, for callers whose keys are unique per batch.
 pub(super) async fn mor_file_locations(
     table: &Table,
     keys: &[HoodieKey],
 ) -> Result<HashMap<String, MorFileLocation>> {
+    Ok(mor_key_locations(table, keys)
+        .await?
+        .into_iter()
+        .map(|(key, location)| (key.record_key, location))
+        .collect())
+}
+
+/// Locations by requested key: a key stored in several partitions resolves
+/// per requested partition.
+async fn mor_key_locations(
+    table: &Table,
+    keys: &[HoodieKey],
+) -> Result<HashMap<HoodieKey, MorFileLocation>> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
     let mut slices_by_file_id = HashMap::with_capacity(slices.len());
     for slice in slices {
@@ -62,7 +76,7 @@ pub(super) async fn mor_file_locations(
                 continue;
             };
             locations.insert(
-                key.record_key,
+                key,
                 MorFileLocation {
                     file_id: location.file_id,
                     partition_path: location.partition_path,
@@ -625,19 +639,26 @@ pub(super) async fn mor_delete_keys(
             "delete requires at least one record key".to_string(),
         ));
     }
-    let locations = mor_file_locations(table, delete_keys).await?;
-    let mut grouped: HashMap<(String, String), Vec<HoodieKey>> = HashMap::new();
-    let mut seen = std::collections::HashSet::new();
+    let locations = mor_key_locations(table, delete_keys).await?;
+    // Each stored copy a requested key resolves to is deleted once. A key
+    // requested in a partition it is not stored in matches nothing, as on COW.
+    let mut grouped: HashMap<(String, String), (&MorFileLocation, Vec<HoodieKey>)> = HashMap::new();
+    let mut seen = HashSet::new();
     for key in delete_keys {
-        // Dedupe by (key, requested partition): the same key may legitimately
-        // be requested in two partitions.
-        if seen.insert((&key.record_key, &key.partition_path))
-            && let Some(location) = locations.get(&key.record_key)
+        let Some(location) = locations.get(key) else {
+            continue;
+        };
+        if (key.partition_path.is_empty() || key.partition_path == location.partition_path)
+            && seen.insert((&key.record_key, &location.partition_path, &location.file_id))
         {
             grouped
                 .entry((location.partition_path.clone(), location.file_id.clone()))
-                .or_default()
-                .push(key.clone());
+                .or_insert_with(|| (location, Vec::new()))
+                .1
+                .push(HoodieKey {
+                    record_key: key.record_key.clone(),
+                    partition_path: location.partition_path.clone(),
+                });
         }
     }
     if grouped.is_empty() {
@@ -661,13 +682,9 @@ pub(super) async fn mor_delete_keys(
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
     let mut deleted = 0;
-    for ((partition_path, file_id), keys) in grouped {
-        let first_key = keys
-            .first()
-            .ok_or_else(|| CoreError::Write("missing delete key".to_string()))?;
-        let location = locations
-            .get(&first_key.record_key)
-            .ok_or_else(|| CoreError::Write("missing file location for delete key".to_string()))?;
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, &instant);
+    let mut record_index = Vec::new();
+    for ((partition_path, file_id), (location, keys)) in grouped {
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
@@ -689,6 +706,13 @@ pub(super) async fn mor_delete_keys(
         }
         written_paths.push(log_file.clone());
         deleted += keys.len();
+        record_index.extend(keys.iter().map(|key| RecordIndexEntry {
+            record_key: key.record_key.clone(),
+            partition_path: key.partition_path.clone(),
+            file_id: String::new(),
+            instant_time_millis,
+            is_deleted: true,
+        }));
         files_mdt.push((partition_path.clone(), log_name.clone(), size, false));
         // Empty when the file group is log-only: Java's delta write stat leaves
         // `baseFile` empty in that case and the file-group builder treats it as
@@ -721,18 +745,6 @@ pub(super) async fn mor_delete_keys(
             ..Default::default()
         });
     }
-    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, &instant);
-    let record_index = delete_keys
-        .iter()
-        .filter(|key| locations.contains_key(&key.record_key))
-        .map(|key| RecordIndexEntry {
-            record_key: key.record_key.clone(),
-            partition_path: key.partition_path.clone(),
-            file_id: String::new(),
-            instant_time_millis,
-            is_deleted: true,
-        })
-        .collect::<Vec<_>>();
     let schema = table.get_schema_with_meta_fields().await?;
     let commit_bytes = crate::write::commit_metadata_bytes(
         table,

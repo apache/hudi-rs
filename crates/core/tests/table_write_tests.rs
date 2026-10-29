@@ -4438,30 +4438,74 @@ async fn test_upsert_keeps_nullable_table_column_nullable() {
 /// so the delete commits nothing.
 #[tokio::test]
 async fn test_delete_keys_in_wrong_partition_is_noop() {
-    let dir = tempdir().unwrap();
-    let mut table = Table::create(dir.path().to_str().unwrap())
-        .with_table_name("trips")
-        .with_record_key_fields(["id"])
-        .with_partition_fields(["city"])
-        .create()
-        .await
-        .unwrap();
-    table
-        .append([partitioned_batch(vec![("a", "sf", 1)])])
-        .await
-        .unwrap();
-    let before = timeline_file_count(dir.path());
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([partitioned_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap();
+        let before = timeline_file_count(dir.path());
 
-    let result = table
-        .delete_keys([HoodieKey {
+        let result = table
+            .delete_keys([HoodieKey {
+                record_key: "a".to_string(),
+                partition_path: "city=nope".to_string(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(result.num_deletes, 0, "{table_type:?}");
+        assert!(result.instant.is_empty(), "{table_type:?}");
+        assert_eq!(timeline_file_count(dir.path()), before, "{table_type:?}");
+    }
+}
+
+/// A key a non-global index stored in two partitions is deleted from each
+/// partition the delete names, once per stored copy.
+#[tokio::test]
+async fn test_delete_keys_removes_each_requested_partition_copy() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_metadata(false)
+            .create()
+            .await
+            .unwrap();
+        for city in ["sf", "nyc"] {
+            table
+                .append([city_batch(vec![("a", city, 1)])])
+                .await
+                .unwrap();
+        }
+        let key = |partition: &str| HoodieKey {
             record_key: "a".to_string(),
-            partition_path: "city=nope".to_string(),
-        }])
-        .await
-        .unwrap();
-    assert_eq!(result.num_deletes, 0);
-    assert!(result.instant.is_empty());
-    assert_eq!(timeline_file_count(dir.path()), before);
+            partition_path: partition.to_string(),
+        };
+        let result = table
+            .delete_keys([key("city=sf"), key("city=nyc"), key("city=sf")])
+            .await
+            .unwrap();
+        assert_eq!(result.num_deletes, 2, "{table_type:?}");
+        let rows = Table::new(dir.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .read(&ReadOptions::new())
+            .await
+            .unwrap();
+        let remaining: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining, 0, "{table_type:?}");
+    }
 }
 
 /// Archival must keep at least one commit and trigger at or above the count
