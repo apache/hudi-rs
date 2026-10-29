@@ -476,9 +476,11 @@ async fn rollback_instant(
         .filter(|n| n.ends_with(".inflight"))
         .chain(fencing_files.iter().filter(|n| n.ends_with(".requested")))
     {
-        let _ = storage
+        // Java fails the rollback here too; the markers stay, so the next
+        // write plans the cleanup again.
+        storage
             .delete_file(&format!("{timeline_dir}/{fencing}"))
-            .await;
+            .await?;
     }
     delete_marker_dir(storage, failed_ts).await;
     Ok(())

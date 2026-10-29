@@ -616,3 +616,75 @@ async fn test_rollback_deletes_orphan_mdt_logs_of_incomplete_mdt_commit() {
         assert_eq!(rows(&Table::new(uri).await.unwrap()).await, 3, "{case}");
     }
 }
+
+/// A rollback that cannot delete the failed instant's fencing files fails the
+/// write that triggered it, as Java's rollback does, leaving the instant
+/// pending; the next write finishes the cleanup.
+#[tokio::test]
+async fn test_rollback_fence_delete_failure_fails_the_write() {
+    use crate::storage::fault::{DeleteFails, FaultyPutStore, PutFault};
+    let dir = tempfile::tempdir().unwrap();
+    let uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(uri)
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_ordering_fields(["ts"])
+        .with_metadata(false)
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
+    let timeline = dir.path().join(".hoodie/timeline");
+    let pending = |timeline: &std::path::Path| -> Vec<String> {
+        std::fs::read_dir(timeline)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".inflight"))
+            .collect()
+    };
+    let before = pending(&timeline);
+    let storage = table.file_system_view.storage.clone();
+    let failing_completion =
+        FaultyPutStore::new(storage.object_store.clone(), PutFault::NotLanded, |path| {
+            path.as_ref().ends_with(".commit")
+        });
+    table.file_system_view.storage = crate::storage::Storage::new_with_object_store(
+        storage.base_url.as_ref().clone(),
+        failing_completion,
+        storage.hudi_configs.clone(),
+    );
+    assert!(table.append([batch(&[("b", "sf", 2, 20)])]).await.is_err());
+    // In layout v2 a completed instant keeps its inflight file, so the failed
+    // write's fence is the one that appeared during it.
+    let failed: Vec<String> = pending(&timeline)
+        .into_iter()
+        .filter(|name| !before.contains(name))
+        .collect();
+    assert_eq!(failed.len(), 1);
+
+    let mut table = Table::new(uri).await.unwrap();
+    let storage = table.file_system_view.storage.clone();
+    table.file_system_view.storage = crate::storage::Storage::new_with_object_store(
+        storage.base_url.as_ref().clone(),
+        Arc::new(DeleteFails(storage.object_store.clone(), |path| {
+            path.ends_with(".inflight")
+        })),
+        storage.hudi_configs.clone(),
+    );
+    let result = table.append([batch(&[("c", "sf", 3, 30)])]).await;
+    assert!(result.is_err(), "the fence delete failure must surface");
+    for name in &failed {
+        assert!(
+            timeline.join(name).exists(),
+            "{name} must stay until cleanup succeeds"
+        );
+    }
+
+    let mut table = Table::new(uri).await.unwrap();
+    table.append([batch(&[("c", "sf", 3, 30)])]).await.unwrap();
+    for name in &failed {
+        assert!(!timeline.join(name).exists(), "{name} was not cleaned up");
+    }
+    assert_eq!(rows(&Table::new(uri).await.unwrap()).await, 2);
+}

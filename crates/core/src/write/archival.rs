@@ -584,89 +584,9 @@ mod delete_failure_tests {
     use super::archive_timeline_if_needed;
     use crate::config::HudiConfigs;
     use crate::storage::Storage;
-    use async_trait::async_trait;
-    use futures::StreamExt;
-    use futures::stream::BoxStream;
+    use crate::storage::fault::DeleteFails;
     use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    };
     use std::sync::Arc;
-
-    /// Fails every delete of a path the predicate matches.
-    #[derive(Debug)]
-    struct DeleteFails(Arc<dyn ObjectStore>, fn(&str) -> bool);
-
-    impl std::fmt::Display for DeleteFails {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "DeleteFails({})", self.0)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for DeleteFails {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> Result<PutResult> {
-            self.0.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
-            self.0.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.0.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
-            let inner = self.0.clone();
-            let fails = self.1;
-            locations
-                .then(move |location| {
-                    let inner = inner.clone();
-                    async move {
-                        let location = location?;
-                        if fails(location.as_ref()) {
-                            return Err(object_store::Error::Generic {
-                                store: "DeleteFails",
-                                source: "delete failed".into(),
-                            });
-                        }
-                        inner
-                            .delete_stream(futures::stream::once(async { Ok(location) }).boxed())
-                            .next()
-                            .await
-                            .unwrap()
-                    }
-                })
-                .boxed()
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.0.list(prefix)
-        }
-
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-            self.0.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            self.0.copy_opts(from, to, options).await
-        }
-    }
 
     /// A fencing file archival cannot delete must stop it before any
     /// completed file goes: an archived instant left with fencing files and
