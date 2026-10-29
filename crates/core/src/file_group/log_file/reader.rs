@@ -21,6 +21,7 @@ use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
+use crate::file_group::base_file::reader::KeyPredicate;
 use crate::file_group::log_file::content::Decoder;
 use crate::file_group::log_file::log_block::{
     BlockMetadataKey, BlockMetadataType, BlockType, DeferredContent, LogBlock, LogBlockContent,
@@ -52,6 +53,9 @@ pub struct LogFileReader {
     /// Predicate to push into parquet log blocks. Unset by default, so a caller
     /// that has not decided whether pushing is sound reads every row.
     row_filter: Option<RowFilterBuilder>,
+    /// Keys to narrow HFile log blocks to. Unset by default, so every record of
+    /// every block is returned.
+    key_predicate: Option<KeyPredicate>,
     /// Schema Avro blocks are resolved up to. Unset by default, so a caller that
     /// has none reads each block at the schema it was written with.
     reader_schema_json: Option<String>,
@@ -85,6 +89,7 @@ impl LogFileReader {
             reader,
             timezone,
             row_filter: None,
+            key_predicate: None,
             reader_schema_json: None,
         })
     }
@@ -108,6 +113,7 @@ impl LogFileReader {
             reader,
             timezone,
             row_filter: None,
+            key_predicate: None,
             reader_schema_json: None,
         })
     }
@@ -188,6 +194,15 @@ impl LogFileReader {
     /// is sound is the caller's decision — see [`Decoder::with_row_filter`].
     pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
         self.row_filter = row_filter;
+        self
+    }
+
+    /// Narrow HFile log blocks to `key_predicate`.
+    ///
+    /// Only the HFile data blocks the keys can fall in are parsed, and only the
+    /// admitted records come back; see [`Decoder::with_key_predicate`].
+    pub(crate) fn with_key_predicate(mut self, key_predicate: Option<KeyPredicate>) -> Self {
+        self.key_predicate = key_predicate;
         self
     }
 
@@ -579,6 +594,7 @@ impl LogFileReader {
 
         let decoder = Decoder::new(self.hudi_configs.clone())
             .with_row_filter(self.row_filter.clone())
+            .with_key_predicate(self.key_predicate.clone())
             .with_reader_schema(self.reader_schema_json.clone());
         // Decode out of the block's own remaining bytes rather than straight off
         // the reader: the reader is async and the decoders are not. The span
