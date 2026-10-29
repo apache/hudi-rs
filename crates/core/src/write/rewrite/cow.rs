@@ -390,6 +390,9 @@ pub(super) struct MergeOutput {
     pub(super) matched: usize,
     /// Input rows this group gained as inserts.
     pub(super) inserted: usize,
+    /// Rows a winning delete marker removed. Java's merge handle counts these
+    /// as deletes on top of the update or insert they arrived as.
+    pub(super) marker_deletes: usize,
     pub(super) ranges: Option<Vec<crate::metadata::table::column_stats::ColumnRangeStats>>,
     /// (record key, partition) tombstones for removed rows.
     pub(super) rli_deletes: Vec<(String, String)>,
@@ -404,6 +407,7 @@ impl MergeOutput {
             num_rows: 0,
             matched: 0,
             inserted: 0,
+            marker_deletes: 0,
             ranges: None,
             rli_deletes: Vec::new(),
         }
@@ -465,6 +469,7 @@ pub(super) fn merge_file_group_task(
             .await?;
         let key_field = MetaField::RecordKey.as_ref();
         let mut rli_deletes = Vec::new();
+        let mut marker_deletes = 0usize;
         let mut inserted = 0;
         let (merged, matched) = match plan.op {
             GroupOp::Upsert {
@@ -567,6 +572,7 @@ pub(super) fn merge_file_group_task(
                     let mut survivors = Vec::with_capacity(merged.num_rows());
                     for (row, source) in selected.iter().enumerate() {
                         if delete_markers[row] && *source as usize >= old.num_rows() {
+                            marker_deletes += 1;
                             rli_deletes
                                 .push((merged_keys[row].clone(), merged_partitions[row].clone()));
                         } else {
@@ -643,6 +649,7 @@ pub(super) fn merge_file_group_task(
                     let mut survivors = Vec::with_capacity(updated.num_rows());
                     for (row, doomed) in doomed.into_iter().enumerate() {
                         if doomed {
+                            marker_deletes += 1;
                             rli_deletes.push((updated_keys[row].clone(), partitions[row].clone()));
                         } else {
                             survivors.push(row as u32);
@@ -683,6 +690,7 @@ pub(super) fn merge_file_group_task(
             num_rows,
             matched,
             inserted,
+            marker_deletes,
             ranges,
             rli_deletes,
         })
@@ -831,6 +839,7 @@ pub(super) async fn commit_merge_plans(
                 num_rows,
                 matched: 0,
                 inserted: num_rows,
+                marker_deletes: 0,
                 ranges: output.ranges,
                 rli_deletes: Vec::new(),
             })
@@ -846,6 +855,7 @@ pub(super) async fn commit_merge_plans(
     let mut stats_updates = Vec::new();
     let mut old_paths = Vec::new();
     let mut matched_total = 0usize;
+    let mut marker_deletes_total = 0usize;
     let mut num_writes = 0usize;
     let mut first_error = None;
     let group_info: Vec<(String, String, String, String, Option<String>)> = plan_meta
@@ -893,10 +903,12 @@ pub(super) async fn commit_merge_plans(
                                 MatchedSlot::Deletes => 0,
                                 _ => output.matched as i64,
                             }),
-                            num_deletes: Some(match matched_slot {
-                                MatchedSlot::Deletes => output.matched as i64,
-                                _ => 0,
-                            }),
+                            num_deletes: Some(
+                                match matched_slot {
+                                    MatchedSlot::Deletes => output.matched as i64,
+                                    _ => 0,
+                                } + output.marker_deletes as i64,
+                            ),
                             num_inserts: Some(output.inserted as i64),
                             partition_path: Some(partition.clone()),
                             total_write_bytes: Some(output.size),
@@ -906,6 +918,7 @@ pub(super) async fn commit_merge_plans(
                     num_writes += output.num_rows;
                 }
                 matched_total += output.matched;
+                marker_deletes_total += output.marker_deletes;
                 outputs.push(output);
             }
             Err(error) => {
@@ -932,9 +945,9 @@ pub(super) async fn commit_merge_plans(
     }
 
     let (updates, deletes) = match matched_slot {
-        MatchedSlot::None => (updates, 0),
-        MatchedSlot::Updates => (matched_total, 0),
-        MatchedSlot::Deletes => (updates, matched_total),
+        MatchedSlot::None => (updates, marker_deletes_total),
+        MatchedSlot::Updates => (matched_total, marker_deletes_total),
+        MatchedSlot::Deletes => (updates, matched_total + marker_deletes_total),
     };
 
     // Zero effect anywhere: abort the fenced instant, leave no commit.

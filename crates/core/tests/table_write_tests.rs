@@ -3496,7 +3496,7 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
             ])])
             .await
             .unwrap();
-        table
+        let result = table
             .upsert([flagged_batch(vec![
                 ("a", "sf", 20, true),
                 ("b", "sf", 5, true),
@@ -3506,6 +3506,11 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
             ])])
             .await
             .unwrap();
+        if table_type == TableTypeValue::CopyOnWrite {
+            // `a`'s winning marker counts as a delete, as Java's merge handle
+            // counts it.
+            assert_eq!(result.num_deletes, 1);
+        }
 
         let batches = table.read(&ReadOptions::new()).await.unwrap();
         assert_eq!(
