@@ -33,6 +33,7 @@ use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::error::CoreError;
+use crate::file_group::pushdown::FilterPushdown;
 use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
 use crate::file_group::reader_v2::input_split::InputSplit;
@@ -50,12 +51,14 @@ use std::sync::Arc;
 /// to resolve partition-valued fields. `data_schema` is the table's schema; the
 /// merge-on-read reader requires it up front rather than deriving it from the
 /// data as the existing reader does.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_file_slice(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
     log_file_paths: Vec<String>,
     partition_path: String,
+    pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<RecordBatch> {
@@ -65,6 +68,7 @@ pub(crate) async fn read_file_slice(
         base_file_path,
         log_file_paths,
         partition_path,
+        pushdown,
         data_schema,
         completion_gate_inputs,
     )?;
@@ -77,12 +81,14 @@ pub(crate) async fn read_file_slice(
 /// Same merge as [`read_file_slice`], but the base file is decoded one row group
 /// at a time instead of whole, so peak memory tracks a row group rather than the
 /// file. Arguments carry the same meaning.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn read_file_slice_stream(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
     log_file_paths: Vec<String>,
     partition_path: String,
+    pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
@@ -92,6 +98,7 @@ pub(crate) async fn read_file_slice_stream(
         base_file_path,
         log_file_paths,
         partition_path,
+        pushdown,
         data_schema,
         completion_gate_inputs,
     )?;
@@ -101,12 +108,14 @@ pub(crate) async fn read_file_slice_stream(
 
 /// Assemble the reader both entry points use, so the eager and streaming reads
 /// cannot resolve their context, split or parameters differently.
+#[allow(clippy::too_many_arguments)]
 fn build_reader(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
     log_file_paths: Vec<String>,
     partition_path: String,
+    pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<HoodieFileGroupReader> {
@@ -121,6 +130,13 @@ fn build_reader(
     // timeline; `None` leaves the gate a no-op, which is what a caller reading
     // from paths alone (the cxx bridge) can offer.
     context.completion_gate_inputs = completion_gate_inputs;
+    if let Some(pushdown) = pushdown {
+        context.row_filter_builder = Some(pushdown.row_filter);
+        context.row_group_selector = Some(pushdown.row_groups);
+        // A merge by row position pairs log records with base rows one to one,
+        // so nothing may drop records from either side before it.
+        context.mor_pk_safe = pushdown.mor_pk_safe && !context.should_merge_use_record_position;
+    }
     context.rebuild_record_context(partition_path.clone());
 
     let base_file_commit_time = base_file_path.and_then(base_file_commit_time);

@@ -25,6 +25,7 @@ pub mod base_file;
 pub mod builder;
 pub mod file_slice;
 pub mod log_file;
+pub(crate) mod pushdown;
 pub mod reader;
 pub(crate) mod reader_v2;
 pub mod record_batches;

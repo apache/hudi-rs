@@ -136,13 +136,10 @@ pub struct ReaderContext {
     /// [`Self::mor_pk_safe`] alone for a parquet log block, which by definition
     /// only exists on a slice that does merge.
     ///
-    /// **Not active for reads through this crate.**
     /// [`resolve_reader_context`](crate::file_group::reader_v2::resolver::resolve_reader_context)
-    /// leaves it `None`, so a `Table` or DataFusion read pushes no predicate into
-    /// either the base file or a log block, and the primary-key-safety gate never
-    /// runs outside the test harness. Filters are applied after the merge instead.
-    /// Groundwork for a caller that supplies one; no performance claim about this
-    /// crate's reads rests on it.
+    /// leaves it `None`; a slice read sets it from the caller's filters
+    /// (`file_group::pushdown`), and the caller still applies those filters
+    /// after the merge.
     pub row_filter_builder: Option<RowFilterBuilder>,
     /// Optional row-group selector for pruning base parquet reads from footer
     /// statistics; `None` when no caller supplied one.
