@@ -2104,6 +2104,45 @@ async fn test_simple_index_prefers_the_incoming_partition() {
             format!("city={resolved}")
         );
     }
+    // Two copies in one partition resolve to the greater file id, whatever
+    // order the slices list in.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_metadata(false)
+        .create()
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        table
+            .append([city_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap();
+    }
+    let file_ids: std::collections::BTreeSet<String> = table
+        .get_file_slices(&ReadOptions::new())
+        .await
+        .unwrap()
+        .iter()
+        .map(|slice| slice.file_id().to_string())
+        .collect();
+    assert_eq!(file_ids.len(), 2);
+    for partition in ["sf", "la"] {
+        let key = HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: format!("city={partition}"),
+        };
+        let locations = SimpleIndex
+            .tag_location(&table, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(&locations[&key].as_ref().unwrap().file_id),
+            file_ids.last()
+        );
+    }
 }
 
 #[tokio::test]
