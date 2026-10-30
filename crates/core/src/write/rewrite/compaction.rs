@@ -36,9 +36,9 @@ use crate::write::markers::Marker;
 /// Result of a compaction.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompactionResult {
-    /// Completed instant timestamp (the requested time); empty when no file
-    /// group carried log files and nothing was written.
-    pub instant: String,
+    /// Requested time of the compaction commit's instant, or `None` when no
+    /// file group carried log files and nothing was written.
+    pub requested_time: Option<String>,
     /// Completion time of the instant on timeline layout v2; `None` on
     /// layout v1 and when nothing was written.
     pub completion_time: Option<String>,
@@ -185,13 +185,15 @@ pub(crate) async fn maybe_compact_inline(table: &mut Table) {
     }
     if inline {
         match compact_table(table).await {
-            Ok(result) if result.instant.is_empty() => {}
-            Ok(result) => log::info!(
-                "inline compaction {} folded {} log files of {} file groups",
-                result.instant,
-                result.num_log_files,
-                result.num_file_groups
+            Ok(CompactionResult {
+                requested_time: Some(instant),
+                num_file_groups,
+                num_log_files,
+                ..
+            }) => log::info!(
+                "inline compaction {instant} folded {num_log_files} log files of {num_file_groups} file groups"
             ),
+            Ok(_) => {}
             Err(error) => log::warn!("inline compaction failed: {error}"),
         }
         return;
@@ -499,7 +501,7 @@ async fn execute_compaction(
     )
     .await?;
     Ok(CompactionResult {
-        instant: instant.to_string(),
+        requested_time: Some(instant.to_string()),
         completion_time: completed.completion_time,
         num_file_groups: groups.len(),
         num_log_files,
@@ -668,7 +670,10 @@ mod tests {
         assert_eq!(with_logs.len(), 2, "a's group in sf and c's group in ny");
 
         let result = table.compact().await.unwrap();
-        assert!(!result.instant.is_empty());
+        let instant = result
+            .requested_time
+            .as_deref()
+            .expect("compaction commits");
         assert!(result.completion_time.is_some());
         assert_eq!(result.num_file_groups, 2);
         assert_eq!(result.num_log_files, 2);
@@ -694,7 +699,7 @@ mod tests {
                     .find(|s| s.partition_path == "city=sf")
                     .unwrap()
                     .file_id(),
-                result.instant
+                instant
             ),
             "compaction stamps the new base file name"
         );
@@ -703,7 +708,7 @@ mod tests {
         assert_eq!(
             slices
                 .iter()
-                .filter(|s| s.creation_instant_time() == result.instant)
+                .filter(|s| s.creation_instant_time() == instant)
                 .count(),
             2
         );
@@ -711,8 +716,7 @@ mod tests {
         // Timeline: plan in the requested file, empty inflight, compacted commit.
         let timeline = dir.path().join(".hoodie/timeline");
         let plan = CompactionPlan::from_avro_bytes(
-            &std::fs::read(timeline.join(format!("{}.compaction.requested", result.instant)))
-                .unwrap(),
+            &std::fs::read(timeline.join(format!("{}.compaction.requested", instant))).unwrap(),
         )
         .unwrap();
         let operations = plan.operations.clone().unwrap();
@@ -739,13 +743,13 @@ mod tests {
         assert_eq!(plan.preserve_hoodie_metadata, Some(true));
         assert!(plan.is_scheduled_by_hudi_rs());
         assert!(
-            std::fs::read(timeline.join(format!("{}.compaction.inflight", result.instant)))
+            std::fs::read(timeline.join(format!("{}.compaction.inflight", instant)))
                 .unwrap()
                 .is_empty()
         );
         let commit_name = format!(
             "{}_{}.commit",
-            result.instant,
+            instant,
             result.completion_time.as_deref().unwrap()
         );
         assert_eq!(completed_commits(dir.path()), vec![commit_name.clone()]);
@@ -783,7 +787,10 @@ mod tests {
             .into_iter()
             .find(|s| s.partition_path == "city=sf")
             .unwrap();
-        assert_eq!(sf.creation_instant_time(), result.instant);
+        assert_eq!(
+            Some(sf.creation_instant_time()),
+            result.requested_time.as_deref()
+        );
         assert_eq!(sf.log_files.len(), 1);
         let row_b = snapshot(&table)
             .await

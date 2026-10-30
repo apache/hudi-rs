@@ -39,7 +39,7 @@ pub(crate) use keygen::{
 };
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;
-pub use rewrite::{CompactionResult, UpsertOptions, WriteResult};
+pub use rewrite::{CompactionResult, UpsertOptions};
 pub(crate) use rewrite::{
     await_async_compaction, compact_table, delete_filter, delete_keys,
     dynamic_partition_overwrite_batches, maybe_compact_inline, overwrite_batches, update_filter,
@@ -763,6 +763,29 @@ pub(crate) async fn complete_write(
     Ok(CompletedWrite {
         completion_time: completion,
     })
+}
+
+/// Result of a write on [`Table`](crate::table::Table), shared by every write verb.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteResult {
+    /// Requested time of the completed commit's instant, or `None` when the
+    /// write matched nothing and made no commit.
+    pub requested_time: Option<String>,
+    /// Completion time of the instant on timeline layout v2, which is what an
+    /// incremental read's start bound is compared against on that layout.
+    /// `None` on layout v1 and when no commit was written.
+    pub completion_time: Option<String>,
+    /// Rows in the data files this write produced: every row of each base
+    /// file it wrote, or each row appended to a merge-on-read log (deletes
+    /// append none).
+    pub num_writes: usize,
+    /// Number of input keys that replaced existing rows.
+    pub num_updates: usize,
+    /// Number of input keys not previously present. An append looks up no
+    /// keys and counts every row.
+    pub num_inserts: usize,
+    /// Number of rows deleted.
+    pub num_deletes: usize,
 }
 
 /// What [`complete_write`] stored on the timeline.

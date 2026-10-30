@@ -463,8 +463,10 @@ table.upsert(batch, update_columns=["fare"])
 ```rust
 let result = table.upsert([batch]).await?;
 println!(
-    "instant={:?} updates={} inserts={}",
-    result.requested_time, result.num_updates, result.num_inserts
+    "instant={} updates={} inserts={}",
+    result.requested_time.as_deref().unwrap_or("none"),
+    result.num_updates,
+    result.num_inserts
 );
 ```
 

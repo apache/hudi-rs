@@ -1088,18 +1088,13 @@ impl HudiCompactionResult {
 impl From<CompactionResult> for HudiCompactionResult {
     fn from(r: CompactionResult) -> Self {
         Self {
-            instant_time: committed(r.instant),
+            instant_time: r.requested_time,
             completion_time: r.completion_time,
             num_file_groups: r.num_file_groups,
             num_log_files: r.num_log_files,
             num_writes: r.num_writes,
         }
     }
-}
-
-/// The core reports a compaction that wrote nothing with an empty instant.
-fn committed(instant: String) -> Option<String> {
-    (!instant.is_empty()).then_some(instant)
 }
 
 /// Result of a table write, shared by every write verb.
