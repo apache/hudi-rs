@@ -48,6 +48,7 @@ use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
+use hudi::table::CompactionResult;
 use hudi::table::builder::TableBuilder;
 use hudi::table::{AppendResult, QueryType, ReadOptions, Table};
 use hudi::timeline::Timeline;
@@ -1035,6 +1036,64 @@ impl HudiTable {
                 .map_err(PythonError::from)
         })?;
         Ok(HudiWriteResult::from(result))
+    }
+
+    fn compact(&mut self, py: Python) -> PyResult<HudiCompactionResult> {
+        let result = py.detach(|| {
+            rt().block_on(self.inner.compact())
+                .map_err(PythonError::from)
+        })?;
+        Ok(HudiCompactionResult::from(result))
+    }
+
+    fn await_compaction(&mut self, py: Python) -> PyResult<Option<HudiCompactionResult>> {
+        let result = py.detach(|| {
+            rt().block_on(self.inner.await_compaction())
+                .map_err(PythonError::from)
+        })?;
+        Ok(result.map(HudiCompactionResult::from))
+    }
+}
+
+/// Result of a compaction.
+#[cfg(not(tarpaulin_include))]
+#[pyclass(frozen, get_all)]
+pub struct HudiCompactionResult {
+    instant_time: Option<String>,
+    completion_time: Option<String>,
+    num_file_groups: usize,
+    num_log_files: usize,
+    num_writes: usize,
+}
+
+#[cfg(not(tarpaulin_include))]
+#[pymethods]
+impl HudiCompactionResult {
+    fn __repr__(&self) -> String {
+        let quoted = |t: &Option<String>| {
+            t.as_ref()
+                .map_or_else(|| "None".to_string(), |t| format!("'{t}'"))
+        };
+        format!(
+            "HudiCompactionResult(instant_time={}, completion_time={}, num_file_groups={}, num_log_files={}, num_writes={})",
+            quoted(&self.instant_time),
+            quoted(&self.completion_time),
+            self.num_file_groups,
+            self.num_log_files,
+            self.num_writes,
+        )
+    }
+}
+
+impl From<CompactionResult> for HudiCompactionResult {
+    fn from(r: CompactionResult) -> Self {
+        Self {
+            instant_time: committed(r.instant),
+            completion_time: r.completion_time,
+            num_file_groups: r.num_file_groups,
+            num_log_files: r.num_log_files,
+            num_writes: r.num_writes,
+        }
     }
 }
 

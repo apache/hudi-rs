@@ -25,6 +25,7 @@ import pyarrow as pa
 import pytest
 
 from hudi import (
+    HudiCompactionResult,
     HudiCoreError,
     HudiQueryType,
     HudiReadOptions,
@@ -810,3 +811,42 @@ def test_unsupported_data_type_raises(tmp_path):
         table.append({"id": ["t1"]})
     with pytest.raises(TypeError, match=r"data\[0\] is not a pyarrow.RecordBatch"):
         table.append([{"id": "t1"}])
+
+
+def test_compact_folds_logs_and_keeps_rows(tmp_path):
+    table = new_table(tmp_path, "mor")
+    table.upsert(trips(("t1", "sf", 2, 31.0), ("t4", "nyc", 2, 10.0)))
+    before = snapshot(table)
+    result = table.compact()
+    assert isinstance(result, HudiCompactionResult)
+    assert result.instant_time is not None and result.completion_time is not None
+    assert (result.num_file_groups, result.num_log_files) == (1, 1)
+    assert result.num_writes == 2
+    assert snapshot(table) == before
+    nothing = table.compact()
+    assert nothing.instant_time is None and nothing.num_file_groups == 0
+    assert table.await_compaction() is None
+
+
+def test_compaction_in_the_background(tmp_path):
+    table = HudiTable.create(
+        str(tmp_path / "trips"),
+        record_key="id",
+        partition_by="city",
+        ordering_fields="ts",
+        table_type="mor",
+        hudi_options={
+            "hoodie.datasource.compaction.async.enable": "true",
+            "hoodie.compact.inline.max.delta.commits": "2",
+        },
+    )
+    table.append(trips(("t1", "sf", 1, 30.0)))
+    table.upsert(trips(("t1", "sf", 2, 31.0)))
+    result = table.await_compaction()
+    assert result is not None and result.num_log_files == 1
+    assert snapshot(table) == {"t1": ("sf", 2, 31.0)}
+
+
+def test_compact_rejects_copy_on_write(tmp_path):
+    with pytest.raises(HudiCoreError, match="MERGE_ON_READ"):
+        new_table(tmp_path).compact()

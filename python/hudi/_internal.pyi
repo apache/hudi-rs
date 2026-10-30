@@ -621,6 +621,40 @@ class HudiTable:
             HudiWriteResult: The replace commit.
         """
         ...
+    def compact(self) -> "HudiCompactionResult":
+        """
+        Compact a merge-on-read table: every file group whose latest file slice
+        carries log files gets a new base file holding its merged rows, under one
+        compaction instant that completes as a commit. Rows keep their commit time,
+        so incremental reads see no new rows from a compaction.
+
+        Compaction also runs on its own after a delta commit when the table was
+        opened with ``hoodie.compact.inline`` (in the write call) or
+        ``hoodie.datasource.compaction.async.enable`` (on a background task, see
+        :meth:`await_compaction`) set to ``true`` and the completed delta commits
+        since the latest compaction reach ``hoodie.compact.inline.max.delta.commits``
+        (default 5). Both are off by default.
+
+        Returns:
+            HudiCompactionResult: No commit is created when no file group has log files.
+
+        Raises:
+            HudiCoreError: If the table is copy-on-write.
+        """
+        ...
+    def await_compaction(self) -> Optional["HudiCompactionResult"]:
+        """
+        Wait for a background compaction started by a write of this process under
+        ``hoodie.datasource.compaction.async.enable`` and return its outcome.
+
+        Returns:
+            Optional[HudiCompactionResult]: ``None`` when no background compaction was
+            started since the last call.
+
+        Raises:
+            HudiCoreError: If the background compaction failed.
+        """
+        ...
 
 @dataclass(init=False)
 class HudiWriteResult:
@@ -647,6 +681,27 @@ class HudiWriteResult:
     num_updates: int
     num_inserts: int
     num_deletes: int
+
+@dataclass(init=False)
+class HudiCompactionResult:
+    """
+    Outcome of :meth:`HudiTable.compact`.
+
+    Attributes:
+        instant_time (Optional[str]): Instant time of the completed compaction commit,
+            or ``None`` when no file group had log files and nothing was written.
+        completion_time (Optional[str]): When the commit completed, or ``None`` when
+            nothing was written or the timeline records no completion times.
+        num_file_groups (int): File groups that received a new base file.
+        num_log_files (int): Log files folded into those base files.
+        num_writes (int): Rows written to the new base files.
+    """
+
+    instant_time: Optional[str]
+    completion_time: Optional[str]
+    num_file_groups: int
+    num_log_files: int
+    num_writes: int
 
 @dataclass(init=False)
 class HudiTimeline:

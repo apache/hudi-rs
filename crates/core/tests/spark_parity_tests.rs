@@ -37,6 +37,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::table::TableTypeValue;
 use hudi_core::index::HoodieKey;
+use hudi_core::metadata::compaction::{CompactionOperation, CompactionPlan};
 use hudi_core::table::{QueryType, ReadOptions, Table};
 use tempfile::tempdir;
 
@@ -1311,4 +1312,240 @@ async fn parity_j_spark_sql_dml_on_rs_tables() {
             "[{type_name}] spark read after rs upsert on Spark SQL commits"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario K: rs compaction of rs-written MOR tables, read and written by
+// Spark; a compaction plan rs left pending is readable by Spark and rolled
+// back by the next rs compaction.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
+async fn parity_k_rs_compaction_spark_interop() {
+    if !enabled() {
+        return;
+    }
+    let env = spark_env();
+    let dir = tempdir().unwrap();
+    let path = dir.path();
+    rs_create(path, TableTypeValue::MergeOnRead, true).await;
+    // rs handles compact the metadata table every two delta commits, so the
+    // Spark reads below, which run with and without the metadata table, read
+    // rs-compacted metadata base files.
+    let open = || async {
+        Table::new_with_options(path.to_str().unwrap(), [(MDT_COMPACT_EVERY, "2")])
+            .await
+            .unwrap()
+    };
+    let mut table = open().await;
+    table
+        .append([batch(&[
+            row("a", Some("sf"), 1, 10),
+            row("b", Some("sf"), 1, 20),
+            row("c", Some("nyc"), 1, 30),
+        ])])
+        .await
+        .unwrap();
+    table
+        .upsert([batch(&[
+            row("a", Some("sf"), 2, 11),
+            row("c", Some("nyc"), 2, 31),
+        ])])
+        .await
+        .unwrap();
+    let delete = table.delete("id = 'b'").await.unwrap();
+    let expected = vec![row("a", Some("sf"), 2, 11), row("c", Some("nyc"), 2, 31)];
+
+    let result = table.compact().await.unwrap();
+    assert_eq!((result.num_file_groups, result.num_log_files), (2, 3));
+    assert!(
+        metadata_compactions(path) >= 2,
+        "rs compacted the metadata table inline"
+    );
+    assert_eq!(
+        spark_read(&env, path),
+        expected,
+        "spark read after rs compaction"
+    );
+    assert_eq!(rs_read(path).await, expected, "rs read after rs compaction");
+    assert_eq!(
+        spark_read_as_of(&env, path, &delete.instant),
+        expected,
+        "spark time travel to the delta commit before the compaction"
+    );
+
+    // Spark writes log files onto the rs-compacted base files.
+    spark_write(
+        &env,
+        path,
+        "upsert",
+        "mor",
+        true,
+        &[row("a", Some("sf"), 3, 12), row("e", Some("sf"), 1, 50)],
+    );
+    let expected = vec![
+        row("a", Some("sf"), 3, 12),
+        row("c", Some("nyc"), 2, 31),
+        row("e", Some("sf"), 1, 50),
+    ];
+    assert_eq!(
+        rs_read(path).await,
+        expected,
+        "rs read after spark upsert on the compacted table"
+    );
+    assert_eq!(
+        spark_read(&env, path),
+        expected,
+        "spark read after its upsert on the compacted table"
+    );
+
+    // rs compacts Spark's log files along with its own. A file slice without
+    // log files is a small-file candidate Spark rewrites as a new base file,
+    // so rs logs to the sf group first and Spark's update then appends a log.
+    let mut table = open().await;
+    table
+        .upsert([batch(&[row("a", Some("sf"), 4, 13)])])
+        .await
+        .unwrap();
+    spark_write(
+        &env,
+        path,
+        "upsert",
+        "mor",
+        true,
+        &[row("e", Some("sf"), 2, 51)],
+    );
+    let mut table = open().await;
+    table.delete("id = 'c'").await.unwrap();
+    let logs_by_group: Vec<(String, usize)> = table
+        .get_file_slices(&ReadOptions::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|slice| slice.has_log_file())
+        .map(|slice| (slice.partition_path.clone(), slice.log_files.len()))
+        .collect();
+    assert!(
+        logs_by_group
+            .iter()
+            .any(|(partition, logs)| partition.ends_with("sf") && *logs >= 2),
+        "rs and spark logs on the sf group: {logs_by_group:?}"
+    );
+    let result = table.compact().await.unwrap();
+    assert_eq!(
+        (result.num_file_groups, result.num_log_files),
+        (
+            logs_by_group.len(),
+            logs_by_group.iter().map(|(_, logs)| logs).sum()
+        ),
+        "every slice with logs, spark's included"
+    );
+    let expected = vec![row("a", Some("sf"), 4, 13), row("e", Some("sf"), 2, 51)];
+    assert_eq!(
+        rs_read(path).await,
+        expected,
+        "rs read after compacting spark's logs"
+    );
+    assert_eq!(
+        spark_read(&env, path),
+        expected,
+        "spark read after rs compacted its logs"
+    );
+
+    // A compaction rs requested and never completed, as a crash leaves it:
+    // Spark reads through the pending plan, and the next rs compaction rolls
+    // it back before compacting.
+    table
+        .upsert([batch(&[row("e", Some("sf"), 3, 52)])])
+        .await
+        .unwrap();
+    let expected = vec![row("a", Some("sf"), 4, 13), row("e", Some("sf"), 3, 52)];
+    let slice = table
+        .get_file_slices(&ReadOptions::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|slice| slice.has_log_file())
+        .unwrap();
+    let plan = CompactionPlan {
+        operations: Some(vec![CompactionOperation {
+            base_instant_time: Some(slice.creation_instant_time().to_string()),
+            delta_file_paths: Some(slice.log_files.iter().map(|log| log.file_name()).collect()),
+            data_file_path: slice.base_file.as_ref().map(|base| base.file_name()),
+            file_id: Some(slice.file_id().to_string()),
+            partition_path: Some(slice.partition_path.clone()),
+            metrics: None,
+            bootstrap_file_path: None,
+        }]),
+        extra_metadata: Some(std::collections::HashMap::from([(
+            CompactionPlan::COMPACTOR_KEY.to_string(),
+            CompactionPlan::HUDI_RS_COMPACTOR.to_string(),
+        )])),
+        version: Some(CompactionPlan::LATEST_VERSION),
+        strategy: None,
+        preserve_hoodie_metadata: Some(true),
+        missing_schedule_partitions: None,
+    };
+    let pending = chrono::Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
+    let timeline = path.join(".hoodie/timeline");
+    std::fs::write(
+        timeline.join(format!("{pending}.compaction.requested")),
+        plan.to_avro_bytes().unwrap(),
+    )
+    .unwrap();
+    std::fs::write(timeline.join(format!("{pending}.compaction.inflight")), b"").unwrap();
+    assert_eq!(
+        spark_read(&env, path),
+        expected,
+        "spark read with an rs compaction pending"
+    );
+    assert_eq!(
+        rs_read(path).await,
+        expected,
+        "rs read with an rs compaction pending"
+    );
+
+    let mut table = open().await;
+    let result = table.compact().await.unwrap();
+    assert_eq!(result.num_file_groups, 1);
+    let names: Vec<String> = std::fs::read_dir(&timeline)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.iter().all(|name| !name.starts_with(&pending)),
+        "{names:?}"
+    );
+    assert!(
+        names.iter().any(|name| name.ends_with(".rollback")),
+        "{names:?}"
+    );
+    assert_eq!(
+        spark_read(&env, path),
+        expected,
+        "spark read after rs rolled back and compacted"
+    );
+    assert_eq!(
+        rs_read(path).await,
+        expected,
+        "rs read after rs rolled back and compacted"
+    );
+}
+
+const MDT_COMPACT_EVERY: &str = "hoodie.metadata.compact.max.delta.commits";
+
+/// Completed compactions on the metadata table's timeline.
+fn metadata_compactions(path: &Path) -> usize {
+    std::fs::read_dir(path.join(".hoodie/metadata/.hoodie/timeline"))
+        .unwrap()
+        .filter(|entry| {
+            let name = entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            name.contains('_') && name.ends_with(".commit")
+        })
+        .count()
 }

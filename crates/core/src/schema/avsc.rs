@@ -134,6 +134,12 @@ vendored_schema!(
     "HoodieRollbackMetadata.avsc",
     "HoodieRollbackMetadata"
 );
+// HoodieCompactionStrategy is inlined (Java keeps it in its own avsc file).
+vendored_schema!(
+    hoodie_compaction_plan_schema,
+    "HoodieCompactionPlan.avsc",
+    "HoodieCompactionPlan"
+);
 
 /// Java `HoodieReplaceCommitMetadata.avsc` references nested `HoodieWriteStat`
 /// from `HoodieCommitMetadata.avsc`. apache-avro `parse_list` does not lift nested

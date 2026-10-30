@@ -41,14 +41,24 @@ use crate::write::markers::{delete_marker_dir, parse_marker_name, read_markers};
 
 const METADATA_BASE: &str = ".hoodie/metadata";
 
-/// A pending (fenced, never completed) instant on the data timeline.
+/// A pending (fenced, never completed) instant on a timeline.
 #[derive(Debug, Clone)]
-struct PendingInstant {
-    timestamp: String,
-    action: String,
+pub(crate) struct PendingInstant {
+    pub(crate) timestamp: String,
+    pub(crate) action: String,
     /// Fencing file names present on the timeline, deleted before the
     /// rollback completes.
-    fencing_files: Vec<String>,
+    pub(crate) fencing_files: Vec<String>,
+}
+
+/// A timeline directory's instants by state, from one listing.
+#[derive(Default)]
+pub(crate) struct TimelineListing {
+    /// Instants of every action with fencing files and no completed file,
+    /// in timestamp order.
+    pub(crate) pending: Vec<PendingInstant>,
+    /// `(timestamp, action)` of completed instants.
+    pub(crate) completed: Vec<(String, String)>,
 }
 
 /// A rollback whose plan was persisted but which never completed.
@@ -58,6 +68,27 @@ struct PendingRollback {
     inflight: bool,
 }
 
+/// Which pending instants a rollback pass targets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    /// Commits, delta commits and replace commits: the data writes.
+    DataWrite,
+    /// Compactions, which belong to the compaction verb rather than to the
+    /// eager rollback every write runs.
+    Compaction,
+}
+
+impl PendingKind {
+    fn matches(self, action: &str) -> bool {
+        match self {
+            PendingKind::DataWrite => {
+                matches!(action, "commit" | "deltacommit" | "replacecommit")
+            }
+            PendingKind::Compaction => action == "compaction",
+        }
+    }
+}
+
 /// Roll back all pending data instants (Java `rollbackFailedWrites`, EAGER).
 ///
 /// Single-writer: any pending instant belongs to a crashed previous write.
@@ -65,10 +96,45 @@ struct PendingRollback {
 /// (Java `getPendingRollbackInfos`), whether its target is still pending or
 /// already gone; MDT-internal instants are never targets.
 pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
+    rollback_pending_instants(table, PendingKind::DataWrite).await
+}
+
+/// Roll back a compaction a crash left pending, deleting the base files its
+/// markers list, before a new one is planned.
+///
+/// Java keeps the plan and reverts the instant to requested so the same plan
+/// runs again; this writer plans afresh from the latest file slices, which
+/// under its single-writer model names the same log files plus any appended
+/// since. A plan another engine scheduled is left alone and fails the call:
+/// that engine may be executing it, and expects to find it.
+pub(crate) async fn rollback_pending_compactions(table: &Table) -> Result<()> {
     let storage = table.file_system_view.storage.clone();
     let timeline = timeline_dir(table);
-    let (pending, pending_rollbacks, completed) =
+    let (pending, _, _) = find_pending_instants(storage.as_ref(), &timeline).await?;
+    for instant in pending.iter().filter(|i| i.action == "compaction") {
+        let requested = format!("{timeline}/{}.compaction.requested", instant.timestamp);
+        let ours = match storage.get_file_data(&requested).await {
+            Ok(bytes) => crate::metadata::compaction::CompactionPlan::from_avro_bytes(&bytes)
+                .is_ok_and(|plan| plan.is_scheduled_by_hudi_rs()),
+            Err(_) => false,
+        };
+        if !ours {
+            return Err(CoreError::Unsupported(format!(
+                "compaction {} is pending and was not scheduled by hudi-rs; complete it with \
+                 the engine that scheduled it before compacting here",
+                instant.timestamp
+            )));
+        }
+    }
+    rollback_pending_instants(table, PendingKind::Compaction).await
+}
+
+async fn rollback_pending_instants(table: &Table, kind: PendingKind) -> Result<()> {
+    let storage = table.file_system_view.storage.clone();
+    let timeline = timeline_dir(table);
+    let (mut pending, pending_rollbacks, completed) =
         find_pending_instants(storage.as_ref(), &timeline).await?;
+    pending.retain(|instant| kind.matches(&instant.action));
     let mut resumable = HashMap::new();
     for rollback in pending_rollbacks {
         let Some(rollback) = load_pending_rollback(storage.as_ref(), &timeline, rollback).await?
@@ -78,11 +144,9 @@ pub(crate) async fn rollback_failed_writes(table: &Table) -> Result<()> {
         let Some(target) = rollback.plan.instant_to_rollback.clone() else {
             continue;
         };
-        // Rollbacks of table-service instants belong to that service.
-        if !matches!(
-            target.action.as_str(),
-            "commit" | "deltacommit" | "replacecommit"
-        ) {
+        // A rollback follows its target: a data write's to the eager pass
+        // every write runs, a compaction's to the compaction verb.
+        if !kind.matches(&target.action) {
             continue;
         }
         // Java reverts a completed target to inflight before deleting its
@@ -177,7 +241,7 @@ pub(crate) fn action_from_fencing_name(name: &str, timestamp: &str) -> String {
     }
 }
 
-/// Pending data instants to roll back, pending rollback instants, and the
+/// Pending data and compaction instants, pending rollback instants, and the
 /// timestamps of completed instants.
 async fn find_pending_instants(
     storage: &Storage,
@@ -187,14 +251,40 @@ async fn find_pending_instants(
     Vec<PendingInstant>,
     std::collections::HashSet<String>,
 )> {
+    let listing = list_timeline(storage, timeline_dir).await?;
+    let mut pending = Vec::new();
+    let mut rollbacks = Vec::new();
+    for instant in listing.pending {
+        match instant.action.as_str() {
+            "commit" | "deltacommit" | "replacecommit" | "compaction" => pending.push(instant),
+            "rollback" => rollbacks.push(instant),
+            // Other table services (clean, clustering, indexing) belong to
+            // the engine that scheduled them.
+            _ => {}
+        }
+    }
+    let completed = listing
+        .completed
+        .into_iter()
+        .map(|(timestamp, _)| timestamp)
+        .collect();
+    Ok((pending, rollbacks, completed))
+}
+
+/// List a timeline directory's pending and completed instants. A missing
+/// directory is an empty timeline.
+pub(crate) async fn list_timeline(
+    storage: &Storage,
+    timeline_dir: &str,
+) -> Result<TimelineListing> {
     let files = match storage.list_files(Some(timeline_dir)).await {
         Ok(files) => files,
         Err(crate::storage::error::StorageError::ObjectStoreError(
             object_store::Error::NotFound { .. },
-        )) => return Ok(Default::default()),
+        )) => return Ok(TimelineListing::default()),
         Err(error) => return Err(error.into()),
     };
-    let mut completed = std::collections::HashSet::new();
+    let mut completed = Vec::new();
     let mut fenced: HashMap<String, (String, Vec<String>)> = HashMap::new();
     for file in &files {
         let name = &file.name;
@@ -215,17 +305,18 @@ async fn find_pending_instants(
                 entry.0 = action;
             }
             entry.1.push(name.clone());
-        } else {
-            completed.insert(timestamp);
+        } else if let Some((_, action)) = name.split_once('.') {
+            completed.push((timestamp, action.to_string()));
         }
     }
-    let mut pending = Vec::new();
-    let mut rollbacks = Vec::new();
-    for (timestamp, (action, fencing_files)) in fenced {
-        if completed.contains(&timestamp) {
-            continue;
-        }
-        let instant = PendingInstant {
+    let completed_timestamps: std::collections::HashSet<&str> = completed
+        .iter()
+        .map(|(timestamp, _)| timestamp.as_str())
+        .collect();
+    let mut pending: Vec<PendingInstant> = fenced
+        .into_iter()
+        .filter(|(timestamp, _)| !completed_timestamps.contains(timestamp.as_str()))
+        .map(|(timestamp, (action, fencing_files))| PendingInstant {
             timestamp,
             action: if action.is_empty() {
                 "commit".to_string()
@@ -233,17 +324,10 @@ async fn find_pending_instants(
                 action
             },
             fencing_files,
-        };
-        match instant.action.as_str() {
-            "commit" | "deltacommit" | "replacecommit" => pending.push(instant),
-            "rollback" => rollbacks.push(instant),
-            // Compaction-style instants are never rolled back here.
-            _ => {}
-        }
-    }
+        })
+        .collect();
     pending.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    rollbacks.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    Ok((pending, rollbacks, completed))
+    Ok(TimelineListing { pending, completed })
 }
 
 /// Java `MarkerBasedRollbackStrategy` at table version 8+: one request per

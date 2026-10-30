@@ -592,6 +592,7 @@ pub(super) async fn mor_upsert_batches(
         &written_paths,
     )
     .await?;
+    crate::write::maybe_compact_inline(table).await;
     Ok(WriteResult {
         instant,
         completion_time: completed.completion_time,
@@ -768,6 +769,7 @@ pub(super) async fn mor_delete_keys(
         &written_paths,
     )
     .await?;
+    crate::write::maybe_compact_inline(table).await;
     Ok(WriteResult {
         instant,
         completion_time: completed.completion_time,

@@ -334,6 +334,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 
     let commit_bytes =
         crate::write::commit_metadata_bytes(table, "INSERT", write_stats, None, schema.as_ref())?;
+    let is_delta_commit = action == Action::DeltaCommit;
     let completed = crate::write::complete_write(
         table,
         &request_instant,
@@ -352,6 +353,9 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         &written_paths,
     )
     .await?;
+    if is_delta_commit {
+        crate::write::maybe_compact_inline(table).await;
+    }
 
     Ok(AppendResult {
         instant: request_instant,

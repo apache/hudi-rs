@@ -44,6 +44,13 @@ pub enum Action {
     Rollback,
     /// A restore, which is made up of several rollbacks.
     Restore,
+    /// A compaction of merge-on-read file groups. Pending states carry this
+    /// action; the completed instant is a [`Action::Commit`], as Java writes
+    /// it, so it is absent from [`DEFAULT_LOADING_ACTIONS`] like the others
+    /// that never complete under their own name.
+    ///
+    /// [`DEFAULT_LOADING_ACTIONS`]: crate::timeline::DEFAULT_LOADING_ACTIONS
+    Compaction,
 }
 
 impl FromStr for Action {
@@ -56,6 +63,7 @@ impl FromStr for Action {
             "replacecommit" => Ok(Action::ReplaceCommit),
             "rollback" => Ok(Action::Rollback),
             "restore" => Ok(Action::Restore),
+            "compaction" => Ok(Action::Compaction),
             _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
@@ -69,6 +77,7 @@ impl AsRef<str> for Action {
             Action::ReplaceCommit => "replacecommit",
             Action::Rollback => "rollback",
             Action::Restore => "restore",
+            Action::Compaction => "compaction",
         }
     }
 }
@@ -754,6 +763,7 @@ mod tests {
             Action::ReplaceCommit,
             Action::Rollback,
             Action::Restore,
+            Action::Compaction,
         ] {
             let suffix = action.as_ref();
             assert_eq!(

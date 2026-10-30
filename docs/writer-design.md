@@ -44,13 +44,16 @@ design as implemented in `crates/core/src/write/`.
   `record_index` partitions, all enabled by default.
 - Marker-based rollback of failed writes, LSM timeline archival, in-process
   locking.
+- Merge-on-read compaction (experimental), on demand or triggered after delta
+  commits, and inline compaction of the metadata table (§5.1).
 
 **Not yet implemented**
 
 - Write bindings for Python / C++ / DataFusion (the read path covers those).
-- Table services as *drivers* (hudi-rs interoperates with Spark-run
-  compaction, clustering, and cleaning, but does not schedule or execute them
-  natively).
+- Clustering and cleaning as *drivers* (hudi-rs interoperates with Spark-run
+  clustering and cleaning, but does not schedule or execute them natively);
+  log compaction; compaction strategies other than "every file slice with log
+  files"; metadata table timeline archival.
 - Multi-writer concurrency control beyond in-process locking; bootstrap
   tables; CDC-format writes; `delete_partition`.
 
@@ -161,12 +164,10 @@ never passes a pending instant. Reads never open the history: an instant below
 the earliest active instant counts as committed (Java's
 `isBeforeTimelineStarts`), since archival only moves completed instants, and
 the same rule admits MDT base files whose instant the MDT timeline has
-archived. The MDT's own timeline is *not* archived: like the Java writer, MDT
-archival is bounded by MDT compaction, which is not implemented natively.
-Java's archiver also holds data archival behind the latest MDT compaction;
-this one does not, since without native MDT compaction that bound would stop
-archival altogether, and an archived instant's MDT log blocks stay readable
-through its active MDT deltacommit (§3.3).
+archived. The MDT's own timeline is *not* archived yet. Java's archiver also
+holds data archival behind the latest MDT compaction; this one does not, since
+an archived instant's MDT log blocks stay readable through its active MDT
+deltacommit (§3.3).
 
 ## 4. Writing data
 
@@ -180,6 +181,7 @@ through its active MDT deltacommit (§3.3).
 | `delete` / `delete_keys` | Filter- or key-based deletes. A file group left empty still receives an empty base file version so the deletion is durable for all readers. |
 | `overwrite` | `INSERT_OVERWRITE_TABLE`: replaces all file groups via a replacecommit. |
 | `dynamic_partition_overwrite` | `INSERT_OVERWRITE`: replaces only the partitions present in the input. |
+| `compact` | MOR only: every latest file slice with log files gets a new base file of its merged rows under one compaction instant (§4.6). |
 
 ### 4.2 Indexing
 
@@ -217,6 +219,36 @@ and assembled in plan order, so results are deterministic.
 - Incoming batches may differ from the table schema in nullability only
   (Spark evolves table schemas to all-nullable); such batches are aligned
   rather than rejected. Name/type/order changes still error.
+
+### 4.6 Compaction
+
+`Table::compact` schedules and executes in one call, since a single writer has
+nothing to interleave between the two. The `.compaction.requested` instant
+carries Java's `HoodieCompactionPlan` (one operation per file slice with log
+files), the inflight file is empty, and the instant completes as a `commit`
+whose metadata is marked `compacted` with operation `COMPACT`. Each file group
+is read through the file group reader and written as a new base file by the
+same merge workers copy-on-write upserts use; rows keep their
+`_hoodie_commit_time`, so incremental reads see nothing new. The record index
+is untouched, since no record changes file group.
+
+Two triggers run it after a merge-on-read delta commit once the completed delta
+commits since the latest compaction reach
+`hoodie.compact.inline.max.delta.commits` (default 5), both off by default:
+`hoodie.compact.inline` compacts in the write call, and
+`hoodie.datasource.compaction.async.enable` compacts on a background task with
+its own table handle while writes continue (`Table::await_compaction` waits for
+it). The background task takes the table lock only for its two critical
+sections like any write.
+
+The plan is built under the table lock: a delta commit completing between the
+listing and the minting would complete below the compaction instant and stay
+on the superseded slice. A compaction a crash left pending is rolled back from
+its markers before the next compaction plans; Java would re-run the plan
+instead. Only plans marked `compactor=hudi-rs` in their `extraMetadata` are
+rolled back, and a pending plan another engine scheduled fails the compaction.
+Each write's eager rollback leaves pending compactions alone, so a background
+compaction is never rolled back by a concurrent write of the same process.
 
 ## 5. Metadata table
 
@@ -257,6 +289,37 @@ they came from** (base HFile or log block), so mixed-writer tables decode
 correctly. A file slice merges to its base file's schema, so the writer uses
 Java's metadata table writer schema: `HoodieMetadataRecord` with the five
 `_hoodie_*` meta fields prepended, always null.
+
+### 5.1 Metadata table compaction
+
+After a data write completes, still inside its completion critical section,
+the writer compacts the metadata table once it holds
+`hoodie.metadata.compact.max.delta.commits` (default 20, twice Java's) delta
+commits since its latest compaction, and only while no data instant is pending:
+a pending instant's metadata log blocks would otherwise sort below the
+compaction instant and attach to the superseded slice, since this writer
+places metadata logs by the instant in their name. Java instead schedules the
+compaction 1 ms below the earliest pending data instant whose metadata delta
+commit completed and leaves out logs that completed later; that rule is not
+yet implemented here. Every slice of the
+`files`, `column_stats`, `partition_stats` and `record_index` partitions with
+log files gets a new base HFile (1 MiB data blocks), under a `compaction`
+instant with a `HoodieCompactionPlan` that completes as a `commit`.
+
+Log blocks are admitted with the reader's valid-instant set. A base record no
+log block touches is copied as its key and value bytes without being decoded.
+A touched record merges with `HoodieMetadataPayload` semantics; for
+`record_index` that is the newest record's bytes, so a record index compaction
+decodes nothing. A key whose last record is a delete-block tombstone is
+dropped. A merged stats record decoded from a millisecond value type is
+written back with that type, as Java's merge keeps the newer record's. Records
+written with a schema other than the output schema are refused, since generic
+Avro resolution would retype stats bounds whose union branches share a shape;
+base files are checked from their file info first, so a table whose metadata
+an older Java release wrote skips compaction before anything is fenced. Each
+slice is compacted in memory, two slices at a time. A crashed metadata
+compaction is rolled back (its base files and fencing files deleted) before
+the next one runs.
 
 ## 6. Query semantics (writer-relevant)
 
@@ -315,6 +378,12 @@ The acceptance gate for interop lives in
   Spark-created and to an rs-created partitioned table; filtered Spark reads
   with data skipping (column_stats + partition_stats pruning) must match the
   same reads without it.
+- **K — rs compaction**: rs compacts an rs-written MOR table, and its handles
+  compact the metadata table inline every two delta commits; Spark reads the
+  result (snapshot and time travel, with and without the metadata table),
+  upserts on the new base files, and rs then compacts Spark's log files. A
+  pending rs compaction plan is read through by both engines and rolled back
+  by the next rs compaction.
 
 ## 8. Module map
 
@@ -328,6 +397,10 @@ crates/core/src/write/
                 MOR delta logs), instant request/complete helpers
   sizing.rs     small-file packing: SizingConfig, insert bucket assignment
   metadata.rs   MDT updates: files, record_index, column/partition stats
+  metadata_compaction.rs
+                inline MDT compaction with byte-copied untouched records
+  rewrite/compaction.rs
+                MOR compaction: plan, merge workers, inline/async triggers
   markers.rs    marker files (timeline-server-based format)
   rollback.rs   eager rollback of failed writes
   archival.rs   LSM timeline archival

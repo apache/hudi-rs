@@ -56,4 +56,4 @@ pub use error::{HFileError, Result};
 pub use key::{Key, KeyValue, Utf8Key};
 pub use reader::{HFileReader, HFileRecordIterator, SeekResult};
 pub use record::HFileRecord;
-pub use writer::HFileWriter;
+pub use writer::{HFileBuilder, HFileWriter};

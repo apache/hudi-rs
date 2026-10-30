@@ -133,7 +133,7 @@ pub fn record_index_metadata_avro_schema_json() -> Result<&'static str> {
     hoodie_metadata_schema_json()
 }
 
-fn metadata_schema() -> Result<&'static Schema> {
+pub(crate) fn metadata_schema() -> Result<&'static Schema> {
     static SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
@@ -241,7 +241,8 @@ pub struct ColumnStatsMetadata {
     pub is_deleted: bool,
     pub is_tight_bound: bool,
     /// Java `ValueType` ordinal decoded from a V2 record's `valueType`;
-    /// `None` for V1 records. Ignored on encode (derived from the values).
+    /// `None` for V1 records. On encode, only a millisecond type is kept (its
+    /// values are written back as millis); any other is derived from the values.
     pub decoded_value_type_ordinal: Option<i32>,
 }
 
@@ -722,6 +723,48 @@ fn lift_stat_value(value: ColumnStatValue, ordinal: i32, info: Option<&str>) -> 
     }
 }
 
+/// The millisecond `ValueType` ordinal a decoded record carried, when its
+/// values were lifted from it to micros by [`lift_stat_value`]. Java's merge
+/// keeps the newer record's value type, so a re-encoded record writes it back,
+/// but only while every bound is a whole millisecond: a bound merged in from a
+/// micros record would otherwise round, and a max rounded down prunes files
+/// that hold matching rows.
+fn millis_value_type(
+    decoded: Option<i32>,
+    min: Option<&ColumnStatValue>,
+    max: Option<&ColumnStatValue>,
+) -> Option<i32> {
+    let whole_millis = |value: &ColumnStatValue| match value {
+        ColumnStatValue::TimeMicros(v)
+        | ColumnStatValue::TimestampMicros(v)
+        | ColumnStatValue::LocalTimestampMicros(v) => v.rem_euclid(1_000) == 0,
+        _ => false,
+    };
+    let ordinal = match (decoded?, min.or(max)?) {
+        (13, ColumnStatValue::TimeMicros(_))
+        | (15, ColumnStatValue::TimestampMicros(_))
+        | (18, ColumnStatValue::LocalTimestampMicros(_)) => decoded,
+        _ => None,
+    };
+    ordinal.filter(|_| min.into_iter().chain(max).all(whole_millis))
+}
+
+/// Inverse of the millisecond lifts in [`lift_stat_value`]: `TIME_MILLIS` is
+/// an int, the timestamp types a long. Values are whole milliseconds here.
+fn micros_to_millis(value: &ColumnStatValue) -> Result<ColumnStatValue> {
+    Ok(match value {
+        ColumnStatValue::TimeMicros(v) => {
+            ColumnStatValue::Int(i32::try_from(v / 1_000).map_err(|_| {
+                CoreError::MetadataTable(format!("time {v} micros does not fit TIME_MILLIS"))
+            })?)
+        }
+        ColumnStatValue::TimestampMicros(v) | ColumnStatValue::LocalTimestampMicros(v) => {
+            ColumnStatValue::Long(v / 1_000)
+        }
+        other => other.clone(),
+    })
+}
+
 /// Inverse of [`wrap_stat_value`]: union branch → typed stat value.
 fn unwrap_stat_value(value: Value) -> Option<ColumnStatValue> {
     let Value::Union(branch, inner) = value else {
@@ -841,6 +884,21 @@ fn encode_column_stats_record(
     record_type: MetadataRecordType,
     version: StatsIndexVersion,
 ) -> Result<Vec<u8>> {
+    let sample = metadata.min_value.as_ref().or(metadata.max_value.as_ref());
+    let millis_ordinal = match version {
+        StatsIndexVersion::V1 => None,
+        StatsIndexVersion::V2 => millis_value_type(
+            metadata.decoded_value_type_ordinal,
+            metadata.min_value.as_ref(),
+            metadata.max_value.as_ref(),
+        ),
+    };
+    let bound = |value: Option<&ColumnStatValue>| -> Result<Value> {
+        match (millis_ordinal, value) {
+            (Some(_), Some(value)) => wrap_stat_value(Some(&micros_to_millis(value)?), version),
+            _ => wrap_stat_value(value, version),
+        }
+    };
     let payload = Value::Union(
         1,
         Box::new(Value::Record(vec![
@@ -852,14 +910,8 @@ fn encode_column_stats_record(
                 "columnName".to_string(),
                 Value::Union(1, Box::new(Value::String(metadata.column_name.clone()))),
             ),
-            (
-                "minValue".to_string(),
-                wrap_stat_value(metadata.min_value.as_ref(), version)?,
-            ),
-            (
-                "maxValue".to_string(),
-                wrap_stat_value(metadata.max_value.as_ref(), version)?,
-            ),
+            ("minValue".to_string(), bound(metadata.min_value.as_ref())?),
+            ("maxValue".to_string(), bound(metadata.max_value.as_ref())?),
             (
                 "valueCount".to_string(),
                 Value::Union(1, Box::new(Value::Long(metadata.value_count))),
@@ -883,14 +935,16 @@ fn encode_column_stats_record(
             ),
             // V1 leaves valueType null (Java ValueMetadata.V1EmptyMetadata);
             // V2 (tv9+) carries HoodieValueTypeInfo. Ordinal derives from the
-            // stat values; all-null columns fall back to NULL (ordinal 1).
+            // stat values, or is the millisecond type they were decoded from;
+            // all-null columns fall back to NULL (ordinal 1).
             (
                 "valueType".to_string(),
                 match version {
                     StatsIndexVersion::V1 => null_union(),
                     StatsIndexVersion::V2 => {
-                        let sample = metadata.min_value.as_ref().or(metadata.max_value.as_ref());
-                        let ordinal = sample.map(ColumnStatValue::value_type_ordinal).unwrap_or(1);
+                        let ordinal = millis_ordinal.unwrap_or_else(|| {
+                            sample.map(ColumnStatValue::value_type_ordinal).unwrap_or(1)
+                        });
                         let additional_info = match sample {
                             Some(ColumnStatValue::Decimal {
                                 precision, scale, ..
@@ -1441,5 +1495,82 @@ mod tests {
                 .expect("tombstone still decodes to a record");
             assert!(decoded.is_deleted, "{version:?}");
         }
+    }
+
+    /// A V2 record decoded from a millisecond type is re-encoded with that
+    /// type and its millisecond values, so a decode and encode leaves its
+    /// bytes as they were.
+    #[test]
+    fn test_v2_millis_value_type_survives_reencoding() {
+        let schema = metadata_schema().unwrap();
+        for (ordinal, min, max) in [
+            (
+                13,
+                ColumnStatValue::TimeMicros(1_000),
+                ColumnStatValue::TimeMicros(86_399_999_000),
+            ),
+            (
+                15,
+                ColumnStatValue::TimestampMicros(-1_000),
+                ColumnStatValue::TimestampMicros(1_700_000_000_000_000),
+            ),
+            (
+                18,
+                ColumnStatValue::LocalTimestampMicros(0),
+                ColumnStatValue::LocalTimestampMicros(2_000),
+            ),
+        ] {
+            let meta = ColumnStatsMetadata {
+                file_name: "f.parquet".to_string(),
+                column_name: "c".to_string(),
+                min_value: Some(min),
+                max_value: Some(max),
+                value_count: 2,
+                null_count: 0,
+                total_size: 10,
+                total_uncompressed_size: 10,
+                is_deleted: false,
+                is_tight_bound: false,
+                decoded_value_type_ordinal: Some(ordinal),
+            };
+            let bytes = encode_column_stats(&meta, StatsIndexVersion::V2).unwrap();
+            let decoded = decode_column_stats_entry(&bytes, Some(schema))
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, meta, "ordinal {ordinal}");
+            assert_eq!(
+                encode_column_stats(&decoded, StatsIndexVersion::V2).unwrap(),
+                bytes,
+                "ordinal {ordinal}"
+            );
+        }
+    }
+
+    /// A bound that is not a whole millisecond (merged in from a micros
+    /// record) keeps the micros type instead of rounding.
+    #[test]
+    fn test_v2_millis_value_type_yields_to_sub_millisecond_bounds() {
+        let meta = ColumnStatsMetadata {
+            file_name: "f.parquet".to_string(),
+            column_name: "c".to_string(),
+            min_value: Some(ColumnStatValue::TimestampMicros(1_000)),
+            max_value: Some(ColumnStatValue::TimestampMicros(1_500)),
+            value_count: 2,
+            null_count: 0,
+            total_size: 10,
+            total_uncompressed_size: 10,
+            is_deleted: false,
+            is_tight_bound: false,
+            decoded_value_type_ordinal: Some(15),
+        };
+        let bytes = encode_column_stats(&meta, StatsIndexVersion::V2).unwrap();
+        let decoded = decode_column_stats_entry(&bytes, Some(metadata_schema().unwrap()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decoded.decoded_value_type_ordinal, Some(16));
+        assert_eq!(
+            decoded.max_value,
+            Some(ColumnStatValue::TimestampMicros(1_500))
+        );
     }
 }

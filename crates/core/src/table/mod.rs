@@ -99,7 +99,7 @@ pub use crate::config::read_options::{QueryType, ReadOptions};
 pub use crate::index::{HoodieKey, SimpleIndex};
 pub use crate::write::TableCreateBuilder;
 pub use crate::write::append::AppendResult;
-pub use crate::write::{UpsertOptions, WriteResult};
+pub use crate::write::{CompactionResult, UpsertOptions, WriteResult};
 
 use crate::Result;
 use crate::config::ConfigParser;
@@ -232,6 +232,28 @@ impl Table {
 
     /// Reload the active timeline and drop listing caches before a write plans.
     pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
+        self.validate_for_write().await?;
+        // Eager rollback of crashed writes (Java rollbackFailedWrites) before
+        // any new instant is minted.
+        crate::write::rollback::rollback_failed_writes(self).await?;
+        self.timeline.reload_completed_commits().await?;
+        self.clear_read_caches();
+        Ok(())
+    }
+
+    /// [`Self::reload_timeline_for_write`] for a compaction, which rolls back
+    /// only a compaction a crash left pending. A compaction may run alongside
+    /// a write of this process, whose pending instant is live rather than
+    /// crashed; the write's own eager rollback skips compactions the same way.
+    pub(crate) async fn reload_timeline_for_compaction(&mut self) -> Result<()> {
+        self.validate_for_write().await?;
+        crate::write::rollback::rollback_pending_compactions(self).await?;
+        self.timeline.reload_completed_commits().await?;
+        self.clear_read_caches();
+        Ok(())
+    }
+
+    async fn validate_for_write(&mut self) -> Result<()> {
         crate::write::ensure_writable_table_version(self)?;
         crate::write::ensure_complex_keygen_validated(&self.hudi_configs)?;
         crate::write::archival::validated_keep_range(&self.hudi_configs)?;
@@ -241,11 +263,6 @@ impl Table {
         crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
             &self.hudi_configs,
         ));
-        // Eager rollback of crashed writes (Java rollbackFailedWrites) before
-        // any new instant is minted.
-        crate::write::rollback::rollback_failed_writes(self).await?;
-        self.timeline.reload_completed_commits().await?;
-        self.clear_read_caches();
         Ok(())
     }
 
@@ -437,6 +454,41 @@ impl Table {
     ) -> Result<WriteResult> {
         let keys: Vec<crate::index::HoodieKey> = keys.into_iter().collect();
         crate::write::delete_keys(self, &keys).await
+    }
+
+    /// Compact a merge-on-read table: every file group whose latest file
+    /// slice carries log files gets a new base file holding its merged rows,
+    /// under one compaction instant that completes as a `commit`.
+    ///
+    /// Rows keep their `_hoodie_commit_time`, so incremental reads see no new
+    /// rows from a compaction. Returns a result with an empty instant when no
+    /// file group had log files, in which case nothing is written.
+    ///
+    /// Compaction also runs on its own after a delta commit when
+    /// `hoodie.compact.inline` is `true` and the completed delta commits since
+    /// the latest compaction reach `hoodie.compact.inline.max.delta.commits`
+    /// (default 5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`](crate::error::CoreError::Unsupported)
+    /// on a copy-on-write table, which has no log files to compact.
+    pub async fn compact(&mut self) -> Result<CompactionResult> {
+        crate::write::compact_table(self).await
+    }
+
+    /// Wait for a background compaction started by a write of this process
+    /// under `hoodie.datasource.compaction.async.enable`, and return its
+    /// outcome; `None` when none was started since the last call. Dropping
+    /// the process before this returns leaves the compaction pending for the
+    /// next one to roll back.
+    pub async fn await_compaction(&mut self) -> Result<Option<CompactionResult>> {
+        let result = crate::write::await_async_compaction(self).await?;
+        if result.is_some() {
+            self.timeline.reload_completed_commits().await?;
+            self.clear_read_caches();
+        }
+        Ok(result)
     }
 
     /// UPDATE: set columns from a single-row batch on rows matching `filter`.
