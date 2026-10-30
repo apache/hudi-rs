@@ -135,7 +135,14 @@ impl Timeline {
             None,
         )?;
         let all_active = timeline.load_instants(&selector, false).await?;
-        timeline.earliest_active_instant = all_active
+        timeline.set_active_instants(all_active);
+        Ok(timeline)
+    }
+
+    /// Set the completed commits, the pending instants and the archival
+    /// boundary from one listing of the active timeline in every state.
+    fn set_active_instants(&mut self, all_active: Vec<Instant>) {
+        self.earliest_active_instant = all_active
             .iter()
             .map(|instant| instant.timestamp.clone())
             .min();
@@ -151,13 +158,12 @@ impl Timeline {
             .iter()
             .map(|instant| instant.timestamp.clone())
             .collect();
-        timeline.pending_instants = pending
+        self.pending_instants = pending
             .into_iter()
             .map(|instant| instant.timestamp)
             .filter(|timestamp| !completed_times.contains(timestamp))
             .collect();
-        timeline.completed_commits = completed;
-        Ok(timeline)
+        self.completed_commits = completed;
     }
 
     /// The inputs the log-block scan needs to tell a committed instant from one
@@ -196,7 +202,8 @@ impl Timeline {
     /// Reload completed commits from storage after a write.
     pub(crate) async fn reload_completed_commits(&mut self) -> Result<()> {
         // Same listing as `new_from_storage`: every state, so the archival
-        // boundary can be refreshed together with the completed commits.
+        // boundary and the pending instants are refreshed together with the
+        // completed commits.
         // Archival (running inside writes) raises the boundary; a reload that
         // kept the old one would leave newly-archived instants neither in the
         // completed set nor below the boundary — read as uncommitted, silently
@@ -209,14 +216,7 @@ impl Timeline {
             None,
         )?;
         let all_active = self.load_instants(&selector, false).await?;
-        self.earliest_active_instant = all_active
-            .iter()
-            .map(|instant| instant.timestamp.clone())
-            .min();
-        self.completed_commits = all_active
-            .into_iter()
-            .filter(|instant| instant.state == State::Completed)
-            .collect();
+        self.set_active_instants(all_active);
         Ok(())
     }
 

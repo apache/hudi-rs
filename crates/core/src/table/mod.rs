@@ -721,9 +721,13 @@ impl Table {
             )
             .await?;
 
-        if let Some(located) = self
-            .file_groups_for_record_keys(filters, timestamp, &table_schema)
-            .await
+        // The index describes merged rows, which a read-optimized read of a
+        // merge-on-read table does not see.
+        let read_optimized = base_file_only && self.is_mor();
+        if !read_optimized
+            && let Some(located) = self
+                .file_groups_for_record_keys(filters, timestamp, &table_schema)
+                .await
         {
             let planned: HashSet<(&str, &str)> = file_slices
                 .iter()

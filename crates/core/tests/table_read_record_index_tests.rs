@@ -407,3 +407,72 @@ async fn test_key_filter_with_a_complex_key_generator_below_version_9() {
         (3, vec!["k04".to_string()])
     );
 }
+
+/// The index describes merged rows, so a read-optimized read, which reads
+/// base files only, does not narrow by it: a key deleted in a log file is
+/// still in its base file.
+#[tokio::test]
+async fn test_a_read_optimized_read_does_not_use_the_index() {
+    let dir = tempdir().unwrap();
+    three_groups(dir.path(), TableTypeValue::MergeOnRead, true).await;
+    let mut writer = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    writer
+        .delete_keys([HoodieKey {
+            record_key: "k04".to_string(),
+            partition_path: String::new(),
+        }])
+        .await
+        .unwrap();
+
+    let reader = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    let options = filters(&[("id", "=", "k04")])
+        .with_hudi_option("hoodie.read.use.read_optimized.mode", "true");
+    let (_, ids) = slices_and_ids(&reader, &options).await;
+    assert_eq!(ids, vec!["k04".to_string()]);
+}
+
+/// A commit pending when the table was opened and completed before this
+/// handle writes is part of the snapshot the handle reads after its write.
+#[tokio::test]
+async fn test_a_read_after_a_write_sees_a_commit_that_was_pending_at_open() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let mut table = Table::create(path)
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_record_index(true)
+        .with_option("hoodie.parquet.small.file.limit", "0")
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(0, 0)]).await.unwrap();
+    table.append([batch(1, 100)]).await.unwrap();
+    let pending_instant = Table::new(path)
+        .await
+        .unwrap()
+        .get_timeline()
+        .completed_commits
+        .iter()
+        .map(|i| i.timestamp.clone())
+        .max()
+        .unwrap();
+
+    // Open the handle while the second append looks in flight.
+    let timeline = dir.path().join(".hoodie/timeline");
+    let completed = std::fs::read_dir(&timeline)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            name.starts_with(&format!("{pending_instant}_")) && name.ends_with(".commit")
+        })
+        .unwrap();
+    let hidden = dir.path().join("hidden.commit");
+    std::fs::rename(&completed, &hidden).unwrap();
+    let mut handle = Table::new(path).await.unwrap();
+    std::fs::rename(&hidden, &completed).unwrap();
+
+    handle.append([batch(2, 200)]).await.unwrap();
+    let (_, ids) = slices_and_ids(&handle, &filters(&[("id", "=", "k04")])).await;
+    assert_eq!(ids, vec!["k04".to_string()]);
+}
