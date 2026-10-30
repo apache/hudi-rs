@@ -690,6 +690,22 @@ fn stats_index_version(
     })
 }
 
+/// The stats index version new column_stats and partition_stats records of
+/// this table are encoded with.
+pub(crate) async fn current_stats_index_version(table: &Table) -> Result<StatsIndexVersion> {
+    let index_definitions = read_index_definitions(table).await?;
+    let parsed: Option<serde_json::Value> = index_definitions
+        .as_ref()
+        .and_then(|(_, existing)| existing.as_deref())
+        .filter(|bytes| !bytes.is_empty())
+        .map(serde_json::from_slice)
+        .transpose()
+        .map_err(|e| {
+            crate::error::CoreError::MetadataTable(format!("invalid index definitions: {e}"))
+        })?;
+    stats_index_version(table, parsed.as_ref())
+}
+
 /// Columns indexed by `column_stats` / `partition_stats` for this table,
 /// honoring the column list and max-columns write configs.
 fn table_columns_to_index(

@@ -25,6 +25,7 @@ mod keygen;
 pub mod lock;
 pub(crate) mod markers;
 pub(crate) mod metadata;
+mod metadata_compaction;
 mod rewrite;
 pub(crate) mod rollback;
 pub(crate) mod sizing;
@@ -38,10 +39,11 @@ pub(crate) use keygen::{
 };
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;
-pub use rewrite::{UpsertOptions, WriteResult};
+pub use rewrite::{CompactionResult, UpsertOptions, WriteResult};
 pub(crate) use rewrite::{
-    delete_filter, delete_keys, dynamic_partition_overwrite_batches, overwrite_batches,
-    update_filter, upsert_batches,
+    await_async_compaction, compact_table, delete_filter, delete_keys,
+    dynamic_partition_overwrite_batches, maybe_compact_inline, overwrite_batches, update_filter,
+    upsert_batches,
 };
 
 use std::collections::HashMap;
@@ -575,6 +577,42 @@ pub(crate) fn commit_metadata_bytes(
     partition_to_replace_file_ids: Option<HashMap<String, Vec<String>>>,
     schema: &arrow_schema::Schema,
 ) -> Result<Vec<u8>> {
+    data_instant_metadata_bytes(
+        table,
+        operation,
+        partition_to_write_stats,
+        partition_to_replace_file_ids,
+        schema,
+        false,
+    )
+}
+
+/// [`commit_metadata_bytes`] for a compaction: Java marks the commit metadata
+/// `compacted`, which is how its readers tell a compaction commit from a
+/// copy-on-write one.
+pub(crate) fn compaction_commit_metadata_bytes(
+    table: &crate::table::Table,
+    partition_to_write_stats: HashMap<String, Vec<crate::metadata::commit::HoodieWriteStat>>,
+    schema: &arrow_schema::Schema,
+) -> Result<Vec<u8>> {
+    data_instant_metadata_bytes(
+        table,
+        "COMPACT",
+        partition_to_write_stats,
+        None,
+        schema,
+        true,
+    )
+}
+
+fn data_instant_metadata_bytes(
+    table: &crate::table::Table,
+    operation: &str,
+    partition_to_write_stats: HashMap<String, Vec<crate::metadata::commit::HoodieWriteStat>>,
+    partition_to_replace_file_ids: Option<HashMap<String, Vec<String>>>,
+    schema: &arrow_schema::Schema,
+    compacted: bool,
+) -> Result<Vec<u8>> {
     let schema_json =
         append::arrow_schema_to_avro_json(&append::strip_meta_fields_from_schema(schema))?;
     let extra_metadata = Some(HashMap::from([("schema".to_string(), schema_json)]));
@@ -585,7 +623,7 @@ pub(crate) fn commit_metadata_bytes(
                 version: Some(1),
                 operation_type: Some(operation.to_string()),
                 partition_to_write_stats: Some(partition_to_write_stats),
-                compacted: Some(false),
+                compacted: Some(compacted),
                 extra_metadata,
                 partition_to_replace_file_ids: Some(partition_to_replace_file_ids),
             };
@@ -600,7 +638,7 @@ pub(crate) fn commit_metadata_bytes(
                 version: Some(1),
                 operation_type: Some(operation.to_string()),
                 partition_to_write_stats: Some(partition_to_write_stats),
-                compacted: Some(false),
+                compacted: Some(compacted),
                 extra_metadata,
                 partition_to_replace_file_ids: None,
             };
@@ -712,6 +750,11 @@ pub(crate) async fn complete_write(
     // The commit is durable; bookkeeping retries on the next write.
     if let Err(error) = post_complete_bookkeeping(table, storage.as_ref(), instant).await {
         log::warn!("post-commit bookkeeping for {instant} failed: {error}");
+    }
+    // Under the lock: a compaction instant minted here sorts above every
+    // metadata log block written so far and below every one written later.
+    if let Err(error) = metadata_compaction::compact_metadata_table_if_needed(table).await {
+        log::warn!("metadata table compaction after {instant} failed: {error}");
     }
     drop(critical_section);
 

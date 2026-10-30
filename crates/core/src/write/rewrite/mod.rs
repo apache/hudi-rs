@@ -52,6 +52,7 @@ use crate::write::append::{
 use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
 use crate::write::metadata::is_column_stats_enabled;
 
+mod compaction;
 mod cow;
 #[cfg(test)]
 mod lifecycle_tests;
@@ -59,6 +60,8 @@ mod mor;
 mod rows;
 mod validate;
 
+pub use compaction::CompactionResult;
+pub(crate) use compaction::{await_async_compaction, compact_table, maybe_compact_inline};
 use cow::*;
 use mor::*;
 use rows::*;

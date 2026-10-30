@@ -41,6 +41,11 @@ Cross-checks hudi-rs against the Apache Hudi Spark writer/reader:
   whose UTF-8 and UTF-16 orders differ, against the bloom footer key range
 - **J** — Spark SQL UPDATE/DELETE/INSERT on rs-written COW/MOR tables
   registered in a non-default database, then rs writes on top
+- **K** — rs compaction of rs-written MOR tables, with rs also compacting the
+  metadata table inline: Spark snapshot and time-travel reads of the compacted
+  table, Spark upserts on the new base files, rs compaction of Spark's log
+  files, and a pending rs compaction plan that Spark reads through and the
+  next rs compaction rolls back
 
 Spark snapshot reads always run twice — with and without
 `hoodie.metadata.enable` — and fail on mismatch, so MDT interop bugs surface

@@ -38,56 +38,147 @@ impl HFileWriter {
     /// Write sorted key/value records into a single uncompressed HFile data block.
     pub fn write(
         entries: &[(String, Vec<u8>)],
-        mut file_info: BTreeMap<String, Vec<u8>>,
+        file_info: BTreeMap<String, Vec<u8>>,
     ) -> Result<Vec<u8>> {
         let mut entries: Vec<&(String, Vec<u8>)> = entries.iter().collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let first_key = entries
-            .first()
-            .map(|(key, _)| structured_key(key))
-            .transpose()?
-            .unwrap_or_default();
-        let last_key = entries
-            .last()
-            .map(|(key, _)| structured_key(key))
-            .transpose()?
-            .unwrap_or_default();
-
-        // Per entry: two i32 lengths, the structured key (content + 12 bytes of
-        // framing), the value and a trailing byte.
-        let mut data = Vec::with_capacity(
-            entries
-                .iter()
-                .map(|(key, value)| key.len() + value.len() + 21)
-                .sum(),
-        );
-        for (key, value) in &entries {
-            let key_len = i32::try_from(key.len() + STRUCTURED_KEY_OVERHEAD)
-                .map_err(|_| HFileError::InvalidFormat("HFile key is too large".to_string()))?;
-            let value_len = i32::try_from(value.len())
-                .map_err(|_| HFileError::InvalidFormat("HFile value is too large".to_string()))?;
-            data.extend_from_slice(&key_len.to_be_bytes());
-            data.extend_from_slice(&value_len.to_be_bytes());
-            push_structured_key(&mut data, key)?;
-            data.extend_from_slice(value);
-            data.push(0);
+        let mut builder = HFileBuilder::new(usize::MAX);
+        for (key, value) in entries {
+            builder.append(key.as_bytes(), value)?;
         }
+        builder.finish(file_info)
+    }
+}
 
-        let mut output = write_block(HFileBlockType::Data, &data, -1)?;
-        let data_block_size = output.len();
+/// Builds an uncompressed HFile v3 from cells appended in key order, cutting a
+/// new data block once the current one reaches the block size.
+///
+/// Cells are taken as key content and value slices, so a caller holding a cell
+/// read from another HFile writes it without decoding the value.
+pub struct HFileBuilder {
+    block_size: usize,
+    output: Vec<u8>,
+    /// The data block being filled.
+    data: Vec<u8>,
+    /// Root index entries: block offset, on-disk size and first key.
+    index: Vec<(u64, u32, Vec<u8>)>,
+    first_key_of_block: Option<Vec<u8>>,
+    last_key_content: Vec<u8>,
+    last_data_block_offset: i64,
+    total_uncompressed_bytes: u64,
+    entry_count: u64,
+}
+
+impl HFileBuilder {
+    /// A builder cutting data blocks at `block_size` bytes of cell data.
+    pub fn new(block_size: usize) -> Self {
+        Self {
+            block_size: block_size.max(1),
+            output: Vec::new(),
+            data: Vec::new(),
+            index: Vec::new(),
+            first_key_of_block: None,
+            last_key_content: Vec::new(),
+            last_data_block_offset: -1,
+            total_uncompressed_bytes: 0,
+            entry_count: 0,
+        }
+    }
+
+    /// Append one cell. Keys must arrive in ascending byte order, which is the
+    /// order HFile readers seek by.
+    pub fn append(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        if self.entry_count > 0 && key < self.last_key_content.as_slice() {
+            return Err(HFileError::InvalidFormat(format!(
+                "HFile keys must be appended in ascending order: '{}' after '{}'",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(&self.last_key_content)
+            )));
+        }
+        if self.first_key_of_block.is_none() {
+            self.first_key_of_block = Some(structured_key(key)?);
+        }
+        let key_len = i32::try_from(key.len() + STRUCTURED_KEY_OVERHEAD)
+            .map_err(|_| HFileError::InvalidFormat("HFile key is too large".to_string()))?;
+        let value_len = i32::try_from(value.len())
+            .map_err(|_| HFileError::InvalidFormat("HFile value is too large".to_string()))?;
+        self.data.reserve(key.len() + value.len() + 21);
+        self.data.extend_from_slice(&key_len.to_be_bytes());
+        self.data.extend_from_slice(&value_len.to_be_bytes());
+        push_structured_key(&mut self.data, key)?;
+        self.data.extend_from_slice(value);
+        self.data.push(0);
+        self.last_key_content.clear();
+        self.last_key_content.extend_from_slice(key);
+        self.entry_count += 1;
+        if self.data.len() >= self.block_size {
+            self.flush_data_block()?;
+        }
+        Ok(())
+    }
+
+    /// Number of cells appended so far.
+    pub fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    fn flush_data_block(&mut self) -> Result<()> {
+        let Some(first_key) = self.first_key_of_block.take() else {
+            return Ok(());
+        };
+        let offset = self.output.len() as u64;
+        let block = write_block(
+            HFileBlockType::Data,
+            &self.data,
+            self.last_data_block_offset,
+        )?;
+        let on_disk_size = u32::try_from(block.len())
+            .map_err(|_| HFileError::InvalidFormat("HFile block is too large".to_string()))?;
+        self.output.extend_from_slice(&block);
+        self.total_uncompressed_bytes += self.data.len() as u64;
+        self.index.push((offset, on_disk_size, first_key));
+        self.last_data_block_offset = offset as i64;
+        self.data.clear();
+        Ok(())
+    }
+
+    /// Write the index, file info and trailer, returning the file's bytes.
+    pub fn finish(mut self, mut file_info: BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>> {
+        self.flush_data_block()?;
+        let mut output = std::mem::take(&mut self.output);
+        // An empty file still carries a single empty data block, as readers
+        // expect a data block before the load-on-open section.
+        if self.index.is_empty() {
+            output = write_block(HFileBlockType::Data, &[], -1)?;
+        }
+        let last_key = if self.entry_count > 0 {
+            structured_key(&self.last_key_content)?
+        } else {
+            Vec::new()
+        };
 
         let mut root_index = Vec::new();
-        root_index.extend_from_slice(&0i64.to_be_bytes());
-        root_index.extend_from_slice(
-            &u32::try_from(data_block_size)
-                .map_err(|_| HFileError::InvalidFormat("HFile block is too large".to_string()))?
-                .to_be_bytes(),
-        );
-        write_hadoop_vlong(&mut root_index, first_key.len() as u64);
-        root_index.extend_from_slice(&first_key);
+        if self.index.is_empty() {
+            root_index.extend_from_slice(&0i64.to_be_bytes());
+            root_index.extend_from_slice(
+                &u32::try_from(output.len())
+                    .map_err(|_| HFileError::InvalidFormat("HFile block is too large".to_string()))?
+                    .to_be_bytes(),
+            );
+            write_hadoop_vlong(&mut root_index, 0);
+        }
+        for (offset, size, first_key) in &self.index {
+            root_index.extend_from_slice(&(*offset as i64).to_be_bytes());
+            root_index.extend_from_slice(&size.to_be_bytes());
+            write_hadoop_vlong(&mut root_index, first_key.len() as u64);
+            root_index.extend_from_slice(first_key);
+        }
         let root_index_offset = output.len() as u64;
-        output.extend_from_slice(&write_block(HFileBlockType::RootIndex, &root_index, 0)?);
+        output.extend_from_slice(&write_block(
+            HFileBlockType::RootIndex,
+            &root_index,
+            self.last_data_block_offset.max(0),
+        )?);
 
         let meta_index_offset = output.len() as u64;
         output.extend_from_slice(&write_block(
@@ -126,13 +217,13 @@ impl HFileWriter {
             file_info_offset: Some(file_info_offset),
             load_on_open_data_offset: Some(root_index_offset),
             uncompressed_data_index_size: Some(root_index.len() as u64),
-            total_uncompressed_bytes: Some(data.len() as u64),
-            data_index_count: Some(u32::from(!entries.is_empty())),
+            total_uncompressed_bytes: Some(self.total_uncompressed_bytes),
+            data_index_count: Some(self.index.len() as u32),
             meta_index_count: Some(0),
-            entry_count: Some(entries.len() as u64),
+            entry_count: Some(self.entry_count),
             num_data_index_levels: Some(1),
             first_data_block_offset: Some(0),
-            last_data_block_offset: Some(0),
+            last_data_block_offset: Some(self.last_data_block_offset.max(0) as u64),
             // Java's native HFile writer; an HBase-backed reader instantiates it.
             comparator_class_name: Some(
                 "org.apache.hudi.io.storage.HoodieHBaseKVComparator".to_string(),
@@ -158,7 +249,7 @@ impl HFileWriter {
 /// family terminator, the i64 timestamp and the type byte.
 const STRUCTURED_KEY_OVERHEAD: usize = 2 + 1 + 8 + 1;
 
-fn structured_key(content: &str) -> crate::hfile::error::Result<Vec<u8>> {
+fn structured_key(content: &[u8]) -> crate::hfile::error::Result<Vec<u8>> {
     let mut key = Vec::with_capacity(content.len() + STRUCTURED_KEY_OVERHEAD);
     push_structured_key(&mut key, content)?;
     Ok(key)
@@ -166,7 +257,7 @@ fn structured_key(content: &str) -> crate::hfile::error::Result<Vec<u8>> {
 
 /// Appends the structured key for `content` to `out`, so a data block is built
 /// without a buffer per entry.
-fn push_structured_key(out: &mut Vec<u8>, content: &str) -> crate::hfile::error::Result<()> {
+fn push_structured_key(out: &mut Vec<u8>, content: &[u8]) -> crate::hfile::error::Result<()> {
     // The KeyValue row-length field is u16; truncating would corrupt framing.
     let len = u16::try_from(content.len()).map_err(|_| {
         crate::hfile::error::HFileError::InvalidFormat(format!(
@@ -175,7 +266,7 @@ fn push_structured_key(out: &mut Vec<u8>, content: &str) -> crate::hfile::error:
         ))
     })?;
     out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(content.as_bytes());
+    out.extend_from_slice(content);
     out.push(0);
     out.extend_from_slice(&i64::MAX.to_be_bytes());
     out.push(4);
@@ -237,6 +328,43 @@ fn write_protobuf_varint(output: &mut Vec<u8>, mut value: u64) {
 mod tests {
     use super::*;
     use crate::hfile::HFileReader;
+
+    /// Cells spread over several data blocks read back in order, and a point
+    /// lookup lands in the right block.
+    #[test]
+    fn test_builder_writes_multiple_data_blocks() {
+        let mut builder = HFileBuilder::new(64);
+        let keys: Vec<String> = (0..50).map(|i| format!("key{i:03}")).collect();
+        for key in &keys {
+            builder
+                .append(key.as_bytes(), format!("value-{key}").as_bytes())
+                .unwrap();
+        }
+        let bytes = builder
+            .finish(BTreeMap::from([("schema".to_string(), b"s".to_vec())]))
+            .unwrap();
+        let trailer = crate::hfile::trailer::HFileTrailer::read(&bytes).unwrap();
+        assert!(trailer.data_index_count > 1, "{}", trailer.data_index_count);
+        assert_eq!(trailer.entry_count, 50);
+        let mut reader = HFileReader::new(bytes).unwrap();
+        let records = reader.collect_records().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.key_as_str().unwrap().to_string())
+                .collect::<Vec<_>>(),
+            keys
+        );
+        let found = reader.lookup_records(&["key037"]).unwrap();
+        assert_eq!(found[0].1.as_ref().unwrap().value(), b"value-key037");
+    }
+
+    #[test]
+    fn test_builder_rejects_descending_keys() {
+        let mut builder = HFileBuilder::new(1024);
+        builder.append(b"b", b"1").unwrap();
+        assert!(builder.append(b"a", b"2").is_err());
+    }
 
     #[test]
     fn test_write_roundtrip_records() {

@@ -368,6 +368,9 @@ pub(super) enum GroupOp {
     DeleteWhere { filter: Filter },
     /// SET single-row `set` values on rows matching the filter.
     UpdateWhere { filter: Filter, set: RecordBatch },
+    /// Write the group's merged rows unchanged: the slice read already folded
+    /// its log files into the base file's rows.
+    Compact,
 }
 
 /// One file group's merge assignment.
@@ -687,6 +690,7 @@ impl MergePlan {
                 };
                 (updated, matched)
             }
+            GroupOp::Compact => (old, 0),
         };
         let merged = restamp_file_name(&merged, &self.out_name)?;
         let num_rows = merged.num_rows();

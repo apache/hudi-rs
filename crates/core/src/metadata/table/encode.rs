@@ -133,7 +133,7 @@ pub fn record_index_metadata_avro_schema_json() -> Result<&'static str> {
     hoodie_metadata_schema_json()
 }
 
-fn metadata_schema() -> Result<&'static Schema> {
+pub(crate) fn metadata_schema() -> Result<&'static Schema> {
     static SCHEMA: OnceLock<std::result::Result<Schema, String>> = OnceLock::new();
     SCHEMA
         .get_or_init(|| {
