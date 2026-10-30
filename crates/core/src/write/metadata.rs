@@ -74,8 +74,11 @@ pub struct StatsFileUpdate {
     pub ranges: Vec<ColumnRangeStats>,
 }
 
-fn record_index_file_id(shard: usize) -> String {
-    format!("record-index-{shard:04}-0")
+/// Prefix of a global record index file group id, `record-index-NNNN-0`.
+pub(crate) const RECORD_INDEX_FILE_ID_PREFIX: &str = "record-index-";
+
+pub(crate) fn record_index_file_id(shard: usize) -> String {
+    format!("{RECORD_INDEX_FILE_ID_PREFIX}{shard:04}-0")
 }
 
 /// Java `HoodieTableMetadataUtil.mapRecordKeyToFileGroupIndex` (31-hash, signed i32).
@@ -468,7 +471,7 @@ async fn detect_rli_num_file_groups(storage: &Storage) -> Result<usize> {
     detect_num_file_groups(
         storage,
         MetadataPartitionType::RecordIndex.partition_name(),
-        "record-index-",
+        RECORD_INDEX_FILE_ID_PREFIX,
         DEFAULT_RLI_NUM_FILE_GROUPS,
     )
     .await
@@ -484,8 +487,24 @@ async fn detect_num_file_groups(
     // change the shard modulus (it would diverge from what Java computes),
     // and listing errors must propagate rather than silently changing it.
     let slices = mdt_partition_latest_slices(storage, partition_name).await?;
+    shard_count_from_slices(&slices, file_id_prefix, default)
+}
+
+/// The shard modulus implied by a partition's committed slices: the number of
+/// distinct shard ids, or `default` when there are none.
+///
+/// Keys are routed by hashing modulo this count, so a gap in the shard ids is
+/// an error rather than a smaller count: with shard 5 of 10 missing, a count of
+/// 9 would send most keys to intact shards that do not hold them. A missing
+/// highest shard cannot be told from a smaller partition, since nothing on
+/// disk records the count; Java routes by the listed count as well.
+pub(crate) fn shard_count_from_slices(
+    slices: &[(String, Option<String>, Vec<String>)],
+    file_id_prefix: &str,
+    default: usize,
+) -> Result<usize> {
     let mut shards = std::collections::BTreeSet::new();
-    for (file_id, _, _) in &slices {
+    for (file_id, _, _) in slices {
         if let Some(rest) = file_id.strip_prefix(file_id_prefix)
             && let Some(shard_str) = rest.get(..4)
             && let Ok(shard) = shard_str.parse::<usize>()
@@ -493,11 +512,17 @@ async fn detect_num_file_groups(
             shards.insert(shard);
         }
     }
-    if shards.is_empty() {
-        Ok(default)
-    } else {
-        Ok(shards.len())
+    let Some(&highest) = shards.last() else {
+        return Ok(default);
+    };
+    if highest + 1 != shards.len() {
+        let missing: Vec<usize> = (0..highest).filter(|s| !shards.contains(s)).collect();
+        return Err(crate::error::CoreError::MetadataTable(format!(
+            "metadata table file groups {file_id_prefix}NNNN are missing shards {missing:?} \
+             below the highest listed shard {highest}, so keys cannot be routed to them"
+        )));
     }
+    Ok(shards.len())
 }
 
 /// Refuse to write a table whose metadata table has a layout this writer does
@@ -566,7 +591,7 @@ pub(crate) async fn ensure_supported_metadata_layout(table: &Table) -> Result<()
 /// partitioned ones `record-index-<escapedPartition>-NNNN-0`.
 fn is_global_record_index_file_id(file_id: &str) -> bool {
     file_id
-        .strip_prefix("record-index-")
+        .strip_prefix(RECORD_INDEX_FILE_ID_PREFIX)
         .and_then(|rest| rest.split_once('-'))
         .is_some_and(|(index, suffix)| {
             [index, suffix]

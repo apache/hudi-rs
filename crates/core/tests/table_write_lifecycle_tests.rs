@@ -1036,3 +1036,66 @@ fn walkdir_count_parquet(root: &std::path::Path) -> usize {
     }
     n
 }
+
+/// Keys spread over every record index shard, so a lookup has to route each
+/// key to its shard and honour later log blocks and delete blocks over
+/// earlier ones.
+#[tokio::test]
+async fn test_record_index_lookup_across_shards_blocks_and_tombstones() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let total = 20_000usize;
+    let key = |i: usize| format!("{:08x}-{i}", i.wrapping_mul(2_654_435_761));
+    let keys: Vec<String> = (0..total).map(key).collect();
+    table
+        .append([batch(
+            keys.iter().map(|k| (k.as_str(), 1)).collect::<Vec<_>>(),
+        )])
+        .await
+        .unwrap();
+
+    // Every 7th key is updated, every 11th deleted; a key that is both is
+    // deleted last, so the index must answer "absent" for it afterwards.
+    let updated: Vec<&str> = keys.iter().step_by(7).map(String::as_str).collect();
+    let result = table
+        .upsert([batch(updated.iter().map(|k| (*k, 2)).collect())])
+        .await
+        .unwrap();
+    assert_eq!((result.num_updates, result.num_inserts), (updated.len(), 0));
+
+    let deleted: Vec<&str> = keys.iter().step_by(11).map(String::as_str).collect();
+    let result = table
+        .delete_keys(deleted.iter().map(|k| HoodieKey {
+            record_key: (*k).to_string(),
+            partition_path: String::new(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(result.num_deletes, deleted.len());
+
+    // Re-upserting a mix of live, deleted and unknown keys exercises the
+    // lookup against both the log blocks and the delete blocks.
+    let probe: Vec<(&str, i64)> = vec![
+        (updated[1], 3),        // updated, still live
+        (deleted[1], 3),        // deleted: must come back as an insert
+        (keys[77].as_str(), 3), // updated, then deleted: also an insert
+        (keys[2].as_str(), 3),
+        ("never-written", 3),
+    ];
+    let result = table.upsert([batch(probe)]).await.unwrap();
+    assert_eq!((result.num_updates, result.num_inserts), (2, 3));
+
+    let rows = rows_by_id(&table.read(&ReadOptions::new()).await.unwrap());
+    assert_eq!(rows.len(), total - deleted.len() + 3);
+    let value = |k: &str| rows.iter().find(|(id, _)| id == k).map(|(_, v)| *v);
+    assert_eq!(value(updated[1]), Some(3));
+    assert_eq!(value(deleted[1]), Some(3));
+    assert_eq!(value(deleted[2]), None);
+    assert_eq!(value(updated[2]), Some(2));
+    assert_eq!(value("never-written"), Some(3));
+}

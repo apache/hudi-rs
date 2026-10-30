@@ -40,7 +40,7 @@ impl HFileWriter {
         entries: &[(String, Vec<u8>)],
         mut file_info: BTreeMap<String, Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let mut entries = entries.to_vec();
+        let mut entries: Vec<&(String, Vec<u8>)> = entries.iter().collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
 
         let first_key = entries
@@ -54,16 +54,22 @@ impl HFileWriter {
             .transpose()?
             .unwrap_or_default();
 
-        let mut data = Vec::new();
+        // Per entry: two i32 lengths, the structured key (content + 12 bytes of
+        // framing), the value and a trailing byte.
+        let mut data = Vec::with_capacity(
+            entries
+                .iter()
+                .map(|(key, value)| key.len() + value.len() + 21)
+                .sum(),
+        );
         for (key, value) in &entries {
-            let key = structured_key(key)?;
-            let key_len = i32::try_from(key.len())
+            let key_len = i32::try_from(key.len() + STRUCTURED_KEY_OVERHEAD)
                 .map_err(|_| HFileError::InvalidFormat("HFile key is too large".to_string()))?;
             let value_len = i32::try_from(value.len())
                 .map_err(|_| HFileError::InvalidFormat("HFile value is too large".to_string()))?;
             data.extend_from_slice(&key_len.to_be_bytes());
             data.extend_from_slice(&value_len.to_be_bytes());
-            data.extend_from_slice(&key);
+            push_structured_key(&mut data, key)?;
             data.extend_from_slice(value);
             data.push(0);
         }
@@ -147,7 +153,19 @@ impl HFileWriter {
     }
 }
 
+/// Bytes a structured key adds around its content: the u16 length, the
+/// family terminator, the i64 timestamp and the type byte.
+const STRUCTURED_KEY_OVERHEAD: usize = 2 + 1 + 8 + 1;
+
 fn structured_key(content: &str) -> crate::hfile::error::Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(content.len() + STRUCTURED_KEY_OVERHEAD);
+    push_structured_key(&mut key, content)?;
+    Ok(key)
+}
+
+/// Appends the structured key for `content` to `out`, so a data block is built
+/// without a buffer per entry.
+fn push_structured_key(out: &mut Vec<u8>, content: &str) -> crate::hfile::error::Result<()> {
     // The KeyValue row-length field is u16; truncating would corrupt framing.
     let len = u16::try_from(content.len()).map_err(|_| {
         crate::hfile::error::HFileError::InvalidFormat(format!(
@@ -155,13 +173,12 @@ fn structured_key(content: &str) -> crate::hfile::error::Result<Vec<u8>> {
             content.len()
         ))
     })?;
-    let mut key = Vec::with_capacity(content.len() + 12);
-    key.extend_from_slice(&len.to_be_bytes());
-    key.extend_from_slice(content.as_bytes());
-    key.push(0);
-    key.extend_from_slice(&i64::MAX.to_be_bytes());
-    key.push(4);
-    Ok(key)
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(content.as_bytes());
+    out.push(0);
+    out.extend_from_slice(&i64::MAX.to_be_bytes());
+    out.push(4);
+    Ok(())
 }
 
 fn write_block(block_type: HFileBlockType, data: &[u8], previous_offset: i64) -> Result<Vec<u8>> {

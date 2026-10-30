@@ -67,6 +67,7 @@ pub struct AppendResult {
 
 /// Append one or more record batches as a single INSERT commit.
 pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+    let batches = &crate::write::normalize_for_write(batches)?;
     if table_version(table) < 8 {
         return append_version_6(table, batches).await;
     }
@@ -1399,6 +1400,42 @@ mod version_6_tests {
             let mut retry = Table::new(uri).await.unwrap();
             retry.append([id_batch(vec![3, 4, 5])]).await.unwrap();
             assert_eq!(row_count(uri).await, rows_after_retry, "{fault:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fixed_size_list_appends_as_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut table = version_6_table(dir.path()).await;
+        let item = Arc::new(Field::new("item", DataType::Float32, true));
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "embedding",
+                DataType::FixedSizeList(item.clone(), 2),
+                true,
+            )])),
+            vec![Arc::new(arrow::array::FixedSizeListArray::new(
+                item,
+                2,
+                Arc::new(arrow::array::Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+                None,
+            ))],
+        )
+        .unwrap();
+        table.append([batch.clone()]).await.unwrap();
+        table.append([batch]).await.unwrap();
+        assert_eq!(row_count(uri).await, 4);
+        let element = DataType::List(Arc::new(Field::new("element", DataType::Float32, true)));
+        // Reader version 1 hands back each file's own schema.
+        let options = ReadOptions::new().with_hudi_option(
+            crate::config::read::HudiReadConfig::FileGroupReaderVersion.as_ref(),
+            "1",
+        );
+        let batches = table.read(&options).await.unwrap();
+        assert_eq!(batches.len(), 2);
+        for batch in batches {
+            assert_eq!(batch.schema().field(0).data_type(), &element);
         }
     }
 
