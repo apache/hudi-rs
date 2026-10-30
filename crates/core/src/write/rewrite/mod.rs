@@ -155,6 +155,7 @@ pub async fn upsert_batches(
 ) -> Result<WriteResult> {
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
+    let batches = &crate::write::normalize_for_write(batches)?;
     ensure_configured_record_key(table)?;
     if table.is_mor() {
         return mor_upsert_batches(table, batches, options).await;
@@ -563,6 +564,7 @@ pub async fn update_filter(
     updates: RecordBatch,
 ) -> Result<WriteResult> {
     table.reload_timeline_for_write().await?;
+    let updates = crate::write::normalize_write_batch(&updates)?;
     if updates.num_rows() != 1 {
         return Err(CoreError::Write(
             "update requires a single-row RecordBatch of SET values".to_string(),
@@ -843,6 +845,7 @@ where
 pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
+    let batches = &crate::write::normalize_for_write(batches)?;
     // Insert-overwrite writes new BASE file groups + a replacecommit on both
     // COW and MOR (Java uses the same executor for either table type).
     ensure_supported_merge_configs(table)?;
@@ -893,6 +896,7 @@ pub async fn dynamic_partition_overwrite_batches(
 ) -> Result<WriteResult> {
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
+    let batches = &crate::write::normalize_for_write(batches)?;
     // Works on COW and MOR alike (see overwrite_batches).
     ensure_supported_merge_configs(table)?;
     if batches.is_empty() {
