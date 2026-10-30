@@ -256,7 +256,7 @@ async fn run_sequence(table_type: TableTypeValue, metadata: bool, seed: u64, ops
         .with_record_key_fields(["id"])
         .with_partition_fields(["city"])
         .with_ordering_fields(["ts"])
-        .with_metadata(metadata)
+        .with_metadata_table_enabled(metadata)
         .create()
         .await
         .unwrap();

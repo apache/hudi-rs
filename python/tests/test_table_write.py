@@ -115,7 +115,7 @@ def test_create_with_explicit_options(tmp_path):
         partition_by=["city"],
         table_name="renamed",
         table_version=8,
-        metadata_table=False,
+        metadata_table_enabled=False,
         hive_style_partitioning=False,
         hudi_options={"hoodie.table.timeline.timezone": "UTC"},
     )
@@ -142,16 +142,19 @@ def test_create_on_existing_table_raises(tmp_path):
     "flags, error",
     [
         (
-            dict(metadata_table=False, record_index=True),
-            "record index requires the metadata",
+            dict(metadata_table_enabled=False, record_index_enabled=True),
+            "record_index requires the metadata",
         ),
         (
-            dict(metadata_table=False, column_stats=True),
+            dict(metadata_table_enabled=False, column_stats_enabled=True),
             "column_stats requires the metadata",
         ),
         # The explicit partition_stats choice is applied after column_stats,
         # so it is reported rather than silently turned off.
-        (dict(column_stats=False, partition_stats=True), "partition_stats requires"),
+        (
+            dict(column_stats_enabled=False, partition_stats_enabled=True),
+            "partition_stats requires",
+        ),
     ],
 )
 def test_create_rejects_inconsistent_index_options(tmp_path, flags, error):
@@ -166,9 +169,9 @@ def test_create_index_options(tmp_path):
         str(base),
         record_key="id",
         partition_by="city",
-        record_index=False,
-        column_stats=True,
-        partition_stats=False,
+        record_index_enabled=False,
+        column_stats_enabled=True,
+        partition_stats_enabled=False,
     )
     partitions = table.hudi_options()["hoodie.table.metadata.partitions"].split(",")
     assert "column_stats" in partitions

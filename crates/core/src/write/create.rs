@@ -80,7 +80,7 @@ pub struct TableCreateBuilder {
     record_key_fields: Vec<String>,
     partition_fields: Vec<String>,
     ordering_fields: Vec<String>,
-    metadata_enabled: bool,
+    metadata_table_enabled: bool,
     record_index_enabled: bool,
     /// Java reads its record index key before the alternative.
     record_index_set_by_java_key: bool,
@@ -104,7 +104,7 @@ impl TableCreateBuilder {
             record_key_fields: Vec::new(),
             partition_fields: Vec::new(),
             ordering_fields: Vec::new(),
-            metadata_enabled: true,
+            metadata_table_enabled: true,
             record_index_enabled: true,
             record_index_set_by_java_key: false,
             // Match Spark engine defaults: column stats on when MDT is on.
@@ -173,8 +173,8 @@ impl TableCreateBuilder {
     ///
     /// Defaults to enabled. Disabling also turns off record/column/partition
     /// stats indexes; the table version is unchanged (v8+ works without MDT).
-    pub fn with_metadata(mut self, enabled: bool) -> Self {
-        self.metadata_enabled = enabled;
+    pub fn with_metadata_table_enabled(mut self, enabled: bool) -> Self {
+        self.metadata_table_enabled = enabled;
         if enabled {
             // MDT requires v8+; never downgrade an explicit v9 choice.
             if self.table_version < 8 {
@@ -193,7 +193,7 @@ impl TableCreateBuilder {
     ///
     /// Defaults to enabled. When disabled, writers use [`crate::index::SimpleIndex`].
     /// Requires metadata table enabled.
-    pub fn with_record_index(mut self, enabled: bool) -> Self {
+    pub fn with_record_index_enabled(mut self, enabled: bool) -> Self {
         self.record_index_enabled = enabled;
         self
     }
@@ -202,7 +202,7 @@ impl TableCreateBuilder {
     ///
     /// Defaults to enabled when metadata is on (Spark-aligned). Disabling also
     /// disables `partition_stats`.
-    pub fn with_column_stats(mut self, enabled: bool) -> Self {
+    pub fn with_column_stats_enabled(mut self, enabled: bool) -> Self {
         self.column_stats_enabled = enabled;
         if !enabled {
             self.partition_stats_enabled = false;
@@ -214,7 +214,7 @@ impl TableCreateBuilder {
     ///
     /// Defaults to enabled when metadata is on. Ignored for non-partitioned
     /// tables, matching Java's metadata writer.
-    pub fn with_partition_stats(mut self, enabled: bool) -> Self {
+    pub fn with_partition_stats_enabled(mut self, enabled: bool) -> Self {
         self.partition_stats_enabled = enabled;
         self
     }
@@ -233,13 +233,13 @@ impl TableCreateBuilder {
     /// being overridden. The Java writer's record index switch,
     /// `hoodie.metadata.global.record.level.index.enable` or its alternative
     /// `hoodie.metadata.record.index.enable`, acts as
-    /// [`Self::with_record_index`], read the way Java's `Boolean.parseBoolean` is.
+    /// [`Self::with_record_index_enabled`], read the way Java's `Boolean.parseBoolean` is.
     pub fn with_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
         let key = key.as_ref();
         let value = value.into();
         if key == RECORD_INDEX_ENABLE_KEYS[0] {
             self.record_index_set_by_java_key = true;
-            return self.with_record_index(value.eq_ignore_ascii_case("true"));
+            return self.with_record_index_enabled(value.eq_ignore_ascii_case("true"));
         }
         if key == RECORD_INDEX_ENABLE_KEYS[1] {
             if !self.record_index_set_by_java_key {
@@ -278,21 +278,21 @@ impl TableCreateBuilder {
             return Err(CoreError::Write("table name must be non-empty".to_string()));
         }
 
-        if self.record_index_enabled && !self.metadata_enabled {
+        if self.record_index_enabled && !self.metadata_table_enabled {
             return Err(CoreError::Write(
-                "record index requires the metadata table; call with_metadata(true) or with_record_index(false)"
+                "record_index requires the metadata table; set metadata_table_enabled to true or record_index_enabled to false"
                     .to_string(),
             ));
         }
-        if self.column_stats_enabled && !self.metadata_enabled {
+        if self.column_stats_enabled && !self.metadata_table_enabled {
             return Err(CoreError::Write(
-                "column_stats requires the metadata table; call with_metadata(true) or with_column_stats(false)"
+                "column_stats requires the metadata table; set metadata_table_enabled to true or column_stats_enabled to false"
                     .to_string(),
             ));
         }
         if self.partition_stats_enabled && !self.column_stats_enabled {
             return Err(CoreError::Write(
-                "partition_stats requires column_stats; call with_column_stats(true) or with_partition_stats(false)"
+                "partition_stats requires column_stats; set column_stats_enabled to true or partition_stats_enabled to false"
                     .to_string(),
             ));
         }
@@ -429,7 +429,7 @@ impl TableCreateBuilder {
         // Canonical MDT signal is hoodie.table.metadata.partitions (Java create).
         // Do not invent hoodie.metadata.enable / hoodie.metadata.record.index.enable
         // into hoodie.properties — those are write-side configs in Java.
-        if self.metadata_enabled {
+        if self.metadata_table_enabled {
             let mut partitions = vec!["files".to_string()];
             if self.record_index_enabled {
                 partitions.push("record_index".to_string());
@@ -587,7 +587,7 @@ impl TableCreateBuilder {
         // No data column is known before the first commit, so the column_stats
         // definition starts with the always-indexed meta fields; every commit
         // then sets it to the indexed columns (write::metadata).
-        let index_definition_written = self.metadata_enabled && self.column_stats_enabled;
+        let index_definition_written = self.metadata_table_enabled && self.column_stats_enabled;
         let finished: Result<()> = async {
             if self.timeline_layout_version == 2 {
                 let timeline_path: String = props
@@ -624,7 +624,7 @@ impl TableCreateBuilder {
                         .await?;
                 }
             }
-            if self.metadata_enabled {
+            if self.metadata_table_enabled {
                 bootstrap_metadata_table(
                     &storage,
                     &table_name,
@@ -813,9 +813,9 @@ mod lifecycle_tests {
         let dir = tempfile::tempdir().unwrap();
         let _ = Table::create(dir.path().to_str().unwrap())
             .with_table_name("nometa")
-            .with_metadata(false)
-            .with_record_index(false)
-            .with_column_stats(false)
+            .with_metadata_table_enabled(false)
+            .with_record_index_enabled(false)
+            .with_column_stats_enabled(false)
             .with_populates_meta_fields(false)
             .with_option("hoodie.parquet.max.file.size", "1048576")
             .create()

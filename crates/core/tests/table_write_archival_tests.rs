@@ -446,7 +446,7 @@ async fn plant_pending_then_archive(
         .with_record_key_fields(["id"])
         .with_partition_fields(["city"])
         // File listing then comes from storage, where the stray file is visible.
-        .with_metadata(false)
+        .with_metadata_table_enabled(false)
         .with_option("hoodie.keep.min.commits", "2")
         .with_option("hoodie.keep.max.commits", "3")
         .create()

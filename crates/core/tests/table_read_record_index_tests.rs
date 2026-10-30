@@ -61,7 +61,7 @@ async fn three_groups(
         .with_table_name("t")
         .with_record_key_fields(["id"])
         .with_table_type(table_type)
-        .with_record_index(record_index)
+        .with_record_index_enabled(record_index)
         // One file group per append.
         .with_option("hoodie.parquet.small.file.limit", "0")
         .create()
@@ -343,7 +343,7 @@ async fn complex_three_groups(dir: &std::path::Path, version: isize) {
         .with_table_name("t")
         .with_table_version(version)
         .with_record_key_fields(["id"])
-        .with_record_index(true)
+        .with_record_index_enabled(true)
         .with_option("hoodie.parquet.small.file.limit", "0")
         .create()
         .await
@@ -440,7 +440,7 @@ async fn test_a_read_after_a_write_sees_a_commit_that_was_pending_at_open() {
     let mut table = Table::create(path)
         .with_table_name("t")
         .with_record_key_fields(["id"])
-        .with_record_index(true)
+        .with_record_index_enabled(true)
         .with_option("hoodie.parquet.small.file.limit", "0")
         .create()
         .await

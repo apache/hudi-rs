@@ -119,7 +119,7 @@ async fn run_composite_key_lifecycle(table_type: TableTypeValue, record_index: b
         .with_table_name("web_returns")
         .with_table_type(table_type)
         .with_record_key_fields(KEY_FIELDS)
-        .with_record_index(record_index)
+        .with_record_index_enabled(record_index)
         .create()
         .await
         .unwrap();
@@ -239,7 +239,7 @@ async fn test_simple_index_tags_virtual_composite_keys() {
         .with_table_name("web_returns")
         .with_record_key_fields(KEY_FIELDS)
         .with_populates_meta_fields(false)
-        .with_record_index(false)
+        .with_record_index_enabled(false)
         .create()
         .await
         .unwrap();
