@@ -21,18 +21,40 @@
 
 use super::*;
 
+/// Indices into `combined` (the group's `num_old` stored rows, then the
+/// incoming rows) that survive an event-time merge, in `combined` order.
+///
+/// Only the stored rows whose key is incoming can change, so the merger sees
+/// just those and the incoming rows. A group with a repeated stored key sends
+/// every stored row through it, since the merger also collapses repeats.
 pub(super) fn merge_with_event_time(
     hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
-    old: &RecordBatch,
-    incoming: &RecordBatch,
     combined: &RecordBatch,
+    num_old: usize,
+    old_by_key: &HashMap<String, u32>,
+    incoming_keys: &[String],
 ) -> Result<Vec<u32>> {
-    let merger = RecordMerger::new(old.schema(), hudi_configs);
+    let mut touched = vec![old_by_key.len() < num_old; num_old];
+    for key in incoming_keys {
+        if let Some(&index) = old_by_key.get(key) {
+            touched[index as usize] = true;
+        }
+    }
+    let (mut candidates, mut selected): (Vec<u32>, Vec<u32>) =
+        (0..num_old as u32).partition(|&index| touched[index as usize]);
+    candidates.extend(num_old as u32..combined.num_rows() as u32);
+    let candidate_rows = take_batch(combined, &candidates)?;
+    let merger = RecordMerger::new(combined.schema(), hudi_configs);
     let merged = merger.merge_record_batches(RecordBatches::new_with_data_batches([
-        old.clone(),
-        incoming.clone(),
+        candidate_rows.clone(),
     ]))?;
-    selected_indices_for_merged(combined, &merged)
+    selected.extend(
+        selected_indices_for_merged(&candidate_rows, &merged)?
+            .into_iter()
+            .map(|index| candidates[index as usize]),
+    );
+    selected.sort_unstable();
+    Ok(selected)
 }
 
 pub(super) fn selected_indices_for_merged(
@@ -479,4 +501,100 @@ pub(super) fn partial_merge(
         )?);
     }
     RecordBatch::try_new(combined.schema(), columns).map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::HudiConfigs;
+    use arrow::array::Int64Array;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// Rows are `(commit time, key, ts)`; the seqno is unique per row.
+    fn combined(rows: &[(&str, &str, i64)]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(MetaField::CommitTime.as_ref(), DataType::Utf8, false),
+            Field::new(MetaField::CommitSeqno.as_ref(), DataType::Utf8, false),
+            Field::new(MetaField::RecordKey.as_ref(), DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let seqnos: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, (commit, _, _))| format!("{commit}_0-{index}-0"))
+            .collect();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(StringArray::from(seqnos)),
+                Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// The selection over every row of the group, sorted into `combined` order.
+    fn full_merge(configs: Arc<HudiConfigs>, combined: &RecordBatch) -> Vec<u32> {
+        let merged = RecordMerger::new(combined.schema(), configs)
+            .merge_record_batches(RecordBatches::new_with_data_batches([combined.clone()]))
+            .unwrap();
+        let mut selected = selected_indices_for_merged(combined, &merged).unwrap();
+        selected.sort_unstable();
+        selected
+    }
+
+    #[test]
+    fn test_merge_with_event_time_matches_full_merge() {
+        let configs = Arc::new(HudiConfigs::new([
+            (RecordMergeStrategy, "OVERWRITE_WITH_LATEST".to_string()),
+            (OrderingFields, "ts".to_string()),
+        ]));
+        // Incoming: lower (a), equal (b) and higher (c) ordering than stored,
+        // two versions of d, and a new key f twice; e is untouched.
+        let incoming = [
+            ("002", "a", 50),
+            ("002", "b", 100),
+            ("002", "c", 150),
+            ("002", "d", 120),
+            ("002", "d", 130),
+            ("002", "f", 10),
+            ("002", "f", 20),
+        ];
+        let unique = vec![
+            ("001", "e", 100),
+            ("001", "a", 100),
+            ("001", "b", 100),
+            ("001", "c", 100),
+            ("001", "d", 100),
+        ];
+        let mut repeated = unique.clone();
+        repeated.extend([("001", "e", 90), ("001", "a", 110)]);
+        for old in [unique, repeated] {
+            let rows: Vec<_> = old.iter().chain(incoming.iter()).copied().collect();
+            let combined = combined(&rows);
+            let keys = keys(&combined, MetaField::RecordKey.as_ref()).unwrap();
+            let num_old = old.len();
+            let old_by_key: HashMap<String, u32> = keys[..num_old]
+                .iter()
+                .enumerate()
+                .map(|(index, key)| (key.clone(), index as u32))
+                .collect();
+            let selected = merge_with_event_time(
+                configs.clone(),
+                &combined,
+                num_old,
+                &old_by_key,
+                &keys[num_old..],
+            )
+            .unwrap();
+            assert_eq!(selected, full_merge(configs.clone(), &combined), "{old:?}");
+            if num_old == 5 {
+                // e and a stored; b, c, the later d and the later f incoming.
+                assert_eq!(selected, vec![0, 1, 6, 7, 9, 11]);
+            }
+        }
+    }
 }

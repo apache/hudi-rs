@@ -569,7 +569,13 @@ pub(super) fn merge_file_group_task(
                     concat_batches(&old.schema(), [&old, &incoming])?
                 };
                 let selected = if ctx.event_time && old.num_rows() > 0 {
-                    merge_with_event_time(ctx.hudi_configs.clone(), &old, &incoming, &combined)?
+                    merge_with_event_time(
+                        ctx.hudi_configs.clone(),
+                        &combined,
+                        old.num_rows(),
+                        &old_by_key,
+                        &incoming_keys,
+                    )?
                 } else {
                     selected
                 };
