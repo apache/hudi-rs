@@ -199,7 +199,7 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
     let mut table = Table::create(base_uri)
         .with_table_name("trips")
         .with_record_key_fields(["id"])
-        .with_metadata(true)
+        .with_metadata_table_enabled(true)
         .create()
         .await
         .unwrap();
@@ -607,13 +607,13 @@ async fn test_record_index_requires_metadata() {
     let dir = tempdir().unwrap();
     let err = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
-        .with_metadata(false)
-        .with_record_index(true)
+        .with_metadata_table_enabled(false)
+        .with_record_index_enabled(true)
         .create()
         .await
         .unwrap_err();
     assert!(matches!(err, hudi_core::error::CoreError::Write(_)));
-    assert!(err.to_string().contains("record index requires"));
+    assert!(err.to_string().contains("record_index requires"));
 }
 
 /// A create that fails after writing `hoodie.properties` removes it, whichever
@@ -651,7 +651,7 @@ async fn test_record_index_off_falls_back_to_simple_index() {
     let mut table = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
         .with_record_key_fields(["id"])
-        .with_record_index(false)
+        .with_record_index_enabled(false)
         .create()
         .await
         .unwrap();
@@ -927,7 +927,7 @@ async fn test_cow_upsert_preserves_unrelated_file_groups() {
         .with_table_name("trips")
         .with_record_key_fields(["id"])
         .with_partition_fields(["city"])
-        .with_metadata(false)
+        .with_metadata_table_enabled(false)
         .with_option("hoodie.parquet.max.file.size", "1")
         .with_option("hoodie.copyonwrite.record.size.estimate", "1")
         .create()

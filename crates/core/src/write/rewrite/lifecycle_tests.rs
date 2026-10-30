@@ -254,7 +254,7 @@ async fn test_replace_verbs_exclude_log_only_mor_groups() {
             .with_record_key_fields(["id"])
             .with_partition_fields(["city"])
             .with_ordering_fields(["ts"])
-            .with_metadata(false)
+            .with_metadata_table_enabled(false)
             .create()
             .await
             .unwrap();
@@ -630,7 +630,7 @@ async fn test_rollback_fence_delete_failure_fails_the_write() {
         .with_record_key_fields(["id"])
         .with_partition_fields(["city"])
         .with_ordering_fields(["ts"])
-        .with_metadata(false)
+        .with_metadata_table_enabled(false)
         .create()
         .await
         .unwrap();

@@ -462,10 +462,10 @@ class HudiTable:
         table_type: str = "cow",
         table_name: Optional[str] = None,
         table_version: Optional[int] = None,
-        record_index: Optional[bool] = None,
-        metadata_table: Optional[bool] = None,
-        column_stats: Optional[bool] = None,
-        partition_stats: Optional[bool] = None,
+        metadata_table_enabled: Optional[bool] = None,
+        record_index_enabled: Optional[bool] = None,
+        column_stats_enabled: Optional[bool] = None,
+        partition_stats_enabled: Optional[bool] = None,
         hive_style_partitioning: Optional[bool] = None,
         hudi_options: Optional[Dict[str, str]] = None,
         storage_options: Optional[Dict[str, str]] = None,
@@ -475,7 +475,7 @@ class HudiTable:
 
         Arguments left as ``None`` keep the native defaults: table version 9,
         metadata table on with the record index, column stats and partition
-        stats, and hive-style partition paths. Turning ``metadata_table`` off also
+        stats, and hive-style partition paths. Turning ``metadata_table_enabled`` off also
         turns off the indexes that live in it.
 
         Parameters:
@@ -488,10 +488,10 @@ class HudiTable:
                 case-insensitive.
             table_name (Optional[str]): Defaults to the last path segment of ``base_uri``.
             table_version (Optional[int]): Table version to write, 8 or 9.
-            record_index (Optional[bool]): Record-level index in the metadata table.
-            metadata_table (Optional[bool]): Metadata table.
-            column_stats (Optional[bool]): Column stats index in the metadata table.
-            partition_stats (Optional[bool]): Partition stats index in the metadata table.
+            metadata_table_enabled (Optional[bool]): Metadata table.
+            record_index_enabled (Optional[bool]): Record-level index in the metadata table.
+            column_stats_enabled (Optional[bool]): Column stats index in the metadata table.
+            partition_stats_enabled (Optional[bool]): Partition stats index in the metadata table.
             hive_style_partitioning (Optional[bool]): Use ``field=value`` partition paths.
             hudi_options (Optional[Dict[str, str]]): Extra ``hoodie.*`` table configs, written into
                 ``hoodie.properties``. Read options belong on the reader, not here.

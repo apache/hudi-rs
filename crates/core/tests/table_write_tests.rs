@@ -187,7 +187,7 @@ async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
     let mut table = Table::create(root.to_str().unwrap())
         .with_table_name("trips")
         .with_record_key_fields(["id"])
-        .with_metadata(true)
+        .with_metadata_table_enabled(true)
         .create()
         .await
         .unwrap();
@@ -330,7 +330,7 @@ async fn test_create_rejects_managed_option_overrides_before_persisting() {
 }
 
 /// The Java writer's record index switch and its alternative key turn the
-/// record index on or off like `with_record_index`.
+/// record index on or off like `with_record_index_enabled`.
 #[tokio::test]
 async fn test_create_reads_java_record_index_switch() {
     const KEY: &str = "hoodie.metadata.global.record.level.index.enable";
@@ -345,7 +345,7 @@ async fn test_create_reads_java_record_index_switch() {
         let mut builder = Table::create(dir.path().to_str().unwrap())
             .with_table_name("trips")
             .with_record_key_fields(["id"])
-            .with_record_index(!enabled);
+            .with_record_index_enabled(!enabled);
         for (key, value) in &options {
             builder = builder.with_option(*key, *value);
         }
@@ -391,7 +391,7 @@ async fn test_create_with_metadata_and_append_updates_files_partition() {
     let mut table = Table::create(base_uri)
         .with_table_name("trips")
         .with_record_key_fields(["id"])
-        .with_metadata(true)
+        .with_metadata_table_enabled(true)
         .create()
         .await
         .unwrap();
@@ -1684,7 +1684,7 @@ async fn test_simple_index_first_upsert_inserts_every_key() {
             .with_table_name("trips")
             .with_table_type(table_type.clone())
             .with_record_key_fields(["id"])
-            .with_metadata(false)
+            .with_metadata_table_enabled(false)
             .create()
             .await
             .unwrap();
@@ -2081,7 +2081,7 @@ async fn test_simple_index_prefers_the_incoming_partition() {
             .with_table_name("trips")
             .with_record_key_fields(["id"])
             .with_partition_fields(["city"])
-            .with_metadata(false)
+            .with_metadata_table_enabled(false)
             .create()
             .await
             .unwrap();
@@ -2111,7 +2111,7 @@ async fn test_simple_index_prefers_the_incoming_partition() {
         .with_table_name("trips")
         .with_record_key_fields(["id"])
         .with_partition_fields(["city"])
-        .with_metadata(false)
+        .with_metadata_table_enabled(false)
         .create()
         .await
         .unwrap();
@@ -3142,21 +3142,21 @@ async fn test_create_builder_rejects_invalid_combinations() {
     let err = Table::create(dir.path().to_str().unwrap())
         .with_table_name("t")
         .with_record_key_fields(["id"])
-        .with_metadata(false)
-        .with_record_index(true)
+        .with_metadata_table_enabled(false)
+        .with_record_index_enabled(true)
         .create()
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("record index requires"));
+    assert!(err.to_string().contains("record_index requires"));
 
     // column_stats without MDT.
     let dir = tempdir().unwrap();
     let err = Table::create(dir.path().to_str().unwrap())
         .with_table_name("t")
         .with_record_key_fields(["id"])
-        .with_metadata(false)
-        .with_record_index(false)
-        .with_column_stats(true)
+        .with_metadata_table_enabled(false)
+        .with_record_index_enabled(false)
+        .with_column_stats_enabled(true)
         .create()
         .await
         .unwrap_err();
@@ -3167,8 +3167,8 @@ async fn test_create_builder_rejects_invalid_combinations() {
     let err = Table::create(dir.path().to_str().unwrap())
         .with_table_name("t")
         .with_record_key_fields(["id"])
-        .with_column_stats(false)
-        .with_partition_stats(true)
+        .with_column_stats_enabled(false)
+        .with_partition_stats_enabled(true)
         .create()
         .await
         .unwrap_err();
@@ -4405,9 +4405,9 @@ async fn test_base_file_footer_omits_bloom_filter_without_meta_fields() {
     let dir = tempdir().unwrap();
     let mut table = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
-        .with_metadata(false)
-        .with_record_index(false)
-        .with_column_stats(false)
+        .with_metadata_table_enabled(false)
+        .with_record_index_enabled(false)
+        .with_column_stats_enabled(false)
         .with_populates_meta_fields(false)
         .create()
         .await
@@ -4531,7 +4531,7 @@ async fn test_delete_keys_removes_each_requested_partition_copy() {
             .with_table_type(table_type.clone())
             .with_record_key_fields(["id"])
             .with_partition_fields(["city"])
-            .with_metadata(false)
+            .with_metadata_table_enabled(false)
             .create()
             .await
             .unwrap();

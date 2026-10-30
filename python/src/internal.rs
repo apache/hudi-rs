@@ -871,10 +871,10 @@ impl HudiTable {
         table_type="cow",
         table_name=None,
         table_version=None,
-        record_index=None,
-        metadata_table=None,
-        column_stats=None,
-        partition_stats=None,
+        metadata_table_enabled=None,
+        record_index_enabled=None,
+        column_stats_enabled=None,
+        partition_stats_enabled=None,
         hive_style_partitioning=None,
         hudi_options=None,
         storage_options=None,
@@ -889,10 +889,10 @@ impl HudiTable {
         table_type: &str,
         table_name: Option<String>,
         table_version: Option<isize>,
-        record_index: Option<bool>,
-        metadata_table: Option<bool>,
-        column_stats: Option<bool>,
-        partition_stats: Option<bool>,
+        metadata_table_enabled: Option<bool>,
+        record_index_enabled: Option<bool>,
+        column_stats_enabled: Option<bool>,
+        partition_stats_enabled: Option<bool>,
         hive_style_partitioning: Option<bool>,
         hudi_options: Option<HashMap<String, String>>,
         storage_options: Option<HashMap<String, String>>,
@@ -918,17 +918,17 @@ impl HudiTable {
         if let Some(version) = table_version {
             builder = builder.with_table_version(version);
         }
-        if let Some(enabled) = metadata_table {
-            builder = builder.with_metadata(enabled);
+        if let Some(enabled) = metadata_table_enabled {
+            builder = builder.with_metadata_table_enabled(enabled);
         }
-        if let Some(enabled) = record_index {
-            builder = builder.with_record_index(enabled);
+        if let Some(enabled) = record_index_enabled {
+            builder = builder.with_record_index_enabled(enabled);
         }
-        if let Some(enabled) = column_stats {
-            builder = builder.with_column_stats(enabled);
+        if let Some(enabled) = column_stats_enabled {
+            builder = builder.with_column_stats_enabled(enabled);
         }
-        if let Some(enabled) = partition_stats {
-            builder = builder.with_partition_stats(enabled);
+        if let Some(enabled) = partition_stats_enabled {
+            builder = builder.with_partition_stats_enabled(enabled);
         }
         if let Some(enabled) = hive_style_partitioning {
             builder = builder.with_hive_style_partitioning(enabled);

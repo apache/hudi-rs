@@ -92,7 +92,7 @@ fn test_read_decodes_file_slices_off_the_calling_thread() {
         let mut table = Table::create(dir.path().to_str().unwrap())
             .with_table_name("trips")
             .with_record_key_fields(["id"])
-            .with_metadata(false)
+            .with_metadata_table_enabled(false)
             // One file group per append, so the read has several slices.
             .with_option("hoodie.parquet.small.file.limit", "0")
             .create()
