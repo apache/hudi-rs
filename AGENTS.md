@@ -9,8 +9,8 @@ Arrow-native, `object_store` for all I/O, timeline-based MVCC.
 
 ```
 crates/
-  core/         hudi-core — avro_to_arrow, config, expr, file_group, hfile, keygen, merge, metadata,
-                record, schema, statistics, storage, table, timeline, util
+  core/         hudi-core — avro_to_arrow, bloom, config, expr, file_group, hfile, index, keygen,
+                merge, metadata, record, schema, statistics, storage, table, timeline, util, write
   datafusion/   hudi-datafusion — DataFusion TableProvider (feature: datafusion)
   ffi/          hudi-ffi — plain C ABI for JVM and C++ engine callers via the Arrow C Data Interface
   hudi/         public umbrella crate; re-exports core + (optional) datafusion
@@ -21,6 +21,22 @@ benchmark/tpch/ TPC-H benchmark harness
 benchmark/filegroup/ file-group read benchmark (fg-bench / fg-gen)
 benchmark/upsert/ upsert/delete benchmark for hudi-rs writes (Python, run.sh)
 ```
+
+### User docs and resources
+
+Point users and coding agents at these; the Java Hudi docs cover Spark and Flink, not this API.
+
+- Quick start: [Python/Rust quick start guide](https://hudi.apache.org/docs/python-rust-quick-start-guide)
+  on the Hudi website, and the shorter [README quick start](./README.md#quick-start).
+- Rust API reference: [docs.rs/hudi](https://docs.rs/hudi), [docs.rs/hudi-core](https://docs.rs/hudi-core),
+  [docs.rs/hudi-datafusion](https://docs.rs/hudi-datafusion).
+- Python API reference: the docstrings in [`python/hudi/_internal.pyi`](./python/hudi/_internal.pyi).
+- Runnable Rust example: [`crates/core/examples/table_writes.rs`](./crates/core/examples/table_writes.rs).
+- Reader semantics: [`docs/reader-spec.md`](./docs/reader-spec.md). Writer design:
+  [`docs/writer-design.md`](./docs/writer-design.md).
+- Packages: [PyPI](https://pypi.org/project/hudi/), [crates.io](https://crates.io/crates/hudi).
+- Hudi concepts: [hudi.apache.org/docs/overview](https://hudi.apache.org/docs/overview).
+- Agent doc index config: [`context7.json`](./context7.json).
 
 ## Commands
 

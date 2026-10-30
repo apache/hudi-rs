@@ -18,7 +18,7 @@ Convert Rust errors to specific Python exceptions; never let a panic surface to 
 #[pyfunction]
 fn read_table(path: &str) -> PyResult<PyObject> {
     let result = hudi_core::read_table(path)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to read table: {e}")))?;
+        .map_err(convert_to_py_err)?; // raises hudi.HudiCoreError, a subclass of Exception
     // ...
 }
 
@@ -32,11 +32,11 @@ fn read_table(path: &str) -> PyObject {
 
 ### GIL Management
 
-Release the GIL with `py.allow_threads(...)` for blocking I/O.
+Release the GIL with `py.detach(...)` (PyO3's former `allow_threads`) for blocking I/O.
 
 ```rust
 fn read_files(&self, py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<PyObject>> {
-    let batches = py.allow_threads(|| {
+    let batches = py.detach(|| {
         self.inner.read_files_blocking(&paths)
     })?;
     // ...
@@ -53,7 +53,7 @@ Tests in `python/tests/`.
 
 ```python
 import pytest
-from hudi import HudiReadOptions, HudiTableBuilder
+from hudi import HudiCoreError, HudiReadOptions, HudiTableBuilder
 
 
 def test_read_snapshot_with_filters():
@@ -63,6 +63,6 @@ def test_read_snapshot_with_filters():
 
 
 def test_invalid_path_raises():
-    with pytest.raises(RuntimeError, match="Failed to"):
+    with pytest.raises(HudiCoreError):
         HudiTableBuilder.from_base_uri("/nonexistent").build()
 ```
