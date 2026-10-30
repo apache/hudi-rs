@@ -379,35 +379,35 @@ pub async fn update_files_partition_entries(
 /// records with null `recordIndexMetadata`, which NPEs Java's RLI reader.
 ///
 /// Returns the `record_index` partition write stats for the caller's single
-/// MDT deltacommit (see [`write_metadata_commit`]).
+/// MDT deltacommit (see [`write_metadata_commit`]). At most `max_parallelism`
+/// shards are built at once.
 pub async fn update_record_index(
     data_storage: &Storage,
     instant: &str,
-    entries: &[RecordIndexEntry],
+    entries: Vec<RecordIndexEntry>,
+    max_parallelism: usize,
 ) -> Result<Vec<HoodieWriteStat>> {
     if entries.is_empty() {
         return Ok(Vec::new());
     }
     let num_groups = detect_rli_num_file_groups(data_storage).await?;
     let schema_json = record_index_metadata_avro_schema_json()?.to_string();
-    let mut puts_by_shard: HashMap<usize, Vec<(String, Vec<u8>)>> = HashMap::new();
+    // Only the routing happens here; each shard encodes its own entries on
+    // the blocking pool below.
+    let mut puts_by_shard: HashMap<usize, Vec<RecordIndexEntry>> = HashMap::new();
     let mut deletes_by_shard: HashMap<usize, Vec<(String, String)>> = HashMap::new();
     for entry in entries {
         let shard = map_record_key_to_file_group_index(&entry.record_key, num_groups);
         if entry.is_deleted {
             // DeleteRecord.partitionPath is the MDT partition (Java HoodieKey for RLI deletes).
             deletes_by_shard.entry(shard).or_default().push((
-                entry.record_key.clone(),
+                entry.record_key,
                 MetadataPartitionType::RecordIndex
                     .partition_name()
                     .to_string(),
             ));
         } else {
-            let bytes = encode_record_index_entry(entry)?;
-            puts_by_shard
-                .entry(shard)
-                .or_default()
-                .push((entry.record_key.clone(), bytes));
+            puts_by_shard.entry(shard).or_default().push(entry);
         }
     }
 
@@ -416,36 +416,64 @@ pub async fn update_record_index(
         .chain(deletes_by_shard.keys())
         .copied()
         .collect();
+    // Building a shard's blocks (sorting its keys, encoding the HFile) is
+    // CPU-only, so up to one shard per core (and no more than `max_parallelism`)
+    // is built on the blocking pool while finished shards are written, in shard
+    // order, and released.
+    use futures::StreamExt;
+    let parallelism = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(max_parallelism)
+        .max(1);
+    let mut builds = futures::stream::iter(shards)
+        .map(|shard| {
+            let puts = puts_by_shard.remove(&shard).unwrap_or_default();
+            let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
+            let schema_json = schema_json.clone();
+            let instant = instant.to_string();
+            tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>, i64)> {
+                let puts = puts
+                    .into_iter()
+                    .map(|entry| {
+                        let bytes = encode_record_index_entry(&entry)?;
+                        Ok((entry.record_key, bytes))
+                    })
+                    .collect::<Result<Vec<(String, Vec<u8>)>>>()?;
+                let mut log_bytes = Vec::new();
+                let mut num_writes = 0i64;
+                if !puts.is_empty() {
+                    num_writes += puts.len() as i64;
+                    let hfile = HFileWriter::write(
+                        &puts,
+                        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+                    )
+                    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+                    log_bytes.extend(LogFileWriter::write_log_block(
+                        BlockType::HfileData,
+                        HashMap::from([
+                            (BlockMetadataKey::InstantTime, instant.clone()),
+                            (BlockMetadataKey::Schema, schema_json),
+                        ]),
+                        &hfile,
+                    ));
+                }
+                if !deletes.is_empty() {
+                    num_writes += deletes.len() as i64;
+                    log_bytes.extend(crate::write::build_delete_log_block(&instant, &deletes, 0)?);
+                }
+                Ok((shard, log_bytes, num_writes))
+            })
+        })
+        .buffered(parallelism);
     let mut stats = Vec::new();
-    for shard in shards {
-        let file_id = record_index_file_id(shard);
-        let puts = puts_by_shard.remove(&shard).unwrap_or_default();
-        let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
-        let mut log_bytes = Vec::new();
-        let mut num_writes = 0i64;
-        if !puts.is_empty() {
-            num_writes += puts.len() as i64;
-            let hfile = HFileWriter::write(
-                &puts,
-                BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
-            )
-            .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
-            log_bytes.extend(LogFileWriter::write_log_block(
-                BlockType::HfileData,
-                HashMap::from([
-                    (BlockMetadataKey::InstantTime, instant.to_string()),
-                    (BlockMetadataKey::Schema, schema_json.clone()),
-                ]),
-                &hfile,
-            ));
-        }
-        if !deletes.is_empty() {
-            num_writes += deletes.len() as i64;
-            log_bytes.extend(crate::write::build_delete_log_block(instant, &deletes, 0)?);
-        }
+    while let Some(shard_build) = builds.next().await {
+        let (shard, log_bytes, num_writes) = shard_build.map_err(|e| {
+            crate::error::CoreError::Write(format!("record index shard build failed: {e}"))
+        })??;
         if log_bytes.is_empty() {
             continue;
         }
+        let file_id = record_index_file_id(shard);
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
         let log_rel = format!("record_index/{log_name}");
         let log_size = log_bytes.len() as i64;
