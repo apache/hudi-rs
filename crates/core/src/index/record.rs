@@ -18,13 +18,13 @@
  */
 //! Record-level index backed by the metadata table `record_index` partition.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::Result;
 use crate::config::read::HudiReadConfig;
 use crate::error::CoreError;
-use crate::file_group::base_file::reader::KeyPredicate;
+use crate::file_group::base_file::reader::{KeyMatcher, KeyPredicate};
 use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
@@ -106,7 +106,7 @@ async fn lookup_record_index(
         &slices,
         RECORD_INDEX_FILE_ID_PREFIX,
         DEFAULT_RLI_NUM_FILE_GROUPS,
-    );
+    )?;
     let mut keys_by_shard: HashMap<String, Vec<String>> = HashMap::new();
     for key in record_keys {
         let shard = map_record_key_to_file_group_index(key, num_groups);
@@ -123,8 +123,9 @@ async fn lookup_record_index(
                 .map(|keys| (KeyPredicate::Keys(keys), base, logs))
         })
         .collect();
-    // A key that hashed to a shard the listing does not have would read as
-    // absent and turn an upsert into a duplicate insert.
+    // Shard numbers are contiguous, but a listed id spelled other than
+    // `record-index-NNNN-0` would still leave its keys unread, and an absent
+    // key turns an upsert into a duplicate insert.
     if let Some(missing) = keys_by_shard.keys().next() {
         return Err(CoreError::MetadataTable(format!(
             "record keys route to record index file group {missing}, which is not in the record_index partition ({num_groups} file groups listed)"
@@ -146,8 +147,8 @@ async fn lookup_record_index(
     let whole_below =
         hfile_whole_read_max_size(&table.hudi_configs)?.min(HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE);
 
-    // Shards hold disjoint keys, so each is read on its own and the results
-    // are merged afterwards, with the same fan-out ceiling as a table read.
+    // Shards hold disjoint keys, so each is folded on its own and the maps
+    // are combined afterwards, with the same fan-out ceiling as a table read.
     let concurrency: usize = table
         .hudi_configs
         .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
@@ -156,7 +157,8 @@ async fn lookup_record_index(
     let per_shard = bounded_in_order(&touched, concurrency, |(predicate, base, logs)| {
         let storage = storage.clone();
         async move {
-            let mut found: Vec<HFileRecord> = Vec::new();
+            let matcher = predicate.matcher();
+            let mut merged: HashMap<String, LoadedLocation> = HashMap::new();
             if let Some(base) = base {
                 let reader = HFileReader::open_sized(storage.as_ref(), base, whole_below, None)
                     .await
@@ -164,71 +166,64 @@ async fn lookup_record_index(
                         CoreError::HFile(format!("failed to open record_index base: {e:?}"))
                     })?;
                 let blocks = reader.blocks_for_predicate(predicate);
-                let matcher = predicate.matcher();
-                // A selected block holds every key in its range; keep only the
-                // requested ones so each shard holds no more than it returns.
-                found.extend(
-                    reader
-                        .read_records_batched(&blocks)
-                        .await
-                        .map_err(|e| {
-                            CoreError::HFile(format!("failed to read record_index base: {e:?}"))
-                        })?
-                        .into_iter()
-                        .filter(|r| r.key_as_str().is_some_and(|k| matcher.admits(k))),
-                );
+                // A scattered batch can select most blocks of a large shard, so
+                // they are fetched a window at a time. A resident file is under
+                // the keyed whole-read bound and needs no windows.
+                let windows = match reader.window_budget() {
+                    Some(budget) => HFileReader::plan_windows(&blocks, budget),
+                    None => vec![blocks],
+                };
+                for window in windows {
+                    let records = reader.read_records_batched(&window).await.map_err(|e| {
+                        CoreError::HFile(format!("failed to read record_index base: {e:?}"))
+                    })?;
+                    apply_hfile_records(&mut merged, &records, &matcher)?;
+                }
             }
             if let (false, Some(range)) = (logs.is_empty(), range) {
                 let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage)
                     .with_key_predicate(Some(predicate.clone()));
-                found.extend(scanner.scan_hfile_records(logs.clone(), range).await?);
+                let records = scanner.scan_hfile_records(logs.clone(), range).await?;
+                apply_hfile_records(&mut merged, &records, &matcher)?;
             }
-            Ok::<_, CoreError>(found)
+            Ok::<_, CoreError>(merged)
         }
     })
     .await?;
-    let requested: HashSet<&str> = record_keys.iter().copied().collect();
-    let mut merged: HashMap<String, Option<LoadedLocation>> = HashMap::new();
-    for records in per_shard {
-        apply_hfile_records(&mut merged, &records, &requested)?;
-    }
-
-    Ok(merged
-        .into_iter()
-        .filter_map(|(key, location)| location.map(|loc| (key, loc)))
-        .collect())
+    Ok(per_shard.into_iter().flatten().collect())
 }
 
-/// Fold `records` into `merged`, later records overriding earlier ones.
+/// Fold `records` into `merged`, later records overriding earlier ones and a
+/// tombstone removing the key.
 ///
-/// A record whose key was not asked for is dropped before its value is
-/// decoded: a selected HFile block holds every key in its range, and a delete
-/// block names every key its commit removed.
+/// A record `matcher` does not admit is dropped before its value is decoded: a
+/// selected base block holds every key in its range, and a delete block names
+/// every key its commit removed.
 fn apply_hfile_records(
-    merged: &mut HashMap<String, Option<LoadedLocation>>,
+    merged: &mut HashMap<String, LoadedLocation>,
     records: &[HFileRecord],
-    requested: &HashSet<&str>,
+    matcher: &KeyMatcher<'_>,
 ) -> Result<()> {
     for record in records {
         let key = record
             .key_as_str()
             .ok_or_else(|| CoreError::MetadataTable("record_index key must be utf8".to_string()))?;
-        if !requested.contains(key) {
+        if !matcher.admits(key) {
             continue;
         }
         match decode_record_index_entry(key, record.value(), record.avro_schema())? {
             Some(entry) => {
                 merged.insert(
                     key.to_string(),
-                    Some(LoadedLocation {
+                    LoadedLocation {
                         file_id: entry.file_id,
                         partition_path: entry.partition_path,
                         instant_time_millis: entry.instant_time_millis,
-                    }),
+                    },
                 );
             }
             None => {
-                merged.insert(key.to_string(), None);
+                merged.remove(key);
             }
         }
     }
@@ -281,16 +276,41 @@ mod tests {
     use crate::hfile::HFileReader;
     use crate::metadata::table::encode::decode_record_index_entry;
 
+    /// A missing shard also shrinks the modulus, so the keys it misroutes are
+    /// mostly ones that live in intact shards, not ones in the missing shard.
     #[tokio::test]
-    async fn test_lookup_errors_when_a_key_routes_to_a_missing_shard() {
+    async fn test_lookup_errors_when_a_shard_is_missing() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
         let dir = tempfile::tempdir().unwrap();
-        Table::create(dir.path().to_str().unwrap())
+        let mut table = Table::create(dir.path().to_str().unwrap())
             .with_table_name("t")
             .with_record_key_fields(["id"])
             .create()
             .await
             .unwrap();
-        // Drop every file of shard 5: nine shards remain, so keys route mod 9.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["d"])),
+                Arc::new(Int64Array::from(vec![1])),
+            ],
+        )
+        .unwrap();
+        table.append([batch]).await.unwrap();
+        // `d` lives in shard 0 of 10, and mod 9 it would route to shard 1,
+        // which is intact.
+        assert_eq!(map_record_key_to_file_group_index("d", 10), 0);
+        assert_eq!(map_record_key_to_file_group_index("d", 9), 1);
+        let storage = table.file_system_view.storage.clone();
+        let found = lookup_record_index(&table, storage, &["d"]).await.unwrap();
+        assert!(found.contains_key("d"));
+
         let rli = dir.path().join(".hoodie/metadata/record_index");
         for entry in std::fs::read_dir(&rli).unwrap() {
             let path = entry.unwrap().path();
@@ -299,17 +319,13 @@ mod tests {
             }
         }
         let table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
-        let key = (0..)
-            .map(|i| format!("k{i}"))
-            .find(|k| map_record_key_to_file_group_index(k, 9) == 5)
-            .unwrap();
         let storage = table.file_system_view.storage.clone();
-        let err = lookup_record_index(&table, storage, &[key.as_str()])
+        let err = lookup_record_index(&table, storage, &["d"])
             .await
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("not in the record_index partition"), "{err}");
+        assert!(err.contains("missing shards [5]"), "{err}");
     }
 
     #[tokio::test]

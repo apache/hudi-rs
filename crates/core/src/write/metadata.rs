@@ -487,16 +487,22 @@ async fn detect_num_file_groups(
     // change the shard modulus (it would diverge from what Java computes),
     // and listing errors must propagate rather than silently changing it.
     let slices = mdt_partition_latest_slices(storage, partition_name).await?;
-    Ok(shard_count_from_slices(&slices, file_id_prefix, default))
+    shard_count_from_slices(&slices, file_id_prefix, default)
 }
 
 /// The shard modulus implied by a partition's committed slices: the number of
 /// distinct shard ids, or `default` when there are none.
+///
+/// Keys are routed by hashing modulo this count, so a gap in the shard ids is
+/// an error rather than a smaller count: with shard 5 of 10 missing, a count of
+/// 9 would send most keys to intact shards that do not hold them. A missing
+/// highest shard cannot be told from a smaller partition, since nothing on
+/// disk records the count; Java routes by the listed count as well.
 pub(crate) fn shard_count_from_slices(
     slices: &[(String, Option<String>, Vec<String>)],
     file_id_prefix: &str,
     default: usize,
-) -> usize {
+) -> Result<usize> {
     let mut shards = std::collections::BTreeSet::new();
     for (file_id, _, _) in slices {
         if let Some(rest) = file_id.strip_prefix(file_id_prefix)
@@ -506,11 +512,17 @@ pub(crate) fn shard_count_from_slices(
             shards.insert(shard);
         }
     }
-    if shards.is_empty() {
-        default
-    } else {
-        shards.len()
+    let Some(&highest) = shards.last() else {
+        return Ok(default);
+    };
+    if highest + 1 != shards.len() {
+        let missing: Vec<usize> = (0..highest).filter(|s| !shards.contains(s)).collect();
+        return Err(crate::error::CoreError::MetadataTable(format!(
+            "metadata table file groups {file_id_prefix}NNNN are missing shards {missing:?} \
+             below the highest listed shard {highest}, so keys cannot be routed to them"
+        )));
     }
+    Ok(shards.len())
 }
 
 /// Refuse to write a table whose metadata table has a layout this writer does
