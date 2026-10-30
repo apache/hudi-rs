@@ -121,6 +121,12 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     let mut write_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
+    let rli_instant_millis = crate::index::is_record_index_enabled(table).then(|| {
+        crate::write::metadata::instant_to_epoch_millis_in(
+            &request_instant,
+            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+        )
+    });
     let mut stats_updates = Vec::new();
     let mut written_paths: Vec<String> = Vec::new();
     let mut primary_base_path = String::new();
@@ -298,18 +304,16 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                     plan.file_name.clone(),
                     output.size,
                 ));
-                let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-                    &request_instant,
-                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                );
-                for key in &plan.chunk_keys {
-                    rli_entries.push(RecordIndexEntry {
-                        record_key: key.record_key.clone(),
-                        partition_path: plan.partition_path.clone(),
-                        file_id: plan.file_id.clone(),
-                        instant_time_millis,
-                        is_deleted: false,
-                    });
+                if let Some(instant_time_millis) = rli_instant_millis {
+                    for key in &plan.chunk_keys {
+                        rli_entries.push(RecordIndexEntry {
+                            record_key: key.record_key.clone(),
+                            partition_path: plan.partition_path.clone(),
+                            file_id: plan.file_id.clone(),
+                            instant_time_millis,
+                            is_deleted: false,
+                        });
+                    }
                 }
             }
             Err(error) => {

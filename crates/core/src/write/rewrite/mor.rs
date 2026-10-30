@@ -123,6 +123,10 @@ pub(super) async fn mor_upsert_batches(
         std::slice::from_ref(&incoming),
     )?;
     let instant = request_deltacommit(table, "UPSERT").await?;
+    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+        &instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
     let incoming_keys: Vec<String> = tagged_keys.iter().map(|k| k.record_key.clone()).collect();
     let locations = mor_file_locations(table, &tagged_keys).await?;
@@ -444,10 +448,6 @@ pub(super) async fn mor_upsert_batches(
                     output.size,
                     false,
                 ));
-                let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-                    &instant,
-                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                );
                 rli_entries.extend(insert_indices.iter().map(|row| {
                     let key = &tagged_keys[*row as usize];
                     RecordIndexEntry {
@@ -517,10 +517,6 @@ pub(super) async fn mor_upsert_batches(
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
-        let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-            &instant,
-            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-        );
         // Packed inserts are written as log records into the small slice and
         // must be registered in the RLI under this file group.
         rli_entries.extend(packed_rows.iter().map(|index| {
