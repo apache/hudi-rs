@@ -18,16 +18,51 @@
  */
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
 use crate::Result;
 use crate::config::HudiConfigs;
-use crate::config::table::{HudiTableConfig, TableTypeValue};
+use crate::config::properties::escape_property;
+use crate::config::table::{HudiTableConfig, TableTypeValue, TimelineTimezoneValue};
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::storage::Storage;
 use crate::table::Table;
 use crate::write::metadata::bootstrap_metadata_table;
+
+/// Java's `GLOBAL_RECORD_LEVEL_INDEX_ENABLE_PROP` and its alternative key.
+const RECORD_INDEX_ENABLE_KEYS: [&str; 2] = [
+    "hoodie.metadata.global.record.level.index.enable",
+    "hoodie.metadata.record.index.enable",
+];
+
+const BUILDER_MANAGED_KEYS: &[&str] = &[
+    "hoodie.base.path",
+    "hoodie.table.name",
+    "hoodie.table.type",
+    "hoodie.table.version",
+    "hoodie.table.initial.version",
+    "hoodie.timeline.layout.version",
+    "hoodie.populate.meta.fields",
+    "hoodie.table.recordkey.fields",
+    "hoodie.table.partition.fields",
+    "hoodie.table.ordering.fields",
+    "hoodie.table.precombine.field",
+    "hoodie.table.keygenerator.type",
+    "hoodie.table.keygenerator.class",
+    "hoodie.table.base.file.format",
+    "hoodie.table.metadata.partitions",
+    "hoodie.table.metadata.partitions.inflight",
+    "hoodie.table.index.defs.path",
+    "hoodie.metadata.enable",
+    "hoodie.metadata.index.column.stats.enable",
+    "hoodie.metadata.index.partition.stats.enable",
+    "hoodie.datasource.write.hive_style_partitioning",
+    "hoodie.datasource.write.drop.partition.columns",
+    "hoodie.table.cdc.enabled",
+    "hoodie.table.multiple.base.file.formats.enable",
+];
 
 /// Builder for creating a new Hudi table on storage.
 ///
@@ -47,6 +82,8 @@ pub struct TableCreateBuilder {
     ordering_fields: Vec<String>,
     metadata_enabled: bool,
     record_index_enabled: bool,
+    /// Java reads its record index key before the alternative.
+    record_index_set_by_java_key: bool,
     column_stats_enabled: bool,
     partition_stats_enabled: bool,
     hive_style_partitioning: bool,
@@ -69,6 +106,7 @@ impl TableCreateBuilder {
             ordering_fields: Vec::new(),
             metadata_enabled: true,
             record_index_enabled: true,
+            record_index_set_by_java_key: false,
             // Match Spark engine defaults: column stats on when MDT is on.
             column_stats_enabled: true,
             partition_stats_enabled: true,
@@ -189,8 +227,27 @@ impl TableCreateBuilder {
         self
     }
 
+    /// Set an additional table property. A property that a dedicated builder
+    /// method sets, such as the table name, type, version, key and partition
+    /// fields or metadata layout, makes [`Self::create`] fail rather than
+    /// being overridden. The Java writer's record index switch,
+    /// `hoodie.metadata.global.record.level.index.enable` or its alternative
+    /// `hoodie.metadata.record.index.enable`, acts as
+    /// [`Self::with_record_index`], read the way Java's `Boolean.parseBoolean` is.
     pub fn with_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
-        self.options.insert(key.as_ref().to_string(), value.into());
+        let key = key.as_ref();
+        let value = value.into();
+        if key == RECORD_INDEX_ENABLE_KEYS[0] {
+            self.record_index_set_by_java_key = true;
+            return self.with_record_index(value.eq_ignore_ascii_case("true"));
+        }
+        if key == RECORD_INDEX_ENABLE_KEYS[1] {
+            if !self.record_index_set_by_java_key {
+                self.record_index_enabled = value.eq_ignore_ascii_case("true");
+            }
+            return self;
+        }
+        self.options.insert(key.to_string(), value);
         self
     }
 
@@ -201,16 +258,24 @@ impl TableCreateBuilder {
     }
 
     /// Create the table layout on storage and open a [`Table`] handle.
-    pub async fn create(self) -> Result<Table> {
+    pub async fn create(mut self) -> Result<Table> {
+        // The builder derives the metadata table layout, key generator and
+        // checksum from these, so an override would persist a table that
+        // disagrees with what was initialized.
+        if let Some(key) = self
+            .options
+            .keys()
+            .find(|key| BUILDER_MANAGED_KEYS.contains(&key.as_str()))
+        {
+            return Err(CoreError::Write(format!(
+                "'{key}' is set by a dedicated table builder method and cannot be passed to with_option"
+            )));
+        }
         let table_name = self.table_name.ok_or_else(|| {
             CoreError::Write("Table name is required to create a Hudi table".to_string())
         })?;
-        // Property files are line-oriented; control characters in the name
-        // would corrupt hoodie.properties.
-        if table_name.is_empty() || table_name.chars().any(|c| c.is_control() || c == '=') {
-            return Err(CoreError::Write(format!(
-                "invalid table name '{table_name}': must be non-empty without control characters or '='"
-            )));
+        if table_name.is_empty() {
+            return Err(CoreError::Write("table name must be non-empty".to_string()));
         }
 
         if self.record_index_enabled && !self.metadata_enabled {
@@ -278,10 +343,6 @@ impl TableCreateBuilder {
             table_name.clone(),
         );
         props.insert(
-            HudiTableConfig::DatabaseName.as_ref().to_string(),
-            "default".to_string(),
-        );
-        props.insert(
             HudiTableConfig::TableType.as_ref().to_string(),
             self.table_type.as_ref().to_string(),
         );
@@ -338,15 +399,19 @@ impl TableCreateBuilder {
         // LOCAL like the Spark writer default: Spark table services mint
         // LOCAL-time instants regardless of the table property, so declaring
         // (and minting) LOCAL keeps mixed-writer timelines ordered.
+        // Taken out of the options so the copy loop below cannot put back a
+        // spelling Java's case-sensitive parse rejects.
         let timeline_timezone = self
             .options
-            .get(HudiTableConfig::TimelineTimezone.as_ref())
-            .cloned()
-            .unwrap_or_else(|| "LOCAL".to_string());
-        crate::write::set_commit_timezone(&timeline_timezone);
+            .remove(HudiTableConfig::TimelineTimezone.as_ref())
+            .map(|zone| TimelineTimezoneValue::from_str(&zone))
+            .transpose()?
+            .unwrap_or(TimelineTimezoneValue::Local)
+            .java_name();
+        crate::write::set_commit_timezone(timeline_timezone);
         props.insert(
             HudiTableConfig::TimelineTimezone.as_ref().to_string(),
-            timeline_timezone,
+            timeline_timezone.to_string(),
         );
         props.insert("hoodie.table.cdc.enabled".to_string(), "false".to_string());
         props.insert(
@@ -479,12 +544,13 @@ impl TableCreateBuilder {
             HudiTableConfig::BasePath.as_ref().to_string(),
             self.base_uri.clone(),
         );
+        let configs = HudiConfigs::new(hudi_for_storage);
+        // Refuse what opening the table would reject before any file is written.
+        crate::table::validation::validate_configs(&configs)?;
+        crate::write::archival::validated_keep_range(&configs)?;
         let mut storage_options = self.storage_options.clone();
         crate::table::builder::resolve_storage_env_vars(&mut storage_options);
-        let storage = Storage::new(
-            Arc::new(storage_options),
-            Arc::new(HudiConfigs::new(hudi_for_storage)),
-        )?;
+        let storage = Storage::new(Arc::new(storage_options), Arc::new(configs))?;
 
         let properties_path = format!("{HUDI_METADATA_DIR}/hoodie.properties");
         if storage.exists(&properties_path).await? {
@@ -503,7 +569,11 @@ impl TableCreateBuilder {
         keys.retain(|k| k != HudiTableConfig::Checksum.as_ref());
         for key in keys {
             let value = &props[&key];
-            body.push_str(&format!("{key}={value}\n"));
+            body.push_str(&format!(
+                "{}={}\n",
+                escape_property(&key, true),
+                escape_property(value, false)
+            ));
         }
         body.push_str(&format!(
             "{}={}\n",
@@ -591,7 +661,7 @@ impl TableCreateBuilder {
 }
 
 /// Java `HoodieTableConfig.generateChecksum`: CRC32 of `{database}.{table}`.
-fn table_checksum(database: &str, table: &str) -> u32 {
+pub(crate) fn table_checksum(database: &str, table: &str) -> u32 {
     crc32(format!("{database}.{table}").as_bytes())
 }
 
@@ -667,6 +737,27 @@ mod lifecycle_tests {
         .unwrap();
         assert!(mdt_props.contains("hoodie.table.name=trips_metadata"));
         assert!(mdt_props.contains("hoodie.table.type=MERGE_ON_READ"));
+        // Like Java, the database name is persisted only when the caller sets
+        // one; Spark SQL rejects writes whose database differs from it.
+        assert!(!props.contains("hoodie.database.name"), "{props}");
+        assert!(props.contains(&format!(
+            "hoodie.table.checksum={}\n",
+            super::table_checksum("", "trips")
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_option("hoodie.database.name", "db")
+            .create()
+            .await
+            .unwrap();
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        assert!(props.contains("hoodie.database.name=db\n"), "{props}");
+        assert!(props.contains(&format!(
+            "hoodie.table.checksum={}\n",
+            super::table_checksum("db", "trips")
+        )));
     }
 
     /// `create` takes storage options from env vars like `TableBuilder` does.

@@ -125,6 +125,11 @@ pub struct HoodieCommitMetadata {
     pub version: Option<i32>,
     #[avro(rename = "operationType")]
     pub operation_type: Option<String>,
+    /// Set only on replacecommits read back; Java's commit metadata schema has
+    /// no such field, so it is never written.
+    #[avro(rename = "partitionToReplaceFileIds")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_to_replace_file_ids: Option<HashMap<String, Vec<String>>>,
 }
 
 impl HoodieCommitMetadata {
@@ -159,6 +164,33 @@ impl HoodieCommitMetadata {
         from_value::<Self>(&value).map_err(|e| {
             CoreError::CommitMetadata(format!("Failed to deserialize Avro value: {e}"))
         })
+    }
+
+    /// Get the file IDs to be replaced for a specific partition
+    pub fn get_partition_replace_file_ids(&self, partition: &str) -> Option<&Vec<String>> {
+        self.partition_to_replace_file_ids
+            .as_ref()
+            .and_then(|ids| ids.get(partition))
+    }
+
+    /// Get all partitions with file replacements
+    pub fn get_partitions_with_replacements(&self) -> Vec<String> {
+        self.partition_to_replace_file_ids
+            .as_ref()
+            .map(|ids| ids.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Iterate over all replace file IDs across all partitions
+    pub fn iter_replace_file_ids(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.partition_to_replace_file_ids
+            .as_ref()
+            .into_iter()
+            .flat_map(|replace_ids| {
+                replace_ids.iter().flat_map(|(partition, file_ids)| {
+                    file_ids.iter().map(move |file_id| (partition, file_id))
+                })
+            })
     }
 
     /// Convert commit metadata to a JSON Map for compatibility with existing code
@@ -291,6 +323,124 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_replace_file_ids() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "30": ["d398fae1-c0e6-4098-8124-f55f7098bdba-0"],
+                "20": ["88163884-fef0-4aab-865d-c72327a8a1d5-0"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+
+        let file_ids = metadata.get_partition_replace_file_ids("30").unwrap();
+        assert_eq!(file_ids.len(), 1);
+        assert_eq!(file_ids[0], "d398fae1-c0e6-4098-8124-f55f7098bdba-0");
+    }
+
+    #[test]
+    fn test_get_partition_replace_file_ids() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "30": ["d398fae1-c0e6-4098-8124-f55f7098bdba-0"],
+                "20": ["88163884-fef0-4aab-865d-c72327a8a1d5-0"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+
+        // Test getting existing partition
+        let file_ids_30 = metadata.get_partition_replace_file_ids("30").unwrap();
+        assert_eq!(file_ids_30.len(), 1);
+        assert_eq!(file_ids_30[0], "d398fae1-c0e6-4098-8124-f55f7098bdba-0");
+
+        // Test getting non-existent partition
+        assert!(metadata.get_partition_replace_file_ids("40").is_none());
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "30": ["file1"],
+                "20": ["file2"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let mut partitions = metadata.get_partitions_with_replacements();
+        partitions.sort();
+        assert_eq!(partitions, vec!["20".to_string(), "30".to_string()]);
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements_empty() {
+        let json = json!({});
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let partitions = metadata.get_partitions_with_replacements();
+        assert_eq!(partitions.len(), 0);
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1", "file2"],
+                "p2": ["file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 3);
+
+        let file_ids: Vec<_> = metadata
+            .iter_replace_file_ids()
+            .map(|(_, file_id)| file_id.as_str())
+            .collect();
+        assert!(file_ids.contains(&"file1"));
+        assert!(file_ids.contains(&"file2"));
+        assert!(file_ids.contains(&"file3"));
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids_empty() {
+        let json = json!({});
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_get_partitions_with_replacements_sorting() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1"],
+                "p2": ["file2", "file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let mut partitions = metadata.get_partitions_with_replacements();
+        partitions.sort();
+        assert_eq!(partitions, vec!["p1".to_string(), "p2".to_string()]);
+    }
+
+    #[test]
+    fn test_iter_replace_file_ids_multiple_partitions() {
+        let json = json!({
+            "partitionToReplaceFileIds": {
+                "p1": ["file1"],
+                "p2": ["file2", "file3"]
+            }
+        });
+
+        let metadata: HoodieCommitMetadata = serde_json::from_value(json).unwrap();
+        let count = metadata.iter_replace_file_ids().count();
+        assert_eq!(count, 3); // 1 from p1, 2 from p2
+    }
+
+    #[test]
     fn test_iter_write_stats() {
         let json = json!({
             "partitionToWriteStats": {
@@ -330,7 +480,7 @@ mod tests {
             assert!(field_names.contains(&"partitionToWriteStats"));
             assert!(field_names.contains(&"compacted"));
             assert!(field_names.contains(&"extraMetadata"));
-            assert!(!field_names.contains(&"partitionToReplaceFileIds"));
+            assert!(field_names.contains(&"partitionToReplaceFileIds"));
         } else {
             panic!("Expected Record schema");
         }
@@ -690,6 +840,7 @@ mod tests {
             )])),
             compacted: Some(false),
             extra_metadata: Some(HashMap::from([("schema".to_string(), "{}".to_string())])),
+            partition_to_replace_file_ids: None,
         };
         let bytes = metadata.to_avro_bytes().unwrap();
         let parsed = HoodieCommitMetadata::from_avro_bytes(&bytes).unwrap();

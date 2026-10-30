@@ -27,9 +27,7 @@
 //! Unlike the `KeyValue` type which references into file bytes,
 //! `HFileRecord` owns its data and can be freely moved.
 
-use apache_avro::Schema as AvroSchema;
 use std::cmp::Ordering;
-use std::sync::Arc;
 
 /// An owned HFile record with key and value.
 ///
@@ -38,57 +36,37 @@ use std::sync::Arc;
 /// the value is the raw bytes (typically Avro-serialized payload).
 ///
 /// # Example
-/// ```ignore
-/// let record = HFileRecord::new("my-key".into(), value_bytes);
-/// println!("Key: {}", record.key_as_str());
-/// // Decode value on demand
-/// let payload = decode_avro(&record.value);
 /// ```
-#[derive(Debug, Clone)]
+/// use hudi_core::hfile::HFileRecord;
+///
+/// let record = HFileRecord {
+///     key: b"my-key".to_vec(),
+///     value: vec![1, 2],
+/// };
+/// let HFileRecord { key, value } = record.clone();
+/// assert_eq!(key, b"my-key");
+/// assert_eq!(record, HFileRecord::from_str_key("my-key", value));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HFileRecord {
     /// Record key (UTF-8 string content only, no length prefix)
     pub key: Vec<u8>,
     /// Record value (raw bytes, typically Avro-serialized)
     pub value: Vec<u8>,
-    /// Writer schema of the container this record was read from (the HFile's
-    /// embedded "schema" file-info entry). Decoding must use this schema when
-    /// present: bytes written by another writer (e.g. Spark) may not match the
-    /// schema of the base file they are merged against.
-    schema: Option<Arc<AvroSchema>>,
 }
-
-impl PartialEq for HFileRecord {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key && self.value == other.value
-    }
-}
-
-impl Eq for HFileRecord {}
 
 impl HFileRecord {
     /// Create a new HFile record.
     pub fn new(key: Vec<u8>, value: Vec<u8>) -> Self {
-        Self {
-            key,
-            value,
-            schema: None,
-        }
+        Self { key, value }
     }
 
     /// Create a record from string key and value bytes.
     pub fn from_str_key(key: &str, value: Vec<u8>) -> Self {
-        Self::new(key.as_bytes().to_vec(), value)
-    }
-
-    /// Attach the writer schema of the container this record came from.
-    pub fn with_avro_schema(mut self, schema: Option<Arc<AvroSchema>>) -> Self {
-        self.schema = schema;
-        self
-    }
-
-    /// The writer schema of this record's source container, if known.
-    pub fn avro_schema(&self) -> Option<&AvroSchema> {
-        self.schema.as_deref()
+        Self {
+            key: key.as_bytes().to_vec(),
+            value,
+        }
     }
 
     /// Returns the key as a UTF-8 string.

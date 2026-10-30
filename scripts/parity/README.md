@@ -35,6 +35,12 @@ Cross-checks hudi-rs against the Apache Hudi Spark writer/reader:
 - **G** — Spark data skipping over rs-written column_stats/partition_stats,
   alone and mixed with Spark's stats in one partition: filtered reads with
   and without data skipping must agree
+- **I** — Spark upserts with SIMPLE, BLOOM and GLOBAL_BLOOM indexes on
+  rs-written COW/MOR tables find every key rs wrote (base files, inserts,
+  updates) and re-insert one rs deleted without duplicates; includes keys
+  whose UTF-8 and UTF-16 orders differ, against the bloom footer key range
+- **J** — Spark SQL UPDATE/DELETE/INSERT on rs-written COW/MOR tables
+  registered in a non-default database, then rs writes on top
 
 Spark snapshot reads always run twice — with and without
 `hoodie.metadata.enable` — and fail on mismatch, so MDT interop bugs surface

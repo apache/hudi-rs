@@ -38,8 +38,6 @@ use crate::table::Table;
 const DEFAULT_SMALL_FILE_LIMIT: i64 = 104_857_600;
 /// Java `hoodie.copyonwrite.insert.split.size` default.
 const DEFAULT_INSERT_SPLIT_SIZE: usize = 500_000;
-/// Java `hoodie.logfile.to.parquet.compression.ratio` default.
-const DEFAULT_LOG_TO_PARQUET_RATIO: f64 = 0.35;
 /// How many recent commits to inspect for record-size estimation.
 const RECORD_SIZE_ESTIMATION_MAX_COMMITS: usize = 5;
 
@@ -51,7 +49,6 @@ pub(crate) struct SizingConfig {
     pub insert_split_size: usize,
     pub auto_split: bool,
     pub record_size_estimate: i64,
-    pub log_to_parquet_ratio: f64,
 }
 
 impl SizingConfig {
@@ -81,10 +78,6 @@ impl SizingConfig {
                 "hoodie.copyonwrite.record.size.estimate",
                 crate::write::append::DEFAULT_RECORD_SIZE_ESTIMATE,
             ),
-            log_to_parquet_ratio: options
-                .get("hoodie.logfile.to.parquet.compression.ratio")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_LOG_TO_PARQUET_RATIO),
         }
     }
 
@@ -162,34 +155,20 @@ pub(crate) struct SmallFileGroup {
     pub size_bytes: i64,
 }
 
-/// Small file groups in a partition's latest file slices.
-///
-/// COW measures the base file; MOR measures the whole slice at
-/// parquet-equivalent size (base + logs × compression ratio), including
-/// log-only slices — Java `SparkUpsertDeltaCommitPartitioner.getSmallFiles`.
+/// Small file groups in a partition's latest file slices, measured by their
+/// base file (Java `UpsertPartitioner.getSmallFiles`).
 pub(crate) fn small_file_groups(
     slices: &[&FileSlice],
-    is_mor: bool,
     config: &SizingConfig,
 ) -> Vec<SmallFileGroup> {
     let mut out = Vec::new();
     for slice in slices {
-        let base_size = slice
+        let size = slice
             .base_file
             .as_ref()
             .and_then(|base_file| base_file.file_metadata.as_ref())
             .map(|m| m.size as i64)
             .unwrap_or(0);
-        let size = if is_mor {
-            let log_size: i64 = slice
-                .log_files
-                .iter()
-                .filter_map(|l| l.file_metadata.as_ref().map(|m| m.size as i64))
-                .sum();
-            base_size + (log_size as f64 * config.log_to_parquet_ratio) as i64
-        } else {
-            base_size
-        };
         if size > 0 && size < config.small_file_limit {
             out.push(SmallFileGroup {
                 file_id: slice.file_id().to_string(),

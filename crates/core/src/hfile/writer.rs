@@ -133,8 +133,9 @@ impl HFileWriter {
             num_data_index_levels: Some(1),
             first_data_block_offset: Some(0),
             last_data_block_offset: Some(0),
+            // Java's native HFile writer; an HBase-backed reader instantiates it.
             comparator_class_name: Some(
-                "org.apache.hadoop.hbase.KeyValue$KeyOnlyKeyValue".to_string(),
+                "org.apache.hudi.io.storage.HoodieHBaseKVComparator".to_string(),
             ),
             compression_codec: Some(2),
             encryption_key: None,
@@ -248,10 +249,16 @@ mod tests {
             BTreeMap::new(),
         )
         .expect("write hfile");
-        let mut reader = HFileReader::new(bytes).expect("read hfile");
+        let mut reader = HFileReader::new(bytes.clone()).expect("read hfile");
         let records = reader.collect_records().expect("collect records");
         assert_eq!(records.len(), 3);
         assert_eq!(records[0].key_as_str(), Some("alpha"));
         assert_eq!(records[2].key_as_str(), Some("charlie"));
+        assert_eq!(
+            crate::hfile::trailer::HFileTrailer::read(&bytes)
+                .expect("read trailer")
+                .comparator_class_name,
+            "org.apache.hudi.io.storage.HoodieHBaseKVComparator"
+        );
     }
 }

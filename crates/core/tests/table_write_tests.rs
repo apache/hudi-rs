@@ -17,12 +17,13 @@
  * under the License.
  */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use hudi_core::config::table::TableTypeValue;
+use hudi_core::config::table::{HudiTableConfig, TableTypeValue};
 use hudi_core::error::CoreError;
 use hudi_core::index::{HoodieIndex, HoodieKey, SimpleIndex};
 use hudi_core::table::partition::PartitionPruner;
@@ -216,6 +217,152 @@ async fn test_mdt_failure_before_commit_leaves_no_completed_data_instant() {
         completed.is_empty(),
         "failed MDT update must not leave a completed data commit: {completed:?}"
     );
+}
+
+fn timeline_file_count(base: &std::path::Path) -> usize {
+    std::fs::read_dir(base.join(".hoodie/timeline"))
+        .unwrap()
+        .count()
+}
+
+fn nullable_value_batch(nullable: bool, ids: Vec<&str>, values: Vec<Option<i64>>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, nullable),
+        ])),
+        vec![
+            Arc::new(StringArray::from(ids)),
+            Arc::new(Int64Array::from(values)),
+        ],
+    )
+    .unwrap()
+}
+
+/// A rejected write must leave no instant on the data timeline.
+fn assert_no_instant(base: &std::path::Path) {
+    let names: Vec<String> = std::fs::read_dir(base.join(".hoodie/timeline"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.starts_with('2'))
+        .collect();
+    assert!(names.is_empty(), "rejected write left instants: {names:?}");
+}
+
+/// hoodie.properties is written and read with the Java `Properties` escapes,
+/// so names and a pretty-printed create schema survive a reopen.
+#[tokio::test]
+async fn test_properties_preserve_names_and_formatted_schema() {
+    for (name, escaped) in [
+        (r"café a=b:c\d", r"caf\u00E9 a\=b\:c\\d"),
+        (" review", r"\ review"),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let schema = r#"{
+  "type": "record",
+  "name": "record",
+  "fields": [{"name": "id", "type": "string"}, {"name": "value", "type": "long"}]
+}"#;
+        Table::create(path)
+            .with_table_name(name)
+            .with_record_key_fields(["id"])
+            .with_option(HudiTableConfig::CreateSchema, schema)
+            .create()
+            .await
+            .unwrap();
+        let reopened = Table::new(path).await.unwrap();
+        let actual: String = reopened
+            .hudi_configs
+            .get(HudiTableConfig::TableName)
+            .unwrap()
+            .into();
+        assert_eq!(actual, name);
+        assert_eq!(
+            reopened.get_schema().await.unwrap().fields().len(),
+            2,
+            "{name}"
+        );
+        let props = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        assert!(props.is_ascii(), "{props}");
+        assert!(
+            props.contains(&format!("hoodie.table.name={escaped}\n")),
+            "{props}"
+        );
+        let metadata = std::fs::read_to_string(
+            dir.path()
+                .join(".hoodie/metadata/.hoodie/hoodie.properties"),
+        )
+        .unwrap();
+        assert!(
+            metadata.contains(&format!("hoodie.table.name={escaped}_metadata\n")),
+            "{metadata}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_create_rejects_managed_option_overrides_before_persisting() {
+    for (key, value) in [
+        ("hoodie.table.name", "renamed"),
+        ("hoodie.table.version", "6"),
+        ("hoodie.metadata.enable", "false"),
+        (
+            "hoodie.table.index.defs.path",
+            ".hoodie/.index_defs/custom.json",
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let error = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("original")
+            .with_record_key_fields(["id"])
+            .with_option(key, value)
+            .create()
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{key} override accepted"));
+        assert!(error.to_string().contains(key), "{key}: {error}");
+        assert!(
+            !dir.path().join(".hoodie").exists(),
+            "{key} left a partial table"
+        );
+    }
+}
+
+/// The Java writer's record index switch and its alternative key turn the
+/// record index on or off like `with_record_index`.
+#[tokio::test]
+async fn test_create_reads_java_record_index_switch() {
+    const KEY: &str = "hoodie.metadata.global.record.level.index.enable";
+    const ALTERNATIVE: &str = "hoodie.metadata.record.index.enable";
+    for (options, enabled) in [
+        (vec![(KEY, "false")], false),
+        (vec![(ALTERNATIVE, "FALSE")], false),
+        (vec![(KEY, "true")], true),
+        (vec![(KEY, "true"), (ALTERNATIVE, "false")], true),
+    ] {
+        let dir = tempdir().unwrap();
+        let mut builder = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_record_index(!enabled);
+        for (key, value) in &options {
+            builder = builder.with_option(*key, *value);
+        }
+        builder.create().await.unwrap();
+        let properties =
+            std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+        let partitions = properties
+            .lines()
+            .find_map(|line| line.strip_prefix("hoodie.table.metadata.partitions="))
+            .unwrap();
+        assert_eq!(
+            partitions.split(',').any(|p| p == "record_index"),
+            enabled,
+            "{options:?}: {partitions}"
+        );
+        assert!(!properties.contains(KEY) && !properties.contains(ALTERNATIVE));
+    }
 }
 
 #[tokio::test]
@@ -482,6 +629,287 @@ async fn test_partial_upsert_preserves_unselected_columns() {
     assert_eq!(values.value(0), 2);
 }
 
+fn rows_with_event_time(batches: &[RecordBatch]) -> Vec<(String, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = |name| batch.column_by_name(name).unwrap().as_any();
+        let ids = column("id").downcast_ref::<StringArray>().unwrap();
+        let values = column("value").downcast_ref::<Int64Array>().unwrap();
+        let times = column("event_time").downcast_ref::<Int64Array>().unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row).to_string(),
+                values.value(row),
+                times.value(row),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// A copy-on-write merge copies the stored rows of keys it does not touch as
+/// they are, duplicates included, and a partial update takes its unselected
+/// columns from the winning stored duplicate.
+#[tokio::test]
+async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_batch(vec![
+            ("a", 1, 1),
+            ("a", 2, 2),
+            ("b", 100, 10),
+            ("b", 50, 5),
+        ])])
+        .await
+        .unwrap();
+
+    table
+        .upsert([ordered_batch(vec![("c", 3, 3)])])
+        .await
+        .unwrap();
+    let row = |id: &str, value, event_time| (id.to_string(), value, event_time);
+    assert_eq!(
+        rows_with_event_time(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            row("a", 1, 1),
+            row("a", 2, 2),
+            row("b", 50, 5),
+            row("b", 100, 10),
+            row("c", 3, 3),
+        ]
+    );
+
+    table
+        .upsert_with(
+            [ordered_batch(vec![("b", 999, 20)])],
+            UpsertOptions {
+                update_columns: Some(vec!["value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_with_event_time(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            row("a", 1, 1),
+            row("a", 2, 2),
+            row("b", 999, 10),
+            row("c", 3, 3)
+        ]
+    );
+}
+
+/// On an event-time ordered table a partial update that sets the ordering
+/// field merges by it; one that does not wins as under commit-time ordering
+/// and keeps the stored ordering value.
+#[tokio::test]
+async fn test_partial_upsert_orders_by_event_time_only_when_setting_it() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_batch(vec![("a", 1, 10)])])
+        .await
+        .unwrap();
+    let partial = |columns: &[&str]| UpsertOptions {
+        update_columns: Some(columns.iter().map(|c| c.to_string()).collect()),
+    };
+    let rows = |batches: Vec<RecordBatch>| rows_with_event_time(&batches);
+
+    table
+        .upsert_with([ordered_batch(vec![("a", 2, 5)])], partial(&["value"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(table.read(&ReadOptions::new()).await.unwrap()),
+        vec![("a".to_string(), 2, 10)]
+    );
+
+    for (value, event_time, expected) in [(3, 1, (2, 10)), (4, 20, (4, 20))] {
+        table
+            .upsert_with(
+                [ordered_batch(vec![("a", value, event_time)])],
+                partial(&["value", "event_time"]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows(table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), expected.0, expected.1)]
+        );
+    }
+}
+
+/// A partial update that leaves the ordering field out also dedupes its batch
+/// and moves partitions by commit time: the last duplicate wins, and a lower
+/// ordering value does not keep the row in its old partition.
+#[tokio::test]
+async fn test_partial_upsert_without_ordering_field_dedupes_and_moves_by_commit_time() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city", "zone"])
+        .with_ordering_fields(["ts"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([zoned_batch(&[("a", "sf", "z1", 10, 1)])])
+        .await
+        .unwrap();
+    table
+        .upsert_with(
+            [zoned_batch(&[
+                ("a", "ny", "z1", 1, 7),
+                ("a", "ny", "z1", 0, 8),
+            ])],
+            UpsertOptions {
+                update_columns: Some(vec!["city".to_string(), "value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let rows = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+    let column = |name: &str| {
+        arrow::util::display::array_value_to_string(rows.column_by_name(name).unwrap(), 0).unwrap()
+    };
+    assert_eq!(rows.num_rows(), 1);
+    assert_eq!(
+        [column("city"), column("ts"), column("value")],
+        ["ny", "10", "8"].map(String::from)
+    );
+}
+
+fn zoned_batch(rows: &[(&str, &str, &str, i64, i64)]) -> RecordBatch {
+    let column =
+        |index: usize| -> Vec<&str> { rows.iter().map(|r| [r.0, r.1, r.2][index]).collect() };
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("city", DataType::Utf8, false),
+            Field::new("zone", DataType::Utf8, false),
+            Field::new("ts", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(column(0))),
+            Arc::new(StringArray::from(column(1))),
+            Arc::new(StringArray::from(column(2))),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// A partial upsert merges with the stored row before routing: the merged
+/// partition decides whether the row moves, and a moved row keeps the
+/// stored values of the columns it does not update.
+#[tokio::test]
+async fn test_partial_upsert_routes_by_merged_partition() {
+    for (update_columns, expected) in [
+        (vec!["value"], ("sf", "z1", "city=sf/zone=z1")),
+        (vec!["city", "value"], ("ny", "z1", "city=ny/zone=z1")),
+        (
+            vec!["city", "zone", "value"],
+            ("ny", "z9", "city=ny/zone=z9"),
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut table = Table::create(path)
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city", "zone"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([zoned_batch(&[("a", "sf", "z1", 1, 10)])])
+            .await
+            .unwrap();
+        table
+            .upsert_with(
+                [zoned_batch(&[("a", "ny", "z9", 2, 20)])],
+                UpsertOptions {
+                    update_columns: Some(update_columns.iter().map(|c| c.to_string()).collect()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let batches = Table::new(path)
+            .await
+            .unwrap()
+            .read(&ReadOptions::new())
+            .await
+            .unwrap();
+        let rows = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        let text = |name: &str| {
+            let column =
+                arrow::compute::cast(rows.column_by_name(name).unwrap(), &DataType::Utf8).unwrap();
+            let column = column.as_any().downcast_ref::<StringArray>().unwrap();
+            (0..column.len())
+                .map(|i| column.value(i).to_string())
+                .collect::<Vec<_>>()
+        };
+        let (city, zone, partition_path) = expected;
+        assert_eq!(
+            [
+                text("id"),
+                text("city"),
+                text("zone"),
+                text("ts"),
+                text("value"),
+                text("_hoodie_partition_path")
+            ],
+            [
+                vec!["a".to_string()],
+                vec![city.to_string()],
+                vec![zone.to_string()],
+                vec!["1".to_string()],
+                vec!["20".to_string()],
+                vec![partition_path.to_string()]
+            ],
+            "{update_columns:?}"
+        );
+
+        // The index must point at the row's final location.
+        table
+            .upsert([zoned_batch(&[("a", city, zone, 3, 30)])])
+            .await
+            .unwrap();
+        let rows: usize = table
+            .read(&ReadOptions::new())
+            .await
+            .unwrap()
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum();
+        assert_eq!(rows, 1, "{update_columns:?}");
+    }
+}
+
 #[tokio::test]
 async fn test_partial_upsert_stale_event_time_keeps_lineage() {
     // A partial update whose ordering value LOSES the event-time merge must
@@ -517,7 +945,7 @@ async fn test_partial_upsert_stale_event_time_keeps_lineage() {
         .upsert_with(
             [ordered_batch(vec![("a", 2, 50)])],
             UpsertOptions {
-                update_columns: Some(vec!["value".to_string()]),
+                update_columns: Some(vec!["value".to_string(), "event_time".to_string()]),
             },
         )
         .await
@@ -933,7 +1361,8 @@ fn ordered_flagged_rows(batches: &[RecordBatch]) -> Vec<(String, i64, i64, bool)
 /// Copy-on-write event-time upserts into a group where most stored rows are
 /// untouched: each touched key resolves by ordering value (ties go to the
 /// incoming row), a winning delete marker removes the row, in-batch duplicates
-/// keep the highest ordering value, and untouched rows pass through.
+/// keep the highest ordering value, untouched rows pass through, and a partial
+/// update without the ordering field wins as under commit-time ordering.
 #[tokio::test]
 async fn test_cow_event_time_upsert_merges_only_touched_keys() {
     let dir = tempdir().unwrap();
@@ -985,7 +1414,7 @@ async fn test_cow_event_time_upsert_merges_only_touched_keys() {
         ("c", 30, 150),
         ("e", 5, 100),
         ("f", 6, 100),
-        ("g", 7, 100),
+        ("g", 70, 100),
         ("h", 80, 100),
         ("i", 90, 10),
         ("j", 101, 20),
@@ -1060,13 +1489,14 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
         .read(&ReadOptions::new().with_hudi_option("hoodie.read.use.read_optimized.mode", "true"))
         .await
         .unwrap();
-    // `c` was a packed insert (small-file routing) living only in log files,
-    // so read-optimized mode cannot see it until compaction — Java parity.
+    // Inserts land in base files, so read-optimized mode sees `c`; the
+    // logged updates stay invisible until compaction.
     assert_eq!(
         rows_by_id(&read_optimized),
         vec![
             ("a".to_string(), 1),
             ("b".to_string(), 2),
+            ("c".to_string(), 3),
             ("d".to_string(), 4),
         ]
     );
@@ -1242,6 +1672,477 @@ async fn test_simple_index_tags_existing_and_missing_keys() {
     let locations = SimpleIndex.tag_location(&table, &keys).await.unwrap();
     assert!(locations[&keys[0]].is_some());
     assert!(locations[&keys[1]].is_none());
+}
+
+/// Without the metadata table the simple index tags keys; on a table with no
+/// commits every key is an insert and no table schema is needed.
+#[tokio::test]
+async fn test_simple_index_first_upsert_inserts_every_key() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_metadata(false)
+            .create()
+            .await
+            .unwrap();
+
+        let first = table
+            .upsert([batch(vec![("a", 1), ("b", 2)])])
+            .await
+            .unwrap();
+        assert_eq!(
+            (first.num_inserts, first.num_updates),
+            (2, 0),
+            "{table_type:?}"
+        );
+        let second = table.upsert([batch(vec![("a", 10)])]).await.unwrap();
+        assert_eq!(
+            (second.num_inserts, second.num_updates),
+            (0, 1),
+            "{table_type:?}"
+        );
+        assert_eq!(
+            rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), 10), ("b".to_string(), 2)],
+            "{table_type:?}"
+        );
+    }
+}
+
+/// Arrow types that the Avro commit schema stores as one type, each with a
+/// null value, and the type the table reads them back as.
+fn aliased_batch(id: &str) -> RecordBatch {
+    use arrow::array::{
+        Decimal256Array, Int8Array, Int16Array, LargeBinaryArray, LargeStringArray,
+        TimestampMicrosecondArray,
+    };
+    use arrow::datatypes::{TimeUnit, i256};
+    let columns: Vec<(Field, arrow::array::ArrayRef)> = vec![
+        (
+            Field::new("id", DataType::Utf8, false),
+            Arc::new(StringArray::from(vec![id])),
+        ),
+        (
+            Field::new("i8", DataType::Int8, true),
+            Arc::new(Int8Array::from(vec![Some(-7)])),
+        ),
+        (
+            Field::new("i16", DataType::Int16, true),
+            Arc::new(Int16Array::from(vec![None::<i16>])),
+        ),
+        (
+            Field::new("s", DataType::LargeUtf8, true),
+            Arc::new(LargeStringArray::from(vec![Some("text")])),
+        ),
+        (
+            Field::new("b", DataType::LargeBinary, true),
+            Arc::new(LargeBinaryArray::from(vec![Some(&b"\x00\x01"[..])])),
+        ),
+        (
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+05:00".into())),
+                true,
+            ),
+            Arc::new(
+                TimestampMicrosecondArray::from(vec![Some(1_000_000)]).with_timezone("+05:00"),
+            ),
+        ),
+        (
+            Field::new(
+                "l",
+                DataType::LargeList(Arc::new(Field::new("item", DataType::Int16, true))),
+                true,
+            ),
+            Arc::new(arrow::array::LargeListArray::new(
+                Arc::new(Field::new("item", DataType::Int16, true)),
+                arrow::buffer::OffsetBuffer::from_lengths([2]),
+                Arc::new(Int16Array::from(vec![Some(1), None])),
+                None,
+            )),
+        ),
+        (
+            Field::new("d", DataType::Decimal256(10, 2), true),
+            Arc::new(
+                Decimal256Array::from(vec![Some(i256::from_i128(12345))])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
+        ),
+    ];
+    let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+}
+
+#[tokio::test]
+async fn test_aliased_arrow_types_support_repeated_writes() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_str().unwrap();
+        let mut table = Table::create(path)
+            .with_table_name("types")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([aliased_batch("a")]).await.unwrap();
+        table.append([aliased_batch("b")]).await.unwrap();
+        table.upsert([aliased_batch("a")]).await.unwrap();
+        table.overwrite([aliased_batch("c")]).await.unwrap();
+        table
+            .update("id = 'c'", aliased_batch("c").project(&[1]).unwrap())
+            .await
+            .unwrap();
+
+        let table = Table::new(path).await.unwrap();
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        let rows = arrow::compute::concat_batches(&batches[0].schema(), &batches).unwrap();
+        assert_eq!(rows.num_rows(), 1, "{table_type:?}");
+        let rendered: Vec<String> = ["i8", "i16", "s", "b", "ts", "l", "d"]
+            .iter()
+            .map(|name| {
+                let column = rows.column_by_name(name).unwrap();
+                let value = match column.data_type() {
+                    DataType::Timestamp(..) => {
+                        arrow::compute::cast(column, &DataType::Int64).unwrap()
+                    }
+                    _ => column.clone(),
+                };
+                format!(
+                    "{:?}={}",
+                    column.data_type(),
+                    arrow::util::display::array_value_to_string(&value, 0).unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "Int32=-7",
+                "Int32=",
+                "Utf8=text",
+                "Binary=0001",
+                "Timestamp(Microsecond, Some(\"UTC\"))=1000000",
+                "List(Field { name: \"element\", data_type: Int32, nullable: true })=[1, ]",
+                "Decimal128(10, 2)=123.45",
+            ],
+            "{table_type:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_decimal_beyond_avro_precision_rejected_before_commit() {
+    use arrow::array::Decimal256Array;
+    use arrow::datatypes::i256;
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("types")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("d", DataType::Decimal256(40, 0), false),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec!["a"])),
+            Arc::new(
+                Decimal256Array::from(vec![i256::from_i128(1)])
+                    .with_precision_and_scale(40, 0)
+                    .unwrap(),
+            ),
+        ],
+    )
+    .unwrap();
+    let error = table.append([batch]).await.unwrap_err();
+    assert!(error.to_string().contains("precision 40"), "{error}");
+    assert_no_instant(dir.path());
+}
+
+/// Like a non-prepped Java write, caller-supplied meta columns are dropped,
+/// so stale values cannot hide a write or change a row's key.
+#[tokio::test]
+async fn test_input_meta_columns_are_replaced() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([batch(vec![("a", 1)])]).await.unwrap();
+
+        let read_back = table.read(&ReadOptions::new()).await.unwrap();
+        let result = table.upsert(read_back).await.unwrap();
+        let rows = table.read(&ReadOptions::new()).await.unwrap();
+        let commit_times = rows[0]
+            .column_by_name("_hoodie_commit_time")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(commit_times.value(0), result.instant, "{table_type:?}");
+
+        let mut fields = vec![Field::new("_hoodie_record_key", DataType::Utf8, true)];
+        fields.extend(
+            batch(vec![])
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone()),
+        );
+        let mut columns: Vec<arrow::array::ArrayRef> =
+            vec![Arc::new(StringArray::from(vec!["stale"]))];
+        columns.extend(batch(vec![("b", 2)]).columns().iter().cloned());
+        let stale_key = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        table.append([stale_key]).await.unwrap();
+        table
+            .delete_keys([HoodieKey {
+                record_key: "b".to_string(),
+                partition_path: String::new(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), 1)],
+            "{table_type:?}"
+        );
+    }
+}
+
+/// Batches are concatenated by position, so a later batch whose columns are
+/// renamed or reordered must be rejected rather than merged.
+#[tokio::test]
+async fn test_upsert_rejects_batches_with_differing_schemas() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_ordering_fields(["ts"])
+            .create()
+            .await
+            .unwrap();
+        let first = ordered_batch(vec![("a", 1, 10)]);
+        let schema = first.schema();
+        let reordered = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                schema.field(0).clone(),
+                schema.field(2).clone(),
+                schema.field(1).clone(),
+            ])),
+            {
+                let other = ordered_batch(vec![("b", 2, 20)]);
+                vec![
+                    other.column(0).clone(),
+                    other.column(2).clone(),
+                    other.column(1).clone(),
+                ]
+            },
+        )
+        .unwrap();
+        let error = table
+            .upsert([first, reordered])
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{table_type:?} accepted the batches"));
+        assert!(
+            matches!(error, CoreError::Schema(_)),
+            "{table_type:?}: {error}"
+        );
+        assert_no_instant(dir.path());
+    }
+}
+
+/// Rows written into a merge-on-read log file carry the file group id in
+/// `_hoodie_file_name`, as Java's append handle writes them; Spark SQL derives
+/// the record location from it.
+#[tokio::test]
+async fn test_mor_log_rows_name_their_file_group() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([batch(vec![("a", 1)])]).await.unwrap();
+    table
+        .upsert([batch(vec![("a", 2), ("b", 3)])])
+        .await
+        .unwrap();
+
+    let file_groups: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".parquet"))
+        .map(|name| name.split('_').next().unwrap().to_string())
+        .collect();
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    for batch in &batches {
+        let names = batch
+            .column_by_name("_hoodie_file_name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for name in names.iter().flatten() {
+            let file_id = name.split('_').next().unwrap();
+            assert!(file_groups.iter().any(|id| id == file_id), "{name}");
+        }
+    }
+}
+
+/// Copy-on-write write stats count each file's own updates, inserts and
+/// deletes, as Java's handles do, not the commit totals.
+#[tokio::test]
+async fn test_cow_write_stats_count_per_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_str().unwrap();
+    let mut table = Table::create(path)
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([city_batch(vec![("a", "sf", 1), ("b", "nyc", 2)])])
+        .await
+        .unwrap();
+    table
+        .upsert([city_batch(vec![("a", "sf", 10), ("c", "la", 3)])])
+        .await
+        .unwrap();
+    let counts = |table: &Table| {
+        let table = table.clone();
+        async move {
+            let instant = table.timeline.completed_commits.last().unwrap().clone();
+            let json = table
+                .timeline
+                .get_instant_metadata_in_json(&instant)
+                .await
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let mut counts: Vec<(String, i64, i64, i64)> = json["partitionToWriteStats"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .flat_map(|(partition, stats)| {
+                    stats.as_array().unwrap().iter().map(move |stat| {
+                        let n = |k: &str| stat[k].as_i64().unwrap_or(0);
+                        (
+                            partition.clone(),
+                            n("numUpdateWrites"),
+                            n("numInserts"),
+                            n("numDeletes"),
+                        )
+                    })
+                })
+                .collect();
+            counts.sort();
+            counts
+        }
+    };
+    let table = Table::new(path).await.unwrap();
+    assert_eq!(
+        counts(&table).await,
+        vec![
+            ("city=la".to_string(), 0, 1, 0),
+            ("city=sf".to_string(), 1, 0, 0)
+        ]
+    );
+}
+
+/// A key stored in several partitions (as a non-global Java index allows)
+/// resolves to the copy in the incoming record's partition.
+#[tokio::test]
+async fn test_simple_index_prefers_the_incoming_partition() {
+    for (stored, incoming, resolved) in [
+        (["sf", "nyc"], "sf", "sf"),
+        (["sf", "nyc"], "nyc", "nyc"),
+        (["sf", "nyc"], "la", "sf"),
+        (["nyc", "sf"], "la", "sf"),
+    ] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_metadata(false)
+            .create()
+            .await
+            .unwrap();
+        for city in stored {
+            table
+                .append([city_batch(vec![("a", city, 1)])])
+                .await
+                .unwrap();
+        }
+        let key = HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: format!("city={incoming}"),
+        };
+        let locations = SimpleIndex
+            .tag_location(&table, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            locations[&key].as_ref().unwrap().partition_path,
+            format!("city={resolved}")
+        );
+    }
+    // Two copies in one partition resolve to the greater file id, whatever
+    // order the slices list in.
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_metadata(false)
+        .create()
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        table
+            .append([city_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap();
+    }
+    let file_ids: std::collections::BTreeSet<String> = table
+        .get_file_slices(&ReadOptions::new())
+        .await
+        .unwrap()
+        .iter()
+        .map(|slice| slice.file_id().to_string())
+        .collect();
+    assert_eq!(file_ids.len(), 2);
+    for partition in ["sf", "la"] {
+        let key = HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: format!("city={partition}"),
+        };
+        let locations = SimpleIndex
+            .tag_location(&table, std::slice::from_ref(&key))
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(&locations[&key].as_ref().unwrap().file_id),
+            file_ids.last()
+        );
+    }
 }
 
 #[tokio::test]
@@ -2516,6 +3417,43 @@ fn flagged_batch(rows: Vec<(&str, &str, i64, bool)>) -> RecordBatch {
     .unwrap()
 }
 
+/// A delete marker deletes the stored row even in a partial upsert that does
+/// not select it, whether or not the input names the stored partition.
+#[tokio::test]
+async fn test_partial_upsert_honors_delete_marker() {
+    for input_city in ["sf", "nyc"] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([flagged_batch(vec![
+                ("a", "sf", 1, false),
+                ("b", "nyc", 2, false),
+            ])])
+            .await
+            .unwrap();
+        table
+            .upsert_with(
+                [flagged_batch(vec![("a", input_city, 9, true)])],
+                UpsertOptions {
+                    update_columns: Some(vec!["value".to_string()]),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_by_id(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("b".to_string(), 2)],
+            "input city {input_city}"
+        );
+    }
+}
+
 /// `_hoodie_is_deleted` is a data column (Hudi's delete marker), not one of
 /// the writer-managed meta fields: it stays in the table and commit schema.
 #[tokio::test]
@@ -2597,7 +3535,7 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
             ])])
             .await
             .unwrap();
-        table
+        let result = table
             .upsert([flagged_batch(vec![
                 ("a", "sf", 20, true),
                 ("b", "sf", 5, true),
@@ -2607,6 +3545,11 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
             ])])
             .await
             .unwrap();
+        if table_type == TableTypeValue::CopyOnWrite {
+            // `a`'s winning marker counts as a delete, as Java's merge handle
+            // counts it.
+            assert_eq!(result.num_deletes, 1);
+        }
 
         let batches = table.read(&ReadOptions::new()).await.unwrap();
         assert_eq!(
@@ -3315,4 +4258,438 @@ async fn upserts_into_spark_written_table_read_through_metadata_table() {
         let after = data_rows(table.read(&ReadOptions::new()).await.unwrap());
         assert_eq!(after.num_rows(), rows.num_rows(), "{format:?}");
     }
+}
+
+fn assert_send<F: std::future::Future + Send>(_: F) {}
+
+/// Compile-time check that every public write future can be spawned on a
+/// multi-threaded runtime.
+#[allow(dead_code)]
+fn write_futures_are_send(table: &mut Table) {
+    let key = HoodieKey {
+        record_key: "a".to_string(),
+        partition_path: String::new(),
+    };
+    assert_send(Table::create("unused").create());
+    assert_send(table.append([sample_batch()]));
+    assert_send(table.upsert([sample_batch()]));
+    assert_send(table.upsert_with([sample_batch()], UpsertOptions::default()));
+    assert_send(table.overwrite([sample_batch()]));
+    assert_send(table.dynamic_partition_overwrite([sample_batch()]));
+    assert_send(table.delete("id = 'a'"));
+    assert_send(table.delete_keys([key]));
+    assert_send(table.update("id = 'a'", sample_batch()));
+}
+
+/// Footer key-value metadata and record keys of every base file under `dir`.
+fn base_file_footers(dir: &std::path::Path) -> Vec<(HashMap<String, String>, Vec<String>)> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let mut footers = Vec::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap().map(Result::unwrap) {
+            let path = entry.path();
+            if path.is_dir() && entry.file_name() != ".hoodie" {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "parquet") {
+                let builder =
+                    ParquetRecordBatchReaderBuilder::try_new(std::fs::File::open(&path).unwrap())
+                        .unwrap();
+                let footer = builder
+                    .metadata()
+                    .file_metadata()
+                    .key_value_metadata()
+                    .into_iter()
+                    .flatten()
+                    .map(|kv| (kv.key.clone(), kv.value.clone().unwrap_or_default()))
+                    .collect();
+                let keys = builder
+                    .build()
+                    .unwrap()
+                    .flat_map(|batch| {
+                        let batch = batch.unwrap();
+                        let keys = batch.column_by_name("_hoodie_record_key").map(|keys| {
+                            keys.as_any()
+                                .downcast_ref::<StringArray>()
+                                .unwrap()
+                                .iter()
+                                .map(|key| key.unwrap().to_string())
+                                .collect::<Vec<_>>()
+                        });
+                        keys.unwrap_or_default()
+                    })
+                    .collect();
+                footers.push((footer, keys));
+            }
+        }
+    }
+    footers
+}
+
+/// Every base file carries the footer Java's bloom index reads: the bloom
+/// filter at Java's default sizing holding every record key, its type code,
+/// and the record key range, which an empty file leaves out.
+#[tokio::test]
+async fn test_base_file_footer_carries_bloom_filter_and_key_range() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_partition_fields(["city"])
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .upsert([partitioned_batch(vec![
+                ("k3", "sf", 1),
+                ("k1", "sf", 2),
+                ("k2", "nyc", 3),
+            ])])
+            .await
+            .unwrap();
+        table
+            .upsert([partitioned_batch(vec![
+                ("k1", "sf", 20),
+                ("k0", "sf", 5),
+                ("k4", "nyc", 6),
+            ])])
+            .await
+            .unwrap();
+        table.delete("id IN ('k2', 'k4')").await.unwrap();
+
+        let footers = base_file_footers(dir.path());
+        if table_type == TableTypeValue::CopyOnWrite {
+            // Insert, merge rewrite, and the delete's empty rewrite of nyc.
+            assert!(footers.len() >= 4, "saw {} base files", footers.len());
+            assert!(footers.iter().any(|(_, keys)| keys.is_empty()));
+        } else {
+            assert!(footers.len() >= 2, "saw {} base files", footers.len());
+        }
+        for (footer, keys) in &footers {
+            assert_record_key_footer(footer, keys);
+        }
+    }
+}
+
+fn assert_record_key_footer(footer: &HashMap<String, String>, keys: &[String]) {
+    use base64::Engine;
+    assert_eq!(
+        footer
+            .get("hoodie_bloom_filter_type_code")
+            .map(String::as_str),
+        Some("DYNAMIC_V0")
+    );
+    let bloom = base64::engine::general_purpose::STANDARD
+        .decode(&footer["org.apache.hudi.bloomfilter"])
+        .unwrap();
+    let int_at = |offset: usize| i32::from_be_bytes(bloom[offset..offset + 4].try_into().unwrap());
+    // Version, hash count, hash type, bit count: Java's 60000 entries at fpp 1e-9.
+    assert_eq!(
+        (int_at(0), int_at(4), bloom[8], int_at(9)),
+        (-1, 30, 1, 2_587_966)
+    );
+    // Entries per row, keys added, row count.
+    assert_eq!(
+        (int_at(13), int_at(17), int_at(21)),
+        (60_000, keys.len() as i32, 1)
+    );
+    assert_eq!(footer.get("hoodie_min_record_key"), keys.iter().min());
+    assert_eq!(footer.get("hoodie_max_record_key"), keys.iter().max());
+}
+
+/// A table without meta fields writes no bloom filter, as Java does.
+#[tokio::test]
+async fn test_base_file_footer_omits_bloom_filter_without_meta_fields() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_metadata(false)
+        .with_record_index(false)
+        .with_column_stats(false)
+        .with_populates_meta_fields(false)
+        .create()
+        .await
+        .unwrap();
+    table.append([sample_batch()]).await.unwrap();
+    let footers = base_file_footers(dir.path());
+    assert_eq!(footers.len(), 1);
+    assert!(
+        footers[0].0.keys().all(|key| key == "ARROW:schema"),
+        "{:?}",
+        footers[0].0.keys()
+    );
+}
+
+/// An append whose batch declares a column non-nullable keeps the table's
+/// nullable declaration, so the file holding nulls stays readable.
+#[tokio::test]
+async fn test_append_keeps_nullable_table_column_nullable() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([nullable_value_batch(
+            true,
+            vec!["a", "b"],
+            vec![Some(1), None],
+        )])
+        .await
+        .unwrap();
+    table
+        .append([nullable_value_batch(false, vec!["c"], vec![Some(3)])])
+        .await
+        .unwrap();
+
+    let schema = table.get_schema().await.unwrap();
+    assert!(schema.field_with_name("value").unwrap().is_nullable());
+    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+}
+
+/// Upserts on both table types keep nullable table columns nullable too.
+#[tokio::test]
+async fn test_upsert_keeps_nullable_table_column_nullable() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .upsert([nullable_value_batch(
+                true,
+                vec!["a", "b"],
+                vec![Some(1), None],
+            )])
+            .await
+            .unwrap();
+        table
+            .upsert([nullable_value_batch(false, vec!["c"], vec![Some(3)])])
+            .await
+            .unwrap();
+
+        let schema = table.get_schema().await.unwrap();
+        assert!(
+            schema.field_with_name("value").unwrap().is_nullable(),
+            "{table_type:?}"
+        );
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+    }
+}
+
+/// A key whose requested partition is not where it is stored matches nothing,
+/// so the delete commits nothing.
+#[tokio::test]
+async fn test_delete_keys_in_wrong_partition_is_noop() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([partitioned_batch(vec![("a", "sf", 1)])])
+            .await
+            .unwrap();
+        let before = timeline_file_count(dir.path());
+
+        let result = table
+            .delete_keys([HoodieKey {
+                record_key: "a".to_string(),
+                partition_path: "city=nope".to_string(),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(result.num_deletes, 0, "{table_type:?}");
+        assert!(result.instant.is_empty(), "{table_type:?}");
+        assert_eq!(timeline_file_count(dir.path()), before, "{table_type:?}");
+    }
+}
+
+/// A key a non-global index stored in two partitions is deleted from each
+/// partition the delete names, once per stored copy.
+#[tokio::test]
+async fn test_delete_keys_removes_each_requested_partition_copy() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_metadata(false)
+            .create()
+            .await
+            .unwrap();
+        for city in ["sf", "nyc"] {
+            table
+                .append([city_batch(vec![("a", city, 1)])])
+                .await
+                .unwrap();
+        }
+        let key = |partition: &str| HoodieKey {
+            record_key: "a".to_string(),
+            partition_path: partition.to_string(),
+        };
+        let result = table
+            .delete_keys([key("city=sf"), key("city=nyc"), key("city=sf")])
+            .await
+            .unwrap();
+        assert_eq!(result.num_deletes, 2, "{table_type:?}");
+        let rows = Table::new(dir.path().to_str().unwrap())
+            .await
+            .unwrap()
+            .read(&ReadOptions::new())
+            .await
+            .unwrap();
+        let remaining: usize = rows.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(remaining, 0, "{table_type:?}");
+    }
+}
+
+/// Archival must keep at least one commit and trigger at or above the count
+/// it trims to. Create refuses any other range before writing, and a write
+/// opened with one fails before it starts.
+#[tokio::test]
+async fn test_invalid_archival_keep_range_is_rejected() {
+    for (min, max) in [("0", "2"), ("4", "3"), ("x", "30")] {
+        let dir = tempdir().unwrap();
+        let error = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.keep.min.commits", min)
+            .with_option("hoodie.keep.max.commits", max)
+            .create()
+            .await
+            .expect_err("invalid keep range accepted");
+        assert!(
+            error.to_string().contains("hoodie.keep.min.commits"),
+            "{error}"
+        );
+        assert!(!dir.path().join(".hoodie").exists());
+
+        let base_uri = dir.path().to_str().unwrap();
+        Table::create(base_uri)
+            .with_table_name("trips")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        let mut table = Table::new_with_options(
+            base_uri,
+            [
+                ("hoodie.keep.min.commits", min),
+                ("hoodie.keep.max.commits", max),
+            ],
+        )
+        .await
+        .unwrap();
+        let error = table
+            .append([batch(vec![("a", 1)])])
+            .await
+            .expect_err("invalid keep range accepted");
+        assert!(
+            error.to_string().contains("hoodie.keep.min.commits"),
+            "{error}"
+        );
+        assert_no_instant(dir.path());
+    }
+}
+
+/// The timeline zone is persisted in the case Java parses.
+#[tokio::test]
+async fn test_create_persists_timeline_zone_in_java_case() {
+    let dir = tempdir().unwrap();
+    Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_option("hoodie.table.timeline.timezone", "local")
+        .create()
+        .await
+        .unwrap();
+    let properties = std::fs::read_to_string(dir.path().join(".hoodie/hoodie.properties")).unwrap();
+    assert!(
+        properties.contains("hoodie.table.timeline.timezone=LOCAL\n"),
+        "{properties}"
+    );
+}
+
+/// Options that opening the table rejects fail create before anything is
+/// written.
+#[tokio::test]
+async fn test_create_rejects_unopenable_options_before_persisting() {
+    let dir = tempdir().unwrap();
+    let error = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["a", "b"])
+        .create()
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("ordering"), "{error}");
+    assert!(!dir.path().join(".hoodie").exists());
+}
+
+/// Sequence numbers take Java's `{instant}_{partition}_{row}` form on both
+/// newly written and updated rows.
+#[tokio::test]
+async fn test_commit_seqno_uses_java_form() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([batch(vec![("a", 1), ("b", 2)])])
+        .await
+        .unwrap();
+    table
+        .update("id = 'b'", batch(vec![("b", 20)]).project(&[1]).unwrap())
+        .await
+        .unwrap();
+
+    let mut seqnos = Vec::new();
+    for batch in table.read(&ReadOptions::new()).await.unwrap() {
+        let column = |name| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (times, seqs, ids) = (
+            column("_hoodie_commit_time"),
+            column("_hoodie_commit_seqno"),
+            column("id"),
+        );
+        for row in 0..batch.num_rows() {
+            let suffix = seqs.value(row).strip_prefix(times.value(row)).unwrap();
+            seqnos.push((ids.value(row).to_string(), suffix.to_string()));
+        }
+    }
+    seqnos.sort();
+    assert_eq!(
+        seqnos,
+        vec![
+            ("a".to_string(), "_0_0".to_string()),
+            ("b".to_string(), "_0_1".to_string()),
+        ]
+    );
 }

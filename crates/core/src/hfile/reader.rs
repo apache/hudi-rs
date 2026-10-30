@@ -34,7 +34,7 @@ use crate::storage::Storage;
 use crate::storage::reader::LogBlockFetcher;
 use apache_avro::Schema as AvroSchema;
 use prost::Message;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 /// Magic bytes indicating protobuf format in file info block
 const PBUF_MAGIC: &[u8; 4] = b"PBUF";
@@ -176,7 +176,7 @@ pub struct HFileReader {
     /// Last key in the file
     last_key: Option<Key>,
     /// Cached Avro schema (parsed lazily from file info)
-    cached_schema: OnceLock<Arc<AvroSchema>>,
+    cached_schema: OnceLock<AvroSchema>,
     /// Current cursor position
     cursor: Cursor,
     /// Currently loaded data block
@@ -429,16 +429,11 @@ impl HFileReader {
         admits: impl Fn(&str) -> bool,
     ) -> Result<Vec<HFileRecord>> {
         let data_block = self.data_block(entry)?;
-        // Records carry the file's own writer schema so a decoder can honor the
-        // shape this file was written with rather than a vendored one.
-        let schema = self.get_avro_schema_arc()?;
         let mut records = Vec::new();
         for entry in data_block.entries() {
             let (key, value) = entry?;
             if std::str::from_utf8(key).is_ok_and(&admits) {
-                records.push(
-                    HFileRecord::new(key.to_vec(), value.to_vec()).with_avro_schema(schema.clone()),
-                );
+                records.push(HFileRecord::new(key.to_vec(), value.to_vec()));
             }
         }
         Ok(records)
@@ -610,7 +605,6 @@ impl HFileReader {
             return Ok(Vec::new());
         }
         let blocks = self.fetch_blocks(entries).await?;
-        let schema = self.get_avro_schema_arc()?;
         let mut records = Vec::new();
         for block in blocks {
             if block.block_type() != HFileBlockType::Data {
@@ -621,7 +615,7 @@ impl HFileReader {
             }
             let data_block = DataBlock::from_block(block);
             for kv in data_block.iter() {
-                records.push(Self::key_value_to_record(&kv, schema.clone()));
+                records.push(Self::key_value_to_record(&kv));
             }
         }
         Ok(records)
@@ -1069,16 +1063,6 @@ impl HFileReader {
     }
 
     pub fn get_avro_schema(&self) -> Result<Option<&AvroSchema>> {
-        // `get_avro_schema_arc` populates the cache before returning `Some`, so
-        // the second lookup cannot miss; `and_then` keeps that free of unwrap.
-        Ok(self
-            .get_avro_schema_arc()?
-            .and_then(|_| self.cached_schema.get().map(Arc::as_ref)))
-    }
-
-    /// Like [`Self::get_avro_schema`], but returns a shared handle suitable for
-    /// attaching to records read from this file.
-    pub fn get_avro_schema_arc(&self) -> Result<Option<Arc<AvroSchema>>> {
         // Check if schema exists in file info
         let schema_bytes = match self.file_info.get(FILE_INFO_SCHEMA) {
             Some(bytes) => bytes,
@@ -1087,7 +1071,7 @@ impl HFileReader {
 
         // Try to get from cache, or parse and cache
         if let Some(schema) = self.cached_schema.get() {
-            return Ok(Some(Arc::clone(schema)));
+            return Ok(Some(schema));
         }
 
         // Parse schema from JSON
@@ -1098,9 +1082,9 @@ impl HFileReader {
             .map_err(|e| HFileError::InvalidFormat(format!("Invalid Avro schema: {e}")))?;
 
         // Cache the schema (ignore if already set by another thread)
-        let _ = self.cached_schema.set(Arc::new(schema));
+        let _ = self.cached_schema.set(schema);
 
-        Ok(self.cached_schema.get().map(Arc::clone))
+        Ok(self.cached_schema.get())
     }
 
     /// Get the min and max record keys from file info.
@@ -1446,11 +1430,9 @@ impl HFileReader {
     /// Convert a KeyValue to an owned HFileRecord.
     ///
     /// This extracts the key content (without length prefix) and value bytes
-    /// into an owned struct suitable for metadata table operations. The file's
-    /// embedded Avro schema (when present) is attached so downstream decoding
-    /// uses this file's writer schema rather than an assumed one.
-    fn key_value_to_record(kv: &KeyValue, schema: Option<Arc<AvroSchema>>) -> HFileRecord {
-        HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec()).with_avro_schema(schema)
+    /// into an owned struct suitable for metadata table operations.
+    fn key_value_to_record(kv: &KeyValue) -> HFileRecord {
+        HFileRecord::new(kv.key().content().to_vec(), kv.value().to_vec())
     }
 
     /// Collect all records from the HFile as owned HFileRecords.
@@ -1466,11 +1448,10 @@ impl HFileReader {
     /// }
     /// ```
     pub fn collect_records(&mut self) -> Result<Vec<HFileRecord>> {
-        let schema = self.get_avro_schema_arc().ok().flatten();
         let mut records = Vec::with_capacity(self.trailer.entry_count as usize);
         for result in self.iter()? {
             let kv = result?;
-            records.push(Self::key_value_to_record(&kv, schema.clone()));
+            records.push(Self::key_value_to_record(&kv));
         }
         Ok(records)
     }
@@ -1488,9 +1469,8 @@ impl HFileReader {
     ///
     /// Returns None if not seeked or at EOF.
     pub fn get_record(&mut self) -> Result<Option<HFileRecord>> {
-        let schema = self.get_avro_schema_arc().ok().flatten();
         match self.get_key_value()? {
-            Some(kv) => Ok(Some(Self::key_value_to_record(&kv, schema))),
+            Some(kv) => Ok(Some(Self::key_value_to_record(&kv))),
             None => Ok(None),
         }
     }
@@ -1538,7 +1518,6 @@ impl HFileReader {
     ///
     /// Returns all records where the key starts with the given prefix.
     pub fn collect_records_by_prefix(&mut self, prefix: &str) -> Result<Vec<HFileRecord>> {
-        let schema = self.get_avro_schema_arc().ok().flatten();
         let mut records = Vec::new();
         let prefix_bytes = prefix.as_bytes();
 
@@ -1573,7 +1552,7 @@ impl HFileReader {
                 Some(kv) => {
                     let key_content = kv.key().content();
                     if key_content.starts_with(prefix_bytes) {
-                        records.push(Self::key_value_to_record(&kv, schema.clone()));
+                        records.push(Self::key_value_to_record(&kv));
                     } else if key_content > prefix_bytes {
                         // Past the prefix range
                         break;
@@ -1604,10 +1583,9 @@ impl<'a> Iterator for HFileRecordIterator<'a> {
             return None;
         }
 
-        let schema = self.reader.get_avro_schema_arc().ok().flatten();
         match self.reader.get_key_value() {
             Ok(Some(kv)) => {
-                let record = HFileReader::key_value_to_record(&kv, schema);
+                let record = HFileReader::key_value_to_record(&kv);
                 match self.reader.next() {
                     Ok(_) => {}
                     Err(e) => return Some(Err(e)),
@@ -1670,6 +1648,28 @@ fn read_varint(bytes: &[u8]) -> (u64, usize) {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// Raw key/value reads do not depend on the embedded Avro schema, so a
+    /// file whose schema entry is not valid Avro still reads.
+    #[test]
+    fn test_raw_reads_ignore_invalid_embedded_schema() {
+        use crate::file_group::base_file::reader::KeyPredicate;
+        let bytes = crate::hfile::HFileWriter::write(
+            &[("k1".to_string(), b"v1".to_vec())],
+            BTreeMap::from([(FILE_INFO_SCHEMA.to_string(), b"not-avro".to_vec())]),
+        )
+        .unwrap();
+        let mut reader = HFileReader::new(bytes).unwrap();
+        assert!(reader.get_avro_schema().is_err());
+        let expected = vec![HFileRecord::from_str_key("k1", b"v1".to_vec())];
+        let blocks = reader.blocks_for_predicate(&KeyPredicate::Keys(vec!["k1".to_string()]));
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(
+            reader.records_in_block(&blocks[0], |_| true).unwrap(),
+            expected
+        );
+        assert_eq!(reader.collect_records().unwrap(), expected);
+    }
 
     fn test_data_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

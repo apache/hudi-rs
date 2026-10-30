@@ -627,12 +627,11 @@ mod tests {
         )
         .unwrap();
 
-        let table_properties = crate::config::util::parse_data_for_options(
+        let table_properties = crate::config::properties::parse_properties(
             &storage
                 .get_file_data(".hoodie/hoodie.properties")
                 .await
                 .unwrap(),
-            "=",
         )
         .unwrap();
         options_map.extend(table_properties);
@@ -665,12 +664,11 @@ mod tests {
         .unwrap();
 
         let hudi_configs = HudiConfigs::new([(HudiTableConfig::BasePath, base_url.to_string())]);
-        let table_properties = crate::config::util::parse_data_for_options(
+        let table_properties = crate::config::properties::parse_properties(
             &storage
                 .get_file_data(".hoodie/hoodie.properties")
                 .await
                 .unwrap(),
-            "=",
         )
         .unwrap();
         let mut hudi_configs_map = hudi_configs.as_options();

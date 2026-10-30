@@ -18,7 +18,7 @@
  */
 
 //! Merge-on-read upsert, update and delete: log blocks appended to the file
-//! groups the index locates, with inserts packed into new groups.
+//! groups the index locates, with inserts written to new base file groups.
 
 use super::*;
 
@@ -31,10 +31,24 @@ pub(super) struct MorFileLocation {
     pub(super) base_instant: String,
 }
 
+/// Locations by record key, for callers whose keys are unique per batch.
 pub(super) async fn mor_file_locations(
     table: &Table,
     keys: &[HoodieKey],
 ) -> Result<HashMap<String, MorFileLocation>> {
+    Ok(mor_key_locations(table, keys)
+        .await?
+        .into_iter()
+        .map(|(key, location)| (key.record_key, location))
+        .collect())
+}
+
+/// Locations by requested key: a key stored in several partitions resolves
+/// per requested partition.
+async fn mor_key_locations(
+    table: &Table,
+    keys: &[HoodieKey],
+) -> Result<HashMap<HoodieKey, MorFileLocation>> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
     let mut slices_by_file_id = HashMap::with_capacity(slices.len());
     for slice in slices {
@@ -62,7 +76,7 @@ pub(super) async fn mor_file_locations(
                 continue;
             };
             locations.insert(
-                key.record_key,
+                key,
                 MorFileLocation {
                     file_id: location.file_id,
                     partition_path: location.partition_path,
@@ -92,41 +106,17 @@ pub(super) async fn mor_upsert_batches(
         ));
     }
 
+    let batches = &validate_write_input(table, batches, "upsert").await?;
     let incoming = concat(batches)?;
-    if incoming.num_rows() == 0 {
-        return Err(CoreError::Write(
-            "upsert requires at least one row".to_string(),
-        ));
-    }
-    let schema_check_batches = prepare_batches_for_write(
-        &table.hudi_configs,
-        std::slice::from_ref(&incoming),
-        "schema-check",
-        "schema-check",
-    )?;
-    if table
-        .timeline
-        .get_latest_commit_timestamp_as_option()
-        .is_some()
-    {
-        let table_schema = std::sync::Arc::new(table.get_schema_with_meta_fields().await?);
-        if crate::write::align_batch_to_schema(&schema_check_batches[0], &table_schema).is_none() {
-            return Err(CoreError::Schema(
-                "upsert batch schema does not match the current table schema".to_string(),
-            ));
-        }
-    }
     let incoming_keys = batch_record_keys(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
+    let ordering_fields = event_time_ordering_fields(&table.hudi_configs)?;
+    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &ordering_fields)?;
     crate::write::keygen::validate_keygen_inputs(
         &table.hudi_configs,
         std::slice::from_ref(&incoming),
     )?;
     let instant = request_deltacommit(table, "UPSERT").await?;
-    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-        &instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, &instant);
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
     let incoming_keys: Vec<String> = tagged_keys.iter().map(|k| k.record_key.clone()).collect();
     let locations = mor_file_locations(table, &tagged_keys).await?;
@@ -166,6 +156,7 @@ pub(super) async fn mor_upsert_batches(
         &incoming,
         &moved_candidates,
         &mor_slice_by_file_id,
+        &ordering_fields,
     )
     .await?;
     // Delete markers follow Java's append handle: one that would land as a
@@ -233,6 +224,7 @@ pub(super) async fn mor_upsert_batches(
         &incoming,
         &in_place_deletes,
         &mor_slice_by_file_id,
+        &ordering_fields,
     )
     .await?;
     for (key, location) in in_place_deletes
@@ -248,57 +240,33 @@ pub(super) async fn mor_upsert_batches(
     }
 
     let storage = table.file_system_view.storage.clone();
-    // Small-file packing (Java SparkUpsertDeltaCommitPartitioner): inserts
-    // fill existing small file slices (base + logs at parquet-equivalent
-    // size) as log appends, then overflow into new base file groups of
-    // ~max.file.size records each.
+    // Inserts go to new base file groups of ~max.file.size records each, never
+    // to log files: Java's SIMPLE and BLOOM indexes read only base files, so a
+    // key inserted into a log would be inserted again by a Java writer.
     let sizing = crate::write::sizing::SizingConfig::from_table(table);
     let avg_record_size =
         crate::write::sizing::average_record_size(table, storage.as_ref(), &sizing).await;
     let slices_by_partition = crate::write::sizing::latest_slices_by_partition(table).await?;
-    let mut packed_inserts: HashMap<(String, String), Vec<u32>> = HashMap::new();
     let mut new_group_inserts: Vec<(String, String, String, Vec<u32>)> = Vec::new();
     for (partition, indices) in insert_indices_by_partition {
-        let slices: Vec<&crate::file_group::file_slice::FileSlice> = slices_by_partition
-            .get(&partition)
-            .map(|v| v.iter().collect())
-            .unwrap_or_default();
-        let small = crate::write::sizing::small_file_groups(&slices, true, &sizing);
         let assignments = crate::write::sizing::assign_insert_buckets(
             indices.len(),
-            &small,
+            &[],
             avg_record_size,
             &sizing,
         );
         let mut cursor = 0usize;
-        for (bucket, count) in assignments {
+        for (_, count) in assignments {
             let chunk = indices[cursor..cursor + count].to_vec();
             cursor += count;
-            match bucket {
-                crate::write::sizing::InsertBucket::Existing { file_id } => {
-                    packed_inserts
-                        .entry((partition.clone(), file_id))
-                        .or_default()
-                        .extend(chunk);
-                }
-                crate::write::sizing::InsertBucket::New => {
-                    let file_id = crate::write::new_file_id();
-                    let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
-                    new_group_inserts.push((partition.clone(), file_id, file_name, chunk));
-                }
-            }
+            let file_id = crate::write::new_file_id();
+            let file_name = format!("{file_id}_0-0-0_{instant}.parquet");
+            new_group_inserts.push((partition.clone(), file_id, file_name, chunk));
         }
     }
-    // Log-append targets: tagged updates plus packed inserts, per file group.
-    let mut log_tasks: HashMap<(String, String), (Vec<u32>, Vec<u32>)> = HashMap::new();
-    for (key, indices) in update_indices {
-        log_tasks.entry(key).or_default().0.extend(indices);
-    }
-    for (key, indices) in packed_inserts {
-        log_tasks.entry(key).or_default().1.extend(indices);
-    }
-    // (partition, file_id) -> (base file name, base instant) from latest slices,
-    // for groups reachable only via packed inserts.
+    // Log-append targets: tagged updates, per file group.
+    let log_tasks: HashMap<(String, String), Vec<u32>> = update_indices;
+    // (partition, file_id) -> (base file name, base instant) from latest slices.
     let mut base_by_group: HashMap<(String, String), (String, String)> = HashMap::new();
     for (partition, slices) in &slices_by_partition {
         for slice in slices {
@@ -359,7 +327,7 @@ pub(super) async fn mor_upsert_batches(
             record_key: key.record_key,
             partition_path: key.partition_path,
             file_id: String::new(),
-            instant_time_millis: instant_to_epoch_millis(&instant),
+            instant_time_millis,
             is_deleted: true,
         })
         .collect();
@@ -400,6 +368,7 @@ pub(super) async fn mor_upsert_batches(
         });
     }
     let props = crate::write::append::parquet_writer_props(table);
+    let bloom = crate::write::append::base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let parallelism = crate::write::write_task_parallelism(table);
 
@@ -421,6 +390,7 @@ pub(super) async fn mor_upsert_batches(
             crate::write::parquet_file_task(
                 storage.clone(),
                 props.clone(),
+                bloom,
                 prepared.clone(),
                 path.clone(),
                 collect_ranges,
@@ -438,7 +408,6 @@ pub(super) async fn mor_upsert_batches(
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: partition_path.clone(),
                         file_name: file_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
@@ -495,11 +464,10 @@ pub(super) async fn mor_upsert_batches(
         base_basename: String,
         base_instant: String,
         update_count: usize,
-        packed_count: usize,
         prepared: Vec<RecordBatch>,
     }
     let mut log_plans: Vec<LogTaskPlan> = Vec::new();
-    for ((partition_path, file_id), (update_rows, packed_rows)) in log_tasks {
+    for ((partition_path, file_id), update_rows) in log_tasks {
         let (base_basename, base_instant) = base_by_group
             .get(&(partition_path.clone(), file_id.clone()))
             .cloned()
@@ -517,23 +485,10 @@ pub(super) async fn mor_upsert_batches(
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
-        // Packed inserts are written as log records into the small slice and
-        // must be registered in the RLI under this file group.
-        rli_entries.extend(packed_rows.iter().map(|index| {
-            let key = &tagged_keys[*index as usize];
-            RecordIndexEntry {
-                record_key: key.record_key.clone(),
-                partition_path: partition_path.clone(),
-                file_id: file_id.clone(),
-                instant_time_millis,
-                is_deleted: false,
-            }
-        }));
-        let mut indices = update_rows.clone();
-        indices.extend(&packed_rows);
-        let update_batch = take_batch(&incoming, &indices)?;
+        let update_batch = take_batch(&incoming, &update_rows)?;
+        // Java's append handle stamps log records with the file group id.
         let prepared =
-            prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &log_name)?;
+            prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &file_id)?;
         log_plans.push(LogTaskPlan {
             partition_path,
             file_id,
@@ -542,7 +497,6 @@ pub(super) async fn mor_upsert_batches(
             base_basename,
             base_instant,
             update_count: update_rows.len(),
-            packed_count: packed_rows.len(),
             prepared,
         });
     }
@@ -575,7 +529,6 @@ pub(super) async fn mor_upsert_batches(
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: plan.partition_path.clone(),
                         file_name: plan.log_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
@@ -585,7 +538,7 @@ pub(super) async fn mor_upsert_batches(
                     output.size,
                     false,
                 ));
-                let total = (plan.update_count + plan.packed_count) as i64;
+                let total = plan.update_count as i64;
                 stats.push(HoodieWriteStat {
                     file_id: Some(plan.file_id.clone()),
                     path: Some(plan.log_file.clone()),
@@ -594,7 +547,7 @@ pub(super) async fn mor_upsert_batches(
                     prev_commit: Some(plan.base_instant.clone()),
                     num_writes: Some(total),
                     num_update_writes: Some(plan.update_count as i64),
-                    num_inserts: Some(plan.packed_count as i64),
+                    num_inserts: Some(0),
                     total_write_bytes: Some(output.size),
                     file_size_in_bytes: Some(output.size),
                     total_log_records: Some(total),
@@ -672,7 +625,7 @@ pub(super) async fn mor_update_filter(
         .collect::<Vec<_>>();
     let updated_rows = take_batch(&merged, &matched_indices)?;
     // Drop meta so prepare_batches_for_write stamps the new commit instant.
-    let data_only = strip_meta_columns(&updated_rows)?;
+    let data_only = crate::write::strip_meta_columns(&updated_rows)?;
     mor_upsert_batches(table, &[data_only], UpsertOptions::default()).await
 }
 
@@ -686,19 +639,26 @@ pub(super) async fn mor_delete_keys(
             "delete requires at least one record key".to_string(),
         ));
     }
-    let locations = mor_file_locations(table, delete_keys).await?;
-    let mut grouped: HashMap<(String, String), Vec<HoodieKey>> = HashMap::new();
-    let mut seen = std::collections::HashSet::new();
+    let locations = mor_key_locations(table, delete_keys).await?;
+    // Each stored copy a requested key resolves to is deleted once. A key
+    // requested in a partition it is not stored in matches nothing, as on COW.
+    let mut grouped: HashMap<(String, String), (&MorFileLocation, Vec<HoodieKey>)> = HashMap::new();
+    let mut seen = HashSet::new();
     for key in delete_keys {
-        // Dedupe by (key, requested partition): the same key may legitimately
-        // be requested in two partitions.
-        if seen.insert((&key.record_key, &key.partition_path))
-            && let Some(location) = locations.get(&key.record_key)
+        let Some(location) = locations.get(key) else {
+            continue;
+        };
+        if (key.partition_path.is_empty() || key.partition_path == location.partition_path)
+            && seen.insert((&key.record_key, &location.partition_path, &location.file_id))
         {
             grouped
                 .entry((location.partition_path.clone(), location.file_id.clone()))
-                .or_default()
-                .push(key.clone());
+                .or_insert_with(|| (location, Vec::new()))
+                .1
+                .push(HoodieKey {
+                    record_key: key.record_key.clone(),
+                    partition_path: location.partition_path.clone(),
+                });
         }
     }
     if grouped.is_empty() {
@@ -722,13 +682,9 @@ pub(super) async fn mor_delete_keys(
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
     let mut deleted = 0;
-    for ((partition_path, file_id), keys) in grouped {
-        let first_key = keys
-            .first()
-            .ok_or_else(|| CoreError::Write("missing delete key".to_string()))?;
-        let location = locations
-            .get(&first_key.record_key)
-            .ok_or_else(|| CoreError::Write("missing file location for delete key".to_string()))?;
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, &instant);
+    let mut record_index = Vec::new();
+    for ((partition_path, file_id), (location, keys)) in grouped {
         let log_name = format!(".{file_id}_{instant}.log.1_0-0-0");
         let log_file = relative_data_path(&partition_path, &log_name);
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
@@ -750,6 +706,13 @@ pub(super) async fn mor_delete_keys(
         }
         written_paths.push(log_file.clone());
         deleted += keys.len();
+        record_index.extend(keys.iter().map(|key| RecordIndexEntry {
+            record_key: key.record_key.clone(),
+            partition_path: key.partition_path.clone(),
+            file_id: String::new(),
+            instant_time_millis,
+            is_deleted: true,
+        }));
         files_mdt.push((partition_path.clone(), log_name.clone(), size, false));
         // Empty when the file group is log-only: Java's delta write stat leaves
         // `baseFile` empty in that case and the file-group builder treats it as
@@ -782,21 +745,6 @@ pub(super) async fn mor_delete_keys(
             ..Default::default()
         });
     }
-    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-        &instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
-    let record_index = delete_keys
-        .iter()
-        .filter(|key| locations.contains_key(&key.record_key))
-        .map(|key| RecordIndexEntry {
-            record_key: key.record_key.clone(),
-            partition_path: key.partition_path.clone(),
-            file_id: String::new(),
-            instant_time_millis,
-            is_deleted: true,
-        })
-        .collect::<Vec<_>>();
     let schema = table.get_schema_with_meta_fields().await?;
     let commit_bytes = crate::write::commit_metadata_bytes(
         table,
@@ -840,16 +788,12 @@ pub(super) async fn moved_keys_rejected_by_event_time(
     incoming: &RecordBatch,
     moved: &HashMap<String, Vec<String>>, // file_id -> record keys moved from it
     slices: &HashMap<String, crate::file_group::file_slice::FileSlice>,
+    ordering_fields: &[String],
 ) -> Result<HashSet<String>> {
     let mut rejected = HashSet::new();
-    if moved.is_empty() || !uses_event_time_merge(&table.hudi_configs)? {
+    if moved.is_empty() {
         return Ok(rejected);
     }
-    let ordering_fields: Vec<String> = table
-        .hudi_configs
-        .try_get(OrderingFields)?
-        .map(Into::into)
-        .unwrap_or_default();
     let Some(ordering_field) = ordering_fields.first() else {
         return Ok(rejected);
     };

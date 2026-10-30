@@ -355,17 +355,14 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     assert_eq!(insert.num_inserts, 1);
     let layout = data_layout(root);
     assert_eq!(
-        layout.base_parquet, 1,
-        "small-file packing routes the insert into the existing slice"
+        layout.base_parquet, 2,
+        "an insert opens a new base file group, never a log append"
     );
-    assert_eq!(
-        layout.log_files, 2,
-        "packed insert lands as a log append (Java small-file routing)"
-    );
+    assert_eq!(layout.log_files, 1);
     assert_eq!(layout.deltacommits, 3);
     assert_snapshot_async(&table, vec![("a", 10), ("b", 2), ("c", 3)]).await;
 
-    // Mixed upsert: update + packed insert both land in the same group's log.
+    // Mixed upsert: the update appends a log, the insert opens a base file.
     let mixed = table
         .upsert([ordered_batch(vec![("b", 20, 2), ("d", 4, 1)])])
         .await
@@ -373,8 +370,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     assert_eq!(mixed.num_updates, 1);
     assert_eq!(mixed.num_inserts, 1);
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 1);
-    assert_eq!(layout.log_files, 3);
+    assert_eq!(layout.base_parquet, 3);
+    assert_eq!(layout.log_files, 2);
     assert_eq!(layout.deltacommits, 4);
     assert_snapshot_async(&table, vec![("a", 10), ("b", 20), ("c", 3), ("d", 4)]).await;
 
@@ -384,8 +381,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .await
         .unwrap();
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 1);
-    assert_eq!(layout.log_files, 4);
+    assert_eq!(layout.base_parquet, 3);
+    assert_eq!(layout.log_files, 3);
     assert_snapshot_async(&table, vec![("a", 11), ("b", 20), ("c", 3), ("d", 4)]).await;
 
     // Delete → delete log block file(s), snapshot excludes key.
@@ -398,8 +395,8 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .unwrap();
     assert_eq!(deleted.num_deletes, 1);
     let layout = data_layout(root);
-    assert_eq!(layout.base_parquet, 1);
-    assert_eq!(layout.log_files, 5, "MOR delete must append a log file");
+    assert_eq!(layout.base_parquet, 3);
+    assert_eq!(layout.log_files, 4, "MOR delete must append a log file");
     assert_snapshot_async(&table, vec![("a", 11), ("b", 20), ("d", 4)]).await;
 
     // Read-optimized should ignore logs and still see pre-log base values for updated keys.
@@ -407,11 +404,16 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .read(&ReadOptions::new().with_hudi_option("hoodie.read.use.read_optimized.mode", "true"))
         .await
         .unwrap();
-    // RO sees bases only: the original append(a=1,b=2); packed inserts c/d
-    // live in logs (small-file routing) and are invisible until compaction.
+    // RO sees base files only: the original append and the inserted groups,
+    // without the logged updates and the delete of c.
     assert_eq!(
         rows_by_id(&ro),
-        vec![("a".to_string(), 1), ("b".to_string(), 2)]
+        vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3),
+            ("d".to_string(), 4)
+        ]
     );
 
     // Incremental from earliest includes all committed data as of latest (merged).
@@ -444,7 +446,7 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
     // Durable after reopen.
     let reopened = Table::new(base_uri).await.unwrap();
     assert_snapshot_async(&reopened, vec![("a", 11), ("b", 20), ("d", 4)]).await;
-    assert_eq!(data_layout(root).log_files, 5);
+    assert_eq!(data_layout(root).log_files, 4);
 }
 
 #[tokio::test]
@@ -799,7 +801,6 @@ async fn test_create_props_match_spark_shape() {
     let props = std::fs::read_to_string(root.join(".hoodie/hoodie.properties")).unwrap();
     for key in [
         "hoodie.table.checksum=",
-        "hoodie.database.name=default",
         "hoodie.table.base.file.format=PARQUET",
         "hoodie.populate.meta.fields=true",
         "hoodie.timeline.path=timeline",
@@ -820,9 +821,11 @@ async fn test_create_props_match_spark_shape() {
         !props.contains("hoodie.metadata.record.index.enable="),
         "must not invent write-side hoodie.metadata.record.index.enable in table props:\n{props}"
     );
-    // Checksum must match Java CRC32("default.trips")
+    // Java persists no database name unless one is given, and its checksum
+    // is then CRC32(".trips").
+    assert!(!props.contains("hoodie.database.name"), "{props}");
     assert!(
-        props.contains("hoodie.table.checksum=2200697520"),
+        props.contains("hoodie.table.checksum=3761586722"),
         "{props}"
     );
 

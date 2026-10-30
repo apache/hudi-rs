@@ -23,13 +23,15 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
-use arrow::array::{ArrayRef, StringArray, UInt32Array};
+use arrow::array::{ArrayRef, AsArray, StringArray, UInt32Array};
 use arrow::record_batch::RecordBatch;
 use arrow_select::take::take;
 use chrono::Utc;
 use parquet::arrow::ArrowWriter;
+use parquet::file::metadata::KeyValue;
 
 use crate::Result;
+use crate::bloom::{BloomFilterConfig, BloomFilterType, RecordKeyFooter};
 use crate::config::table::HudiTableConfig::{
     MetadataTablePartitions, PartitionFields, PopulatesMetaFields, RecordMergeStrategy, TableType,
     TableVersion, TimelineLayoutVersion, TimelinePath,
@@ -78,8 +80,9 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     }
     ensure_supported_table_type(table)?;
 
-    let schema = ensure_batches_share_schema(batches)?;
-    ensure_append_schema_matches_table(table, schema.as_ref()).await?;
+    ensure_batches_share_schema(batches)?;
+    let batches = &match_table_schema(table, batches).await?;
+    let schema = batches[0].schema();
     // Must be expressible in commit metadata (Avro JSON) before fencing.
     arrow_schema_to_avro_json(&strip_meta_fields_from_schema(schema.as_ref()))?;
     let num_rows = ensure_rows_present(batches)?;
@@ -124,12 +127,8 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
     let mut write_stats: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     let mut files_mdt = Vec::new();
     let mut rli_entries = Vec::new();
-    let rli_instant_millis = crate::index::is_record_index_enabled(table).then(|| {
-        crate::write::metadata::instant_to_epoch_millis_in(
-            &request_instant,
-            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-        )
-    });
+    let rli_instant_millis = crate::index::is_record_index_enabled(table)
+        .then(|| crate::write::metadata::instant_millis(&table.hudi_configs, &request_instant));
     let mut stats_updates = Vec::new();
     let mut written_paths: Vec<String> = Vec::new();
     let mut primary_base_path = String::new();
@@ -255,6 +254,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 
     // Phase 2 (parallel): encode + put each file on the write task pool.
     let props = parquet_writer_props(table);
+    let bloom = base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let tasks = chunk_plans
         .iter()
@@ -262,6 +262,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
             crate::write::parquet_file_task(
                 storage.clone(),
                 props.clone(),
+                bloom,
                 plan.prepared.clone(),
                 plan.base_file_path.clone(),
                 collect_ranges,
@@ -281,7 +282,6 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: plan.partition_path.clone(),
                         file_name: plan.file_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
@@ -415,7 +415,7 @@ fn table_version(table: &Table) -> isize {
     table.hudi_configs.get(TableVersion).map_or(0, isize::from)
 }
 
-fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<arrow_schema::SchemaRef> {
+fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<()> {
     let Some(first) = batches.first() else {
         return Err(CoreError::Write(
             "append requires at least one RecordBatch".to_string(),
@@ -431,7 +431,7 @@ fn ensure_batches_share_schema(batches: &[RecordBatch]) -> Result<arrow_schema::
             "All RecordBatches in append must share the same schema".to_string(),
         ));
     }
-    Ok(schema)
+    Ok(())
 }
 
 fn ensure_rows_present(batches: &[RecordBatch]) -> Result<usize> {
@@ -454,10 +454,9 @@ fn ensure_rows_present(batches: &[RecordBatch]) -> Result<usize> {
 /// `complete_write` with the version 8 path, and a crashed write leaves
 /// nothing on the timeline for a later writer to roll back.
 async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
-    let schema = ensure_batches_share_schema(batches)?;
-    if !table.timeline.completed_commits.is_empty() {
-        ensure_batch_schema_matches(&table.get_schema().await?, schema.as_ref())?;
-    }
+    ensure_batches_share_schema(batches)?;
+    let batches = &match_table_schema(table, batches).await?;
+    let schema = batches[0].schema();
     let num_rows = ensure_rows_present(batches)?;
     ensure_version_6_append_only(table)?;
     ensure_unpartitioned(table)?;
@@ -473,7 +472,11 @@ async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<
     let file_id = format!("bulk-insert-{instant}");
     let base_file_path = format!("{file_id}_0-0-0_{instant}.parquet");
     let storage = table.file_system_view.storage.clone();
-    let bytes = write_parquet_bytes_with_props(parquet_writer_props(table), batches)?;
+    let bytes = write_parquet_bytes_with_props(
+        parquet_writer_props(table),
+        base_file_bloom_filter_config(table),
+        batches,
+    )?;
     let file_size = bytes.len() as i64;
     storage.put_file(&base_file_path, bytes).await?;
 
@@ -498,6 +501,7 @@ async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<
         compacted: Some(false),
         // Spark reads a null extraMetadata as a null map and fails on it.
         extra_metadata: Some(HashMap::from([("schema".to_string(), schema_json)])),
+        partition_to_replace_file_ids: None,
     };
     let commit_relative_path = Instant::new_completed(instant.clone(), Action::Commit, None)?
         .relative_path_with_base(HUDI_METADATA_DIR)?;
@@ -732,10 +736,55 @@ pub(crate) fn parquet_writer_props(table: &Table) -> parquet::file::properties::
         .build()
 }
 
+/// The record-key bloom filter a base file footer carries, resolved as Java's
+/// `HoodieFileWriterFactory#enableBloomFilter` and `#createBloomFilter` do.
+pub(crate) fn base_file_bloom_filter_config(table: &Table) -> Option<BloomFilterConfig> {
+    let populates_meta_fields: bool = table
+        .hudi_configs
+        .get_or_default(PopulatesMetaFields)
+        .into();
+    let options = table.hudi_configs.as_options();
+    let enabled = options
+        .get("hoodie.parquet.bloom.filter.enabled")
+        .is_none_or(|v| v.eq_ignore_ascii_case("true"))
+        || options
+            .get("hoodie.index.type")
+            .is_some_and(|v| v.contains("BLOOM"));
+    if !populates_meta_fields || !enabled {
+        return None;
+    }
+    let defaults = BloomFilterConfig::default();
+    let positive_int = |key: &str, default: i32| {
+        options
+            .get(key)
+            .and_then(|v| v.parse::<i32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(default)
+    };
+    Some(BloomFilterConfig {
+        filter_type: options
+            .get("hoodie.bloom.index.filter.type")
+            .and_then(|v| BloomFilterType::parse(v))
+            .unwrap_or(defaults.filter_type),
+        num_entries: positive_int("hoodie.index.bloom.num_entries", defaults.num_entries),
+        fpp: options
+            .get("hoodie.index.bloom.fpp")
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| *v > 0.0 && *v < 1.0)
+            .unwrap_or(defaults.fpp),
+        max_entries: positive_int(
+            "hoodie.bloom.index.filter.dynamic.max.entries",
+            defaults.max_entries,
+        ),
+    })
+}
+
 /// Encode batches to parquet bytes with pre-resolved properties (safe to run
-/// on a blocking thread with owned inputs).
+/// on a blocking thread with owned inputs). With `bloom`, the footer also
+/// carries the bloom filter and range of the batches' `_hoodie_record_key`s.
 pub(crate) fn write_parquet_bytes_with_props(
     props: parquet::file::properties::WriterProperties,
+    bloom: Option<BloomFilterConfig>,
     batches: &[RecordBatch],
 ) -> Result<Vec<u8>> {
     let cursor = Cursor::new(Vec::new());
@@ -743,8 +792,32 @@ pub(crate) fn write_parquet_bytes_with_props(
     for batch in batches {
         writer.write(batch)?;
     }
+    if let Some(config) = bloom {
+        for (key, value) in record_key_footer(&config, batches)? {
+            writer.append_key_value_metadata(KeyValue::new(key.to_string(), value));
+        }
+    }
     let cursor = writer.into_inner()?;
     Ok(cursor.into_inner())
+}
+
+fn record_key_footer(
+    config: &BloomFilterConfig,
+    batches: &[RecordBatch],
+) -> Result<Vec<(&'static str, String)>> {
+    let mut footer = RecordKeyFooter::new(config);
+    let field = MetaField::RecordKey.as_ref();
+    for batch in batches {
+        let keys = batch
+            .column_by_name(field)
+            .ok_or_else(|| CoreError::Write(format!("base file batch is missing '{field}'")))?;
+        let keys = arrow::compute::cast(keys, &arrow_schema::DataType::Utf8)?;
+        for key in keys.as_string::<i32>() {
+            footer
+                .add(key.ok_or_else(|| CoreError::Write(format!("'{field}' cannot be null")))?)?;
+        }
+    }
+    Ok(footer.finish())
 }
 
 /// Arrow→Avro schema JSON for `HoodieCommitMetadata.extraMetadata.schema`.
@@ -837,12 +910,17 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
                 "{{\"type\":\"long\",\"logicalType\":\"{logical}\"}}"
             ))
         }
+        DataType::Decimal256(precision, _) if *precision > 38 => {
+            Err(CoreError::Unsupported(format!(
+                "decimal precision {precision} exceeds the maximum of 38 a table can read back"
+            )))
+        }
         DataType::Decimal128(precision, scale) | DataType::Decimal256(precision, scale) => {
             Ok(format!(
                 "{{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":{precision},\"scale\":{scale}}}"
             ))
         }
-        DataType::List(field) | DataType::LargeList(field) => {
+        DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _) => {
             let item =
                 arrow_type_to_avro_type_json_named(field.data_type(), &format!("{path}_item"))?;
             let item = if field.is_nullable() {
@@ -885,30 +963,28 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
     }
 }
 
-async fn ensure_append_schema_matches_table(
-    table: &Table,
-    batch_schema: &arrow_schema::Schema,
-) -> Result<()> {
+/// Checks the batches against the table schema and returns them with every
+/// column the table declares nullable made nullable.
+async fn match_table_schema(table: &Table, batches: &[RecordBatch]) -> Result<Vec<RecordBatch>> {
     if table.timeline.completed_commits.is_empty() {
-        return Ok(());
+        return Ok(batches.to_vec());
     }
     let table_schema = table.get_schema().await?;
-    ensure_batch_schema_matches(&table_schema, &strip_meta_fields_from_schema(batch_schema))
+    ensure_batch_schema_matches(
+        &table_schema,
+        &strip_meta_fields_from_schema(batches[0].schema().as_ref()),
+    )?;
+    crate::write::widen_to_table_nullability(batches, &table_schema)
 }
 
-/// The table schema resolves from the Avro schema in commit metadata, and the
-/// Arrow to Avro mapping is lossy (Int16 becomes Int32, LargeUtf8 becomes
-/// Utf8), so a batch also matches when its Avro round trip equals the table.
-pub(crate) fn ensure_batch_schema_matches(
+/// The batch is already normalized to the types its commit schema reads back
+/// (see [`crate::write::normalize_for_write`]), so it matches only when its
+/// names and types equal the table's.
+fn ensure_batch_schema_matches(
     table_schema: &arrow_schema::Schema,
     batch_data: &arrow_schema::Schema,
 ) -> Result<()> {
     if schemas_equal_by_fields(table_schema, batch_data) {
-        return Ok(());
-    }
-    let round_trip = arrow_schema_to_avro_json(batch_data)
-        .and_then(|avro| crate::schema::resolver::avro_json_to_arrow_schema(&avro));
-    if round_trip.is_ok_and(|schema| schemas_equal_by_fields(table_schema, &schema)) {
         return Ok(());
     }
     Err(CoreError::Write(format!(
@@ -979,6 +1055,11 @@ fn schemas_equal_by_fields(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -
         .all(|(fa, fb)| fa.name() == fb.name() && fa.data_type() == fb.data_type())
 }
 
+/// `_hoodie_commit_seqno`, in Java's `HoodieRecord.generateSequenceId` form.
+pub(crate) fn commit_seqno(instant: &str, partition_id: u32, row: usize) -> String {
+    format!("{instant}_{partition_id}_{row}")
+}
+
 pub(crate) fn prepare_batches_for_write(
     hudi_configs: &crate::config::HudiConfigs,
     batches: &[RecordBatch],
@@ -1035,7 +1116,7 @@ pub(crate) fn prepare_batches_for_write_with_offset(
                 Arc::new(StringArray::from(vec![instant; rows])),
                 Arc::new(StringArray::from(
                     (0..rows)
-                        .map(|row| format!("{instant}_{partition_id}-{}-0", row_id_offset + row))
+                        .map(|row| commit_seqno(instant, partition_id, row_id_offset + row))
                         .collect::<Vec<_>>(),
                 )),
                 Arc::new(StringArray::from(key_strs)),
@@ -1315,6 +1396,43 @@ mod tests {
             .map(arrow_array::RecordBatch::num_rows)
             .sum();
         assert_eq!(rows, 64);
+    }
+
+    /// The base file bloom filter follows Java's enable rule and sizing configs.
+    #[tokio::test]
+    async fn test_base_file_bloom_filter_config_resolution() {
+        async fn config(options: &[(&str, &str)]) -> Option<BloomFilterConfig> {
+            let dir = tempfile::tempdir().unwrap();
+            let mut builder = crate::table::Table::create(dir.path().to_str().unwrap())
+                .with_table_name("t")
+                .with_record_key_fields(["id"]);
+            for (key, value) in options {
+                builder = builder.with_option(key, *value);
+            }
+            base_file_bloom_filter_config(&builder.create().await.unwrap())
+        }
+        assert_eq!(config(&[]).await, Some(BloomFilterConfig::default()));
+        let disabled = ("hoodie.parquet.bloom.filter.enabled", "false");
+        assert_eq!(config(&[disabled]).await, None);
+        assert_eq!(
+            config(&[disabled, ("hoodie.index.type", "GLOBAL_BLOOM")]).await,
+            Some(BloomFilterConfig::default())
+        );
+        assert_eq!(
+            config(&[
+                ("hoodie.bloom.index.filter.type", "simple"),
+                ("hoodie.index.bloom.num_entries", "100"),
+                ("hoodie.index.bloom.fpp", "0.01"),
+                ("hoodie.bloom.index.filter.dynamic.max.entries", "500"),
+            ])
+            .await,
+            Some(BloomFilterConfig {
+                filter_type: BloomFilterType::Simple,
+                num_entries: 100,
+                fpp: 0.01,
+                max_entries: 500,
+            })
+        );
     }
 
     /// Append with a batch whose schema does not match the table's: rejected.

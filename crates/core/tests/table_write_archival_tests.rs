@@ -253,6 +253,33 @@ async fn test_stale_write_handle_sees_archived_commits() {
     );
 }
 
+/// Archival writes the history where `hoodie.timeline.history.path` says,
+/// which is where readers look for it.
+#[tokio::test]
+async fn test_archival_honors_configured_history_path() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_option("hoodie.keep.min.commits", "1")
+        .with_option("hoodie.keep.max.commits", "2")
+        .with_option("hoodie.timeline.history.path", "archived")
+        .create()
+        .await
+        .unwrap();
+    for i in 0..4 {
+        let id = format!("k{i}");
+        table
+            .append([batch(vec![(id.as_str(), "sf", i)])])
+            .await
+            .unwrap();
+    }
+    let timeline = dir.path().join(".hoodie/timeline");
+    assert!(timeline.join("archived/_version_").exists());
+    assert!(!timeline.join("history").exists());
+}
+
 /// Reads of an MDT-enabled table never consult the archived timeline: a
 /// history file that cannot be parsed must not fail a snapshot read, the MDT
 /// file listing, or a stats-pruned read.

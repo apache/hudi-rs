@@ -22,7 +22,7 @@
 //! When the active timeline holds more than `hoodie.keep.max.commits`
 //! completed commits, the oldest are archived down to `hoodie.keep.min.commits`:
 //! written as one level-0 parquet of `HoodieLSMTimelineInstant` rows under
-//! `{timeline}/history/`, registered in a new `manifest_{N}` (JSON) pointed at
+//! `{timeline}/{hoodie.timeline.history.path}/`, registered in a new `manifest_{N}` (JSON) pointed at
 //! by `_version_`, then removed from the active timeline (pending fencing
 //! files first, completed files after — Java's ordering). Runs inside the
 //! completion critical section (user design; Java runs it post-commit).
@@ -43,9 +43,34 @@ use crate::storage::Storage;
 use crate::write::rollback::action_from_fencing_name;
 
 /// Java `hoodie.keep.min.commits` default.
-pub(crate) const DEFAULT_KEEP_MIN_COMMITS: usize = 20;
+const DEFAULT_KEEP_MIN_COMMITS: usize = 20;
 /// Java `hoodie.keep.max.commits` default.
-pub(crate) const DEFAULT_KEEP_MAX_COMMITS: usize = 30;
+const DEFAULT_KEEP_MAX_COMMITS: usize = 30;
+
+/// `hoodie.keep.min.commits` and `hoodie.keep.max.commits`. Min must be at
+/// least 1, or archival would take the commit that just completed and leave no
+/// active commit for readers to admit files by, and max must not be below min.
+pub(crate) fn validated_keep_range(
+    hudi_configs: &crate::config::HudiConfigs,
+) -> Result<(usize, usize)> {
+    let options = hudi_configs.as_options();
+    let parse = |key: &str, default: usize| -> Result<usize> {
+        options.get(key).map_or(Ok(default), |value| {
+            value
+                .parse()
+                .map_err(|_| CoreError::Write(format!("{key}={value} is not a commit count")))
+        })
+    };
+    let min_keep = parse("hoodie.keep.min.commits", DEFAULT_KEEP_MIN_COMMITS)?;
+    let max_keep = parse("hoodie.keep.max.commits", DEFAULT_KEEP_MAX_COMMITS)?;
+    if min_keep == 0 || max_keep < min_keep {
+        return Err(CoreError::Write(format!(
+            "hoodie.keep.min.commits={min_keep} must be at least 1 and at most hoodie.keep.max.commits={max_keep}"
+        )));
+    }
+    Ok((min_keep, max_keep))
+}
+
 /// Java `hoodie.timeline.manifest.retained.versions` default.
 const RETAINED_MANIFEST_VERSIONS: i64 = 3;
 
@@ -70,11 +95,12 @@ struct CompletedInstant {
     file_name: String,
 }
 
-/// Archive the timeline at `timeline_dir` if it exceeds `max_keep` completed
-/// commits, retaining the newest `min_keep`.
+/// Archive the timeline at `timeline_dir` into `history_dir` if it exceeds
+/// `max_keep` completed commits, retaining the newest `min_keep`.
 pub(crate) async fn archive_timeline_if_needed(
     storage: &Storage,
     timeline_dir: &str,
+    history_dir: &str,
     min_keep: usize,
     max_keep: usize,
 ) -> Result<()> {
@@ -189,9 +215,6 @@ pub(crate) async fn archive_timeline_if_needed(
         .iter()
         .filter(|c| is_commit_action(&c.action))
         .count();
-    // Misconfigured min > max would underflow below and archive the whole
-    // timeline; treat min as the effective floor.
-    let min_keep = min_keep.min(max_keep);
     if commit_count <= max_keep {
         return Ok(());
     }
@@ -234,53 +257,69 @@ pub(crate) async fn archive_timeline_if_needed(
         return Ok(());
     }
 
+    // A retry after the active files failed to go finds some of its instants
+    // already in the history; publish only the rest, so none appears twice.
+    let (current_version, mut manifest) = read_manifest(storage, history_dir).await?;
+    let archived = archived_instant_times(
+        storage,
+        history_dir,
+        &manifest,
+        &to_archive[0].requested,
+        &to_archive[to_archive.len() - 1].requested,
+    )
+    .await?;
+    let to_publish: Vec<&CompletedInstant> = to_archive
+        .iter()
+        .filter(|instant| !archived.contains(&instant.requested))
+        .collect();
+
     // Build HoodieLSMTimelineInstant rows: metadata = completed file bytes;
-    // plan = inflight (fallback requested) bytes for replacecommits.
+    // plan = the plan of the action the instant was requested as, like Java's
+    // `createLSMTimelineInstant` (a replace takes its inflight metadata, else
+    // the requested one).
     let mut instant_times = Vec::new();
     let mut completion_times = Vec::new();
     let mut actions = Vec::new();
     let mut metadata_bytes: Vec<Option<Vec<u8>>> = Vec::new();
     let mut plan_bytes: Vec<Option<Vec<u8>>> = Vec::new();
-    for instant in &to_archive {
+    for instant in &to_publish {
         let metadata = storage
             .get_file_data(&format!("{timeline_dir}/{}", instant.file_name))
             .await?;
-        let plan = if instant.action == "replacecommit" {
-            let mut plan = None;
-            for fencing in fencing_by_instant
-                .get(&instant.requested)
-                .into_iter()
-                .flatten()
-            {
-                if fencing.ends_with(".inflight")
-                    && let Ok(bytes) = storage
-                        .get_file_data(&format!("{timeline_dir}/{fencing}"))
-                        .await
-                    && !bytes.is_empty()
-                {
-                    plan = Some(bytes.to_vec());
-                }
-            }
-            if plan.is_none() {
-                for fencing in fencing_by_instant
-                    .get(&instant.requested)
-                    .into_iter()
-                    .flatten()
-                {
-                    if fencing.ends_with(".requested")
-                        && let Ok(bytes) = storage
-                            .get_file_data(&format!("{timeline_dir}/{fencing}"))
-                            .await
-                        && !bytes.is_empty()
-                    {
-                        plan = Some(bytes.to_vec());
-                    }
-                }
-            }
-            plan
-        } else {
-            None
+        let fencing = fencing_by_instant
+            .get(&instant.requested)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let requested = fencing.iter().find(|name| name.ends_with(".requested"));
+        let inflight = fencing.iter().find(|name| name.ends_with(".inflight"));
+        let pending_action = requested
+            .or(inflight)
+            .map(|name| action_from_fencing_name(name, &instant.requested))
+            .unwrap_or_default();
+        let plan_files = match pending_action.as_str() {
+            "replacecommit" | "clustering" => vec![inflight, requested],
+            "clean" | "compaction" | "logcompaction" => vec![requested],
+            _ => Vec::new(),
         };
+        // The plan's file is deleted once archived, so only a missing file
+        // may archive without it; any other read error aborts for a retry.
+        let mut plan = None;
+        for name in plan_files.into_iter().flatten() {
+            match storage
+                .get_file_data(&format!("{timeline_dir}/{name}"))
+                .await
+            {
+                Ok(bytes) if !bytes.is_empty() => {
+                    plan = Some(bytes.to_vec());
+                    break;
+                }
+                Ok(_)
+                | Err(crate::storage::error::StorageError::ObjectStoreError(
+                    object_store::Error::NotFound { .. },
+                )) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         instant_times.push(instant.requested.clone());
         completion_times.push(instant.completion.clone());
         actions.push(instant.action.clone());
@@ -288,24 +327,109 @@ pub(crate) async fn archive_timeline_if_needed(
         plan_bytes.push(plan);
     }
 
-    let parquet = write_lsm_parquet(
-        &instant_times,
-        &completion_times,
-        &actions,
-        &metadata_bytes,
-        &plan_bytes,
-    )?;
-    let history_dir = format!("{timeline_dir}/history");
-    let min_instant = &to_archive[0].requested;
-    let max_instant = &to_archive[to_archive.len() - 1].requested;
-    let parquet_name = format!("{min_instant}_{max_instant}_0.parquet");
+    if let (Some(first), Some(last)) = (to_publish.first(), to_publish.last()) {
+        let parquet_name = format!("{}_{}_0.parquet", first.requested, last.requested);
+        publish_lsm_file(
+            storage,
+            history_dir,
+            current_version,
+            &mut manifest,
+            parquet_name,
+            write_lsm_parquet(
+                &instant_times,
+                &completion_times,
+                &actions,
+                &metadata_bytes,
+                &plan_bytes,
+            )?,
+        )
+        .await?;
+    }
+
+    // Remove archived instants from the active timeline: fencing files first
+    // (ascending), completed files after. A fencing file that survives stops
+    // archival before any completed file goes, since an instant with fencing
+    // files and no completed file reads as a failed write to roll back.
+    for instant in &to_archive {
+        for fencing in fencing_by_instant
+            .get(&instant.requested)
+            .into_iter()
+            .flatten()
+        {
+            storage
+                .delete_file(&format!("{timeline_dir}/{fencing}"))
+                .await?;
+        }
+    }
+    // Completed files go in ascending order and stop at the first failure
+    // (Java TimelineArchiverV2), so the survivors are the newest instants and
+    // a retry never archives a set that skips a published instant.
+    for instant in &to_archive {
+        storage
+            .delete_file(&format!("{timeline_dir}/{}", instant.file_name))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Instant times held by the published history files whose name range
+/// (`{min}_{max}_{level}.parquet`) overlaps `[min, max]`.
+async fn archived_instant_times(
+    storage: &Storage,
+    history_dir: &str,
+    manifest: &LsmManifest,
+    min: &str,
+    max: &str,
+) -> Result<std::collections::HashSet<String>> {
+    let mut archived = std::collections::HashSet::new();
+    for entry in &manifest.files {
+        let mut range = entry.file_name.splitn(3, '_');
+        let (Some(file_min), Some(file_max)) = (range.next(), range.next()) else {
+            continue;
+        };
+        if file_max < min || file_min > max {
+            continue;
+        }
+        let bytes = storage
+            .get_file_data(&format!("{history_dir}/{}", entry.file_name))
+            .await?;
+        let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(bytes)
+            .and_then(|builder| {
+                let instant_time = parquet::arrow::ProjectionMask::columns(
+                    builder.parquet_schema(),
+                    ["instantTime"],
+                );
+                builder.with_projection(instant_time).build()
+            })
+            .map_err(|e| CoreError::Timeline(format!("read LSM file {}: {e}", entry.file_name)))?;
+        for batch in reader {
+            let batch = batch.map_err(CoreError::ArrowError)?;
+            let Some(times) = batch
+                .column_by_name("instantTime")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+            else {
+                continue;
+            };
+            archived.extend(times.iter().flatten().map(str::to_string));
+        }
+    }
+    Ok(archived)
+}
+
+/// Writes one level-0 file, then publishes it: manifest_{N+1}, then
+/// `_version_` (Java order).
+async fn publish_lsm_file(
+    storage: &Storage,
+    history_dir: &str,
+    current_version: i64,
+    manifest: &mut LsmManifest,
+    parquet_name: String,
+    parquet: Vec<u8>,
+) -> Result<()> {
     let parquet_len = parquet.len() as i64;
     storage
         .put_file(&format!("{history_dir}/{parquet_name}"), parquet)
         .await?;
-
-    // Manifest protocol: parquet → manifest_{N+1} → _version_ (Java order).
-    let (current_version, mut manifest) = read_manifest(storage, &history_dir).await?;
     manifest.files.push(LsmFileEntry {
         file_name: parquet_name,
         file_len: parquet_len,
@@ -325,35 +449,13 @@ pub(crate) async fn archive_timeline_if_needed(
             next_version.to_string().into_bytes(),
         )
         .await?;
-    // Retain only the last N manifest versions.
-    let stale_floor = next_version - RETAINED_MANIFEST_VERSIONS;
-    let mut stale = stale_floor;
-    while stale > 0 {
-        let path = format!("{history_dir}/manifest_{stale}");
-        if storage.delete_file(&path).await.is_err() {
-            break;
-        }
-        stale -= 1;
-    }
-
-    // Remove archived instants from the active timeline: fencing files first
-    // (ascending), completed files after. A fencing file that survives stops
-    // archival before any completed file goes, since an instant with fencing
-    // files and no completed file reads as a failed write to roll back.
-    for instant in &to_archive {
-        for fencing in fencing_by_instant
-            .get(&instant.requested)
-            .into_iter()
-            .flatten()
-        {
-            storage
-                .delete_file(&format!("{timeline_dir}/{fencing}"))
-                .await?;
-        }
-    }
-    for instant in &to_archive {
+    // Retain only the last N manifest versions; each publish retires one, so
+    // older ones went in earlier runs. A failed delete only leaves a stale
+    // manifest that `_version_` no longer names.
+    let stale = next_version - RETAINED_MANIFEST_VERSIONS;
+    if stale > 0 {
         let _ = storage
-            .delete_file(&format!("{timeline_dir}/{}", instant.file_name))
+            .delete_file(&format!("{history_dir}/manifest_{stale}"))
             .await;
     }
     Ok(())
@@ -558,88 +660,9 @@ mod delete_failure_tests {
     use super::archive_timeline_if_needed;
     use crate::config::HudiConfigs;
     use crate::storage::Storage;
-    use async_trait::async_trait;
-    use futures::StreamExt;
-    use futures::stream::BoxStream;
+    use crate::storage::fault::{DeleteFails, GetFails};
     use object_store::local::LocalFileSystem;
-    use object_store::path::Path;
-    use object_store::{
-        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-        PutMultipartOptions, PutOptions, PutPayload, PutResult, Result,
-    };
     use std::sync::Arc;
-
-    /// Fails every delete of an `.inflight` file.
-    #[derive(Debug)]
-    struct InflightDeleteFails(Arc<dyn ObjectStore>);
-
-    impl std::fmt::Display for InflightDeleteFails {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            write!(f, "InflightDeleteFails({})", self.0)
-        }
-    }
-
-    #[async_trait]
-    impl ObjectStore for InflightDeleteFails {
-        async fn put_opts(
-            &self,
-            location: &Path,
-            payload: PutPayload,
-            opts: PutOptions,
-        ) -> Result<PutResult> {
-            self.0.put_opts(location, payload, opts).await
-        }
-
-        async fn put_multipart_opts(
-            &self,
-            location: &Path,
-            opts: PutMultipartOptions,
-        ) -> Result<Box<dyn MultipartUpload>> {
-            self.0.put_multipart_opts(location, opts).await
-        }
-
-        async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-            self.0.get_opts(location, options).await
-        }
-
-        fn delete_stream(
-            &self,
-            locations: BoxStream<'static, Result<Path>>,
-        ) -> BoxStream<'static, Result<Path>> {
-            let inner = self.0.clone();
-            locations
-                .then(move |location| {
-                    let inner = inner.clone();
-                    async move {
-                        let location = location?;
-                        if location.as_ref().ends_with(".inflight") {
-                            return Err(object_store::Error::Generic {
-                                store: "InflightDeleteFails",
-                                source: "delete failed".into(),
-                            });
-                        }
-                        inner
-                            .delete_stream(futures::stream::once(async { Ok(location) }).boxed())
-                            .next()
-                            .await
-                            .unwrap()
-                    }
-                })
-                .boxed()
-        }
-
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-            self.0.list(prefix)
-        }
-
-        async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
-            self.0.list_with_delimiter(prefix).await
-        }
-
-        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
-            self.0.copy_opts(from, to, options).await
-        }
-    }
 
     /// A fencing file archival cannot delete must stop it before any
     /// completed file goes: an archived instant left with fencing files and
@@ -657,11 +680,20 @@ mod delete_failure_tests {
             std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
         }
         let base_url = url::Url::from_directory_path(dir.path()).unwrap();
-        let store = Arc::new(InflightDeleteFails(Arc::new(LocalFileSystem::new())));
+        let store = Arc::new(DeleteFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with(".inflight")
+        }));
         let storage =
             Storage::new_with_object_store(base_url, store, Arc::new(HudiConfigs::empty()));
 
-        let result = archive_timeline_if_needed(storage.as_ref(), ".hoodie/timeline", 1, 2).await;
+        let result = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
 
         for ts in &instants {
             assert!(
@@ -671,5 +703,356 @@ mod delete_failure_tests {
             );
         }
         assert!(result.is_err());
+    }
+
+    fn archived_batches(timeline: &std::path::Path) -> Vec<arrow_array::RecordBatch> {
+        let history = timeline.join("history");
+        let version = std::fs::read_to_string(history.join("_version_")).unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(history.join(format!("manifest_{}", version.trim()))).unwrap(),
+        )
+        .unwrap();
+        let mut batches = Vec::new();
+        for entry in manifest["files"].as_array().unwrap() {
+            let bytes = std::fs::read(history.join(entry["fileName"].as_str().unwrap())).unwrap();
+            let reader = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(
+                bytes::Bytes::from(bytes),
+            )
+            .unwrap()
+            .build()
+            .unwrap();
+            batches.extend(reader.map(Result::unwrap));
+        }
+        batches
+    }
+
+    fn archived_instants(timeline: &std::path::Path) -> Vec<String> {
+        use arrow_array::{Array, StringArray};
+        let mut instants = Vec::new();
+        for batch in archived_batches(timeline) {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            instants.extend((0..column.len()).map(|i| column.value(i).to_string()));
+        }
+        instants.sort();
+        instants
+    }
+
+    /// Archived compaction, log-compaction and clean instants keep their
+    /// requested plans; a plain commit has none.
+    #[tokio::test]
+    async fn test_archival_keeps_table_service_plans() {
+        use arrow_array::{Array, BinaryArray, StringArray};
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let ts = |i: u32| format!("2026010100000000{i}");
+        let write =
+            |name: String, bytes: &[u8]| std::fs::write(timeline.join(name), bytes).unwrap();
+        for i in [1, 5, 6] {
+            write(format!("{}.commit.requested", ts(i)), b"");
+            write(format!("{}.inflight", ts(i)), b"");
+            write(format!("{0}_{0}.commit", ts(i)), b"{}");
+        }
+        write(
+            format!("{}.compaction.requested", ts(2)),
+            b"compaction plan",
+        );
+        write(format!("{}.compaction.inflight", ts(2)), b"");
+        write(format!("{0}_{0}.commit", ts(2)), b"{}");
+        write(format!("{}.clean.requested", ts(3)), b"clean plan");
+        write(format!("{}.clean.inflight", ts(3)), b"clean inflight");
+        write(format!("{0}_{0}.clean", ts(3)), b"{}");
+        write(
+            format!("{}.logcompaction.requested", ts(4)),
+            b"log compaction plan",
+        );
+        write(format!("{}.logcompaction.inflight", ts(4)), b"");
+        write(format!("{0}_{0}.deltacommit", ts(4)), b"{}");
+        let storage = Storage::new_with_object_store(
+            url::Url::from_directory_path(dir.path()).unwrap(),
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            2,
+            3,
+        )
+        .await
+        .unwrap();
+
+        let mut plans = Vec::new();
+        for batch in archived_batches(&timeline) {
+            let instants = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let plan = batch.column_by_name("plan").unwrap();
+            let plan = plan.as_any().downcast_ref::<BinaryArray>().unwrap();
+            for row in 0..batch.num_rows() {
+                let bytes = (!plan.is_null(row)).then(|| plan.value(row).to_vec());
+                plans.push((instants.value(row).to_string(), bytes));
+            }
+        }
+        plans.sort();
+        let plan = |i: u32, bytes: Option<&[u8]>| (ts(i), bytes.map(<[u8]>::to_vec));
+        assert_eq!(
+            plans,
+            vec![
+                plan(1, None),
+                plan(2, Some(b"compaction plan")),
+                plan(3, Some(b"clean plan")),
+                plan(4, Some(b"log compaction plan")),
+            ]
+        );
+    }
+
+    /// A plan that cannot be read aborts archival with its file intact, so a
+    /// retry archives the plan instead of losing it.
+    #[tokio::test]
+    async fn test_archival_aborts_when_a_plan_read_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let ts = |i: u32| format!("2026010100000000{i}");
+        let write =
+            |name: String, bytes: &[u8]| std::fs::write(timeline.join(name), bytes).unwrap();
+        write(format!("{}.clean.requested", ts(1)), b"clean plan");
+        write(format!("{}.clean.inflight", ts(1)), b"");
+        write(format!("{0}_{0}.clean", ts(1)), b"{}");
+        for i in 2..=4 {
+            write(format!("{}.commit.requested", ts(i)), b"");
+            write(format!("{}.inflight", ts(i)), b"");
+            write(format!("{0}_{0}.commit", ts(i)), b"{}");
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let failing = Arc::new(GetFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with(".clean.requested")
+        }));
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            failing,
+            Arc::new(HudiConfigs::empty()),
+        );
+        let result = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(timeline.join(format!("{}.clean.requested", ts(1))).exists());
+
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        use arrow_array::Array;
+        let plans: Vec<Option<Vec<u8>>> = archived_batches(&timeline)
+            .iter()
+            .flat_map(|batch| {
+                let plan = batch
+                    .column_by_name("plan")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<arrow_array::BinaryArray>()
+                    .unwrap()
+                    .clone();
+                (0..plan.len())
+                    .map(move |row| (!plan.is_null(row)).then(|| plan.value(row).to_vec()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(plans.contains(&Some(b"clean plan".to_vec())));
+    }
+
+    /// Completed files are deleted in instant order and archival stops at the
+    /// first failure, as in Java, and a retry does not rewrite a level-0 file
+    /// the manifest already lists. Otherwise a retry that archives only the
+    /// survivors can replace a published file and lose the instants deleted
+    /// in between.
+    #[tokio::test]
+    async fn test_archival_retry_after_completed_delete_failure_keeps_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=4).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants {
+            std::fs::write(timeline.join(format!("{ts}.commit.requested")), b"").unwrap();
+            std::fs::write(timeline.join(format!("{ts}.inflight")), b"").unwrap();
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let failing = Arc::new(DeleteFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with("20260101000000001_20260101000000001.commit")
+                || path.ends_with("20260101000000003_20260101000000003.commit")
+        }));
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            failing,
+            Arc::new(HudiConfigs::empty()),
+        );
+        let _ = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
+        for ts in &instants {
+            assert!(
+                timeline.join(format!("{ts}_{ts}.commit")).exists(),
+                "{ts}: deletes must stop at the first failure"
+            );
+        }
+
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
+        for ts in &instants[..3] {
+            assert!(!timeline.join(format!("{ts}_{ts}.commit")).exists(), "{ts}");
+        }
+        assert!(
+            timeline
+                .join(format!("{0}_{0}.commit", instants[3]))
+                .exists()
+        );
+    }
+
+    /// A `_version_` write that lands and then errors leaves the active files
+    /// in place; the retry must not publish the same file a second time.
+    #[tokio::test]
+    async fn test_archival_retry_after_version_put_error_publishes_once() {
+        use crate::storage::fault::{FaultyPutStore, PutFault};
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=4).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants {
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let faulty = FaultyPutStore::new_for_any_put(
+            Arc::new(LocalFileSystem::new()),
+            PutFault::LandedThenError,
+            |path| path.as_ref().ends_with("history/_version_"),
+        );
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            faulty.clone(),
+            Arc::new(HudiConfigs::empty()),
+        );
+        let result = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
+        assert!(result.is_err() && !faulty.is_armed());
+
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(archived_instants(&timeline), instants[..3].to_vec());
+    }
+
+    /// A retry whose range is wider than the published file's archives only
+    /// the instants the history does not already hold.
+    #[tokio::test]
+    async fn test_archival_retry_over_wider_range_archives_each_instant_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let timeline = dir.path().join(".hoodie/timeline");
+        std::fs::create_dir_all(&timeline).unwrap();
+        let instants: Vec<String> = (1..=5).map(|i| format!("2026010100000000{i}")).collect();
+        for ts in &instants[..4] {
+            std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        }
+        let base_url = url::Url::from_directory_path(dir.path()).unwrap();
+        let failing = Arc::new(DeleteFails(Arc::new(LocalFileSystem::new()), |path| {
+            path.ends_with("20260101000000002_20260101000000002.commit")
+        }));
+        let storage = Storage::new_with_object_store(
+            base_url.clone(),
+            failing,
+            Arc::new(HudiConfigs::empty()),
+        );
+        let _ = archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await;
+        assert!(
+            !timeline
+                .join(format!("{0}_{0}.commit", instants[0]))
+                .exists()
+        );
+
+        let ts = &instants[4];
+        std::fs::write(timeline.join(format!("{ts}_{ts}.commit")), b"{}").unwrap();
+        let storage = Storage::new_with_object_store(
+            base_url,
+            Arc::new(LocalFileSystem::new()),
+            Arc::new(HudiConfigs::empty()),
+        );
+        archive_timeline_if_needed(
+            storage.as_ref(),
+            ".hoodie/timeline",
+            ".hoodie/timeline/history",
+            1,
+            2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(archived_instants(&timeline), instants[..4].to_vec());
     }
 }

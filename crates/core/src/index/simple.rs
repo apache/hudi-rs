@@ -50,11 +50,15 @@ impl HoodieIndex for SimpleIndex {
         if requested.is_empty() {
             return Ok(locations);
         }
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        if slices.is_empty() {
+            return Ok(locations);
+        }
         let reader = table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
             .await?;
-        let mut by_record_key: HashMap<String, RecordLocation> = HashMap::new();
-        for slice in table.get_file_slices(&ReadOptions::new()).await? {
+        let mut by_record_key: HashMap<String, Vec<RecordLocation>> = HashMap::new();
+        for slice in slices {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
             let location = RecordLocation {
                 file_id: slice.file_id().to_string(),
@@ -63,7 +67,10 @@ impl HoodieIndex for SimpleIndex {
             };
             let mut tag = |key: &str| {
                 if requested.contains(key) {
-                    by_record_key.insert(key.to_string(), location.clone());
+                    by_record_key
+                        .entry(key.to_string())
+                        .or_default()
+                        .push(location.clone());
                 }
             };
             match batch.column_by_name(MetaField::RecordKey.as_ref()) {
@@ -84,9 +91,24 @@ impl HoodieIndex for SimpleIndex {
                     .for_each(|key| tag(key)),
             }
         }
+        // A key stored in several partitions (a non-global Java index allows
+        // it) resolves to the copy in the incoming record's partition. With no
+        // copy there the lookup stays global, as for a single copy: the record
+        // moves from the copy with the greatest partition path and the others
+        // stay. Ties break on file id, since slice listing order varies
+        // between processes.
         for (hoodie_key, slot) in locations.iter_mut() {
-            if let Some(location) = by_record_key.get(&hoodie_key.record_key) {
-                *slot = Some(location.clone());
+            if let Some(candidates) = by_record_key.get(&hoodie_key.record_key) {
+                *slot = candidates
+                    .iter()
+                    .filter(|location| location.partition_path == hoodie_key.partition_path)
+                    .max_by_key(|location| &location.file_id)
+                    .or_else(|| {
+                        candidates
+                            .iter()
+                            .max_by_key(|location| (&location.partition_path, &location.file_id))
+                    })
+                    .cloned();
             }
         }
         Ok(locations)

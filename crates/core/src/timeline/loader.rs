@@ -47,6 +47,14 @@ enum TimelineLayout {
     V2Archived,
 }
 
+/// The layout-2 LSM history directory, shared by the reader and the archiver
+/// so both resolve the same folder.
+pub(crate) fn lsm_history_dir(hudi_configs: &HudiConfigs) -> String {
+    let timeline_path: String = hudi_configs.get_or_default(TimelinePath).into();
+    let history_path: String = hudi_configs.get_or_default(TimelineHistoryPath).into();
+    format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
+}
+
 #[allow(dead_code)]
 impl TimelineLoader {
     /// Create a new Layout One Active loader
@@ -127,11 +135,7 @@ impl TimelineLoader {
                 self.hudi_configs.get_or_default(ArchiveLogFolder).into()
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                // Layout 2 uses LSM history directory
-                let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
-                let history_path: String =
-                    self.hudi_configs.get_or_default(TimelineHistoryPath).into();
-                format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
+                lsm_history_dir(&self.hudi_configs)
             }
         }
     }

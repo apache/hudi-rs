@@ -18,6 +18,7 @@
  */
 //! Record-level index backed by the metadata table `record_index` partition.
 
+use apache_avro::Schema as AvroSchema;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ use crate::config::read::HudiReadConfig;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::base_file::reader::{KeyMatcher, KeyPredicate};
-use crate::file_group::log_file::scanner::LogFileScanner;
+use crate::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
 use crate::metadata::table::encode::decode_record_index_entry;
@@ -37,9 +38,9 @@ use crate::table::Table;
 use crate::timeline::selector::InstantRange;
 use crate::util::concurrency::bounded_in_order;
 use crate::write::metadata::{
-    DEFAULT_RLI_NUM_FILE_GROUPS, RECORD_INDEX_FILE_ID_PREFIX, epoch_millis_to_instant,
+    DEFAULT_RLI_NUM_FILE_GROUPS, RECORD_INDEX_FILE_ID_PREFIX, epoch_millis_to_instant_in,
     map_record_key_to_file_group_index, mdt_partition_latest_slices, record_index_file_id,
-    shard_count_from_slices,
+    shard_count_from_slices, timeline_timezone,
 };
 
 /// Metadata-table record-level index (global: key = record key).
@@ -64,13 +65,17 @@ impl HoodieIndex for RecordIndex {
         let storage = table.file_system_view.storage.clone();
         let record_keys: Vec<&str> = keys.iter().map(|key| key.record_key.as_str()).collect();
         let found = lookup_record_index(table, storage, &record_keys).await?;
+        let timezone = timeline_timezone(&table.hudi_configs);
         for key in keys {
             if let Some(entry) = found.get(&key.record_key) {
                 locations.insert(
                     key.clone(),
                     Some(RecordLocation {
                         file_id: entry.file_id.clone(),
-                        instant_time: epoch_millis_to_instant(entry.instant_time_millis),
+                        instant_time: epoch_millis_to_instant_in(
+                            entry.instant_time_millis,
+                            &timezone,
+                        ),
                         partition_path: entry.partition_path.clone(),
                     }),
                 );
@@ -228,18 +233,24 @@ async fn lookup_as_of(
                     Some(budget) => HFileReader::plan_windows(&blocks, budget),
                     None => vec![blocks],
                 };
+                let schema = reader.get_avro_schema().map_err(|e| {
+                    CoreError::HFile(format!("failed to read record_index schema: {e:?}"))
+                })?;
                 for window in windows {
                     let records = reader.read_records_batched(&window).await.map_err(|e| {
                         CoreError::HFile(format!("failed to read record_index base: {e:?}"))
                     })?;
-                    apply_hfile_records(&mut merged, &records, &matcher)?;
+                    apply_hfile_records(&mut merged, &records, schema, &matcher)?;
                 }
             }
             if let (false, Some(range)) = (logs.is_empty(), range) {
                 let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage)
                     .with_key_predicate(Some(predicate.clone()));
-                let records = scanner.scan_hfile_records(logs.clone(), range).await?;
-                apply_hfile_records(&mut merged, &records, &matcher)?;
+                for HFileRecordGroup { schema, records } in
+                    scanner.scan_hfile_records(logs.clone(), range).await?
+                {
+                    apply_hfile_records(&mut merged, &records, schema.as_deref(), &matcher)?;
+                }
             }
             Ok::<_, CoreError>(merged)
         }
@@ -257,6 +268,7 @@ async fn lookup_as_of(
 fn apply_hfile_records(
     merged: &mut HashMap<String, LoadedLocation>,
     records: &[HFileRecord],
+    schema: Option<&AvroSchema>,
     matcher: &KeyMatcher<'_>,
 ) -> Result<()> {
     for record in records {
@@ -266,7 +278,7 @@ fn apply_hfile_records(
         if !matcher.admits(key) {
             continue;
         }
-        match decode_record_index_entry(key, record.value(), record.avro_schema())? {
+        match decode_record_index_entry(key, record.value(), schema)? {
             Some(entry) => {
                 merged.insert(
                     key.to_string(),
@@ -437,11 +449,12 @@ mod tests {
             firsts.push(recs.first().unwrap().key_as_str().unwrap().to_string());
             lasts.push(recs.last().unwrap().key_as_str().unwrap().to_string());
         }
+        let schema = reader.get_avro_schema().unwrap().cloned();
         let all = reader.collect_records().unwrap();
         let mut expected = HashMap::new();
         for r in &all {
             let k = r.key_as_str().unwrap().to_string();
-            let e = decode_record_index_entry(&k, r.value(), r.avro_schema())
+            let e = decode_record_index_entry(&k, r.value(), schema.as_ref())
                 .unwrap()
                 .unwrap();
             expected.insert(k, (e.file_id, e.partition_path, e.instant_time_millis));

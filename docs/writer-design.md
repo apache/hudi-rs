@@ -163,6 +163,10 @@ the earliest active instant counts as committed (Java's
 the same rule admits MDT base files whose instant the MDT timeline has
 archived. The MDT's own timeline is *not* archived: like the Java writer, MDT
 archival is bounded by MDT compaction, which is not implemented natively.
+Java's archiver also holds data archival behind the latest MDT compaction;
+this one does not, since without native MDT compaction that bound would stop
+archival altogether, and an archived instant's MDT log blocks stay readable
+through its active MDT deltacommit (§3.3).
 
 ## 4. Writing data
 
@@ -196,8 +200,9 @@ Upsert inserts follow the Java `UpsertPartitioner` model: file groups under
 `hoodie.parquet.small.file.limit` (default 100 MB) absorb new inserts up to
 `hoodie.parquet.max.file.size` (default 120 MB), using the average record
 size estimated from commit history; the remainder splits into new file groups
-of `hoodie.copyonwrite.insert.split.size` records (or auto-computed). MOR log
-files count at `hoodie.logfile.to.parquet.compression.ratio` of their size.
+of `hoodie.copyonwrite.insert.split.size` records (or auto-computed). On MOR,
+inserts always go to new base file groups, never to log files, since Java's
+SIMPLE and BLOOM indexes do not read log files.
 
 ### 4.4 Parallel write tasks
 

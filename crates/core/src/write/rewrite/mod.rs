@@ -50,7 +50,7 @@ use crate::write::append::{
     timeline_dir,
 };
 use crate::write::keygen::{hoodie_keys_for_batch, relative_data_path};
-use crate::write::metadata::{instant_to_epoch_millis, is_column_stats_enabled};
+use crate::write::metadata::is_column_stats_enabled;
 
 mod cow;
 #[cfg(test)]
@@ -74,7 +74,9 @@ pub struct WriteResult {
     /// incremental read's start bound is compared against on that layout.
     /// `None` on layout v1 and when no commit was written.
     pub completion_time: Option<String>,
-    /// Number of rows written to replacement base files.
+    /// Rows in the data files this write produced: every row of each
+    /// rewritten copy-on-write base file, or each row appended to a
+    /// merge-on-read log (deletes append none).
     pub num_writes: usize,
     /// Number of input keys that replaced existing rows.
     pub num_updates: usize,
@@ -88,6 +90,11 @@ pub struct WriteResult {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpsertOptions {
     /// Data columns to overwrite for matched rows. `None` replaces complete rows.
+    ///
+    /// On an event-time ordered table, matched rows merge by ordering value
+    /// only when these columns include every ordering field. Otherwise the
+    /// update wins as under commit-time ordering and the row keeps its stored
+    /// ordering value.
     pub update_columns: Option<Vec<String>>,
 }
 
@@ -156,7 +163,7 @@ async fn request_deltacommit(table: &Table, operation: &str) -> Result<String> {
 pub async fn upsert_batches(
     table: &mut Table,
     batches: &[RecordBatch],
-    options: UpsertOptions,
+    mut options: UpsertOptions,
 ) -> Result<WriteResult> {
     crate::write::ensure_supported_key_generator(&table.hudi_configs)?;
     table.reload_timeline_for_write().await?;
@@ -171,7 +178,7 @@ pub async fn upsert_batches(
             "upsert requires at least one RecordBatch".to_string(),
         ));
     }
-    validate_write_input(table, batches, "upsert").await?;
+    let batches = &validate_write_input(table, batches, "upsert").await?;
     if let Some(columns) = &options.update_columns {
         let schema = batches[0].schema();
         for column in columns {
@@ -187,12 +194,28 @@ pub async fn upsert_batches(
             }
         }
     }
+    // The input row's delete marker applies whatever columns a partial upsert
+    // selects; Java checks the incoming record for a delete before merging.
+    if let Some(columns) = options.update_columns.as_mut()
+        && batches[0]
+            .schema()
+            .field_with_name("_hoodie_is_deleted")
+            .is_ok()
+        && !columns.iter().any(|column| column == "_hoodie_is_deleted")
+    {
+        columns.push("_hoodie_is_deleted".to_string());
+    }
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
     let instant = request_rewrite_instant(table, "UPSERT", RewriteKind::Commit).await?;
     let incoming = prepare_batches_for_write(&table.hudi_configs, batches, &instant, "pending")?;
     let incoming = concat(&incoming)?;
     let incoming_keys = batch_record_keys(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
+    // Java dedupes the batch through the merge-mode merger
+    // (BaseWriteHelper.reduceRecords), so commit-time ordering keeps the last
+    // occurrence here too.
+    let ordering_fields =
+        upsert_ordering_fields(&table.hudi_configs, options.update_columns.as_deref())?;
+    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &ordering_fields)?;
     let incoming_hoodie_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, None)?;
     let delete_markers = delete_marker_rows(&incoming);
     let locations = crate::index::for_table_checked(table)
@@ -225,7 +248,7 @@ pub async fn upsert_batches(
             .get(partition)
             .map(|v| v.iter().collect())
             .unwrap_or_default();
-        let small = crate::write::sizing::small_file_groups(&slices, false, &sizing);
+        let small = crate::write::sizing::small_file_groups(&slices, &sizing);
         let assignments = crate::write::sizing::assign_insert_buckets(
             rows.len(),
             &small,
@@ -289,11 +312,32 @@ pub async fn upsert_batches(
         .iter()
         .map(|(id, (_, slice))| (id.clone(), slice.clone()))
         .collect();
-    let rejected_moves =
-        moved_keys_rejected_by_event_time(table, &incoming, &moved_candidates, &move_slices)
-            .await?;
+    let rejected_moves = moved_keys_rejected_by_event_time(
+        table,
+        &incoming,
+        &moved_candidates,
+        &move_slices,
+        &ordering_fields,
+    )
+    .await?;
+    let (incoming, route_keys) = match &options.update_columns {
+        Some(columns) if !moved_candidates.is_empty() => {
+            resolve_partial_moves(
+                table,
+                &incoming,
+                &incoming_hoodie_keys,
+                &moved_candidates,
+                &move_slices,
+                &rejected_moves,
+                columns,
+            )
+            .await?
+        }
+        _ => (incoming, incoming_hoodie_keys.clone()),
+    };
     let mut moved_deletes = Vec::new();
-    for (index, hoodie_key) in incoming_hoodie_keys.iter().enumerate() {
+    for (index, (hoodie_key, route_key)) in incoming_hoodie_keys.iter().zip(&route_keys).enumerate()
+    {
         // A location whose file group has no live slice is a stale index
         // entry (its group was replaced); the row no longer exists, so the
         // incoming record is an insert (Java re-validates tags the same way).
@@ -306,7 +350,7 @@ pub async fn upsert_batches(
         // stored row. In-place markers are resolved by the group merge.
         if delete_markers[index]
             && !located.is_some_and(|location| {
-                location.partition_path == hoodie_key.partition_path
+                location.partition_path == route_key.partition_path
                     || rejected_moves.contains(&hoodie_key.record_key)
             })
         {
@@ -324,7 +368,7 @@ pub async fn upsert_batches(
             continue;
         }
         let target = match located {
-            Some(location) if location.partition_path == hoodie_key.partition_path => {
+            Some(location) if location.partition_path == route_key.partition_path => {
                 updates += 1;
                 Some(location.file_id.clone())
             }
@@ -353,7 +397,7 @@ pub async fn upsert_batches(
                 .or_default()
                 .push(index as u32),
             None => new_rows_by_partition
-                .entry(hoodie_key.partition_path.clone())
+                .entry(route_key.partition_path.clone())
                 .or_default()
                 .push(index as u32),
         }
@@ -382,6 +426,7 @@ pub async fn upsert_batches(
                 incoming: take_batch(&incoming, &rows)?,
                 partial_columns: options.update_columns.clone(),
                 evict_keys,
+                by_event_time: !ordering_fields.is_empty(),
             },
         });
     }
@@ -431,10 +476,7 @@ pub async fn upsert_batches(
         }
     }
 
-    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-        &instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, &instant);
     // RLI adds: every input row's final location is known from the plan. A
     // REJECTED cross-partition move keeps the old row, so its index entry
     // must carry the old partition, not the losing incoming value.
@@ -452,7 +494,7 @@ pub async fn upsert_batches(
                     .map(|location| location.partition_path.clone())
                     .unwrap_or_else(|| key.partition_path.clone())
             } else {
-                key.partition_path.clone()
+                route_keys[row].partition_path.clone()
             };
             Some(RecordIndexEntry {
                 record_key: key.record_key.clone(),
@@ -469,7 +511,7 @@ pub async fn upsert_batches(
                     record_key,
                     partition_path,
                     file_id: String::new(),
-                    instant_time_millis: instant_to_epoch_millis(&instant),
+                    instant_time_millis,
                     is_deleted: true,
                 }),
         )
@@ -777,7 +819,7 @@ async fn rli_deletes_for_replaced_groups(
     let reader = table
         .create_file_group_reader_with_options(Some(&options), std::iter::empty::<(&str, String)>())
         .await?;
-    let millis = instant_to_epoch_millis(instant);
+    let millis = crate::write::metadata::instant_millis(&table.hudi_configs, instant);
     let mut entries = Vec::new();
     for slice in replaced {
         let batch = reader.read_file_slice(slice, &options).await?;
@@ -854,7 +896,7 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
             "overwrite requires at least one RecordBatch".to_string(),
         ));
     }
-    validate_write_input(table, batches, "overwrite").await?;
+    let batches = &validate_write_input(table, batches, "overwrite").await?;
     // Listing enumerates the replaced groups; their record keys are read
     // (key column only) afterwards to tombstone dropped index entries.
     crate::write::keygen::validate_keygen_inputs(&table.hudi_configs, batches)?;
@@ -875,17 +917,13 @@ pub async fn overwrite_batches(table: &mut Table, batches: &[RecordBatch]) -> Re
         table,
         &instant,
         &replacement,
-        None,
         file_ids,
         old_paths,
         log_only,
         replaced_log_paths,
         "INSERT_OVERWRITE_TABLE",
-        0,
         replacement.num_rows(),
-        0,
         rli_deletes,
-        RewriteKind::Replace,
     )
     .await
 }
@@ -915,7 +953,7 @@ pub async fn dynamic_partition_overwrite_batches(
                 .to_string(),
         ));
     }
-    validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
+    let batches = &validate_write_input(table, batches, "dynamic_partition_overwrite").await?;
     // Partition paths depend only on the input batches; derive and validate
     // them before fencing so bad input leaves no timeline trace.
     let raw = concat(batches)?;
@@ -957,17 +995,13 @@ pub async fn dynamic_partition_overwrite_batches(
         table,
         &instant,
         &replacement,
-        None,
         file_ids,
         old_paths,
         log_only,
         replaced_log_paths,
         "INSERT_OVERWRITE",
-        0,
         replacement.num_rows(),
-        0,
         rli_deletes,
-        RewriteKind::Replace,
     )
     .await
 }

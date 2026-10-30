@@ -39,10 +39,6 @@ pub(crate) fn ensure_writable_table_version(table: &Table) -> Result<()> {
     Ok(())
 }
 
-/// Pre-fence input validation shared by write verbs: batches must agree with
-/// each other and (when the table already has data) with the table schema, and
-/// must contain at least one row — all checked BEFORE an instant is fenced so
-/// invalid input leaves no timeline trace. Returns the row count.
 /// SET may not target record-key or partition columns: changing a row's
 /// identity would strand its index entry and diverge the partition value from
 /// the path it physically lives in.
@@ -72,11 +68,16 @@ pub(super) fn ensure_set_columns_updatable(table: &Table, updates: &RecordBatch)
     Ok(())
 }
 
+/// Pre-fence input validation shared by write verbs: batches must agree with
+/// each other and (when the table already has data) with the table schema, and
+/// must contain at least one row, all checked BEFORE an instant is fenced so
+/// invalid input leaves no timeline trace. Returns the batches widened to the
+/// table's nullability.
 pub(super) async fn validate_write_input(
     table: &Table,
     batches: &[RecordBatch],
     verb: &str,
-) -> Result<usize> {
+) -> Result<Vec<RecordBatch>> {
     let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
     if rows == 0 {
         return Err(CoreError::Write(format!(
@@ -110,8 +111,9 @@ pub(super) async fn validate_write_input(
                 )));
             }
         }
+        return crate::write::widen_to_table_nullability(batches, &table_schema);
     }
-    Ok(rows)
+    Ok(batches.to_vec())
 }
 
 pub(super) fn ensure_rewrite_supported(table: &Table) -> Result<()> {
@@ -200,4 +202,31 @@ pub(super) fn uses_event_time_merge(hudi_configs: &crate::config::HudiConfigs) -
             .try_get(OrderingFields)?
             .map(|v| -> Vec<String> { v.into() })
             .is_some_and(|fields| fields.iter().any(|f| !f.trim().is_empty())))
+}
+
+/// The ordering fields a write compares, empty unless it merges by event time.
+pub(super) fn event_time_ordering_fields(
+    hudi_configs: &crate::config::HudiConfigs,
+) -> Result<Vec<String>> {
+    if !uses_event_time_merge(hudi_configs)? {
+        return Ok(Vec::new());
+    }
+    Ok(hudi_configs
+        .try_get(OrderingFields)?
+        .map(Into::into)
+        .unwrap_or_default())
+}
+
+/// The ordering fields an upsert compares. A partial update that does not set
+/// every ordering field merges by commit time, since the merged row takes its
+/// ordering value from the stored row, not the update.
+pub(super) fn upsert_ordering_fields(
+    hudi_configs: &crate::config::HudiConfigs,
+    update_columns: Option<&[String]>,
+) -> Result<Vec<String>> {
+    let fields = event_time_ordering_fields(hudi_configs)?;
+    if update_columns.is_some_and(|columns| fields.iter().any(|field| !columns.contains(field))) {
+        return Ok(Vec::new());
+    }
+    Ok(fields)
 }

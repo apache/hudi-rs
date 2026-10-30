@@ -22,28 +22,22 @@
 
 use super::*;
 
+/// Insert-overwrite: writes `batch` into new file groups that replace
+/// `replaced_file_ids` in one replacecommit.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn rewrite(
     table: &mut Table,
     instant: &str,
     batch: &RecordBatch,
-    row_targets: Option<Vec<String>>,
     replaced_file_ids: Vec<String>,
     mut old_paths: Vec<String>,
     log_only_replaced: Vec<(String, String)>,
     extra_replaced_paths: Vec<String>,
     operation: &str,
-    updates: usize,
     inserts: usize,
-    deletes: usize,
     mut rli_deletes: Vec<RecordIndexEntry>,
-    kind: RewriteKind,
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
-    let action = match kind {
-        RewriteKind::Commit => Action::Commit,
-        RewriteKind::Replace => Action::ReplaceCommit,
-    };
     // The instant was already requested (fenced) under critical section 1 by
     // request_rewrite_instant in the calling verb.
 
@@ -58,70 +52,37 @@ pub(super) async fn rewrite(
             .unwrap_or_default();
         prev_commit_by_file_id.insert(file_id.clone(), prev_commit_from_base_path(old_path));
         partition_by_file_id.insert(file_id.clone(), partition.clone());
-        if kind == RewriteKind::Replace {
-            partition_to_replace_file_ids
-                .entry(partition)
-                .or_default()
-                .push(file_id.clone());
-        }
+        partition_to_replace_file_ids
+            .entry(partition)
+            .or_default()
+            .push(file_id.clone());
     }
     // Safe only after the positional zip above.
     old_paths.extend(extra_replaced_paths);
-    if kind == RewriteKind::Replace {
-        for (partition, file_id) in &log_only_replaced {
-            partition_to_replace_file_ids
-                .entry(partition.clone())
-                .or_default()
-                .push(file_id.clone());
-        }
+    for (partition, file_id) in &log_only_replaced {
+        partition_to_replace_file_ids
+            .entry(partition.clone())
+            .or_default()
+            .push(file_id.clone());
     }
 
-    // Group planning: rows with a named target rewrite that file group (same
-    // fileId, MERGE marker); untargeted rows form NEW file groups, split into
-    // buckets of ~max.file.size records (Java UpsertPartitioner overflow /
-    // insert-overwrite sizing).
+    // Group planning: rows form new file groups, split into buckets of
+    // ~max.file.size records (Java insert-overwrite sizing).
     struct GroupPlan {
         partition: String,
         file_id: String,
         out_name: String,
-        existing: bool,
         rows: Vec<u32>,
     }
     let mut groups: Vec<GroupPlan> = Vec::new();
     if batch.num_rows() > 0 {
         let row_keys = hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?;
-        let mut existing_groups: HashMap<String, usize> = HashMap::new();
         let mut new_rows_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
         for (row, key) in row_keys.iter().enumerate() {
-            let target = if kind == RewriteKind::Replace {
-                ""
-            } else {
-                row_targets
-                    .as_ref()
-                    .and_then(|t| t.get(row).map(String::as_str))
-                    .unwrap_or("")
-            };
-            if target.is_empty() {
-                new_rows_by_partition
-                    .entry(key.partition_path.clone())
-                    .or_default()
-                    .push(row as u32);
-            } else {
-                let index = *existing_groups
-                    .entry(target.to_string())
-                    .or_insert_with(|| {
-                        let out_name = format!("{target}_0-0-0_{instant}.parquet");
-                        groups.push(GroupPlan {
-                            partition: key.partition_path.clone(),
-                            file_id: target.to_string(),
-                            out_name,
-                            existing: true,
-                            rows: Vec::new(),
-                        });
-                        groups.len() - 1
-                    });
-                groups[index].rows.push(row as u32);
-            }
+            new_rows_by_partition
+                .entry(key.partition_path.clone())
+                .or_default()
+                .push(row as u32);
         }
         // Untargeted rows: new file groups sized by the insert bucket size.
         let sizing = crate::write::sizing::SizingConfig::from_table(table);
@@ -137,53 +98,22 @@ pub(super) async fn rewrite(
                     partition: partition.clone(),
                     file_id,
                     out_name,
-                    existing: false,
                     rows: chunk.to_vec(),
                 });
             }
         }
     }
-    if kind == RewriteKind::Commit {
-        // Any affected file group left with zero surviving rows (a delete
-        // emptied it) still needs an empty base file: without a new slice
-        // the old base stays the group's latest version and deleted rows
-        // resurface — especially once the deleting commit is archived.
-        let planned: HashSet<String> = groups.iter().map(|g| g.file_id.clone()).collect();
-        for file_id in &replaced_file_ids {
-            if planned.contains(file_id) {
-                continue;
-            }
-            let partition = partition_by_file_id
-                .get(file_id)
-                .cloned()
-                .unwrap_or_default();
-            let out_name = format!("{file_id}_0-0-0_{instant}.parquet");
-            groups.push(GroupPlan {
-                partition,
-                file_id: file_id.clone(),
-                out_name,
-                existing: true,
-                rows: Vec::new(),
-            });
-        }
-    }
-
     let mut additions = Vec::new();
     let mut partition_to_write_stats = HashMap::<String, Vec<HoodieWriteStat>>::new();
     let mut written_paths = Vec::new();
     let mut row_group_file_ids: HashMap<u32, String> = HashMap::new();
     let mut stats_updates = Vec::new();
 
-    // Markers before any data file is put: MERGE for same-file-group rewrites,
-    // CREATE for new groups.
-    let mut planned_markers = Vec::new();
-    for group in &groups {
-        planned_markers.push(if group.existing {
-            crate::write::markers::Marker::merge(&group.partition, &group.out_name)
-        } else {
-            crate::write::markers::Marker::create(&group.partition, &group.out_name)
-        });
-    }
+    // Markers before any data file is put.
+    let planned_markers: Vec<_> = groups
+        .iter()
+        .map(|group| crate::write::markers::Marker::create(&group.partition, &group.out_name))
+        .collect();
     crate::write::markers::write_markers(storage.as_ref(), instant, &planned_markers).await?;
 
     // Phase 1 (sequential): slice + prepare each group.
@@ -217,6 +147,7 @@ pub(super) async fn rewrite(
 
     // Phase 2 (parallel): encode + put on the write task pool.
     let props = crate::write::append::parquet_writer_props(table);
+    let bloom = crate::write::append::base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let tasks = group_prepared
         .iter()
@@ -224,6 +155,7 @@ pub(super) async fn rewrite(
             crate::write::parquet_file_task(
                 storage.clone(),
                 props.clone(),
+                bloom,
                 prepared.clone(),
                 path.clone(),
                 collect_ranges,
@@ -244,7 +176,6 @@ pub(super) async fn rewrite(
                     stats_updates.push(crate::write::metadata::StatsFileUpdate {
                         partition_path: group.partition.clone(),
                         file_name: group.out_name.clone(),
-                        is_deleted: false,
                         ranges,
                     });
                 }
@@ -268,9 +199,9 @@ pub(super) async fn rewrite(
                         base_file: Some(group.out_name.clone()),
                         prev_commit: Some(prev_commit),
                         num_writes: Some(num_rows as i64),
-                        num_deletes: Some(deletes as i64),
-                        num_update_writes: Some(updates as i64),
-                        num_inserts: Some(inserts as i64),
+                        num_deletes: Some(0),
+                        num_update_writes: Some(0),
+                        num_inserts: Some(num_rows as i64),
                         total_write_bytes: Some(output.size),
                         file_size_in_bytes: Some(output.size),
                         partition_path: Some(group.partition.clone()),
@@ -291,10 +222,7 @@ pub(super) async fn rewrite(
         return Err(error);
     }
 
-    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
-        instant,
-        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-    );
+    let instant_time_millis = crate::write::metadata::instant_millis(&table.hudi_configs, instant);
     let rli_entries = {
         let mut entries = if batch.num_rows() > 0 && is_record_index_enabled(table) {
             hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?
@@ -320,8 +248,8 @@ pub(super) async fn rewrite(
     finalize_rewrite_commit(
         table,
         instant,
-        kind,
-        action,
+        RewriteKind::Replace,
+        Action::ReplaceCommit,
         operation,
         batch.schema(),
         partition_to_write_stats,
@@ -332,9 +260,9 @@ pub(super) async fn rewrite(
         &old_paths,
         rli_entries,
         batch.num_rows(),
-        updates,
+        0,
         inserts,
-        deletes,
+        0,
     )
     .await
 }
@@ -410,6 +338,7 @@ pub(super) struct MergeCtx {
     pub(super) reader: Option<std::sync::Arc<crate::file_group::reader::FileGroupReader>>,
     pub(super) instant: String,
     pub(super) props: parquet::file::properties::WriterProperties,
+    pub(super) bloom: Option<crate::bloom::BloomFilterConfig>,
     pub(super) collect_ranges: bool,
     pub(super) event_time: bool,
     /// Collect (key, partition) of removed rows for RLI tombstones.
@@ -426,6 +355,9 @@ pub(super) enum GroupOp {
         incoming: RecordBatch,
         partial_columns: Option<Vec<String>>,
         evict_keys: std::sync::Arc<HashSet<String>>,
+        /// Whether incoming rows merge with stored ones by ordering value
+        /// rather than by commit time.
+        by_event_time: bool,
     },
     /// Remove rows by record key ((key, partition) exact or key-only).
     DeleteKeys {
@@ -456,9 +388,30 @@ pub(super) struct MergeOutput {
     pub(super) num_rows: usize,
     /// Rows the op affected in this group (updated or deleted).
     pub(super) matched: usize,
+    /// Input rows this group gained as inserts.
+    pub(super) inserted: usize,
+    /// Rows a winning delete marker removed. Java's merge handle counts these
+    /// as deletes on top of the update or insert they arrived as.
+    pub(super) marker_deletes: usize,
     pub(super) ranges: Option<Vec<crate::metadata::table::column_stats::ColumnRangeStats>>,
     /// (record key, partition) tombstones for removed rows.
     pub(super) rli_deletes: Vec<(String, String)>,
+}
+
+impl MergeOutput {
+    /// The op matched nothing in the group, which keeps its current file.
+    fn unchanged() -> Self {
+        Self {
+            wrote: false,
+            size: 0,
+            num_rows: 0,
+            matched: 0,
+            inserted: 0,
+            marker_deletes: 0,
+            ranges: None,
+            rli_deletes: Vec::new(),
+        }
+    }
 }
 
 /// Replace `_hoodie_file_name` with `out_name` for every row.
@@ -492,7 +445,7 @@ pub(super) fn restamp_matched_rows(
     let new_ct: ArrayRef = std::sync::Arc::new(StringArray::from(vec![instant; batch.num_rows()]));
     let new_sq: ArrayRef = std::sync::Arc::new(StringArray::from(
         (0..batch.num_rows())
-            .map(|row| format!("{instant}_0-{row}-0"))
+            .map(|row| crate::write::append::commit_seqno(instant, 0, row))
             .collect::<Vec<_>>(),
     ));
     let mut columns = batch.columns().to_vec();
@@ -516,11 +469,14 @@ pub(super) fn merge_file_group_task(
             .await?;
         let key_field = MetaField::RecordKey.as_ref();
         let mut rli_deletes = Vec::new();
+        let mut marker_deletes = 0usize;
+        let mut inserted = 0;
         let (merged, matched) = match plan.op {
             GroupOp::Upsert {
                 incoming,
                 partial_columns,
                 evict_keys,
+                by_event_time,
             } => {
                 let incoming = if old.num_rows() > 0 {
                     crate::write::align_batch_to_schema(&incoming, &old.schema()).ok_or_else(
@@ -549,37 +505,55 @@ pub(super) fn merge_file_group_task(
                     take_batch(&old, &survivors)?
                 };
                 let old_keys = keys(&old, key_field)?;
-                let mut old_by_key = HashMap::with_capacity(old.num_rows());
-                for (index, key) in old_keys.iter().enumerate() {
-                    old_by_key.insert(key.clone(), index as u32);
-                }
                 let incoming_keys = keys(&incoming, key_field)?;
-                let mut final_indices: HashMap<String, u32> = old_by_key.clone();
-                let mut matched = 0usize;
-                for (index, key) in incoming_keys.iter().enumerate() {
-                    if old_by_key.contains_key(key) {
-                        matched += 1;
-                    }
-                    final_indices.insert(key.clone(), (old.num_rows() + index) as u32);
-                }
-                let mut selected = final_indices.into_values().collect::<Vec<_>>();
-                selected.sort_unstable();
+                let incoming_key_set: HashSet<&str> =
+                    incoming_keys.iter().map(String::as_str).collect();
+                // Like the Java merge handle, stored rows of keys this upsert
+                // does not touch are copied as they are, duplicates included.
+                let (matched_old, mut selected): (Vec<u32>, Vec<u32>) = (0..old.num_rows() as u32)
+                    .partition(|&index| {
+                        incoming_key_set.contains(old_keys[index as usize].as_str())
+                    });
                 let combined = if old.num_rows() == 0 {
                     incoming.clone()
                 } else {
                     concat_batches(&old.schema(), [&old, &incoming])?
                 };
-                let selected = if ctx.event_time && old.num_rows() > 0 {
-                    merge_with_event_time(
+                let mut old_by_key: HashMap<String, u32> = matched_old
+                    .iter()
+                    .map(|&index| (old_keys[index as usize].clone(), index))
+                    .collect();
+                // A partial update takes unselected columns from the touched
+                // key's stored row, which for a repeated key is its winner.
+                if ctx.event_time
+                    && partial_columns.is_some()
+                    && old_by_key.len() < matched_old.len()
+                {
+                    old_by_key = merge_with_event_time(
                         ctx.hudi_configs.clone(),
                         &combined,
-                        old.num_rows(),
-                        &old_by_key,
-                        &incoming_keys,
+                        matched_old.clone(),
                     )?
+                    .into_iter()
+                    .map(|index| (old_keys[index as usize].clone(), index))
+                    .collect();
+                }
+                let matched = incoming_keys
+                    .iter()
+                    .filter(|key| old_by_key.contains_key(*key))
+                    .count();
+                let incoming_rows = old.num_rows() as u32..combined.num_rows() as u32;
+                if by_event_time && !matched_old.is_empty() {
+                    let candidates = matched_old.into_iter().chain(incoming_rows).collect();
+                    selected.extend(merge_with_event_time(
+                        ctx.hudi_configs.clone(),
+                        &combined,
+                        candidates,
+                    )?);
                 } else {
-                    selected
-                };
+                    selected.extend(incoming_rows);
+                }
+                selected.sort_unstable();
                 let merged = if let Some(columns) = partial_columns {
                     let merged = partial_merge(&combined, &old_by_key, &selected, &columns)?;
                     // Partially-updated rows must carry the updating commit's
@@ -605,6 +579,7 @@ pub(super) fn merge_file_group_task(
                     let mut survivors = Vec::with_capacity(merged.num_rows());
                     for (row, source) in selected.iter().enumerate() {
                         if delete_markers[row] && *source as usize >= old.num_rows() {
+                            marker_deletes += 1;
                             rli_deletes
                                 .push((merged_keys[row].clone(), merged_partitions[row].clone()));
                         } else {
@@ -615,6 +590,7 @@ pub(super) fn merge_file_group_task(
                 } else {
                     merged
                 };
+                inserted = incoming.num_rows() - matched;
                 (merged, matched)
             }
             GroupOp::DeleteKeys { exact, keys_only } => {
@@ -635,6 +611,9 @@ pub(super) fn merge_file_group_task(
                     }
                 }
                 let matched = old.num_rows() - selected.len();
+                if matched == 0 {
+                    return Ok(MergeOutput::unchanged());
+                }
                 (take_batch(&old, &selected)?, matched)
             }
             GroupOp::DeleteWhere { filter } => {
@@ -655,14 +634,7 @@ pub(super) fn merge_file_group_task(
                     }
                 }
                 if matched == 0 {
-                    return Ok(MergeOutput {
-                        wrote: false,
-                        size: 0,
-                        num_rows: 0,
-                        matched: 0,
-                        ranges: None,
-                        rli_deletes,
-                    });
+                    return Ok(MergeOutput::unchanged());
                 }
                 (take_batch(&old, &selected)?, matched)
             }
@@ -670,14 +642,7 @@ pub(super) fn merge_file_group_task(
                 let mask = filters_to_row_mask(std::slice::from_ref(&filter), &old)?;
                 let (updated, matched) = apply_set_updates(&old, &mask, &set)?;
                 if matched == 0 {
-                    return Ok(MergeOutput {
-                        wrote: false,
-                        size: 0,
-                        num_rows: 0,
-                        matched: 0,
-                        ranges: None,
-                        rli_deletes,
-                    });
+                    return Ok(MergeOutput::unchanged());
                 }
                 let updated = restamp_matched_rows(&updated, &mask, &ctx.instant)?;
                 // Setting the delete marker deletes the row, as an upsert does.
@@ -691,6 +656,7 @@ pub(super) fn merge_file_group_task(
                     let mut survivors = Vec::with_capacity(updated.num_rows());
                     for (row, doomed) in doomed.into_iter().enumerate() {
                         if doomed {
+                            marker_deletes += 1;
                             rli_deletes.push((updated_keys[row].clone(), partitions[row].clone()));
                         } else {
                             survivors.push(row as u32);
@@ -707,9 +673,11 @@ pub(super) fn merge_file_group_task(
         let path = relative_data_path(&plan.partition, &plan.out_name);
         let num_rows = merged.num_rows();
         let props = ctx.props.clone();
+        let bloom = ctx.bloom;
         let collect_ranges = ctx.collect_ranges;
         let (bytes, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let bytes = crate::write::append::write_parquet_bytes_with_props(props, &[merged])?;
+            let bytes =
+                crate::write::append::write_parquet_bytes_with_props(props, bloom, &[merged])?;
             let ranges = if collect_ranges {
                 Some(
                     crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
@@ -728,6 +696,8 @@ pub(super) fn merge_file_group_task(
             size,
             num_rows,
             matched,
+            inserted,
+            marker_deletes,
             ranges,
             rli_deletes,
         })
@@ -791,6 +761,7 @@ pub(super) async fn commit_merge_plans(
 ) -> Result<WriteResult> {
     let storage = table.file_system_view.storage.clone();
     let props = crate::write::append::parquet_writer_props(table);
+    let bloom = crate::write::append::base_file_bloom_filter_config(table);
     let collect_ranges = is_column_stats_enabled(table);
     let rli_enabled = table.is_metadata_table_enabled() && is_record_index_enabled(table);
     let ctx = MergeCtx {
@@ -810,6 +781,7 @@ pub(super) async fn commit_merge_plans(
         },
         instant: instant.to_string(),
         props: props.clone(),
+        bloom,
         collect_ranges,
         event_time: uses_event_time_merge(&table.hudi_configs)?,
         collect_rli_deletes: rli_enabled && matched_slot == MatchedSlot::Deletes,
@@ -861,16 +833,20 @@ pub(super) async fn commit_merge_plans(
             let output = crate::write::parquet_file_task(
                 storage,
                 props,
+                bloom,
                 prepared.clone(),
                 path,
                 collect_ranges,
             )
             .await?;
+            let num_rows = prepared.iter().map(RecordBatch::num_rows).sum();
             Ok(MergeOutput {
                 wrote: true,
                 size: output.size,
-                num_rows: prepared.iter().map(RecordBatch::num_rows).sum(),
+                num_rows,
                 matched: 0,
+                inserted: num_rows,
+                marker_deletes: 0,
                 ranges: output.ranges,
                 rli_deletes: Vec::new(),
             })
@@ -886,6 +862,7 @@ pub(super) async fn commit_merge_plans(
     let mut stats_updates = Vec::new();
     let mut old_paths = Vec::new();
     let mut matched_total = 0usize;
+    let mut marker_deletes_total = 0usize;
     let mut num_writes = 0usize;
     let mut first_error = None;
     let group_info: Vec<(String, String, String, String, Option<String>)> = plan_meta
@@ -913,7 +890,6 @@ pub(super) async fn commit_merge_plans(
                         stats_updates.push(crate::write::metadata::StatsFileUpdate {
                             partition_path: partition.clone(),
                             file_name: out_name.clone(),
-                            is_deleted: false,
                             ranges: ranges.clone(),
                         });
                     }
@@ -930,6 +906,17 @@ pub(super) async fn commit_merge_plans(
                             base_file: Some(out_name.clone()),
                             prev_commit: Some(prev_commit.clone()),
                             num_writes: Some(output.num_rows as i64),
+                            num_update_writes: Some(match matched_slot {
+                                MatchedSlot::Deletes => 0,
+                                _ => output.matched as i64,
+                            }),
+                            num_deletes: Some(
+                                match matched_slot {
+                                    MatchedSlot::Deletes => output.matched as i64,
+                                    _ => 0,
+                                } + output.marker_deletes as i64,
+                            ),
+                            num_inserts: Some(output.inserted as i64),
                             partition_path: Some(partition.clone()),
                             total_write_bytes: Some(output.size),
                             file_size_in_bytes: Some(output.size),
@@ -938,6 +925,7 @@ pub(super) async fn commit_merge_plans(
                     num_writes += output.num_rows;
                 }
                 matched_total += output.matched;
+                marker_deletes_total += output.marker_deletes;
                 outputs.push(output);
             }
             Err(error) => {
@@ -964,20 +952,10 @@ pub(super) async fn commit_merge_plans(
     }
 
     let (updates, deletes) = match matched_slot {
-        MatchedSlot::None => (updates, 0),
-        MatchedSlot::Updates => (matched_total, 0),
-        MatchedSlot::Deletes => (updates, matched_total),
+        MatchedSlot::None => (updates, marker_deletes_total),
+        MatchedSlot::Updates => (matched_total, marker_deletes_total),
+        MatchedSlot::Deletes => (updates, matched_total + marker_deletes_total),
     };
-
-    // Fill the per-stat operation counters the way the previous driver did
-    // (totals on each stat).
-    for stats in partition_to_write_stats.values_mut() {
-        for stat in stats.iter_mut() {
-            stat.num_deletes = Some(deletes as i64);
-            stat.num_update_writes = Some(updates as i64);
-            stat.num_inserts = Some(inserts as i64);
-        }
-    }
 
     // Zero effect anywhere: abort the fenced instant, leave no commit.
     if abort_on_noop && written_paths.is_empty() {
@@ -988,6 +966,8 @@ pub(super) async fn commit_merge_plans(
     // RLI tombstones from the workers (deleted rows' actual key/partition),
     // replacing the driver's entry for a key an upsert delete marker removed.
     if rli_enabled {
+        let instant_time_millis =
+            crate::write::metadata::instant_millis(&table.hudi_configs, instant);
         let removed: HashSet<&str> = outputs
             .iter()
             .flat_map(|output| output.rli_deletes.iter().map(|(key, _)| key.as_str()))
@@ -999,7 +979,7 @@ pub(super) async fn commit_merge_plans(
                     record_key: record_key.clone(),
                     partition_path: partition_path.clone(),
                     file_id: String::new(),
-                    instant_time_millis: instant_to_epoch_millis(instant),
+                    instant_time_millis,
                     is_deleted: true,
                 });
             }

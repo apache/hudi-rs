@@ -36,6 +36,9 @@ use crate::keygen::record_key::configured_record_key_fields;
 /// Java `HoodieWriteConfig.COMPLEX_KEYGEN_NEW_ENCODING`.
 const COMPLEX_KEYGEN_NEW_ENCODING: &str = "hoodie.write.complex.keygen.new.encoding";
 
+/// Java `PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH`.
+pub(crate) const DEFAULT_PARTITION_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
+
 /// The key generators hudi-rs tells apart, as Java `KeyGeneratorType` names them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyGeneratorKind {

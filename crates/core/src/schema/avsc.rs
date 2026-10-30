@@ -235,6 +235,7 @@ mod tests {
             partition_to_write_stats: Some(HashMap::from([("p".to_string(), vec![stat.clone()])])),
             compacted: Some(false),
             extra_metadata: Some(HashMap::new()),
+            partition_to_replace_file_ids: None,
         };
         let bytes = commit.to_avro_bytes().unwrap();
         assert_eq!(&bytes[..4], b"Obj\x01");

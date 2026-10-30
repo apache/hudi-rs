@@ -51,6 +51,7 @@
 #![recursion_limit = "256"]
 
 mod avro_to_arrow;
+mod bloom;
 pub mod config;
 pub mod error;
 pub mod expr;

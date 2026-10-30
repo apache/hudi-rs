@@ -29,7 +29,7 @@ mod rewrite;
 pub(crate) mod rollback;
 pub(crate) mod sizing;
 
-pub use append::append_batches;
+pub(crate) use append::append_batches;
 pub(crate) use append::set_commit_timezone;
 pub use create::TableCreateBuilder;
 pub(crate) use keygen::{
@@ -38,9 +38,10 @@ pub(crate) use keygen::{
 };
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;
-pub use rewrite::{
-    UpsertOptions, WriteResult, delete_filter, delete_keys, dynamic_partition_overwrite_batches,
-    overwrite_batches, update_filter, upsert_batches,
+pub use rewrite::{UpsertOptions, WriteResult};
+pub(crate) use rewrite::{
+    delete_filter, delete_keys, dynamic_partition_overwrite_batches, overwrite_batches,
+    update_filter, upsert_batches,
 };
 
 use std::collections::HashMap;
@@ -53,6 +54,7 @@ use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::log_file::writer::LogFileWriter;
 use crate::file_group::log_file::{BlockMetadataKey, BlockType};
+use crate::metadata::meta_field::MetaField;
 use crate::schema::delete::{
     avro_schema_for_delete_record_list, delete_record_list_avro_schema_json,
 };
@@ -109,14 +111,58 @@ pub(crate) fn align_batch_to_schema(
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
 }
 
-/// Bring a write's batches to the list shape the table schema reads back with.
+/// Never tightens a column the table declares nullable: older files may hold
+/// nulls, and a commit schema that tightened the column would fail every later
+/// read of them (Java's `canonicalizeSchema` widens the same way).
+/// Callers have already matched the batches to `table_schema` by name and type.
+pub(crate) fn widen_to_table_nullability(
+    batches: &[arrow_array::RecordBatch],
+    table_schema: &arrow_schema::Schema,
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| {
+            let source = batch.schema();
+            let fields: Vec<arrow_schema::Field> = source
+                .fields()
+                .iter()
+                .map(|field| {
+                    let table_nullable = table_schema
+                        .field_with_name(field.name())
+                        .is_ok_and(|table_field| table_field.is_nullable());
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_nullable(field.is_nullable() || table_nullable)
+                })
+                .collect();
+            let schema = arrow_schema::Schema::new_with_metadata(fields, source.metadata().clone());
+            arrow_array::RecordBatch::try_new(std::sync::Arc::new(schema), batch.columns().to_vec())
+                .map_err(CoreError::ArrowError)
+        })
+        .collect()
+}
+
+/// Drops the writer-managed meta columns; `_hoodie_is_deleted` and other
+/// `_hoodie_`-prefixed data columns stay.
+pub(crate) fn strip_meta_columns(
+    batch: &arrow_array::RecordBatch,
+) -> Result<arrow_array::RecordBatch> {
+    let keep: Vec<usize> = (0..batch.num_columns())
+        .filter(|&i| !MetaField::is_meta_field(batch.schema().field(i).name()))
+        .collect();
+    batch.project(&keep).map_err(CoreError::ArrowError)
+}
+
+/// Normalizes caller batches at a public write entry point.
 ///
-/// Fixed-size lists become lists, and every list item is named `element`, at
-/// any depth: Avro has only `array`, which reads back with an `element` item,
-/// while PyArrow and most Arrow producers name it `item`. The first write is
-/// included so that every file of the table carries the same item name, which
-/// a reader taking each file's own schema needs in order to combine them.
-/// Anything else about a column is left for the schema checks downstream.
+/// Meta columns are dropped as in a non-prepped Java write, since the writer
+/// assigns them. Each column is cast to the type its commit schema reads back
+/// (the Avro round trip of [`append::arrow_schema_to_avro_json`]), so a later
+/// write with the same input schema matches the table and every file carries
+/// the commit schema's types. The first write is included so that every file
+/// of the table agrees, which a reader taking each file's own schema needs in
+/// order to combine them.
 pub(crate) fn normalize_for_write(
     batches: &[arrow_array::RecordBatch],
 ) -> Result<Vec<arrow_array::RecordBatch>> {
@@ -127,67 +173,55 @@ pub(crate) fn normalize_write_batch(
     batch: &arrow_array::RecordBatch,
 ) -> Result<arrow_array::RecordBatch> {
     use arrow_schema::Field;
+    let batch = strip_meta_columns(batch)?;
+    let source = batch.schema();
+    let read_back = crate::schema::resolver::avro_json_to_arrow_schema(
+        &append::arrow_schema_to_avro_json(&source)?,
+    )?;
     let mut changed = false;
     let mut fields = Vec::with_capacity(batch.num_columns());
     let mut columns = Vec::with_capacity(batch.num_columns());
-    for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let target = normalize_list_type(field.data_type());
-        if &target == field.data_type() {
+    for ((field, column), read_back) in source
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .zip(read_back.fields())
+    {
+        let target = read_back.data_type();
+        if target == field.data_type() {
             fields.push(field.clone());
             columns.push(column.clone());
             continue;
         }
         changed = true;
-        let casted = arrow::compute::cast(column.as_ref(), &target).map_err(|e| {
-            CoreError::Schema(format!(
-                "cannot convert column '{}' from {} to {target} for writing: {e}",
-                field.name(),
-                field.data_type()
-            ))
-        })?;
+        // A lossy cast must fail rather than write nulls.
+        let options = arrow::compute::CastOptions {
+            safe: false,
+            ..Default::default()
+        };
+        let casted =
+            arrow::compute::cast_with_options(column.as_ref(), target, &options).map_err(|e| {
+                CoreError::Schema(format!(
+                    "cannot convert column '{}' from {} to {target} for writing: {e}",
+                    field.name(),
+                    field.data_type()
+                ))
+            })?;
         fields.push(std::sync::Arc::new(
-            Field::new(field.name(), target, field.is_nullable())
+            Field::new(field.name(), target.clone(), field.is_nullable())
                 .with_metadata(field.metadata().clone()),
         ));
         columns.push(casted);
     }
     if !changed {
-        return Ok(batch.clone());
+        return Ok(batch);
     }
     let schema = std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
         fields,
-        batch.schema().metadata().clone(),
+        source.metadata().clone(),
     ));
     arrow_array::RecordBatch::try_new(schema, columns)
         .map_err(|e| CoreError::Schema(format!("cannot rebuild batch for writing: {e}")))
-}
-
-/// `dt` with every `FixedSizeList` replaced by a `List` of the same item, and
-/// every list item named `element`, at any depth.
-fn normalize_list_type(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
-    use arrow_schema::{DataType, Field};
-    let normalize_field = |f: &std::sync::Arc<Field>, name: &str| {
-        std::sync::Arc::new(
-            Field::new(name, normalize_list_type(f.data_type()), f.is_nullable())
-                .with_metadata(f.metadata().clone()),
-        )
-    };
-    match dt {
-        DataType::FixedSizeList(item, _) | DataType::List(item) => {
-            DataType::List(normalize_field(item, "element"))
-        }
-        DataType::LargeList(item) => DataType::LargeList(normalize_field(item, "element")),
-        DataType::Struct(fields) => DataType::Struct(
-            fields
-                .iter()
-                .map(|f| normalize_field(f, f.name()))
-                .collect(),
-        ),
-        DataType::Map(entries, sorted) => {
-            DataType::Map(normalize_field(entries, entries.name()), *sorted)
-        }
-        other => other.clone(),
-    }
 }
 
 pub(crate) fn new_file_id() -> String {
@@ -259,13 +293,14 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
     use futures::StreamExt;
     let count = tasks.len();
     let mut results: Vec<Option<Result<T>>> = std::iter::repeat_with(|| None).take(count).collect();
-    let mut stream = futures::stream::iter(
-        tasks
-            .into_iter()
-            .enumerate()
-            .map(|(index, task)| async move { (index, task.await) }),
-    )
-    .buffer_unordered(parallelism.max(1));
+    // Collected rather than mapped lazily: a stream that projects through the
+    // closure's output defeats the compiler's Send check on callers' futures.
+    let indexed: Vec<_> = tasks
+        .into_iter()
+        .enumerate()
+        .map(|(index, task)| async move { (index, task.await) })
+        .collect();
+    let mut stream = futures::stream::iter(indexed).buffer_unordered(parallelism.max(1));
     while let Some((index, result)) = stream.next().await {
         results[index] = Some(result);
     }
@@ -286,13 +321,15 @@ pub(crate) struct FileTaskOutput {
 pub(crate) fn parquet_file_task(
     storage: std::sync::Arc<Storage>,
     props: parquet::file::properties::WriterProperties,
+    bloom: Option<crate::bloom::BloomFilterConfig>,
     prepared: Vec<arrow_array::RecordBatch>,
     relative_path: String,
     collect_ranges: bool,
 ) -> futures::future::BoxFuture<'static, Result<FileTaskOutput>> {
     Box::pin(async move {
         let (bytes, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let bytes = crate::write::append::write_parquet_bytes_with_props(props, &prepared)?;
+            let bytes =
+                crate::write::append::write_parquet_bytes_with_props(props, bloom, &prepared)?;
             let ranges = if collect_ranges {
                 Some(
                     crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
@@ -323,7 +360,8 @@ pub(crate) fn log_file_task(
 ) -> futures::future::BoxFuture<'static, Result<FileTaskOutput>> {
     Box::pin(async move {
         let (block, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let parquet = crate::write::append::write_parquet_bytes_with_props(props, &prepared)?;
+            let parquet =
+                crate::write::append::write_parquet_bytes_with_props(props, None, &prepared)?;
             let ranges = if collect_ranges {
                 Some(
                     crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(
@@ -360,18 +398,14 @@ pub(crate) async fn post_complete_bookkeeping(
     instant: &str,
 ) -> Result<()> {
     markers::delete_marker_dir(storage, instant).await;
-    let options = table.hudi_configs.as_options();
-    let min_keep = options
-        .get("hoodie.keep.min.commits")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(archival::DEFAULT_KEEP_MIN_COMMITS);
-    let max_keep = options
-        .get("hoodie.keep.max.commits")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(archival::DEFAULT_KEEP_MAX_COMMITS);
+    let (min_keep, max_keep) = archival::validated_keep_range(&table.hudi_configs)?;
+    // Not held behind the latest MDT compaction as Java's archiver is: an
+    // archived instant's MDT log blocks stay valid through its MDT
+    // deltacommit, which the MDT keeps active until a compaction covers it.
     archival::archive_timeline_if_needed(
         storage,
         &crate::write::append::timeline_dir(table),
+        &crate::timeline::loader::lsm_history_dir(&table.hudi_configs),
         min_keep,
         max_keep,
     )
@@ -392,6 +426,7 @@ pub(crate) fn inflight_commit_metadata_bytes(operation: &str, layout_two: bool) 
         partition_to_write_stats: Some(std::collections::HashMap::new()),
         compacted: Some(false),
         extra_metadata: Some(std::collections::HashMap::new()),
+        partition_to_replace_file_ids: None,
     };
     if layout_two {
         metadata.to_avro_bytes()
@@ -540,6 +575,7 @@ pub(crate) fn commit_metadata_bytes(
                 partition_to_write_stats: Some(partition_to_write_stats),
                 compacted: Some(false),
                 extra_metadata,
+                partition_to_replace_file_ids: None,
             };
             if layout_two {
                 metadata.to_avro_bytes()
@@ -646,7 +682,10 @@ pub(crate) async fn complete_write(
     storage
         .put_file_if_absent(&commit_relative_path, commit_bytes)
         .await?;
-    let _ = post_complete_bookkeeping(table, storage.as_ref(), instant).await;
+    // The commit is durable; bookkeeping retries on the next write.
+    if let Err(error) = post_complete_bookkeeping(table, storage.as_ref(), instant).await {
+        log::warn!("post-commit bookkeeping for {instant} failed: {error}");
+    }
     drop(critical_section);
 
     let _ = table.timeline.reload_completed_commits().await;
@@ -761,58 +800,39 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_list_type_renames_items_and_widens_fixed_size_lists_at_any_depth() {
-        use arrow_schema::{DataType, Field, Fields};
+    fn test_normalize_write_batch_renames_items_and_widens_lists_at_any_depth() {
+        use arrow_schema::{DataType, Field, Fields, Schema};
         let item = std::sync::Arc::new(Field::new("item", DataType::Float32, true));
         let element = list_of("element", DataType::Float32);
-
-        assert_eq!(
-            normalize_list_type(&DataType::FixedSizeList(item.clone(), 2)),
-            element
+        let in_struct =
+            |vec: DataType| DataType::Struct(Fields::from(vec![Field::new("vec", vec, true)]));
+        let cases = [
+            (DataType::FixedSizeList(item.clone(), 2), element.clone()),
+            (list_of("item", DataType::Float32), element.clone()),
+            (DataType::LargeList(item.clone()), element.clone()),
+            (
+                list_of("item", DataType::FixedSizeList(item.clone(), 2)),
+                list_of("element", element.clone()),
+            ),
+            (
+                in_struct(DataType::FixedSizeList(item, 2)),
+                in_struct(element.clone()),
+            ),
+            (DataType::Int64, DataType::Int64),
+            (element.clone(), element),
+        ];
+        let schema = Schema::new(
+            cases
+                .iter()
+                .enumerate()
+                .map(|(index, (input, _))| Field::new(format!("c{index}"), input.clone(), true))
+                .collect::<Vec<_>>(),
         );
-        assert_eq!(
-            normalize_list_type(&list_of("item", DataType::Float32)),
-            element
-        );
-        assert_eq!(
-            normalize_list_type(&DataType::LargeList(item.clone())),
-            DataType::LargeList(std::sync::Arc::new(Field::new(
-                "element",
-                DataType::Float32,
-                true
-            )))
-        );
-        assert_eq!(
-            normalize_list_type(&list_of("item", DataType::FixedSizeList(item.clone(), 2))),
-            list_of("element", element.clone())
-        );
-
-        // Struct children and map entries keep their names; only list items change.
-        let nested = |vec: DataType| {
-            let entries = Field::new(
-                "entries",
-                DataType::Struct(Fields::from(vec![
-                    Field::new("key", DataType::Utf8, false),
-                    Field::new("value", vec.clone(), true),
-                ])),
-                false,
-            );
-            DataType::Struct(Fields::from(vec![
-                Field::new("vec", vec, true),
-                Field::new(
-                    "tags",
-                    DataType::Map(std::sync::Arc::new(entries), false),
-                    true,
-                ),
-            ]))
-        };
-        assert_eq!(
-            normalize_list_type(&nested(DataType::FixedSizeList(item, 2))),
-            nested(element.clone())
-        );
-
-        assert_eq!(normalize_list_type(&DataType::Int64), DataType::Int64);
-        assert_eq!(normalize_list_type(&element), element);
+        let batch = arrow_array::RecordBatch::new_empty(std::sync::Arc::new(schema));
+        let normalized = normalize_write_batch(&batch).unwrap().schema();
+        for ((_, expected), field) in cases.iter().zip(normalized.fields()) {
+            assert_eq!(field.data_type(), expected, "{}", field.name());
+        }
     }
 
     #[test]

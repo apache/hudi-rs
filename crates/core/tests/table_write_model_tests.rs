@@ -113,6 +113,15 @@ fn dedup_batch(rows: Vec<(String, String, i64, i64)>) -> Vec<(String, String, i6
     best.into_values().collect()
 }
 
+/// Commit-time dedupe within a batch: the last row per key wins.
+fn dedup_batch_last(rows: Vec<(String, String, i64, i64)>) -> Vec<(String, String, i64, i64)> {
+    let mut last: BTreeMap<String, (String, String, i64, i64)> = BTreeMap::new();
+    for row in rows {
+        last.insert(row.0.clone(), row);
+    }
+    last.into_values().collect()
+}
+
 async fn read_table(table: &Table) -> Vec<(String, String, i64, i64, String)> {
     let batches = table.read(&ReadOptions::new()).await.unwrap();
     let mut out = Vec::new();
@@ -305,30 +314,41 @@ async fn run_sequence(table_type: TableTypeValue, metadata: bool, seed: u64, ops
                     oracle.insert(id, Row { city, ts, v });
                 }
             }
-            // Partial upsert of `v` only (COW; unsupported on MOR). Keys keep
-            // their current partition; missing keys insert as full rows.
+            // Partial upsert (COW; unsupported on MOR). Setting the ordering
+            // field merges by event time; setting only `v` merges by commit
+            // time and keeps the stored `ts`. Keys keep their current
+            // partition; missing keys insert as full rows.
             55..=64 if is_cow => {
+                let with_ordering = rng.below(2) == 0;
                 let mut rows = rand_rows(&mut rng, true);
                 for row in &mut rows {
                     if let Some(existing) = oracle.get(&row.0) {
                         row.1 = existing.city.clone();
                     }
                 }
-                eprintln!("{context}: partial {rows:?}");
+                let columns: &[&str] = if with_ordering { &["v", "ts"] } else { &["v"] };
+                eprintln!("{context}: partial {columns:?} {rows:?}");
                 table
                     .upsert_with(
                         [batch_of(&rows)],
                         UpsertOptions {
-                            update_columns: Some(vec!["v".to_string()]),
+                            update_columns: Some(columns.iter().map(|c| c.to_string()).collect()),
                         },
                     )
                     .await
                     .unwrap();
-                for (id, city, ts, v) in dedup_batch(rows) {
+                let rows = if with_ordering {
+                    dedup_batch(rows)
+                } else {
+                    dedup_batch_last(rows)
+                };
+                for (id, city, ts, v) in rows {
                     match oracle.get_mut(&id) {
+                        Some(old) if !with_ordering => old.v = v,
                         Some(old) => {
                             if ts >= old.ts {
-                                old.v = v; // ts is not an update column
+                                old.v = v;
+                                old.ts = ts;
                             }
                         }
                         None => {

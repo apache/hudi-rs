@@ -28,7 +28,7 @@ use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::HudiConfigs;
 use hudi_core::config::table::HudiTableConfig;
-use hudi_core::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use hudi_core::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
 use hudi_core::hfile::HFileReader;
 use hudi_core::metadata::table::encode::{
     ColumnStatValue, ColumnStatsMetadata, decode_column_stats_entry,
@@ -110,10 +110,10 @@ async fn read_stats_records(
     let mut merged = HashMap::new();
     for base in bases {
         let mut reader = HFileReader::open(storage.as_ref(), &base).await.unwrap();
+        let schema = reader.get_avro_schema().unwrap().cloned();
         for record in reader.collect_records().unwrap() {
             let key = record.key_as_str().unwrap().to_string();
-            if let Some(stats) =
-                decode_column_stats_entry(record.value(), record.avro_schema()).unwrap()
+            if let Some(stats) = decode_column_stats_entry(record.value(), schema.as_ref()).unwrap()
             {
                 merged.insert(key, stats);
             }
@@ -122,11 +122,13 @@ async fn read_stats_records(
     if !logs.is_empty() {
         let scanner = LogFileScanner::new(table.hudi_configs.clone(), storage);
         let range = InstantRange::up_to("99991231235959999", "UTC");
-        if let ScanResult::HFileRecords(records) = scanner.scan(logs, &range).await.unwrap() {
+        for HFileRecordGroup { schema, records } in
+            scanner.scan_hfile_records(logs, &range).await.unwrap()
+        {
             for record in &records {
                 let key = record.key_as_str().unwrap().to_string();
                 if let Some(stats) =
-                    decode_column_stats_entry(record.value(), record.avro_schema()).unwrap()
+                    decode_column_stats_entry(record.value(), schema.as_deref()).unwrap()
                 {
                     merged.insert(key, stats);
                 }

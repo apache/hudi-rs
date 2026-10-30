@@ -117,17 +117,16 @@ impl MetadataTableFileGroupReader {
                 .collect()
         };
 
-        let log_records = if log_file_paths.is_empty() {
-            vec![]
-        } else {
-            let instant_range = self.create_instant_range_for_log_file_scan()?;
-            LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
-                .scan_hfile_records(log_file_paths, &instant_range)
-                .await?
-        };
-
         let merger = FilesPartitionMerger::new(schema);
-        merger.merge_for_keys(&base_records, &log_records, &hfile_keys)
+        let mut merged = merger.merge_for_keys(&base_records, &[], &hfile_keys)?;
+        if !log_file_paths.is_empty() {
+            let instant_range = self.create_instant_range_for_log_file_scan()?;
+            let groups = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                .scan_hfile_records(log_file_paths, &instant_range)
+                .await?;
+            merger.merge_log_groups(&mut merged, &groups, &hfile_keys)?;
+        }
+        Ok(merged)
     }
 
     /// The window bounding which log instants this read admits.

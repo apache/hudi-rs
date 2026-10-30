@@ -21,38 +21,24 @@
 
 use super::*;
 
-/// Indices into `combined` (the group's `num_old` stored rows, then the
-/// incoming rows) that survive an event-time merge, in `combined` order.
+/// The `candidates` of `combined` that survive an event-time merge, sorted.
 ///
-/// Only the stored rows whose key is incoming can change, so the merger sees
-/// just those and the incoming rows. A group with a repeated stored key sends
-/// every stored row through it, since the merger also collapses repeats.
+/// Only the candidates go through the merger, since it collapses every repeated
+/// key; rows left out are the caller's to keep or drop.
 pub(super) fn merge_with_event_time(
     hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
     combined: &RecordBatch,
-    num_old: usize,
-    old_by_key: &HashMap<String, u32>,
-    incoming_keys: &[String],
+    candidates: Vec<u32>,
 ) -> Result<Vec<u32>> {
-    let mut touched = vec![old_by_key.len() < num_old; num_old];
-    for key in incoming_keys {
-        if let Some(&index) = old_by_key.get(key) {
-            touched[index as usize] = true;
-        }
-    }
-    let (mut candidates, mut selected): (Vec<u32>, Vec<u32>) =
-        (0..num_old as u32).partition(|&index| touched[index as usize]);
-    candidates.extend(num_old as u32..combined.num_rows() as u32);
     let candidate_rows = take_batch(combined, &candidates)?;
     let merger = RecordMerger::new(combined.schema(), hudi_configs);
     let merged = merger.merge_record_batches(RecordBatches::new_with_data_batches([
         candidate_rows.clone(),
     ]))?;
-    selected.extend(
-        selected_indices_for_merged(&candidate_rows, &merged)?
-            .into_iter()
-            .map(|index| candidates[index as usize]),
-    );
+    let mut selected: Vec<u32> = selected_indices_for_merged(&candidate_rows, &merged)?
+        .into_iter()
+        .map(|index| candidates[index as usize])
+        .collect();
     selected.sort_unstable();
     Ok(selected)
 }
@@ -271,32 +257,6 @@ pub(super) fn delete_marker_rows(batch: &RecordBatch) -> Vec<bool> {
         .unwrap_or_else(|| vec![false; batch.num_rows()])
 }
 
-pub(super) fn strip_meta_columns(batch: &RecordBatch) -> Result<RecordBatch> {
-    let meta: HashSet<&str> = MetaField::field_names_with_operation()
-        .into_iter()
-        .collect();
-    let fields: Vec<_> = batch
-        .schema()
-        .fields()
-        .iter()
-        .filter(|f| !meta.contains(f.name().as_str()))
-        .cloned()
-        .collect();
-    let columns: Vec<ArrayRef> = batch
-        .schema()
-        .fields()
-        .iter()
-        .zip(batch.columns())
-        .filter(|(f, _)| !meta.contains(f.name().as_str()))
-        .map(|(_, c)| c.clone())
-        .collect();
-    RecordBatch::try_new(
-        std::sync::Arc::new(arrow_schema::Schema::new(fields)),
-        columns,
-    )
-    .map_err(Into::into)
-}
-
 /// Overlay single-row SET values onto rows where `matched` is true.
 pub(super) fn apply_set_updates(
     old: &RecordBatch,
@@ -379,26 +339,14 @@ pub(super) fn keys(batch: &RecordBatch, field: &str) -> Result<Vec<String>> {
 /// Keep the final occurrence of each key, in original relative order.
 /// Deduplicate a write batch by record key.
 ///
-/// With an ordering (precombine) field configured, the row with the highest
-/// ordering value wins (ties: later occurrence), matching Java precombine.
-/// Without one, the LAST occurrence wins — the pick among duplicates is
-/// arbitrary by design when no ordering field is configured.
+/// The row with the highest value across `ordering_fields` wins (ties: later
+/// occurrence), matching Java precombine; with no ordering fields the last
+/// occurrence wins.
 pub(super) fn deduplicate_last_by_key(
     batch: &RecordBatch,
     keys: &[String],
-    hudi_configs: &crate::config::HudiConfigs,
+    ordering_fields: &[String],
 ) -> Result<RecordBatch> {
-    // Java routes in-batch dedupe through the merge-mode-derived merger
-    // (BaseWriteHelper.reduceRecords), so a COMMIT_TIME_ORDERING table never
-    // consults the ordering value here either — last occurrence wins.
-    let ordering_fields: Vec<String> = if uses_event_time_merge(hudi_configs)? {
-        hudi_configs
-            .try_get(OrderingFields)?
-            .map(Into::into)
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
     // One comparator per ordering field, hoisted out of the duplicate loop;
     // fields compare lexicographically (first field breaks ties via the next).
     let comparators = ordering_fields
@@ -510,6 +458,116 @@ pub(super) fn partial_merge(
     RecordBatch::try_new(combined.schema(), columns).map_err(Into::into)
 }
 
+/// Merges each partial-upsert row that would change partition with its stored
+/// row before routing, as Java merges before deciding a partition move:
+/// unselected columns come from the stored row and the key is derived again
+/// from the merged values. A row whose merged partition is its stored one
+/// keeps its input values and is keyed to that partition, so the group merge
+/// resolves it as an in-place update. Keys in `rejected` are left as input.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn resolve_partial_moves(
+    table: &Table,
+    incoming: &RecordBatch,
+    tagged_keys: &[HoodieKey],
+    moved: &HashMap<String, Vec<String>>,
+    slices: &HashMap<String, crate::file_group::file_slice::FileSlice>,
+    rejected: &HashSet<String>,
+    update_columns: &[String],
+) -> Result<(RecordBatch, Vec<HoodieKey>)> {
+    let wanted: HashSet<&str> = moved
+        .values()
+        .flatten()
+        .map(String::as_str)
+        .filter(|key| !rejected.contains(*key))
+        .collect();
+    let mut route_keys = tagged_keys.to_vec();
+    if wanted.is_empty() {
+        return Ok((incoming.clone(), route_keys));
+    }
+    let reader = table
+        .create_file_group_reader_with_options(
+            Some(&ReadOptions::new()),
+            std::iter::empty::<(&str, String)>(),
+        )
+        .await?;
+    let mut stored = Vec::new();
+    for file_id in moved.keys() {
+        let Some(slice) = slices.get(file_id) else {
+            continue;
+        };
+        let old = reader.read_file_slice(slice, &ReadOptions::new()).await?;
+        let rows: Vec<u32> = keys(&old, MetaField::RecordKey.as_ref())?
+            .iter()
+            .enumerate()
+            .filter(|(_, key)| wanted.contains(key.as_str()))
+            .map(|(row, _)| row as u32)
+            .collect();
+        stored.push(take_batch(&old, &rows)?);
+    }
+    let stored = concat(&stored)?;
+    let stored = deduplicate_last_by_key(
+        &stored,
+        &keys(&stored, MetaField::RecordKey.as_ref())?,
+        &event_time_ordering_fields(&table.hudi_configs)?,
+    )?;
+    let stored_keys = keys(&stored, MetaField::RecordKey.as_ref())?;
+    let stored_partitions = string_values(&stored, MetaField::PartitionPath.as_ref())?;
+    let stored_partition: HashMap<&str, &str> = stored_keys
+        .iter()
+        .map(String::as_str)
+        .zip(stored_partitions.iter().map(String::as_str))
+        .collect();
+    let old_by_key: HashMap<String, u32> = stored_keys
+        .iter()
+        .enumerate()
+        .map(|(row, key)| (key.clone(), row as u32))
+        .collect();
+
+    let combined = concat_batches(&incoming.schema(), [&stored, incoming])?;
+    let selected: Vec<u32> = (0..incoming.num_rows())
+        .map(|row| (stored.num_rows() + row) as u32)
+        .collect();
+    let mut merge_columns = update_columns.to_vec();
+    merge_columns.extend(
+        MetaField::field_names_with_operation()
+            .into_iter()
+            .map(String::from),
+    );
+    let merged = partial_merge(&combined, &old_by_key, &selected, &merge_columns)?;
+    let merged_keys = hoodie_keys_for_batch(&table.hudi_configs, &merged, None)?;
+
+    let mut take = Vec::with_capacity(incoming.num_rows());
+    for (row, merged_key) in merged_keys.into_iter().enumerate() {
+        match stored_partition.get(merged_key.record_key.as_str()) {
+            Some(&partition) if merged_key.partition_path == partition => {
+                route_keys[row].partition_path = partition.to_string();
+                take.push(row as u32);
+            }
+            Some(_) => {
+                route_keys[row] = merged_key;
+                take.push((incoming.num_rows() + row) as u32);
+            }
+            None => take.push(row as u32),
+        }
+    }
+    let resolved = take_batch(
+        &concat_batches(&incoming.schema(), [incoming, &merged])?,
+        &take,
+    )?;
+    let (index, _) = resolved
+        .schema()
+        .column_with_name(MetaField::PartitionPath.as_ref())
+        .ok_or_else(|| CoreError::Write("partial upsert requires meta fields".to_string()))?;
+    let mut columns = resolved.columns().to_vec();
+    columns[index] = std::sync::Arc::new(StringArray::from_iter_values(
+        route_keys.iter().map(|key| key.partition_path.as_str()),
+    ));
+    Ok((
+        RecordBatch::try_new(resolved.schema(), columns)?,
+        route_keys,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,7 +612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_with_event_time_matches_full_merge() {
+    fn test_merge_with_event_time_merges_only_the_candidates() {
         let configs = Arc::new(HudiConfigs::new([
             (RecordMergeStrategy, "OVERWRITE_WITH_LATEST".to_string()),
             (OrderingFields, "ts".to_string()),
@@ -582,25 +640,25 @@ mod tests {
         for old in [unique, repeated] {
             let rows: Vec<_> = old.iter().chain(incoming.iter()).copied().collect();
             let combined = combined(&rows);
-            let keys = keys(&combined, MetaField::RecordKey.as_ref()).unwrap();
-            let num_old = old.len();
-            let old_by_key: HashMap<String, u32> = keys[..num_old]
-                .iter()
-                .enumerate()
-                .map(|(index, key)| (key.clone(), index as u32))
+            let num_old = old.len() as u32;
+            // Every stored row except e's is touched.
+            let (untouched, touched): (Vec<u32>, Vec<u32>) =
+                (0..num_old).partition(|&index| old[index as usize].1 == "e");
+            let candidates = touched
+                .into_iter()
+                .chain(num_old..combined.num_rows() as u32)
                 .collect();
-            let selected = merge_with_event_time(
-                configs.clone(),
-                &combined,
-                num_old,
-                &old_by_key,
-                &keys[num_old..],
-            )
-            .unwrap();
-            assert_eq!(selected, full_merge(configs.clone(), &combined), "{old:?}");
+            let mut selected =
+                merge_with_event_time(configs.clone(), &combined, candidates).unwrap();
+            selected.extend(untouched);
+            selected.sort_unstable();
             if num_old == 5 {
                 // e and a stored; b, c, the later d and the later f incoming.
                 assert_eq!(selected, vec![0, 1, 6, 7, 9, 11]);
+                assert_eq!(selected, full_merge(configs.clone(), &combined));
+            } else {
+                // Both stored e rows stay; the later stored a wins over both.
+                assert_eq!(selected, vec![0, 5, 6, 8, 9, 11, 13]);
             }
         }
     }

@@ -22,13 +22,12 @@
 //! `scripts/parity/README.md`). Run with `make parity`.
 //!
 //! Scenarios: hudi-rs writes → Spark reads; Spark writes → rs reads;
-//! Spark table services on rs-written tables; interleaved writers.
+//! Spark table services on rs-written tables; interleaved writers; Java index
+//! lookups and Spark SQL DML on rs-written tables.
 //!
 //! MDT HFile interop is exercised here too: whenever Spark reads or compacts
 //! an rs-written table with metadata enabled, its native HFile reader parses
-//! the rs-written MDT base files and log blocks (it ignores the comparator
-//! class name and block checksums, which are the two places our minimal
-//! writer diverges from HBase output).
+//! the rs-written MDT base files and log blocks.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,6 +36,7 @@ use std::sync::Arc;
 use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::table::TableTypeValue;
+use hudi_core::index::HoodieKey;
 use hudi_core::table::{QueryType, ReadOptions, Table};
 use tempfile::tempdir;
 
@@ -831,7 +831,7 @@ async fn parity_e_mixed_workload_archival_and_query_types() {
             }
             table.upsert([batch(&rows)]).await.unwrap();
 
-            // 3. insert: 5 new rows via upsert (small-file packing path).
+            // 3. insert: 5 new rows via upsert.
             let mut rows = Vec::new();
             for (i, part) in parts.iter().enumerate() {
                 clock += 1;
@@ -1075,4 +1075,224 @@ async fn parity_h_append_table_version_6_spark_reads() {
         expected,
         "spark must read the table version 6 table append wrote"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario I: Java index lookups on rs-written tables. Spark upserts with each
+// index type must find every key rs wrote (base files, rs inserts, rs updates)
+// and re-insert a key rs deleted, without duplicating any of them.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
+async fn parity_i_java_index_lookups_on_rs_tables() {
+    if !enabled() {
+        return;
+    }
+    let env = spark_env();
+    for (table_type, type_name) in [
+        (TableTypeValue::CopyOnWrite, "cow"),
+        (TableTypeValue::MergeOnRead, "mor"),
+    ] {
+        for index in ["SIMPLE", "BLOOM", "GLOBAL_BLOOM"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("t");
+            let mut table = rs_create(&path, table_type.clone(), true).await;
+            table
+                .append([batch(&[
+                    row("a", Some("sf"), 1, 10),
+                    row("b", Some("sf"), 1, 20),
+                    row("c", Some("nyc"), 1, 30),
+                ])])
+                .await
+                .unwrap();
+            table
+                .upsert([batch(&[
+                    row("b", Some("sf"), 2, 21),
+                    row("d", Some("nyc"), 2, 40),
+                ])])
+                .await
+                .unwrap();
+            table
+                .delete_keys([HoodieKey {
+                    record_key: "c".to_string(),
+                    partition_path: "part=nyc".to_string(),
+                }])
+                .await
+                .unwrap();
+
+            let index_type = format!("hoodie.index.type={index}");
+            spark_write_with(
+                &env,
+                &path,
+                "upsert",
+                type_name,
+                true,
+                &[
+                    row("a", Some("sf"), 3, 11),
+                    row("b", Some("sf"), 3, 22),
+                    row("c", Some("nyc"), 3, 31),
+                    row("d", Some("nyc"), 3, 41),
+                    row("e", Some("sf"), 3, 50),
+                ],
+                &[
+                    "--write-option",
+                    &index_type,
+                    "--write-option",
+                    "hoodie.metadata.record.index.enable=true",
+                ],
+            );
+
+            let expected = vec![
+                row("a", Some("sf"), 3, 11),
+                row("b", Some("sf"), 3, 22),
+                row("c", Some("nyc"), 3, 31),
+                row("d", Some("nyc"), 3, 41),
+                row("e", Some("sf"), 3, 50),
+            ];
+            assert_eq!(
+                rs_read(&path).await,
+                expected,
+                "[{type_name} {index}] rs read after Spark upsert"
+            );
+            assert_eq!(
+                spark_read(&env, &path),
+                expected,
+                "[{type_name} {index}] spark read after Spark upsert"
+            );
+        }
+    }
+
+    // Java's bloom index tests a key against the footer range with
+    // String.compareTo; these keys sort differently in UTF-8. With small-file
+    // packing off, a missed lookup writes a duplicate instead of merging.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t");
+    let mut table = rs_create(&path, TableTypeValue::CopyOnWrite, true).await;
+    table
+        .append([batch(&[
+            row("\u{FF21}", Some("sf"), 1, 10),
+            row("\u{1F600}", Some("sf"), 1, 20),
+        ])])
+        .await
+        .unwrap();
+    spark_write_with(
+        &env,
+        &path,
+        "upsert",
+        "cow",
+        true,
+        &[row("\u{FF21}", Some("sf"), 2, 11)],
+        &[
+            "--write-option",
+            "hoodie.index.type=BLOOM",
+            "--write-option",
+            "hoodie.parquet.small.file.limit=0",
+        ],
+    );
+    let expected = vec![
+        row("\u{FF21}", Some("sf"), 2, 11),
+        row("\u{1F600}", Some("sf"), 1, 20),
+    ];
+    assert_eq!(rs_read(&path).await, expected, "rs read after bloom upsert");
+    assert_eq!(
+        spark_read(&env, &path),
+        expected,
+        "spark read after bloom upsert"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scenario J: Spark SQL UPDATE, DELETE and INSERT on rs-written tables from a
+// non-default database, then rs writes on top of Spark's commits.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
+async fn parity_j_spark_sql_dml_on_rs_tables() {
+    if !enabled() {
+        return;
+    }
+    let env = spark_env();
+    for (table_type, type_name) in [
+        (TableTypeValue::CopyOnWrite, "cow"),
+        (TableTypeValue::MergeOnRead, "mor"),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("t");
+        let warehouse = dir.path().join("warehouse");
+        let mut table = rs_create(&path, table_type, true).await;
+        table
+            .append([batch(&[
+                row("a", Some("sf"), 1, 10),
+                row("b", Some("sf"), 1, 20),
+                row("c", Some("nyc"), 1, 30),
+            ])])
+            .await
+            .unwrap();
+        // On MOR the update lands in a log file, which Spark SQL must map back
+        // to its file group.
+        table
+            .upsert([batch(&[row("b", Some("sf"), 2, 21)])])
+            .await
+            .unwrap();
+
+        run_spark(
+            &env,
+            "spark_sql.py",
+            &[
+                "--path",
+                &path.to_string_lossy(),
+                "--db",
+                "parity_db",
+                "--table",
+                &format!("parity_{type_name}"),
+                "--warehouse",
+                &warehouse.to_string_lossy(),
+                "--sql",
+                "update {table} set value = 99, ts = 9 where id = 'b'",
+                "--sql",
+                "delete from {table} where id = 'a'",
+                "--sql",
+                "insert into {table} (id, ts, value, part) values ('d', 1, 40, 'nyc')",
+            ],
+        );
+        let expected = vec![
+            row("b", Some("sf"), 9, 99),
+            row("c", Some("nyc"), 1, 30),
+            row("d", Some("nyc"), 1, 40),
+        ];
+        assert_eq!(
+            rs_read(&path).await,
+            expected,
+            "[{type_name}] rs read after Spark SQL"
+        );
+        assert_eq!(
+            spark_read(&env, &path),
+            expected,
+            "[{type_name}] spark read after Spark SQL"
+        );
+
+        let mut table = Table::new(path.to_str().unwrap()).await.unwrap();
+        table
+            .upsert([batch(&[
+                row("c", Some("nyc"), 2, 31),
+                row("d", Some("nyc"), 2, 41),
+            ])])
+            .await
+            .unwrap();
+        let expected = vec![
+            row("b", Some("sf"), 9, 99),
+            row("c", Some("nyc"), 2, 31),
+            row("d", Some("nyc"), 2, 41),
+        ];
+        assert_eq!(
+            rs_read(&path).await,
+            expected,
+            "[{type_name}] rs read after rs upsert on Spark SQL commits"
+        );
+        assert_eq!(
+            spark_read(&env, &path),
+            expected,
+            "[{type_name}] spark read after rs upsert on Spark SQL commits"
+        );
+    }
 }
