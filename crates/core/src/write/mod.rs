@@ -21,7 +21,7 @@
 pub(crate) mod append;
 pub(crate) mod archival;
 mod create;
-pub(crate) mod keygen;
+mod keygen;
 pub mod lock;
 pub(crate) mod markers;
 pub(crate) mod metadata;

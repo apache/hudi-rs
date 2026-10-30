@@ -202,10 +202,10 @@ async fn test_key_filter_on_a_merge_on_read_table_reads_the_updated_row() {
     assert_eq!(values, vec![1001]);
 }
 
-/// A reader opened before a delete keeps its snapshot: the index is ahead of
-/// it, so the key still reads back from a full scan.
+/// A reader opened before a delete keeps its snapshot: the index is read as
+/// of it, so the key still reads back from its own file group.
 #[tokio::test]
-async fn test_a_stale_reader_does_not_use_a_newer_index() {
+async fn test_a_stale_reader_reads_the_index_as_of_its_snapshot() {
     let dir = tempdir().unwrap();
     let reader = three_groups(dir.path(), TableTypeValue::CopyOnWrite, true).await;
     let mut writer = Table::new(dir.path().to_str().unwrap()).await.unwrap();
@@ -218,7 +218,7 @@ async fn test_a_stale_reader_does_not_use_a_newer_index() {
         .unwrap();
     assert_eq!(
         slices_and_ids(&reader, &filters(&[("id", "=", "k04")])).await,
-        (3, vec!["k04".to_string()])
+        (1, vec!["k04".to_string()])
     );
     let fresh = Table::new(dir.path().to_str().unwrap()).await.unwrap();
     assert_eq!(
@@ -235,6 +235,170 @@ async fn test_metadata_disabled_on_the_reader_reads_every_file_group() {
     let table = Table::new_with_options(
         dir.path().to_str().unwrap(),
         [("hoodie.metadata.enable", "false")],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        slices_and_ids(&table, &filters(&[("id", "=", "k04")])).await,
+        (3, vec!["k04".to_string()])
+    );
+}
+
+/// Sorted values of the string column `column` across `batches`.
+fn strings(batches: &[RecordBatch], column: &str) -> Vec<String> {
+    let mut values: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            b.column_by_name(column)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+                .map(|v| v.unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    values.sort();
+    values
+}
+
+/// A commit still pending when the reader opened is not part of its
+/// snapshot, so its index entries are not either, even when it completes
+/// before the read.
+#[tokio::test]
+async fn test_a_commit_pending_when_the_reader_opened_is_not_read_from_the_index() {
+    let dir = tempdir().unwrap();
+    three_groups(dir.path(), TableTypeValue::CopyOnWrite, true).await;
+    let mut writer = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    writer
+        .delete_keys([HoodieKey {
+            record_key: "k04".to_string(),
+            partition_path: String::new(),
+        }])
+        .await
+        .unwrap();
+    let delete_instant = writer
+        .get_timeline()
+        .completed_commits
+        .iter()
+        .map(|i| i.timestamp.clone())
+        .max()
+        .unwrap();
+    writer.upsert([batch(0, 500)]).await.unwrap();
+
+    // Open the reader while the delete looks in flight, then let it complete.
+    let timeline = dir.path().join(".hoodie/timeline");
+    let completed = std::fs::read_dir(&timeline)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            name.starts_with(&format!("{delete_instant}_")) && name.ends_with(".commit")
+        })
+        .unwrap();
+    let hidden = dir.path().join("hidden.commit");
+    std::fs::rename(&completed, &hidden).unwrap();
+    let reader = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    std::fs::rename(&hidden, &completed).unwrap();
+
+    let (_, ids) = slices_and_ids(&reader, &filters(&[("id", "=", "k04")])).await;
+    assert_eq!(ids, vec!["k04".to_string()]);
+}
+
+/// Spark-written partitioned tables whose metadata table holds an instant
+/// newer than the latest data commit (an indexing action). Footer statistics
+/// already narrow the copy-on-write read; the merge-on-read one, whose slices
+/// carry logs, narrows only through the index.
+#[tokio::test]
+async fn test_key_filter_on_spark_written_tables() {
+    use hudi_test::{SampleTable, TableFormat};
+    for format in [TableFormat::Cow, TableFormat::MorAvro] {
+        let path = SampleTable::V9TxnsSimpleMeta.path(format);
+        let table = Table::new(&path).await.unwrap();
+        let all = table
+            .get_file_slices(&ReadOptions::new())
+            .await
+            .unwrap()
+            .len();
+        let keys = strings(&table.read(&ReadOptions::new()).await.unwrap(), "txn_id");
+        let probe = format!("{},{}", keys[0], keys[keys.len() - 1]);
+        let options = filters(&[("txn_id", "IN", probe.as_str())]);
+        let slices = table.get_file_slices(&options).await.unwrap().len();
+        let got = strings(&table.read(&options).await.unwrap(), "txn_id");
+
+        let scan = Table::new_with_options(&path, [("hoodie.metadata.enable", "false")])
+            .await
+            .unwrap();
+        let want = strings(&scan.read(&options).await.unwrap(), "txn_id");
+        assert_eq!(got, want, "{format:?}");
+        assert!(slices < all, "{format:?}: {slices} of {all} slices planned");
+    }
+}
+
+/// Create the three-group table with a declared complex key generator at
+/// `version`, so a single-field key is stored as `id:<value>`.
+async fn complex_three_groups(dir: &std::path::Path, version: isize) {
+    Table::create(dir.to_str().unwrap())
+        .with_table_name("t")
+        .with_table_version(version)
+        .with_record_key_fields(["id"])
+        .with_record_index(true)
+        .with_option("hoodie.parquet.small.file.limit", "0")
+        .create()
+        .await
+        .unwrap();
+    let props = dir.join(".hoodie/hoodie.properties");
+    let rewritten: String = std::fs::read_to_string(&props)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            if line.starts_with("hoodie.table.keygenerator.type=") {
+                "hoodie.table.keygenerator.type=COMPLEX\n".to_string()
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&props, rewritten).unwrap();
+    let mut writer = Table::new_with_options(
+        dir.to_str().unwrap(),
+        [("hoodie.write.complex.keygen.validation.enable", "false")],
+    )
+    .await
+    .unwrap();
+    for (group, base) in [(0, 0), (1, 100), (2, 200)] {
+        writer.append([batch(group, base)]).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_key_filter_with_a_complex_key_generator() {
+    let dir = tempdir().unwrap();
+    complex_three_groups(dir.path(), 9).await;
+    let table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(
+        strings(
+            &table.read(&ReadOptions::new()).await.unwrap(),
+            "_hoodie_record_key"
+        )[0],
+        "id:k00"
+    );
+    assert_eq!(
+        slices_and_ids(&table, &filters(&[("id", "=", "k04")])).await,
+        (1, vec!["k04".to_string()])
+    );
+}
+
+/// Below table version 9 the stored form is not knowable from the table, so
+/// the lookup stays off whatever the reader claims.
+#[tokio::test]
+async fn test_key_filter_with_a_complex_key_generator_below_version_9() {
+    let dir = tempdir().unwrap();
+    complex_three_groups(dir.path(), 8).await;
+    let table = Table::new_with_options(
+        dir.path().to_str().unwrap(),
+        [("hoodie.write.complex.keygen.new.encoding", "true")],
     )
     .await
     .unwrap();

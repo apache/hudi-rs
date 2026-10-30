@@ -729,9 +729,9 @@ impl Table {
                 .iter()
                 .map(|fs| (fs.partition_path.as_str(), fs.file_id()))
                 .collect();
-            // A file group the index names but this snapshot does not know
-            // (clustered or compacted after the table was opened) means the
-            // index is ahead of the reader, so the scan stays complete.
+            // A file group the index names that this plan lacks (another
+            // filter pruned it, or the index disagrees with the snapshot)
+            // leaves the plan as it is.
             if located.iter().all(|(partition, file_id)| {
                 planned.contains(&(partition.as_str(), file_id.as_str()))
             }) {
@@ -753,12 +753,11 @@ impl Table {
     /// `filters` ask for, or `None` when the index cannot answer.
     ///
     /// Only an equality or `IN` filter on the table's single string record key
-    /// field (or on `_hoodie_record_key`) is a key lookup, and only on table
-    /// version 8 or later, whose metadata table this reader can list. The index
-    /// describes the latest commit, so a read as of an earlier instant does not
-    /// use it. Anything the lookup cannot handle, including an error, leaves
-    /// the full scan in place; the row-level mask still applies the filter to
-    /// whatever is read.
+    /// field (or on `_hoodie_record_key`) is a key lookup, and only for a read
+    /// of the latest commit on table version 8 or later, whose metadata table
+    /// this reader can list. Anything the lookup cannot handle, including an
+    /// error, leaves the full scan in place; the row-level mask still applies
+    /// the filter to whatever is read.
     async fn file_groups_for_record_keys(
         &self,
         filters: &[Filter],
@@ -766,7 +765,8 @@ impl Table {
         table_schema: &Schema,
     ) -> Option<HashSet<(String, String)>> {
         use crate::expr::ExprOperator;
-        use crate::index::{HoodieIndex, HoodieKey, RecordIndex, is_record_index_enabled};
+        use crate::index::is_record_index_enabled;
+        use crate::keygen::{KeyGeneratorKind, key_generator_kind};
 
         let metadata_off = self
             .hudi_configs
@@ -804,20 +804,14 @@ impl Table {
             table_schema.field_with_name(key_field).ok()?.data_type(),
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
         );
-        let prefixed = match crate::write::keygen::encodes_single_key_field_name(&self.hudi_configs)
-        {
-            Ok(prefixed) => prefixed,
-            Err(e) => {
-                log::warn!("record index lookup skipped: {e}");
-                return None;
-            }
+        // A complex key generator stores a single-field key as `field:value`
+        // from table version 9; below it the stored form depends on the writer
+        // release, so the index cannot be asked.
+        let prefixed = match key_generator_kind(&self.hudi_configs).ok()? {
+            KeyGeneratorKind::Simple | KeyGeneratorKind::NonPartitioned => false,
+            KeyGeneratorKind::Complex | KeyGeneratorKind::SparkSql if version >= 9 => true,
+            _ => return None,
         };
-        // Below table version 9 a complex key generator may have stored the
-        // key with or without the field name (see
-        // `ensure_complex_keygen_validated`), so only the bare form is looked up.
-        if prefixed && version < 9 {
-            return None;
-        }
         let mut keys: Option<HashSet<String>> = None;
         for filter in filters {
             if !matches!(filter.operator, ExprOperator::Eq | ExprOperator::In) {
@@ -849,63 +843,9 @@ impl Table {
             });
         }
         let keys = keys?;
-        if !crate::index::record_index_has_file_groups(self).await {
-            return None;
-        }
-        // The index is read at its current state while this reader holds an
-        // older snapshot: a key deleted or moved since would come back absent
-        // or elsewhere. Only an index whose latest commit is this snapshot's
-        // can answer for it.
-        match self.get_or_init_metadata_table().await {
-            Ok(metadata_table)
-                if metadata_table
-                    .timeline
-                    .get_latest_commit_timestamp_as_option()
-                    == Some(timestamp) => {}
-            Ok(_) => return None,
-            Err(e) => {
-                log::warn!("record index lookup skipped: {e}");
-                return None;
-            }
-        }
-        // The lookup lists the index's files as they are now, so a base file
-        // compacted after this snapshot would be read as if it belonged to it.
-        let slices = match crate::write::metadata::mdt_partition_latest_slices(
-            self.file_system_view.storage.as_ref(),
-            crate::metadata::table::records::MetadataPartitionType::RecordIndex.partition_name(),
-        )
-        .await
-        {
-            Ok(slices) => slices,
-            Err(e) => {
-                log::warn!("record index lookup skipped: {e}");
-                return None;
-            }
-        };
-        let newer_base = slices.iter().any(|(_, base, _)| {
-            base.as_deref()
-                .and_then(|path| path.rsplit('/').next())
-                .and_then(|name| name.parse::<crate::file_group::base_file::BaseFile>().ok())
-                .is_some_and(|base| base.commit_timestamp.as_str() > timestamp)
-        });
-        if newer_base {
-            return None;
-        }
-        let hoodie_keys: Vec<HoodieKey> = keys
-            .into_iter()
-            .map(|record_key| HoodieKey {
-                record_key,
-                partition_path: String::new(),
-            })
-            .collect();
-        match RecordIndex.tag_location(self, &hoodie_keys).await {
-            Ok(located) => Some(
-                located
-                    .into_values()
-                    .flatten()
-                    .map(|location| (location.partition_path, location.file_id))
-                    .collect(),
-            ),
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        match crate::index::locate_file_groups(self, &keys, timestamp).await {
+            Ok(located) => located,
             Err(e) => {
                 log::warn!("record index lookup failed, reading every file slice: {e}");
                 None
