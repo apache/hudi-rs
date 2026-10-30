@@ -354,15 +354,42 @@ impl FileGroupReader {
         if unchanged { None } else { Some(target) }
     }
 
+    /// The caller's filters, compiled for the parquet reader: all of them for
+    /// a slice read without log files, only the record key filters for one
+    /// that `merges` them. The row-level mask applied afterwards still decides
+    /// every row.
+    fn filter_pushdown(
+        &self,
+        options: &ReadOptions,
+        data_schema: &arrow_schema::Schema,
+        merges: bool,
+    ) -> Option<crate::file_group::pushdown::FilterPushdown> {
+        let record_key_fields: Vec<String> = self
+            .hudi_configs
+            .try_get(HudiTableConfig::RecordKeyFields)
+            .ok()
+            .flatten()
+            .map(Into::into)
+            .unwrap_or_default();
+        crate::file_group::pushdown::filter_pushdown(
+            &options.filters,
+            &record_key_fields,
+            data_schema,
+            merges,
+        )
+    }
+
     /// Read one slice through the merge-on-read reader.
     ///
-    /// Filters and projection are not applied here: the caller runs the result
-    /// through the same `apply_eager_options` the other paths use, so the two
-    /// engines cannot disagree about what a filter means.
+    /// The caller's filters reach the parquet reader as a pushdown (see
+    /// [`Self::filter_pushdown`]); they are still applied, with the
+    /// projection, by the caller's `apply_eager_options`, so the two engines
+    /// cannot disagree about what a filter means.
     async fn read_via_v2(
         &self,
         base_file_path: &str,
         log_file_paths: Vec<String>,
+        options: &ReadOptions,
     ) -> Result<RecordBatch> {
         let data_schema = self.resolved_data_schema(base_file_path).await?;
         if let Some(reason) = crate::file_group::reader_v2::adapter::refuse_reason(
@@ -382,12 +409,14 @@ impl FileGroupReader {
         // Per file slice, so debug: a wide read would repeat this once per
         // slice, and which reader served the table is not news N times over.
         log::debug!("reading '{base_file_path}' with file group reader version 2");
+        let pushdown = self.filter_pushdown(options, &data_schema, !log_file_paths.is_empty());
         let merged = crate::file_group::reader_v2::adapter::read_file_slice(
             self.hudi_configs.clone(),
             self.storage.clone(),
             base_file_path,
             log_file_paths,
             partition_path,
+            pushdown,
             Some(data_schema),
             self.completion_gate_inputs.clone(),
         )
@@ -620,7 +649,8 @@ impl FileGroupReader {
             } else {
                 log_file_paths
             };
-            self.read_via_v2(base_file_path, log_file_paths).await?
+            self.read_via_v2(base_file_path, log_file_paths, &options)
+                .await?
         } else if base_file_only {
             // Nothing to merge — a copy-on-write slice, or a read-optimized read
             // that ignores the log files. Served by the base file reader, not by
@@ -833,12 +863,14 @@ impl FileGroupReader {
 
         // Per file slice — see the eager sibling.
         log::debug!("streaming '{base_file_path}' with file group reader version 2");
+        let pushdown = self.filter_pushdown(options, &data_schema, !log_file_paths.is_empty());
         let merged = crate::file_group::reader_v2::adapter::read_file_slice_stream(
             self.hudi_configs.clone(),
             self.storage.clone(),
             base_file_path,
             log_file_paths,
             partition_path,
+            pushdown,
             Some(data_schema),
             self.completion_gate_inputs.clone(),
         )
@@ -1221,6 +1253,149 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
     use url::Url;
+
+    /// A filtered slice read reaches the parquet reader: with two rows per
+    /// row group, a key filter fetches one row group of the file.
+    #[tokio::test]
+    async fn test_filters_prune_row_groups_of_a_slice_read() {
+        use crate::table::Table;
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_option("hoodie.parquet.block.size", "2048")
+            .with_option("hoodie.copyonwrite.record.size.estimate", "1024")
+            .create()
+            .await
+            .unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    (0..10).map(|i| format!("k{i:02}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from_iter_values(0..10)),
+            ],
+        )
+        .unwrap();
+        table.append([batch]).await.unwrap();
+        let base_file = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .find(|name| name.ends_with(".parquet"))
+            .unwrap();
+
+        let table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let reader = table
+            .create_file_group_reader_with_options(
+                Some(&ReadOptions::new()),
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .await
+            .unwrap();
+        let volume = reader.storage.read_volume();
+        let options = ReadOptions::new()
+            .with_filters([("id", "=", "k05")])
+            .unwrap();
+        let batch = reader
+            .read_file_slice_from_paths(&base_file, Vec::<String>::new(), &options)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(volume.file_row_groups.load(Relaxed), 5);
+        assert_eq!(volume.row_groups_read.load(Relaxed), 1);
+    }
+
+    /// On a slice whose log files merge, the record key half of a mixed
+    /// filter still reaches the parquet reader, and the merged update wins.
+    #[tokio::test]
+    async fn test_key_filters_prune_row_groups_of_a_merging_slice_read() {
+        use crate::config::table::TableTypeValue;
+        use crate::table::Table;
+        use arrow_array::{Int64Array, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let batch = |ids: Vec<String>, values: Vec<i64>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(Int64Array::from(values)),
+                ],
+            )
+            .unwrap()
+        };
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_table_type(TableTypeValue::MergeOnRead)
+            .with_option("hoodie.parquet.block.size", "2048")
+            .with_option("hoodie.copyonwrite.record.size.estimate", "1024")
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([batch(
+                (0..10).map(|i| format!("k{i:02}")).collect(),
+                (0..10).collect(),
+            )])
+            .await
+            .unwrap();
+        table
+            .upsert([batch(vec!["k05".to_string()], vec![500])])
+            .await
+            .unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        let base_file = names.iter().find(|n| n.ends_with(".parquet")).unwrap();
+        let log_files: Vec<&String> = names.iter().filter(|n| n.contains(".log.")).collect();
+        assert_eq!(log_files.len(), 1, "the upsert went to a log");
+
+        let table = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let reader = table
+            .create_file_group_reader_with_options(
+                Some(&ReadOptions::new()),
+                std::iter::empty::<(&str, &str)>(),
+            )
+            .await
+            .unwrap();
+        let volume = reader.storage.read_volume();
+        let options = ReadOptions::new()
+            .with_filters([("id", "=", "k05"), ("value", "=", "500")])
+            .unwrap();
+        let batch = reader
+            .read_file_slice_from_paths(base_file, log_files, &options)
+            .await
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(values.value(0), 500);
+        assert_eq!(volume.file_row_groups.load(Relaxed), 5);
+        assert_eq!(volume.row_groups_read.load(Relaxed), 1);
+    }
 
     const TEST_SAMPLE_BASE_FILE: &str =
         "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
