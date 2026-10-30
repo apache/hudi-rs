@@ -1383,15 +1383,48 @@ async fn parity_k_rs_compaction_spark_interop() {
         "spark read after its upsert on the compacted table"
     );
 
-    // rs compacts Spark's log files along with its own.
+    // rs compacts Spark's log files along with its own. A file slice without
+    // log files is a small-file candidate Spark rewrites as a new base file,
+    // so rs logs to the sf group first and Spark's update then appends a log.
+    let mut table = open().await;
+    table
+        .upsert([batch(&[row("a", Some("sf"), 4, 13)])])
+        .await
+        .unwrap();
+    spark_write(
+        &env,
+        path,
+        "upsert",
+        "mor",
+        true,
+        &[row("e", Some("sf"), 2, 51)],
+    );
     let mut table = open().await;
     table.delete("id = 'c'").await.unwrap();
+    let logs_by_group: Vec<(String, usize)> = table
+        .get_file_slices(&ReadOptions::new())
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|slice| slice.has_log_file())
+        .map(|slice| (slice.partition_path.clone(), slice.log_files.len()))
+        .collect();
+    assert!(
+        logs_by_group
+            .iter()
+            .any(|(partition, logs)| partition.ends_with("sf") && *logs >= 2),
+        "rs and spark logs on the sf group: {logs_by_group:?}"
+    );
     let result = table.compact().await.unwrap();
     assert_eq!(
-        result.num_file_groups, 2,
-        "spark's sf log and rs's nyc delete log"
+        (result.num_file_groups, result.num_log_files),
+        (
+            logs_by_group.len(),
+            logs_by_group.iter().map(|(_, logs)| logs).sum()
+        ),
+        "every slice with logs, spark's included"
     );
-    let expected = vec![row("a", Some("sf"), 3, 12), row("e", Some("sf"), 1, 50)];
+    let expected = vec![row("a", Some("sf"), 4, 13), row("e", Some("sf"), 2, 51)];
     assert_eq!(
         rs_read(path).await,
         expected,
@@ -1407,10 +1440,10 @@ async fn parity_k_rs_compaction_spark_interop() {
     // Spark reads through the pending plan, and the next rs compaction rolls
     // it back before compacting.
     table
-        .upsert([batch(&[row("e", Some("sf"), 2, 51)])])
+        .upsert([batch(&[row("e", Some("sf"), 3, 52)])])
         .await
         .unwrap();
-    let expected = vec![row("a", Some("sf"), 3, 12), row("e", Some("sf"), 2, 51)];
+    let expected = vec![row("a", Some("sf"), 4, 13), row("e", Some("sf"), 3, 52)];
     let slice = table
         .get_file_slices(&ReadOptions::new())
         .await
