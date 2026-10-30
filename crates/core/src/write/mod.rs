@@ -514,6 +514,7 @@ pub(crate) async fn complete_write(
                     storage.as_ref(),
                     instant,
                     std::mem::take(&mut updates.record_index),
+                    write_task_parallelism(table),
                 )
                 .await?;
                 if !stats.is_empty() {

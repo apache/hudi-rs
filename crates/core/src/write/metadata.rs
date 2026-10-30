@@ -376,11 +376,13 @@ pub async fn update_files_partition_entries(
 /// records with null `recordIndexMetadata`, which NPEs Java's RLI reader.
 ///
 /// Returns the `record_index` partition write stats for the caller's single
-/// MDT deltacommit (see [`write_metadata_commit`]).
+/// MDT deltacommit (see [`write_metadata_commit`]). At most `max_parallelism`
+/// shards are built at once.
 pub async fn update_record_index(
     data_storage: &Storage,
     instant: &str,
     entries: Vec<RecordIndexEntry>,
+    max_parallelism: usize,
 ) -> Result<Vec<HoodieWriteStat>> {
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -388,25 +390,23 @@ pub async fn update_record_index(
     let num_groups = detect_rli_num_file_groups(data_storage).await?;
     let schema_json = record_index_metadata_avro_schema_json()?.to_string();
     // Only the routing happens here; each shard encodes its own entries on
-    // the blocking pool below, so the entries are shared with those tasks by
-    // index rather than copied.
-    let mut puts_by_shard: HashMap<usize, Vec<usize>> = HashMap::new();
+    // the blocking pool below.
+    let mut puts_by_shard: HashMap<usize, Vec<RecordIndexEntry>> = HashMap::new();
     let mut deletes_by_shard: HashMap<usize, Vec<(String, String)>> = HashMap::new();
-    for (index, entry) in entries.iter().enumerate() {
+    for entry in entries {
         let shard = map_record_key_to_file_group_index(&entry.record_key, num_groups);
         if entry.is_deleted {
             // DeleteRecord.partitionPath is the MDT partition (Java HoodieKey for RLI deletes).
             deletes_by_shard.entry(shard).or_default().push((
-                entry.record_key.clone(),
+                entry.record_key,
                 MetadataPartitionType::RecordIndex
                     .partition_name()
                     .to_string(),
             ));
         } else {
-            puts_by_shard.entry(shard).or_default().push(index);
+            puts_by_shard.entry(shard).or_default().push(entry);
         }
     }
-    let entries = std::sync::Arc::new(entries);
 
     let shards: std::collections::BTreeSet<usize> = puts_by_shard
         .keys()
@@ -414,23 +414,26 @@ pub async fn update_record_index(
         .copied()
         .collect();
     // Building a shard's blocks (sorting its keys, encoding the HFile) is
-    // CPU-only, so up to one shard per core is built on the blocking pool while
-    // finished shards are written, in shard order, and released.
+    // CPU-only, so up to one shard per core (and no more than `max_parallelism`)
+    // is built on the blocking pool while finished shards are written, in shard
+    // order, and released.
     use futures::StreamExt;
-    let parallelism = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+    let parallelism = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .min(max_parallelism)
+        .max(1);
     let mut builds = futures::stream::iter(shards)
         .map(|shard| {
-            let put_indices = puts_by_shard.remove(&shard).unwrap_or_default();
+            let puts = puts_by_shard.remove(&shard).unwrap_or_default();
             let deletes = deletes_by_shard.remove(&shard).unwrap_or_default();
             let schema_json = schema_json.clone();
             let instant = instant.to_string();
-            let entries = entries.clone();
             tokio::task::spawn_blocking(move || -> Result<(usize, Vec<u8>, i64)> {
-                let puts = put_indices
+                let puts = puts
                     .into_iter()
-                    .map(|index| {
-                        let entry = &entries[index];
-                        Ok((entry.record_key.clone(), encode_record_index_entry(entry)?))
+                    .map(|entry| {
+                        let bytes = encode_record_index_entry(&entry)?;
+                        Ok((entry.record_key, bytes))
                     })
                     .collect::<Result<Vec<(String, Vec<u8>)>>>()?;
                 let mut log_bytes = Vec::new();
