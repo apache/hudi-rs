@@ -116,8 +116,8 @@ pub(super) async fn mor_upsert_batches(
             ));
         }
     }
-    let key_name = record_key_name(table, &incoming)?;
-    let incoming = deduplicate_last_by_key(&incoming, &key_name, &table.hudi_configs)?;
+    let incoming_keys = batch_record_keys(table, &incoming)?;
+    let incoming = deduplicate_last_by_key(&incoming, &incoming_keys, &table.hudi_configs)?;
     crate::write::keygen::validate_keygen_inputs(
         &table.hudi_configs,
         std::slice::from_ref(&incoming),

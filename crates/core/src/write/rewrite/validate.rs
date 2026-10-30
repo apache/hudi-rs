@@ -47,14 +47,7 @@ pub(crate) fn ensure_writable_table_version(table: &Table) -> Result<()> {
 /// identity would strand its index entry and diverge the partition value from
 /// the path it physically lives in.
 pub(super) fn ensure_set_columns_updatable(table: &Table, updates: &RecordBatch) -> Result<()> {
-    let mut identity: Vec<String> = Vec::new();
-    if let Some(fields) = table
-        .hudi_configs
-        .try_get(RecordKeyFields)?
-        .map(|v| -> Vec<String> { v.into() })
-    {
-        identity.extend(fields);
-    }
+    let mut identity = configured_record_key_fields(&table.hudi_configs)?;
     let partition_fields: Vec<String> = table
         .hudi_configs
         .get_or_default(crate::config::table::HudiTableConfig::PartitionFields)

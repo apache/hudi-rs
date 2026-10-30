@@ -114,6 +114,7 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::keygen::is_timestamp_based_keygen;
+use crate::keygen::record_key::configured_record_key_fields;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::meta_field::MetaField;
@@ -419,6 +420,7 @@ impl Table {
     /// A filter that matches no rows succeeds without creating a commit and reports zero deletes.
     pub async fn delete(&mut self, filter: &str) -> Result<WriteResult> {
         let filter = parse_write_filter(filter)?;
+        ensure_record_key_list_parsable(&self.hudi_configs, &filter)?;
         crate::write::delete_filter(self, filter).await
     }
 
@@ -442,6 +444,7 @@ impl Table {
     /// Predicates may target any column. Zero matches succeed without a commit.
     pub async fn update(&mut self, filter: &str, updates: RecordBatch) -> Result<WriteResult> {
         let filter = parse_write_filter(filter)?;
+        ensure_record_key_list_parsable(&self.hudi_configs, &filter)?;
         crate::write::update_filter(self, filter, updates).await
     }
 
@@ -1517,6 +1520,25 @@ fn parse_write_filter(filter: &str) -> Result<Filter> {
     Err(CoreError::Write(format!(
         "write filter must be a single comparison such as `id = 'a'`, got '{filter}'"
     )))
+}
+
+/// [`parse_write_filter`] splits an `IN` list on every `,`, and every
+/// composite record key contains one, so the list would name key fragments.
+fn ensure_record_key_list_parsable(hudi_configs: &HudiConfigs, filter: &Filter) -> Result<()> {
+    if filter.field == MetaField::RecordKey.as_ref()
+        && matches!(
+            filter.operator,
+            crate::expr::ExprOperator::In | crate::expr::ExprOperator::NotIn
+        )
+        && configured_record_key_fields(hudi_configs)?.len() > 1
+    {
+        return Err(CoreError::Unsupported(format!(
+            "an IN list on {} cannot hold composite record keys, which contain ','; \
+             use one `=` predicate per key or a predicate on a non-key column",
+            filter.field
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
