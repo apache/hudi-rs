@@ -30,10 +30,10 @@ use crate::timeline::completion_time::CompletionTimeView;
 use std::fmt::Display;
 use std::str::FromStr;
 
-/// Hudi Base file, part of a [FileSlice].
+/// Hudi Base file, part of a [FileSlice](crate::file_group::file_slice::FileSlice).
 #[derive(Clone, Debug)]
 pub struct BaseFile {
-    /// The id of the enclosing [FileGroup].
+    /// The id of the enclosing [FileGroup](crate::file_group::FileGroup).
     pub file_id: String,
 
     /// Monotonically increasing token for every attempt to write the [BaseFile].

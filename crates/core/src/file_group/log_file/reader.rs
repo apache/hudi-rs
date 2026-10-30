@@ -191,7 +191,7 @@ impl LogFileReader {
     /// Push a predicate into this file's parquet log blocks.
     ///
     /// Left unset, no predicate is pushed and every row is read. Whether pushing
-    /// is sound is the caller's decision — see [`Decoder::with_row_filter`].
+    /// is sound is the caller's decision (see `Decoder::with_row_filter`).
     pub fn with_row_filter(mut self, row_filter: Option<RowFilterBuilder>) -> Self {
         self.row_filter = row_filter;
         self
@@ -207,7 +207,7 @@ impl LogFileReader {
     }
 
     /// Resolve Avro blocks up to this schema. See
-    /// [`Decoder::with_reader_schema`].
+    /// `Decoder::with_reader_schema`.
     pub fn with_reader_schema(mut self, reader_schema_json: Option<String>) -> Self {
         self.reader_schema_json = reader_schema_json;
         self

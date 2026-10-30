@@ -33,7 +33,14 @@ use crate::table::Table;
 /// A record key and its partition path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HoodieKey {
+    /// The record key as stored, such as `a:1,b:x` for a composite key.
     pub record_key: String,
+    /// The partition path relative to the table base, such as `city=sf`; empty for an
+    /// unpartitioned table.
+    ///
+    /// [`Table::delete_keys`](crate::table::Table::delete_keys) locates keys by record key. On a
+    /// copy-on-write table, an empty `partition_path` there deletes the key in any partition and a
+    /// non-empty one only in that partition.
     pub partition_path: String,
 }
 

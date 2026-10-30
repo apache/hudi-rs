@@ -267,7 +267,7 @@ impl Instant {
     /// 1. Date format: `yyyyMMddHHmmss` (14 chars) or `yyyyMMddHHmmssSSS` (17 chars)
     /// 2. Epoch milliseconds: 17-digit number representing milliseconds since Unix epoch
     ///    (used by metadata table for timestamps like `00000000000000000`), or one
-    ///    of the [`Self::BOOTSTRAP_INSTANT_TIMES`] sentinels.
+    ///    of the `Self::BOOTSTRAP_INSTANT_TIMES` sentinels.
     ///
     /// The function tries date format first, then falls back to epoch milliseconds
     /// if the date parsing fails (e.g., invalid month/day like `00`).

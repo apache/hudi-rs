@@ -16,77 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! This module is responsible for Hudi table APIs.
+//! The [`Table`] API for reading and writing a Hudi table.
 //!
-//! It provides a quick entry point for reading Hudi table metadata and data,
-//! facilitating adaptation and compatibility across various engines.
+//! Open an existing table with [`Table::new`] or [`builder::TableBuilder`], or create one with
+//! [`Table::create`]. Reads take [`ReadOptions`]; [`Table::read`] and [`Table::read_stream`] return
+//! records, while [`Table::get_file_slices`] and [`Table::create_file_group_reader_with_options`]
+//! let a query engine plan and distribute the scan itself. A write ([`Table::append`],
+//! [`Table::upsert`], [`Table::delete`], [`Table::update`], [`Table::overwrite`]) that changes
+//! data creates one commit and refreshes the handle so later reads see it. On a merge-on-read
+//! table, [`Table::compact`] folds log files into new base files.
 //!
-//! **Example**
-//! 1. create hudi table
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::Table;
-//!
-//! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//! }
-//! ```
-//! 2. get hudi table schema(arrow_schema::Schema)
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::Table;
-//!
-//! pub async fn test() {
-//!     use arrow_schema::Schema;
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let schema = hudi_table.get_schema().await.unwrap();
-//! }
-//! ```
-//! 3. read hudi table
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::{ReadOptions, Table};
-//!
-//! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let record_read = hudi_table.read(&ReadOptions::new()).await.unwrap();
-//! }
-//! ```
-//! 4. get file slice
-//!    Users can obtain metadata to customize reading methods, read in batches, perform parallel reads, and more.
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::{ReadOptions, Table};
-//! use hudi_core::storage::util::parse_uri;
-//! use hudi_core::storage::util::join_url_segments;
-//!
-//! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let flat_slices = hudi_table
-//!             .get_file_slices(&ReadOptions::new())
-//!             .await.unwrap();
-//!     let file_slices = hudi_core::util::collection::split_into_chunks(flat_slices, 2);
-//!     // define every parquet task reader how many slice
-//!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
-//!         for file_slice_vec in file_slices {
-//!             let file_group_vec = file_slice_vec
-//!                 .iter()
-//!                 .filter_map(|f| {
-//!                     // None when the slice's records live entirely in log
-//!                     // files, so there is no base file to read.
-//!                     let relative_path = f.base_file_relative_path().unwrap()?;
-//!                     let url = join_url_segments(&base_uri, &[relative_path.as_str()]).unwrap();
-//!                     Some(url.path().to_string())
-//!                 })
-//!                 .collect();
-//!             parquet_file_groups.push(file_group_vec)
-//!         }
-//! }
-//! ```
+//! See the crate-level docs for examples.
 
 pub mod builder;
 pub mod file_pruner;
@@ -134,12 +74,19 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
 
-/// The main struct that provides table APIs for interacting with a Hudi table.
+/// A handle to a Hudi table, with the read and write APIs.
+///
+/// Clones share configs and caches. Write methods take `&mut self` and refresh
+/// that handle's timeline; reopen or rebuild other handles to see the new commit.
 #[derive(Debug)]
 pub struct Table {
+    /// Resolved Hudi configs: user options, `hoodie.properties`, and `hudi-defaults.conf`.
     pub hudi_configs: Arc<HudiConfigs>,
+    /// Options for the storage backend, such as cloud credentials.
     pub storage_options: Arc<HashMap<String, String>>,
+    /// The table's timeline of commits.
     pub timeline: Timeline,
+    /// Listing of the table's file groups and file slices.
     pub file_system_view: FileSystemView,
     /// Cached metadata table instance, lazily initialized on first use.
     /// Shared across clones via `Arc`; [`Table::clear_read_caches`] gives this
@@ -354,12 +301,19 @@ impl Table {
         None
     }
 
-    /// Create hudi table by base_uri
+    /// Opens the table at `base_uri`, a local path or an object store URI (`s3://`, `az://`,
+    /// `gs://`, `file://`).
+    ///
+    /// Equivalent to `TableBuilder::from_base_uri(base_uri).build()`; see
+    /// [`builder::TableBuilder`] for how options are resolved.
     pub async fn new(base_uri: &str) -> Result<Self> {
         TableBuilder::from_base_uri(base_uri).build().await
     }
 
-    /// Create hudi table with options
+    /// Opens the table at `base_uri` with extra options.
+    ///
+    /// Keys starting with `hoodie.` are Hudi configs; all others are storage options, such as
+    /// `aws_region`.
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -375,14 +329,18 @@ impl Table {
     /// Start creating a new Hudi table at `base_uri` (does not open until [`TableCreateBuilder::create`]).
     ///
     /// # Example
-    /// ```no_run
-    /// # async fn example() -> hudi_core::error::Result<()> {
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> hudi_core::error::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let base_uri = dir.path().to_str().unwrap();
     /// use hudi_core::table::Table;
-    /// let table = Table::create("/tmp/hudi_table")
+    /// let table = Table::create(base_uri)
     ///     .with_table_name("trips")
     ///     .with_record_key_fields(["id"])
     ///     .create()
     ///     .await?;
+    /// assert_eq!(table.table_name(), "trips");
     /// # Ok(())
     /// # }
     /// ```
@@ -412,7 +370,12 @@ impl Table {
         crate::write::upsert_batches(self, &batches, options).await
     }
 
-    /// Replace all data in a copy-on-write table.
+    /// Replaces all data in the table with `batches` (`INSERT_OVERWRITE_TABLE`), as one
+    /// replacecommit.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, when `batches` is empty or does not match the table schema.
     pub async fn overwrite(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
@@ -421,7 +384,13 @@ impl Table {
         crate::write::overwrite_batches(self, &batches).await
     }
 
-    /// Replace only the partitions present in `batches` in a partitioned copy-on-write table.
+    /// Replaces only the partitions present in `batches` (`INSERT_OVERWRITE`), leaving the others
+    /// untouched, as one replacecommit.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, with [`CoreError::Unsupported`] on an unpartitioned table, and
+    /// when `batches` is empty or does not match the table schema.
     pub async fn dynamic_partition_overwrite(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
@@ -455,9 +424,9 @@ impl Table {
         crate::write::delete_keys(self, &keys).await
     }
 
-    /// Compact a merge-on-read table: every file group whose latest file
-    /// slice carries log files gets a new base file holding its merged rows,
-    /// under one compaction instant that completes as a `commit`.
+    /// Compact a merge-on-read table (experimental): every file group whose
+    /// latest file slice carries log files gets a new base file holding its
+    /// merged rows, under one compaction instant that completes as a `commit`.
     ///
     /// Rows keep their `_hoodie_commit_time`, so incremental reads see no new
     /// rows from a compaction. Returns a result whose `requested_time` is
@@ -471,8 +440,8 @@ impl Table {
     ///
     /// # Errors
     ///
-    /// Returns [`CoreError::Unsupported`](crate::error::CoreError::Unsupported)
-    /// on a copy-on-write table, which has no log files to compact.
+    /// Returns [`CoreError::Unsupported`] on a copy-on-write table, which has no log files to
+    /// compact.
     pub async fn compact(&mut self) -> Result<CompactionResult> {
         crate::write::compact_table(self).await
     }
@@ -502,14 +471,18 @@ impl Table {
         crate::write::update_filter(self, filter, updates).await
     }
 
+    /// A copy of the resolved Hudi configs as key-value pairs.
     pub fn hudi_options(&self) -> HashMap<String, String> {
         self.hudi_configs.as_options()
     }
 
+    /// A copy of the storage options as key-value pairs.
     pub fn storage_options(&self) -> HashMap<String, String> {
         self.storage_options.as_ref().clone()
     }
 
+    /// Registers the table's object stores with a DataFusion runtime, so DataFusion can read the
+    /// table's files.
     #[cfg(feature = "datafusion")]
     pub fn register_storage(
         &self,
@@ -523,6 +496,12 @@ impl Table {
             .register_object_store(runtime_env.clone());
     }
 
+    /// The table's base path as a URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hoodie.base.path` is missing or not a valid URI, which a table opened through
+    /// [`builder::TableBuilder`] always has.
     pub fn base_url(&self) -> Url {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::BasePath);
         self.hudi_configs
@@ -532,6 +511,12 @@ impl Table {
             .expect(&err_msg)
     }
 
+    /// The table name (`hoodie.table.name`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the config is missing, which table opening rejects unless config validation is
+    /// skipped.
     pub fn table_name(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableName);
         self.hudi_configs
@@ -540,6 +525,12 @@ impl Table {
             .into()
     }
 
+    /// The table type: `COPY_ON_WRITE` or `MERGE_ON_READ`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the config is missing or not a valid table type, which table opening rejects
+    /// unless config validation is skipped.
     pub fn table_type(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
         self.hudi_configs
@@ -548,6 +539,11 @@ impl Table {
             .into()
     }
 
+    /// Whether this is a merge-on-read table.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same condition as [`Self::table_type`].
     pub fn is_mor(&self) -> bool {
         self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
@@ -556,6 +552,9 @@ impl Table {
         Ok(!self.is_mor() || options.is_read_optimized()?)
     }
 
+    /// The timezone of the timeline's instant times (`hoodie.table.timeline.timezone`): `utc` or
+    /// `local`, and `utc` when the config is unset. [`Table::create`] records `local` unless that
+    /// config is passed with [`TableCreateBuilder::with_option`].
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)

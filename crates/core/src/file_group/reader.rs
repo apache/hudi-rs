@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! [`FileGroupReader`] reads and merges the records of one file slice.
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig;
@@ -120,14 +122,6 @@ impl FileGroupReader {
         })
     }
 
-    /// Creates a new reader with the given base URI and options.
-    ///
-    /// # Arguments
-    /// * `base_uri` - The base URI of the file group's residing table.
-    /// * `options` - Additional options for the reader.
-    ///
-    /// # Notes
-    /// This API uses [`OptionResolver`] that loads table properties from storage to resolve options.
     /// Refuse a scan-wide memory budget on a reader that reads one file slice.
     ///
     /// `hoodie.read.scan.max.memory.size` bounds a scan by deciding how many slices
@@ -155,6 +149,24 @@ impl FileGroupReader {
         Ok(())
     }
 
+    /// Creates a new reader with the given base URI and options.
+    ///
+    /// # Arguments
+    /// * `base_uri` - The base URI of the file group's residing table.
+    /// * `options` - Additional options for the reader.
+    ///
+    /// # Notes
+    /// This API uses [`OptionResolver`] that loads table properties from storage to resolve options.
+    ///
+    /// A reader built this way has no timeline, so it reads with the base file's schema and does
+    /// not check whether a log block's instant has committed. Prefer
+    /// [`Table::create_file_group_reader_with_options`](crate::table::Table::create_file_group_reader_with_options)
+    /// when a [`Table`](crate::table::Table) is at hand.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the table properties cannot be loaded, and with [`CoreError::InvalidValue`] when
+    /// `hoodie.read.scan.max.memory.size` is set, since this reader reads one slice per call.
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,

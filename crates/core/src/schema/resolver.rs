@@ -61,7 +61,7 @@ pub async fn resolve_schema(table: &Table) -> Result<Schema> {
 /// ### Note
 ///
 /// - For resolving Avro schema, we don't read the schema from a base file like we do when resolving Arrow schema.
-/// - Avro schema does not contain [`MetaField`]s.
+/// - Avro schema does not contain [`MetaField`](crate::metadata::meta_field::MetaField)s.
 pub async fn resolve_avro_schema(table: &Table) -> Result<String> {
     match table.get_timeline().get_latest_avro_schema().await {
         Ok(schema) => Ok(schema),

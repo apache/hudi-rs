@@ -45,6 +45,7 @@ use crate::config::{ConfigParser, HudiConfigValue};
 ///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter)]
 pub enum HudiInternalConfig {
+    /// Skip validating table configs when a table is opened. Defaults to `false`.
     SkipConfigValidation,
     /// Enable reading archived timeline (v1) and LSM history (v2).
     ///

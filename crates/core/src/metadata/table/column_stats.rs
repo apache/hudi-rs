@@ -199,7 +199,7 @@ pub fn column_stats_for_file(
 /// Aggregate file-level ranges into partition-level stats (same column name).
 ///
 /// Ranges must already be expressed in their column's type (see
-/// [`coerce_stat_value`]); values of different types fail the aggregation
+/// `coerce_stat_value`); values of different types fail the aggregation
 /// rather than producing a bound ordered by type instead of by value.
 pub fn aggregate_partition_stats(
     partition_path: &str,

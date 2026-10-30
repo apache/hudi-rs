@@ -17,6 +17,21 @@
  * under the License.
  */
 
+//! [Apache DataFusion](https://datafusion.apache.org) integration for Apache Hudi tables.
+//!
+//! [`HudiDataSource`] is a DataFusion `TableProvider` to register with a `SessionContext`;
+//! [`HudiTableFactory`] serves `CREATE EXTERNAL TABLE ... STORED AS HUDI`. Both read through
+//! `hudi-core` and accept the same table options.
+//!
+//! Applications usually reach this crate through the [`hudi`](https://docs.rs/hudi) crate's
+//! `datafusion` feature. The [Python and Rust quick start guide][quick start guide] shows
+//! DataFusion queries on a hudi-rs table, and the [`hudi`](https://docs.rs/hudi) crate docs list
+//! every resource (API references, quick starts, examples, specs).
+//!
+//! [quick start guide]: https://hudi.apache.org/docs/python-rust-quick-start-guide
+
+#![warn(missing_docs)]
+
 pub(crate) mod hudi_exec;
 pub(crate) mod util;
 
@@ -87,8 +102,10 @@ fn filter_field_matches_partition_column(filter_field: &str, partition_column: &
             .is_some_and(|(_, name)| name == partition_column)
 }
 
-/// Create a `HudiDataSource`.
-/// Used for Datafusion to query Hudi tables
+/// A DataFusion table provider for Apache Hudi tables.
+///
+/// The provider reads the table as of its creation, including its schema and statistics; create
+/// a new provider to see later commits.
 ///
 /// # Examples
 ///
@@ -116,7 +133,6 @@ fn filter_field_matches_partition_column(filter_field: &str, partition_column: &
 ///     Ok(())
 /// }
 /// ```
-/// A DataFusion table provider for Apache Hudi tables.
 #[derive(Clone)]
 pub struct HudiDataSource {
     table: Arc<HudiTable>,
@@ -172,10 +188,22 @@ impl std::fmt::Debug for HudiDataSource {
 }
 
 impl HudiDataSource {
+    /// Creates a provider for the table at `base_uri` with default options.
     pub async fn new(base_uri: &str) -> Result<Self> {
         Self::new_with_options(base_uri, empty_options()).await
     }
 
+    /// Creates a provider for the table at `base_uri` with options, which are passed on to
+    /// [`Table::new_with_options`](hudi_core::table::Table::new_with_options).
+    ///
+    /// The provider also reads `hoodie.read.input.partitions` (default `0`, which defers to
+    /// DataFusion's `target_partitions`), `hoodie.read.use.read_optimized.mode`, and
+    /// `hoodie.read.file.slice.read.concurrency` from these options.
+    ///
+    /// # Errors
+    ///
+    /// Fails when one of those options has an invalid value, the table cannot be opened, or the
+    /// table's base file format is HFile.
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -1014,6 +1042,7 @@ impl TableProvider for HudiDataSource {
 pub struct HudiTableFactory {}
 
 impl HudiTableFactory {
+    /// Creates a factory.
     pub fn new() -> Self {
         Self {}
     }

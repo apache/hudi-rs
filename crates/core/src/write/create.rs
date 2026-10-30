@@ -92,6 +92,8 @@ pub struct TableCreateBuilder {
 }
 
 impl TableCreateBuilder {
+    /// Starts a builder for a table at `base_uri`; same as
+    /// [`Table::create`](crate::table::Table::create).
     pub fn new(base_uri: impl Into<String>) -> Self {
         Self {
             base_uri: base_uri.into(),
@@ -116,31 +118,43 @@ impl TableCreateBuilder {
         }
     }
 
+    /// Sets the table name, which is required and must be non-empty.
     pub fn with_table_name(mut self, name: impl Into<String>) -> Self {
         self.table_name = Some(name.into());
         self
     }
 
+    /// Sets the table type. Defaults to [`TableTypeValue::CopyOnWrite`].
     pub fn with_table_type(mut self, table_type: TableTypeValue) -> Self {
         self.table_type = table_type;
         self
     }
 
+    /// Sets the table version: `9` (the default) or `8`; [`Self::create`] rejects other values.
+    /// A later [`Self::with_metadata_table_enabled`]`(true)` raises a version below 8 to 8.
     pub fn with_table_version(mut self, version: isize) -> Self {
         self.table_version = version;
         self
     }
 
+    /// Sets the timeline layout version. Defaults to `2`, the only layout table versions 8 and 9
+    /// accept.
     pub fn with_timeline_layout_version(mut self, version: isize) -> Self {
         self.timeline_layout_version = version;
         self
     }
 
+    /// Whether records carry the `_hoodie_*` meta fields. Defaults to `true`.
     pub fn with_populates_meta_fields(mut self, value: bool) -> Self {
         self.populates_meta_fields = value;
         self
     }
 
+    /// Sets the record key fields. Several fields form a composite key, stored as `field:value`
+    /// pairs joined by commas. With none, appends generate keys, and
+    /// [`Table::upsert`](crate::table::Table::upsert),
+    /// [`Table::delete_keys`](crate::table::Table::delete_keys), and
+    /// [`Table::update`](crate::table::Table::update) on a merge-on-read table are rejected.
     pub fn with_record_key_fields<I, S>(mut self, fields: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -150,6 +164,7 @@ impl TableCreateBuilder {
         self
     }
 
+    /// Sets the columns whose values form the partition path. Unset means unpartitioned.
     pub fn with_partition_fields<I, S>(mut self, fields: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -251,6 +266,7 @@ impl TableCreateBuilder {
         self
     }
 
+    /// Sets a storage option, such as a cloud credential, used to create and then open the table.
     pub fn with_storage_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
         self.storage_options
             .insert(key.as_ref().to_string(), value.into());
@@ -258,6 +274,14 @@ impl TableCreateBuilder {
     }
 
     /// Create the table layout on storage and open a [`Table`] handle.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, when a table already exists at the base URI, the table name is
+    /// missing or empty, [`Self::with_option`] set a key that a dedicated builder method owns,
+    /// the version settings are unsupported, or an index is enabled without what it depends on
+    /// (the record index and `column_stats` need the metadata table, `partition_stats` needs
+    /// `column_stats`).
     pub async fn create(mut self) -> Result<Table> {
         // The builder derives the metadata table layout, key generator and
         // checksum from these, so an override would persist a table that

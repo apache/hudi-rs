@@ -232,7 +232,7 @@ fn is_repair_target(table: &DataType) -> bool {
 /// judged from the TABLE schema alone.
 ///
 /// Meant to be computed ONCE per scan by whoever supplies the predicate, and handed
-/// to the reader via [`HoodieFileGroupReaderBuilder::with_repair_risk_columns`]
+/// to the reader via `HoodieFileGroupReaderBuilder::with_repair_risk_columns`
 /// (crate::file_group::reader_v2). Two properties earn it that place:
 ///
 /// * **It is usually empty.** Spark's `TimestampType` maps to micros, so a

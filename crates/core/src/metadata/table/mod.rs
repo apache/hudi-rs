@@ -170,7 +170,7 @@ impl Table {
     ///
     /// Records are returned with normalized partition keys. For non-partitioned tables,
     /// the key is "" (empty string) instead of the internal "." representation.
-    /// Normalization happens at decode time in [`decode_files_partition_record_with_schema`].
+    /// Normalization happens at decode time in `decode_files_partition_record_with_schema`.
     ///
     /// # Note
     /// Must be called on a DATA table, not a METADATA table.

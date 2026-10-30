@@ -17,6 +17,8 @@
  * under the License.
  */
 
+//! The [`Filter`] type and helpers to build and evaluate filters.
+
 use crate::Result;
 use crate::error::CoreError;
 use crate::expr::ExprOperator;
@@ -30,14 +32,28 @@ use arrow_schema::{DataType, Field, Schema};
 use std::collections::HashSet;
 use std::str::FromStr;
 
+/// A comparison of one column against one or more values, such as `city = 'sf'`.
+///
+/// Values are kept as strings and cast to the column's Arrow type when the filter is evaluated.
+/// Build one with [`Filter::new`], from a `(field, operator, value)` tuple with
+/// `Filter::try_from`, or with [`col`].
 #[derive(Debug, Clone)]
 pub struct Filter {
+    /// Column name.
     pub field: String,
+    /// Comparison operator.
     pub operator: ExprOperator,
+    /// Values to compare against: exactly one, or at least one for `IN` / `NOT IN`.
     pub values: Vec<String>,
 }
 
 impl Filter {
+    /// Creates a filter, checking the number of values against the operator.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Schema`] when `IN` / `NOT IN` gets no values, or another
+    /// operator does not get exactly one.
     pub fn new(field: String, operator: ExprOperator, values: Vec<String>) -> Result<Self> {
         if operator.is_multi_value() {
             if values.is_empty() {
@@ -60,6 +76,7 @@ impl Filter {
 }
 
 impl Filter {
+    /// The filter with its operator negated (see [`ExprOperator::negate`]).
     pub fn negate(&self) -> Option<Self> {
         self.operator.negate().map(|op| Self {
             operator: op,
@@ -156,6 +173,10 @@ fn escape_in_value(v: &str) -> String {
     out
 }
 
+/// Parses `(field, operator, value)` tuples into filters, as `Filter::try_from` does.
+///
+/// For `IN` / `NOT IN` the value is a comma-separated list; `\,` is a literal comma and `\\`
+/// a literal backslash.
 pub fn from_str_tuples<I, S>(tuples: I) -> Result<Vec<Filter>>
 where
     I: IntoIterator<Item = (S, S, S)>,
@@ -167,7 +188,7 @@ where
         .collect()
 }
 
-/// Evaluate a slice of [`Filter`]s against a [`RecordBatch`] and return a row-level mask
+/// Evaluate a slice of [`Filter`]s against a [`RecordBatch`](arrow_array::RecordBatch) and return a row-level mask
 /// where `true` indicates the row should be retained.
 ///
 /// This is a low-level primitive: filters whose field is not present in the batch are
@@ -224,19 +245,29 @@ where
     Ok(())
 }
 
+/// A column to build [`Filter`]s on; see [`col`].
+///
+/// The builders do not check the number of values, so an empty
+/// [`in_list`](Self::in_list) is not rejected here the way [`Filter::new`] rejects it. Such a
+/// filter panics when evaluated, for example by [`filters_to_row_mask`] during a read that has
+/// it in [`ReadOptions::filters`](crate::table::ReadOptions::filters).
 pub struct FilterField {
+    /// Column name.
     pub name: String,
 }
 
 impl FilterField {
+    /// Creates a field for the column `name`.
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
 
+    /// The column name.
     pub fn name(&self) -> &str {
         &self.name
     }
 
+    /// `field = value`
     pub fn eq(&self, value: impl Into<String>) -> Filter {
         Filter {
             field: self.name.clone(),
@@ -245,6 +276,7 @@ impl FilterField {
         }
     }
 
+    /// `field != value`
     pub fn ne(&self, value: impl Into<String>) -> Filter {
         Filter {
             field: self.name.clone(),
@@ -253,6 +285,7 @@ impl FilterField {
         }
     }
 
+    /// `field < value`
     pub fn lt(&self, value: impl Into<String>) -> Filter {
         Filter {
             field: self.name.clone(),
@@ -261,6 +294,7 @@ impl FilterField {
         }
     }
 
+    /// `field <= value`
     pub fn lte(&self, value: impl Into<String>) -> Filter {
         Filter {
             field: self.name.clone(),
@@ -269,6 +303,7 @@ impl FilterField {
         }
     }
 
+    /// `field > value`
     pub fn gt(&self, value: impl Into<String>) -> Filter {
         Filter {
             field: self.name.clone(),
@@ -277,6 +312,7 @@ impl FilterField {
         }
     }
 
+    /// `field >= value`
     pub fn gte(&self, value: impl Into<String>) -> Filter {
         Filter {
             field: self.name.clone(),
@@ -285,6 +321,7 @@ impl FilterField {
         }
     }
 
+    /// `field IN (values)`
     pub fn in_list<I, S>(&self, values: I) -> Filter
     where
         I: IntoIterator<Item = S>,
@@ -297,6 +334,7 @@ impl FilterField {
         }
     }
 
+    /// `field NOT IN (values)`
     pub fn not_in_list<I, S>(&self, values: I) -> Filter
     where
         I: IntoIterator<Item = S>,
@@ -310,14 +348,29 @@ impl FilterField {
     }
 }
 
+/// Starts a [`Filter`] on the column `name`.
+///
+/// ```
+/// use hudi_core::expr::filter::col;
+///
+/// let filter = col("city").in_list(["sf", "nyc"]);
+/// assert_eq!(filter.values, vec!["sf", "nyc"]);
+/// ```
 pub fn col(name: impl Into<String>) -> FilterField {
     FilterField::new(name)
 }
 
+/// A [`Filter`] resolved against a schema, with its values cast to the column's type.
+///
+/// Created with `SchemableFilter::try_from((filter, &schema))`, which fails with
+/// [`CoreError::Schema`] when the column is missing or a value cannot be cast.
 #[derive(Debug, Clone)]
 pub struct SchemableFilter {
+    /// The schema field the filter applies to.
     pub field: Field,
+    /// Comparison operator.
     pub operator: ExprOperator,
+    /// Values cast to the field's data type.
     pub values: Vec<Scalar<ArrayRef>>,
 }
 
@@ -345,6 +398,8 @@ impl TryFrom<(Filter, &Schema)> for SchemableFilter {
 }
 
 impl SchemableFilter {
+    /// Casts a string value to `data_type`, failing with [`CoreError::Schema`] rather than
+    /// producing a null when the value does not parse.
     pub fn cast_value(value: &[&str; 1], data_type: &DataType) -> Result<Scalar<ArrayRef>> {
         let cast_options = CastOptions {
             safe: false,
@@ -359,6 +414,12 @@ impl SchemableFilter {
         ))
     }
 
+    /// Evaluates the filter against `value` (typically a column), returning `true` for rows
+    /// that match.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`values`](Self::values) is empty.
     pub fn apply_comparison(&self, value: &dyn Datum) -> Result<BooleanArray> {
         match self.operator {
             ExprOperator::Eq => eq(value, &self.values[0]),

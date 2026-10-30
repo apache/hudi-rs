@@ -36,7 +36,7 @@ pub fn partition_identifier(partition_path: &str) -> &str {
     }
 }
 
-/// XXHash64 (seed [`HASH_SEED`]) as big-endian bytes, Java `HashID` BITS_64.
+/// XXHash64 (seed `HASH_SEED`) as big-endian bytes, Java `HashID` BITS_64.
 pub fn xxhash64_bytes(message: &str) -> [u8; 8] {
     xxh64(message.as_bytes(), HASH_SEED).to_be_bytes()
 }

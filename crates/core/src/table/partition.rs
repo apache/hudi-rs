@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! Partition pruning and partition path helpers.
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
@@ -33,7 +35,9 @@ use crate::metadata::meta_field::MetaField;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Name of the metadata file in each partition directory.
 pub const PARTITION_METAFIELD_PREFIX: &str = ".hoodie_partition_metadata";
+/// The partition path of an unpartitioned table.
 pub const EMPTY_PARTITION_PATH: &str = "";
 
 /// Build the partition [Schema] in the order declared by `partition_field_names`.
@@ -65,6 +69,7 @@ pub(crate) fn project_partition_schema(
     Ok(Schema::new(fields))
 }
 
+/// Whether the table has partition fields and does not use a non-partitioned key generator.
 pub fn is_table_partitioned(hudi_configs: &HudiConfigs) -> Result<bool> {
     let has_partition_fields = {
         let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
@@ -102,6 +107,8 @@ pub struct PartitionPruner {
 }
 
 impl PartitionPruner {
+    /// Creates a pruner from the filters that apply to `partition_schema`. Filters on other
+    /// columns, and filters whose value cannot be cast to the column type, are ignored.
     pub fn new(
         and_filters: &[Filter],
         partition_schema: &Schema,

@@ -16,7 +16,13 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Hudi Configurations.
+//! Hudi configurations.
+//!
+//! Each config is an enum variant that knows its `hoodie.*` key, default, and how to parse its
+//! value: [`table::HudiTableConfig`] (mostly persisted in `hoodie.properties`),
+//! [`read::HudiReadConfig`], [`plan::HudiPlanConfig`], and [`internal::HudiInternalConfig`].
+//! [`HudiConfigs`] holds the resolved key-value options of a table, and
+//! [`read_options::ReadOptions`] those of a single read.
 use std::any::type_name;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -39,15 +45,20 @@ pub mod util;
 
 pub use read_options::{QueryType, ReadOptions};
 
+/// Environment variable naming the directory that holds `hudi-defaults.conf`, whose options a
+/// table picks up when they are not set otherwise. Defaults to `/etc/hudi/conf` when unset.
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
 /// An alternative key for a configuration, optionally marked as deprecated.
 pub struct ConfigAlias {
+    /// The alternative key.
     pub key: &'static str,
+    /// Whether using this key logs a deprecation warning.
     pub deprecated: bool,
 }
 
 impl ConfigAlias {
+    /// An alias that is not deprecated.
     pub const fn new(key: &'static str) -> Self {
         Self {
             key,
@@ -55,6 +66,7 @@ impl ConfigAlias {
         }
     }
 
+    /// A deprecated alias.
     pub const fn deprecated(key: &'static str) -> Self {
         Self {
             key,
@@ -71,6 +83,7 @@ pub trait ConfigParser: AsRef<str> {
     /// Supplies the default value of the configuration.
     fn default_value(&self) -> Option<Self::Output>;
 
+    /// The config key, such as `hoodie.table.name`.
     fn key(&self) -> String {
         self.as_ref().to_string()
     }
@@ -136,10 +149,15 @@ pub trait ConfigParser: AsRef<str> {
 /// All possible data types for Hudi Configuration values.
 #[derive(Clone, Debug)]
 pub enum HudiConfigValue {
+    /// A boolean value.
     Boolean(bool),
+    /// A signed integer value.
     Integer(isize),
+    /// An unsigned integer value.
     UInteger(usize),
+    /// A string value.
     String(String),
+    /// A comma-separated list, split into its items.
     List(Vec<String>),
 }
 

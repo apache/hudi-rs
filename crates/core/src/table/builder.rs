@@ -17,6 +17,8 @@
  * under the License.
  */
 
+//! [`TableBuilder`] opens a [`Table`] with options.
+
 use paste::paste;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,7 +37,11 @@ use crate::table::validation::validate_configs;
 use crate::timeline::Timeline;
 use crate::util::collection::extend_if_absent;
 
-/// Builder for creating a [Table] instance.
+/// Builder that opens an existing [`Table`] with options.
+///
+/// `with_hudi_option(s)` set Hudi configs, `with_storage_option(s)` set storage options, and
+/// `with_option(s)` take either, routing keys that start with `hoodie.` to Hudi configs.
+/// [`OptionResolver::resolve_options`] describes how these combine with the table's own configs.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     option_resolver: OptionResolver,
@@ -44,9 +50,13 @@ pub struct TableBuilder {
 /// Resolver for options including Hudi options, storage options, and generic options.
 #[derive(Debug, Clone)]
 pub struct OptionResolver {
+    /// The table's base URI.
     pub base_uri: String,
+    /// Hudi configs (`hoodie.*`).
     pub hudi_options: HashMap<String, String>,
+    /// Storage options, such as cloud credentials.
     pub storage_options: HashMap<String, String>,
+    /// Options not yet split into Hudi configs and storage options.
     pub options: HashMap<String, String>,
 }
 
@@ -102,6 +112,15 @@ impl TableBuilder {
         TableBuilder { option_resolver }
     }
 
+    /// Resolves the options, validates the table configs, and loads the timeline.
+    ///
+    /// Read configs that select which read to perform (query type and timestamps) are dropped
+    /// with a warning; pass them in [`ReadOptions`](crate::table::ReadOptions) instead.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, when `.hoodie/hoodie.properties` cannot be read, or the table
+    /// configs are invalid or unsupported (for example a table version other than 6, 8, or 9).
     pub async fn build(&mut self) -> Result<Table> {
         let option_resolver = &mut self.option_resolver;
 
@@ -238,7 +257,7 @@ impl OptionResolver {
     ///    - Cloud storage options specified via env vars
     /// 4. Global Hudi configs
     ///
-    /// [note] Error may occur when 1 and 2 have conflicts.
+    /// Note: an error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
         self.resolve_user_provided_options();
 

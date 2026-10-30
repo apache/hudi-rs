@@ -294,7 +294,7 @@ impl HFileReader {
     /// Open an HFile without holding it.
     ///
     /// Two ranged reads before any data is touched: the trailer, which is the
-    /// final [`TRAILER_SIZE`] bytes, then the load-on-open section it points at,
+    /// final `TRAILER_SIZE` bytes, then the load-on-open section it points at,
     /// which carries the index and the file info. Data blocks are read later,
     /// through [`Self::read_records_batched`].
     pub async fn open_ranged(storage: &Storage, relative_path: &str) -> Result<Self> {
@@ -1480,7 +1480,7 @@ impl HFileReader {
     /// Keys must be sorted in ascending order. This method efficiently
     /// scans forward through the file to find matching keys.
     ///
-    /// Returns a vector of (key, Option<HFileRecord>) tuples where
+    /// Returns a vector of `(key, Option<HFileRecord>)` tuples where
     /// the Option is Some if the key was found.
     pub fn lookup_records(&mut self, keys: &[&str]) -> Result<Vec<(String, Option<HFileRecord>)>> {
         let mut results = Vec::with_capacity(keys.len());
