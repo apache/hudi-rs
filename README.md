@@ -384,7 +384,10 @@ and no metadata table, one base file per call.
 ```python
 import pyarrow as pa
 
-batch = pa.table({"uuid": ["a", "b"], "city": ["san_francisco"] * 2, "ts": [1, 1], "fare": [30.0, 45.0]})
+# `table` is the HudiTable created above; the input is plain Arrow data.
+batch = pa.record_batch(
+    {"uuid": ["a", "b"], "city": ["san_francisco"] * 2, "ts": [1, 1], "fare": [30.0, 45.0]}
+)
 table.append(batch)
 ```
 
