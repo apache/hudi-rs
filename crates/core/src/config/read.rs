@@ -140,7 +140,9 @@ pub enum HudiReadConfig {
     /// This controls the batch size when using streaming APIs.
     StreamBatchSize,
 
-    /// Maximum number of file-slice streams to poll concurrently within one scan partition.
+    /// Maximum number of file slices to read concurrently within one scan partition.
+    /// Defaults to 4 per DataFusion partition; a `Table` read, which is one
+    /// partition covering the whole scan, defaults to the available cores.
     FileSliceReadConcurrency,
 
     /// Total memory, in bytes, a whole scan may use for concurrent file-slice
