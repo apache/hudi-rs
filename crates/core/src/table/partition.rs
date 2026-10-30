@@ -402,6 +402,136 @@ mod tests {
     }
 
     #[test]
+    fn test_hoodie_partition_path_whole_path_pruning() {
+        // A timestamp key generator rewrites a source-column predicate into a predicate on
+        // the opaque whole-path meta field, so the pruner holds a single-field schema and
+        // must compare the path as one string rather than split it into segments.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        assert!(!pruner.is_empty());
+        assert!(pruner.should_include("ts_str=2023/04/01/12"));
+        assert!(!pruner.should_include("ts_str=2023/05/01/08"));
+    }
+
+    #[test]
+    fn test_hoodie_partition_path_whole_path_pruning_url_encoded() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "true"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        // The encoded path decodes to `ts_str=2023/04/01/12` before comparison.
+        assert!(pruner.should_include("ts_str%3D2023%2F04%2F01%2F12"));
+        assert!(!pruner.should_include("ts_str%3D2023%2F05%2F01%2F08"));
+    }
+
+    #[test]
+    fn test_is_table_partitioned_keygen_declarations() {
+        // Declaring partition fields alone keeps the table partitioned.
+        let configs = HudiConfigs::new([("hoodie.table.partition.fields", "ts")]);
+        assert!(is_table_partitioned(&configs).unwrap());
+
+        // The non-partitioned key generator class cancels the partition fields.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.NonpartitionedKeyGenerator",
+            ),
+        ]);
+        assert!(!is_table_partitioned(&configs).unwrap());
+
+        // So does the short key-generator type, in either accepted spelling.
+        for keygen_type in ["non_partition", "NON_PARTITION_AVRO"] {
+            let configs = HudiConfigs::new([
+                ("hoodie.table.partition.fields", "ts"),
+                ("hoodie.table.keygenerator.type", keygen_type),
+            ]);
+            assert!(!is_table_partitioned(&configs).unwrap(), "{keygen_type}");
+        }
+    }
+
+    #[test]
+    fn test_should_include_tolerates_foreign_field_and_comparison_error() {
+        // Fail-open arms of should_include: a filter whose field is not among the path
+        // segments, and a comparison that fails on a type mismatch, must both keep the
+        // partition rather than silently dropping data.
+        let bound = SchemableFilter::try_from((
+            Filter::try_from(("count", ">", "5")).unwrap(),
+            &create_test_schema(),
+        ))
+        .unwrap();
+
+        // The bound field `count` is not part of this path's segment map.
+        let foreign_field = PartitionPruner {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "date",
+                DataType::Date32,
+                false,
+            )])),
+            is_hive_style: false,
+            is_url_encoded: false,
+            is_partitioned: true,
+            and_filters: vec![bound.clone()],
+        };
+        assert!(foreign_field.should_include("2023-02-01"));
+
+        // The same Int32-bound filter meets a Utf8 segment value: the arrow kernel
+        // rejects the comparison and the partition is kept.
+        let mismatched = PartitionPruner {
+            schema: Arc::new(Schema::new(vec![Field::new(
+                "count",
+                DataType::Utf8,
+                false,
+            )])),
+            is_hive_style: false,
+            is_url_encoded: false,
+            is_partitioned: true,
+            and_filters: vec![bound],
+        };
+        assert!(mismatched.should_include("not_a_number"));
+    }
+
+    #[test]
     fn test_partition_pruner_parse_segments() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
@@ -550,7 +680,7 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].operator, ExprOperator::Gte);
-        assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
+        assert_eq!(transformed[0].values[0], "ts_str=2023/04/15");
 
         // Equality filter: UNIX_TIMESTAMP Eq → single path
         let configs = HudiConfigs::new([
@@ -609,7 +739,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
+        assert_eq!(transformed[0].values[0], "ts_str=2023/04/15");
     }
 
     #[test]
@@ -678,13 +808,13 @@ mod tests {
         assert!(!pruner.is_empty());
 
         // Full path string comparison on _hoodie_partition_path
-        assert!(pruner.should_include("year=2024/month=01/day=15"));
-        assert!(pruner.should_include("year=2024/month=06/day=30"));
-        assert!(pruner.should_include("year=2025/month=01/day=01"));
+        assert!(pruner.should_include("ts=2024/01/15"));
+        assert!(pruner.should_include("ts=2024/06/30"));
+        assert!(pruner.should_include("ts=2025/01/01"));
 
         // Should exclude partitions < 2024/01/15
-        assert!(!pruner.should_include("year=2023/month=12/day=31"));
-        assert!(!pruner.should_include("year=2022/month=01/day=01"));
+        assert!(!pruner.should_include("ts=2023/12/31"));
+        assert!(!pruner.should_include("ts=2022/01/01"));
 
         // Non-hive-style: verify the same logic works
         let configs = HudiConfigs::new([
@@ -712,5 +842,229 @@ mod tests {
         assert!(pruner.should_include("2024/01/15"));
         assert!(!pruner.should_include("2024/01/16"));
         assert!(!pruner.should_include("2023/12/31"));
+    }
+
+    /// A negated predicate must not drop a partition. The transform reduces a timestamp to
+    /// a day, so `2024-03-01` holds every row of that day and all but one instant of it
+    /// satisfies `ts != 2024-03-01T14:30:00Z`. Pruning the partition would lose them all.
+    #[test]
+    fn ne_does_not_prune_a_partition_that_holds_matching_rows() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy-MM-dd"),
+            ("hoodie.datasource.write.hive_style_partitioning", "false"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+
+        let pruner = PartitionPruner::new(
+            &[Filter {
+                field: "ts".to_string(),
+                operator: ExprOperator::Ne,
+                values: vec!["2024-03-01T14:30:00Z".to_string()],
+            }],
+            &partition_schema,
+            &configs,
+        )
+        .unwrap();
+
+        assert!(
+            pruner.should_include("2024-03-01"),
+            "the day containing the excluded instant still holds matching rows"
+        );
+        assert!(pruner.should_include("2024-03-02"));
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Hive-style timestamp-keygen pruning. Every timestamp-keygen fixture in
+    // crates/test/data is non-hive-style, so this branch previously had no table-backed
+    // coverage at all.
+    // ---------------------------------------------------------------------------------
+
+    fn hive_style_ts_configs(output_dateformat: &str) -> HudiConfigs {
+        HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            (
+                "hoodie.keygen.timebased.output.dateformat",
+                output_dateformat,
+            ),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ])
+    }
+
+    fn partition_path_schema() -> Schema {
+        Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )])
+    }
+
+    fn ts_filter(operator: ExprOperator, value: &str) -> Filter {
+        Filter {
+            field: "ts".to_string(),
+            operator,
+            values: vec![value.to_string()],
+        }
+    }
+
+    /// The hive prefix is the declared partition field, applied once to the whole formatted
+    /// value. It never comes from the format tokens.
+    #[test]
+    fn hive_style_path_uses_declared_field_name_not_format_tokens() {
+        for (output_dateformat, expected) in [
+            ("yyyy-MM-dd", "ts=2024-03-01"),
+            ("yyyy/MM/dd", "ts=2024/03/01"),
+            ("yyyy-MM-dd-HH", "ts=2024-03-01-08"),
+            ("yyyyMMdd", "ts=20240301"),
+        ] {
+            let keygen =
+                TimestampBasedKeyGenerator::from_configs(&hive_style_ts_configs(output_dateformat))
+                    .unwrap();
+            let transformed = keygen
+                .transform_filter(&ts_filter(ExprOperator::Eq, "2024-03-01T08:00:00Z"))
+                .unwrap();
+            assert_eq!(
+                transformed[0].values[0], expected,
+                "output.dateformat {output_dateformat}"
+            );
+        }
+    }
+
+    /// A predicate no partition can satisfy must exclude every partition.
+    #[test]
+    fn impossible_predicate_excludes_every_day_partition() {
+        let pruner = PartitionPruner::new(
+            &[ts_filter(ExprOperator::Eq, "1900-01-01T00:00:00Z")],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        for path in ["ts=2024-03-01", "ts=2024-03-02", "ts=2023-12-31"] {
+            assert!(!pruner.should_include(path), "{path} should be excluded");
+        }
+    }
+
+    #[test]
+    fn day_granularity_range_selects_only_days_in_range() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-03-01T00:00:00Z"),
+                ts_filter(ExprOperator::Lt, "2024-03-04T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        for included in ["ts=2024-03-01", "ts=2024-03-02", "ts=2024-03-03"] {
+            assert!(pruner.should_include(included), "{included}");
+        }
+        for excluded in ["ts=2024-02-29", "ts=2024-03-05", "ts=2025-01-01"] {
+            assert!(!pruner.should_include(excluded), "{excluded}");
+        }
+    }
+
+    /// A half-open upper bound widens from `<` to `<=` at partition granularity, so the
+    /// boundary partition is retained. That is deliberate: `ts < 2024-03-02T06:00:00Z`
+    /// genuinely has matching rows inside `ts=2024-03-02`, and the transform has already
+    /// discarded the time of day, so the partition cannot be ruled out here. Row-level
+    /// evaluation removes the rows that do not match.
+    #[test]
+    fn half_open_upper_bound_retains_the_boundary_partition() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-03-01T00:00:00Z"),
+                ts_filter(ExprOperator::Lt, "2024-03-02T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        assert!(pruner.should_include("ts=2024-03-01"));
+        assert!(pruner.should_include("ts=2024-03-02"));
+        assert!(!pruner.should_include("ts=2024-03-03"));
+        assert!(!pruner.should_include("ts=2024-02-29"));
+    }
+
+    #[test]
+    fn hour_granularity_range_spans_a_day_boundary() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-03-01T22:00:00Z"),
+                ts_filter(ExprOperator::Lte, "2024-03-02T01:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd-HH"),
+        )
+        .unwrap();
+
+        for included in [
+            "ts=2024-03-01-22",
+            "ts=2024-03-01-23",
+            "ts=2024-03-02-00",
+            "ts=2024-03-02-01",
+        ] {
+            assert!(pruner.should_include(included), "{included}");
+        }
+        for excluded in ["ts=2024-03-01-21", "ts=2024-03-02-02"] {
+            assert!(!pruner.should_include(excluded), "{excluded}");
+        }
+    }
+
+    /// Leap day and year rollover are ordinary calendar arithmetic, but a format that
+    /// zero-padded inconsistently would break the ordered string comparison, so pin them.
+    #[test]
+    fn leap_day_and_year_rollover_compare_correctly() {
+        let configs = hive_style_ts_configs("yyyy-MM-dd");
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-02-28T00:00:00Z"),
+                ts_filter(ExprOperator::Lte, "2024-03-01T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &configs,
+        )
+        .unwrap();
+        assert!(pruner.should_include("ts=2024-02-29"), "leap day");
+        assert!(!pruner.should_include("ts=2023-02-28"));
+
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-12-31T00:00:00Z"),
+                ts_filter(ExprOperator::Lte, "2025-01-01T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &configs,
+        )
+        .unwrap();
+        assert!(pruner.should_include("ts=2024-12-31"));
+        assert!(pruner.should_include("ts=2025-01-01"));
+        assert!(!pruner.should_include("ts=2024-12-30"));
+        assert!(!pruner.should_include("ts=2025-01-02"));
     }
 }

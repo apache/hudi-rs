@@ -77,10 +77,94 @@ pub fn parse_data_for_options(data: &Bytes, split_chars: &str) -> Result<HashMap
             .trim()
             .to_owned();
         let value = parts.next().unwrap_or("").trim().to_owned();
-        options.insert(key, value);
+        options.insert(
+            unescape_java_properties(&key),
+            unescape_java_properties(&value),
+        );
     }
 
     Ok(options)
+}
+
+/// Unescapes a token the way `java.util.Properties.load` does: a backslash
+/// followed by `t`, `n`, `r` or `f` becomes that control character, `\uXXXX`
+/// becomes the character with that code point, and a backslash followed by
+/// anything else — `\\`, `\:`, `\=`, `\ `, `\#`, `\!` — drops the backslash.
+/// A trailing lone backslash is dropped.
+///
+/// Hudi's writer stores `hoodie.properties` through `Properties.store`, so
+/// values reach this reader with those backslashes in place — an Avro schema
+/// (`{"type"\:"record"...}`) or a `SimpleDateFormat` (`HH\:mm\:ss`) reads back
+/// wrongly without this.
+///
+/// Unlike `Properties.load`, a malformed `\uXXXX` is not an error: this reader
+/// falls back to the drop-the-backslash rule rather than failing a table open
+/// over one bad byte in a config value it may not even consult.
+fn unescape_java_properties(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    let mut out = String::with_capacity(token.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        i += 1;
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let Some(&escaped) = chars.get(i) else {
+            break;
+        };
+        i += 1;
+        match escaped {
+            't' => out.push('\t'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            'f' => out.push('\u{000C}'),
+            'u' => match take_unicode_escape(&chars, &mut i) {
+                Some(decoded) => out.push(decoded),
+                None => out.push('u'),
+            },
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Reads the `XXXX` of a `\uXXXX` escape at `*i`, advancing `*i` past what it
+/// consumed. Returns `None` without advancing when the escape is malformed, so
+/// the caller can fall back to treating it as a plain escaped `u`.
+///
+/// `Properties.store` writes a non-BMP character as the two `\uXXXX` halves of
+/// its UTF-16 surrogate pair. Neither half is a `char` on its own, so the pair
+/// has to be recombined here or an emoji in a column name decodes to mojibake.
+fn take_unicode_escape(chars: &[char], i: &mut usize) -> Option<char> {
+    const HIGH_SURROGATES: std::ops::Range<u32> = 0xD800..0xDC00;
+    const LOW_SURROGATES: std::ops::Range<u32> = 0xDC00..0xE000;
+
+    let unit = read_code_unit(chars, *i)?;
+    if HIGH_SURROGATES.contains(&unit) {
+        if chars.get(*i + 4) != Some(&'\\') || chars.get(*i + 5) != Some(&'u') {
+            return None;
+        }
+        let low = read_code_unit(chars, *i + 6)?;
+        if !LOW_SURROGATES.contains(&low) {
+            return None;
+        }
+        let code_point = 0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00);
+        *i += 10;
+        return char::from_u32(code_point);
+    }
+
+    let decoded = char::from_u32(unit)?;
+    *i += 4;
+    Some(decoded)
+}
+
+fn read_code_unit(chars: &[char], at: usize) -> Option<u32> {
+    chars
+        .get(at..at + 4)?
+        .iter()
+        .try_fold(0u32, |acc, c| Some(acc * 16 + c.to_digit(16)?))
 }
 
 #[cfg(test)]
@@ -200,5 +284,72 @@ mod tests {
         expected.insert("invalid_line".to_string(), "".to_string());
         expected.insert("key2".to_string(), "value2".to_string());
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_parse_data_unescapes_java_properties_escapes() {
+        // How a Java Properties.store writer spells values, taken from a
+        // Spark-written hoodie.properties: escaped separators in the Avro
+        // create-schema and in a SimpleDateFormat, plus control characters.
+        let data = Bytes::from(
+            "hoodie.table.create.schema={\"type\"\\:\"record\",\"fields\"\\:[{\"name\"\\:\"id\"}]}\n\
+             hoodie.keygen.timebased.input.dateformat=yyyy-MM-dd'T'HH\\:mm\\:ss.SSSZ\n\
+             hoodie.table.partition.fields=region\\:SIMPLE,ts_str\\:TIMESTAMP\n\
+             path=C:\\\\dir\n\
+             tab=a\\tb\n\
+             newline=a\\nb\n\
+             carriage_return=a\\rb\n\
+             form_feed=a\\fb\n\
+             trailing_backslash=abc\\",
+        );
+        let result = parse_data_for_options(&data, "=").unwrap();
+
+        assert_eq!(
+            result["hoodie.table.create.schema"],
+            r#"{"type":"record","fields":[{"name":"id"}]}"#
+        );
+        assert_eq!(
+            result["hoodie.keygen.timebased.input.dateformat"],
+            "yyyy-MM-dd'T'HH:mm:ss.SSSZ"
+        );
+        assert_eq!(
+            result["hoodie.table.partition.fields"],
+            "region:SIMPLE,ts_str:TIMESTAMP"
+        );
+        assert_eq!(result["path"], "C:\\dir");
+        assert_eq!(result["tab"], "a\tb");
+        assert_eq!(result["newline"], "a\nb");
+        assert_eq!(result["carriage_return"], "a\rb");
+        assert_eq!(result["form_feed"], "a\u{000C}b");
+        assert_eq!(result["trailing_backslash"], "abc");
+    }
+
+    /// `Properties.store` writes every character outside `0x20..=0x7E` as `\uXXXX`,
+    /// and a non-BMP one as the two halves of its UTF-16 surrogate pair. Falling
+    /// through to the drop-the-backslash rule decoded an accented column name to
+    /// the literal text `u00e9`, corrupting the value rather than leaving it alone.
+    #[test]
+    fn test_parse_data_decodes_unicode_escapes() {
+        let data = Bytes::from(
+            "latin=caf\\u00e9\n\
+             cjk=\\u6570\\u636e\n\
+             astral=\\ud83d\\ude00\n\
+             malformed_short=\\u12\n\
+             malformed_digits=\\uzzzz\n\
+             lone_high_surrogate=\\ud83d\n\
+             high_surrogate_then_plain=\\ud83d\\u0041",
+        );
+        let result = parse_data_for_options(&data, "=").unwrap();
+
+        assert_eq!(result["latin"], "café");
+        assert_eq!(result["cjk"], "数据");
+        assert_eq!(result["astral"], "😀");
+
+        // A malformed escape must not fail the table open: it degrades to the
+        // drop-the-backslash rule that any other unknown escape gets.
+        assert_eq!(result["malformed_short"], "u12");
+        assert_eq!(result["malformed_digits"], "uzzzz");
+        assert_eq!(result["lone_high_surrogate"], "ud83d");
+        assert_eq!(result["high_surrogate_then_plain"], "ud83dA");
     }
 }
