@@ -16,7 +16,7 @@
 # under the License.
 
 """Leg registration, modules loaded with --extra-legs, and the Hudi leg's
-capability checks, which decide unavailable-versus-failed before any write."""
+record key form."""
 
 import textwrap
 

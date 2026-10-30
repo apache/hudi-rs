@@ -432,7 +432,7 @@ table, so the readings travel with the numbers.
 
 The harness's own pass/fail logic (key strings, the sampled check, the oracle
 comparison, byte accounting, the reclaim guard, the headroom gate, the run
-lock, leg registration, the composite-key probe and record key form, the
+lock, leg registration, the composite record key form, the
 incremental and time-travel checks, the workload replay, and the aggregation
 across repetitions, including an end-to-end run of a plain-parquet leg at
 `--repeat` 1 and 2) has unit tests that need only pyarrow:
