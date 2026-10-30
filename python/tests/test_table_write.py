@@ -617,11 +617,6 @@ def test_polars_nested_columns_append(tmp_path):
     assert read.column("tags").to_pylist() == [["a", "b"], ["c"]]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="list item names are not relabeled against the table schema on upsert "
-    "(apache/hudi-rs#868)",
-)
 def test_polars_nested_columns_upsert(tmp_path):
     table = HudiTable.create(str(tmp_path / "t"), record_key="id")
     table.append(polars_frame(["t1", "t2"], [["a", "b"], ["c"]], ["sf", "nyc"]))
@@ -737,34 +732,27 @@ def test_binary_large_list_and_dictionary_columns_are_cast(tmp_path):
             ("id", pa.string()),
             ("blob", pa.large_binary()),
             ("view", pa.binary_view()),
+            ("xs", pa.large_list(pa.int64())),
             ("code", pa.dictionary(pa.int8(), pa.int64())),
         ]
     )
 
-    def rows(id_, blob, code):
+    def rows(id_, blob, xs, code):
         return pa.table(
-            {"id": [id_], "blob": [blob], "view": [blob], "code": [code]},
+            {"id": [id_], "blob": [blob], "view": [blob], "xs": [xs], "code": [code]},
             schema=schema,
         )
 
-    table.append(rows("t1", b"a", 7))
+    table.append(rows("t1", b"a", [1, 2], 7))
     written = table.get_schema()
     assert written.field("blob").type == pa.binary()
     assert written.field("view").type == pa.binary()
+    assert pa.types.is_list(written.field("xs").type)
+    assert written.field("xs").type.value_type == pa.int64()
     assert written.field("code").type == pa.int64()
-    assert table.upsert(rows("t1", b"b", 8)).num_updates == 1
-    read = pa.Table.from_batches(table.read()).select(["blob", "view", "code"])
-    assert read.to_pylist() == [{"blob": b"b", "view": b"b", "code": 8}]
-
-    # Upserting a list column is not yet supported (#868), so lists are only appended.
-    lists = HudiTable.create(str(tmp_path / "lists"), record_key="id")
-    lists.append(
-        pa.table({"id": ["t1"], "xs": pa.array([[1, 2]], pa.large_list(pa.int64()))})
-    )
-    assert lists.get_schema().field("xs").type.value_type == pa.int64()
-    assert pa.types.is_list(lists.get_schema().field("xs").type)
-    read = pa.Table.from_batches(lists.read()).column("xs").to_pylist()
-    assert read == [[1, 2]]
+    assert table.upsert(rows("t1", b"b", [3], 8)).num_updates == 1
+    read = pa.Table.from_batches(table.read()).select(["blob", "view", "xs", "code"])
+    assert read.to_pylist() == [{"blob": b"b", "view": b"b", "xs": [3], "code": 8}]
 
 
 def test_update_dict_struct_value_by_position(tmp_path):
