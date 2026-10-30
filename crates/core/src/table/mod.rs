@@ -98,7 +98,6 @@ pub(crate) mod validation;
 pub use crate::config::read_options::{QueryType, ReadOptions};
 pub use crate::index::{HoodieKey, SimpleIndex};
 pub use crate::write::TableCreateBuilder;
-pub use crate::write::append::AppendResult;
 pub use crate::write::{CompactionResult, UpsertOptions, WriteResult};
 
 use crate::Result;
@@ -1590,7 +1589,7 @@ impl Table {
     pub async fn append(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
-    ) -> Result<AppendResult> {
+    ) -> Result<WriteResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
         crate::write::append_batches(self, &batches).await
     }

@@ -209,7 +209,7 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
             .is_file()
     );
 
-    let append = table
+    table
         .append([batch(vec![("a", 1), ("b", 2), ("c", 3)])])
         .await
         .unwrap();
@@ -223,11 +223,9 @@ async fn test_cow_lifecycle_append_upsert_delete_overwrite_with_mdt() {
             replacecommits: 0,
         }
     );
-    assert!(
-        mdt_active_files(&table)
-            .await
-            .contains(&append.base_file_path)
-    );
+    let slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
+    let base_file = slices[0].base_file_relative_path().unwrap().unwrap();
+    assert!(mdt_active_files(&table).await.contains(&base_file));
     assert_snapshot_async(&table, vec![("a", 1), ("b", 2), ("c", 3)]).await;
 
     // 2) Upsert over time: update + insert; state stays consistent.
@@ -299,11 +297,10 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
         .unwrap();
 
     // Append → base parquet + deltacommit, no logs yet.
-    let append = table
+    table
         .append([ordered_batch(vec![("a", 1, 1), ("b", 2, 1)])])
         .await
         .unwrap();
-    assert!(append.commit_relative_path.ends_with(".deltacommit"));
     assert_eq!(
         data_layout(root),
         FileLayout {
@@ -341,7 +338,10 @@ async fn test_mor_lifecycle_asserts_base_and_log_file_counts() {
             .unwrap()
             .to_str()
             .unwrap()
-            .contains(&format!("_{}.log.", update.instant)),
+            .contains(&format!(
+                "_{}.log.",
+                update.requested_time.as_deref().unwrap()
+            )),
         "log file should include upsert instant: {:?}",
         logs[0]
     );

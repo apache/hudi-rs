@@ -761,15 +761,12 @@ pub(crate) async fn complete_write(
     let _ = table.timeline.reload_completed_commits().await;
     table.clear_read_caches();
     Ok(CompletedWrite {
-        commit_relative_path,
         completion_time: completion,
     })
 }
 
 /// What [`complete_write`] stored on the timeline.
 pub(crate) struct CompletedWrite {
-    /// Path of the completed instant, relative to the table base.
-    pub commit_relative_path: String,
     /// Completion time of the instant on timeline layout v2; `None` on v1,
     /// which records none.
     pub completion_time: Option<String>,
