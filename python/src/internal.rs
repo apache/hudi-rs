@@ -1097,6 +1097,11 @@ impl From<CompactionResult> for HudiCompactionResult {
     }
 }
 
+/// The core reports a compaction that wrote nothing with an empty instant.
+fn committed(instant: String) -> Option<String> {
+    (!instant.is_empty()).then_some(instant)
+}
+
 /// Result of a table write, shared by every write verb.
 #[cfg(not(tarpaulin_include))]
 #[pyclass(frozen, get_all)]

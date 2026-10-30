@@ -680,7 +680,11 @@ mod tests {
         let after = snapshot(&table).await;
         assert_eq!(data_only(&after), data_only(&before));
         let row_a = after.iter().find(|r| r.0 == "a").unwrap();
-        assert_eq!(row_a.4, upsert.instant, "compaction preserves commit time");
+        assert_eq!(
+            Some(row_a.4.clone()),
+            upsert.requested_time,
+            "compaction preserves commit time"
+        );
         assert_eq!(
             row_a.5,
             format!(
@@ -786,7 +790,7 @@ mod tests {
             .into_iter()
             .find(|r| r.0 == "b")
             .unwrap();
-        assert_eq!((row_b.3, row_b.4), (21, later.instant));
+        assert_eq!((row_b.3, row_b.4), (21, later.requested_time.unwrap()));
     }
 
     #[tokio::test]
@@ -1065,7 +1069,7 @@ mod tests {
         assert_eq!(slices[0].log_files.len(), 1, "a pending log is not planned");
         finish_delta_commit_unlocked(&table, before).await;
         let during = table.upsert([batch(&[("b", "sf", 2, 21)])]).await.unwrap();
-        assert!(during.instant > instant);
+        assert!(during.requested_time.unwrap() > instant);
         execute_compaction(&mut table, &instant, slices)
             .await
             .unwrap();
