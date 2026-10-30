@@ -45,6 +45,6 @@ spill-rocksdb = ["hudi/spill-rocksdb"]
 ffi-test-hooks = []
 
 [dependencies]
-hudi = { path = "../hudi", version = "0.6.0-dev", default-features = false }
+hudi = { path = "../hudi", version = "0.7.0-dev", default-features = false }
 arrow = { workspace = true, features = ["ffi"] }
 tokio = { workspace = true }
