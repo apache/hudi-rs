@@ -43,8 +43,8 @@
   </a>
 </p>
 
-The Hudi-rs project aims to standardize the core [Apache Hudi](https://github.com/apache/hudi) APIs, and broaden the
-Hudi integration in the data ecosystems for a diverse range of users and projects.
+hudi-rs is a native Rust implementation of [Apache Hudi](https://github.com/apache/hudi) with Python and C++
+bindings. It creates, writes, and reads Hudi tables from Rust and Python in a single process, with no JVM.
 
 | Source                  | Downloads                   | Installation Command |
 |-------------------------|-----------------------------|----------------------|
@@ -62,6 +62,46 @@ on-disk tier, which a merge-on-read merge spills to when a file group's log reco
 `hoodie.memory.merge.max.size`. RocksDB is built from source with `bindgen`, so it needs `libclang`
 and a C++ toolchain; `default-features = false` drops it, and a merge that would have spilled then
 fails instead.
+
+## Quick start
+
+Create a table, upsert and delete rows, then read what changed after the first commit.
+
+```python
+import tempfile
+
+import pyarrow as pa
+from hudi import HudiQueryType, HudiReadOptions, HudiTable
+
+def docs(ids, version):
+    return pa.table({
+        "doc_id": ids,
+        "title": [f"{d} v{version}" for d in ids],
+        "version": pa.array([version] * len(ids), pa.int64()),
+    })
+
+table = HudiTable.create(f"{tempfile.mkdtemp()}/docs", record_key="doc_id", ordering_fields="version")
+first = table.append(docs(["doc1", "doc2", "doc3"], version=1))
+
+result = table.upsert(docs(["doc2", "doc4"], version=2))
+print(result.num_updates, result.num_inserts)  # 1 1
+
+table.delete("doc_id = 'doc3'")
+
+# Commits that completed after the first one.
+changed = table.read(
+    HudiReadOptions()
+    .with_query_type(HudiQueryType.Incremental)
+    .with_start_timestamp(first.completion_time)
+)
+print(sorted(pa.Table.from_batches(changed).column("doc_id").to_pylist()))  # ['doc2', 'doc4']
+
+snapshot = pa.Table.from_batches(table.read())
+print(sorted(snapshot.column("doc_id").to_pylist()))  # ['doc1', 'doc2', 'doc4']
+```
+
+See [Writing Tables](#writing-tables) for the full write API, and
+[`table_writes.rs`](crates/core/examples/table_writes.rs) for a Rust example.
 
 ## Reading Tables
 
