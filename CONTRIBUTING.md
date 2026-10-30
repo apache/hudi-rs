@@ -127,6 +127,20 @@ pytest -s python/tests
 pytest python/tests/test_table_read.py -s -k "test_read_table_has_correct_schema"
 ```
 
+## Keep disk usage down
+
+A debug build compiles DataFusion, Arrow, Parquet and RocksDB, and every integration test links its
+own executable, so a checkout's `target/` directory can grow to tens of GB. To keep it in check:
+
+- Run `cargo clean` in checkouts you no longer build.
+- Test the crate you changed, for example `cargo test -p hudi-core --lib`, rather than the whole
+  workspace.
+- On an arm64 Mac, run cargo through `make` or `./build-wrapper.sh` every time (for example
+  `./build-wrapper.sh cargo test -p hudi-core --lib`). The wrapper's dependency opt-level is part of
+  each dependency's build hash, so alternating with plain `cargo` keeps two copies of every dependency.
+- Sharing one `CARGO_TARGET_DIR` across worktrees builds dependencies once, but concurrent builds then
+  wait on Cargo's build-directory lock.
+
 ## Before creating a pull request
 
 Run the below command and fix issues if any:
