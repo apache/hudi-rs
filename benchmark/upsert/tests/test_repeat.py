@@ -136,9 +136,16 @@ def register(api):
         def _write(self, table):
             self.version = getattr(self, "version", -1) + 1
             pq.write_table(table, self.root / f"v{self.version:03d}.parquet")
+            self.written = self.version
 
         def _latest(self):
             return sorted(self.root.glob("v*.parquet"))[-1]
+
+        def _version(self, v):
+            return pq.read_table(self.root / f"v{v:03d}.parquet")
+
+        def config(self, plan):
+            return {"incremental_emits_deletes": True}
 
         def load(self, root, table, plan):
             self.root = Path(root)
@@ -148,6 +155,7 @@ def register(api):
         def open(self, root, plan):
             self.root, self.plan = Path(root), plan
             self.version = int(self._latest().stem[1:])
+            self.written = None
 
         def _keep(self, cur, keys):
             k = self.plan["key_cols"][0]
@@ -165,6 +173,22 @@ def register(api):
         def read(self):
             return pq.read_table(self._latest())
 
+        def marker(self):
+            # Like the Hudi leg, known only from this process's own writes.
+            return self.written
+
+        def incremental(self, prev, cur):
+            old, new = self._version(prev), self._version(cur)
+            k = self.plan["key_cols"][0]
+            before = {tuple(r.values()) for r in old.to_pylist()}
+            mask = [tuple(r.values()) not in before for r in new.to_pylist()]
+            changed = new.filter(pa.array(mask, pa.bool_()))
+            gone = old.filter(pc.invert(pc.is_in(old[k], value_set=new[k]))).select([k])
+            return changed.num_rows + gone.num_rows, changed, gone
+
+        def time_travel(self, marker):
+            return self._version(marker)
+
         def live_data_files(self, root):
             return {self._latest().relative_to(root)}
 
@@ -172,7 +196,7 @@ def register(api):
 '''
 
 
-def run_bench(tmp_path, repeat):
+def run_bench(tmp_path, repeat, scenario="uuid"):
     tmp_path.mkdir(parents=True, exist_ok=True)
     plugin = tmp_path / "parquet_leg.py"
     plugin.write_text(textwrap.dedent(PARQUET_LEG))
@@ -180,7 +204,7 @@ def run_bench(tmp_path, repeat):
     cmd = [
         sys.executable,
         str(HERE / "bench.py"),
-        "--scenario", "uuid",
+        "--scenario", scenario,
         "--rows", "2000",
         "--commits", "2",
         "--upsert-batch", "100",
@@ -237,3 +261,12 @@ def test_every_repetition_is_checked_and_aggregated(runs):
     )
     assert s["writes_consistent"], s["write_mismatches"]
     assert two["params"]["repeat"] == 2
+
+
+def test_incremental_reads_start_at_the_previous_commit_in_every_phase(tmp_path):
+    leg = run_bench(tmp_path, 1, scenario="training-set")["legs"]["parquet"]
+    assert leg["status"] == "ok", leg.get("error")
+    phases = leg["repetitions"][0]["phases"]
+    for kind in ("upsert", "delete"):
+        for c in phases[kind]["commits"]:
+            assert c["reads"]["incremental"]["rows"] == c["input_rows"]

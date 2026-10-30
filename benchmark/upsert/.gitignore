@@ -17,6 +17,3 @@
 
 .venv/
 .pytest_cache/
-# The repository ignores every results/ directory; this one holds the results
-# files summarize.py renders.
-!results/

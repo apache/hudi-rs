@@ -216,9 +216,8 @@ class HudiLeg(Leg):
             "read": "HudiTable.read()",
             "incremental_read": (
                 "HudiTable.read(HudiReadOptions().with_query_type(Incremental)"
-                ".with_start_timestamp(<instant of the commit just written>)); on table "
-                "version 9 the start bound is a completion time, so the commit's own "
-                "requested instant selects exactly that commit"
+                ".with_start_timestamp(<previous completion time>)"
+                ".with_end_timestamp(<completion time>))"
             ),
             "incremental_emits_deletes": False,
             "time_travel": "HudiTable.read(HudiReadOptions().with_as_of_timestamp(<load instant>))",
@@ -249,17 +248,22 @@ class HudiLeg(Leg):
             table_type=self.table_type,
             record_index_enabled=self.record_index,
         )
-        r = t.append(base)
-        return {"marker": r.instant_time}
+        return {"marker": self._marker(t.append(base))}
 
     def open(self, root, plan):
         self.plan = plan
         self.t = self._hudi().HudiTable(str(root))
-        self.last_instant = None
+        self.last = None
+
+    @staticmethod
+    def _marker(r):
+        # Time travel resolves requested instants; incremental bounds on table
+        # version 9 are completion times.
+        return {"instant": r.instant_time, "completion": r.completion_time}
 
     def upsert(self, batch):
         r = self.t.upsert(batch)
-        self.last_instant = r.instant_time
+        self.last = self._marker(r)
         return {
             "num_updated": r.num_updates,
             "num_inserted": r.num_inserts,
@@ -278,7 +282,7 @@ class HudiLeg(Leg):
 
     def delete(self, keys):
         r = self.t.delete_keys(self.record_keys(keys))
-        self.last_instant = r.instant_time
+        self.last = self._marker(r)
         return {"num_deleted": r.num_deletes, "instant": r.instant_time}
 
     def _read(self, opts=None):
@@ -291,20 +295,22 @@ class HudiLeg(Leg):
         return self._read()
 
     def marker(self):
-        return self.last_instant
+        return self.last
 
     def incremental(self, prev, cur):
         hudi = self._hudi()
         opts = (
             hudi.HudiReadOptions()
             .with_query_type(hudi.HudiQueryType.Incremental)
-            .with_start_timestamp(cur)
+            .with_start_timestamp(prev["completion"])
+            .with_end_timestamp(cur["completion"])
         )
         t = self._read(opts)
         return (0, None, None) if t is None else (t.num_rows, t, None)
 
     def time_travel(self, first):
-        return self._read(self._hudi().HudiReadOptions().with_as_of_timestamp(first))
+        opts = self._hudi().HudiReadOptions().with_as_of_timestamp(first["instant"])
+        return self._read(opts)
 
     def live_data_files(self, root):
         live = set()
@@ -603,9 +609,9 @@ def run_commits(leg, root, wd, plan, kind, w, a):
             )
     w.rec["rss_before_bytes"] = current_rss_bytes()
     w.rec["commits"] = []
+    prev = a.prev_marker
     for c in range(plan["commits"]):
         arg = pq.read_table(wd / f"{kind}-{c:02d}.parquet")
-        prev = leg.marker() if plan["incremental_reads"] else None
         before = snapshot(root)
         room = gate(root, a.base_bytes, a, f"{kind} commit {c}")
         # Lets the driver name the commit if the process dies on a signal.
@@ -635,11 +641,12 @@ def run_commits(leg, root, wd, plan, kind, w, a):
         else:
             _expect(f"delete {c} deleted rows", info.get("num_deleted"), exp["deleted"])
         if plan["incremental_reads"]:
+            cur = leg.marker()
             rec["reads"] = measure_reads(
                 leg,
                 plan,
                 prev,
-                leg.marker(),
+                cur,
                 a.first_marker,
                 kind,
                 arg,
@@ -647,6 +654,7 @@ def run_commits(leg, root, wd, plan, kind, w, a):
                 emits_deletes,
                 lambda what: gate(root, a.base_bytes, a, f"{what} (commit {c})"),
             )
+            prev = w.rec["marker"] = cur
             w.flush()
         if a.reclaim:
             rec.update(reclaim(leg, root, after))
@@ -815,6 +823,7 @@ def phase_main(argv):
     p.add_argument("--out", required=True)
     p.add_argument("--reclaim", action="store_true")
     p.add_argument("--first-marker", default=None)
+    p.add_argument("--prev-marker", default=None)
     p.add_argument("--extra-legs", action="append", default=[])
     p.add_argument("--work-dir", required=True)
     add_headroom_args(p)
@@ -823,6 +832,8 @@ def phase_main(argv):
     load_extra_legs(a.extra_legs)
     if a.first_marker is not None:
         a.first_marker = json.loads(a.first_marker)
+    if a.prev_marker is not None:
+        a.prev_marker = json.loads(a.prev_marker)
 
     leg = LEGS[a.leg]()
     root = Path(a.root)
@@ -1181,7 +1192,7 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
         shutil.rmtree(root)
     root.mkdir(parents=True)
     start = time.monotonic()
-    first_marker = None
+    first_marker = prev_marker = None
     for phase in PHASES:
         out = log_dir / f"{name}-r{r}-{phase}.json"
         out.unlink(missing_ok=True)
@@ -1209,6 +1220,8 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
             cmd.append("--force")
         if first_marker is not None:
             cmd += ["--first-marker", json.dumps(first_marker)]
+        if prev_marker is not None:
+            cmd += ["--prev-marker", json.dumps(prev_marker)]
         timeout = None
         if a.leg_timeout:
             timeout = a.leg_timeout - (time.monotonic() - start)
@@ -1230,7 +1243,9 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
         result.pop("traceback", None)
         rep["phases"][phase] = result
         if phase == "load":
-            first_marker = result.get("engine", {}).get("marker")
+            first_marker = prev_marker = result.get("engine", {}).get("marker")
+        else:
+            prev_marker = result.get("marker", prev_marker)
         if rc is None:
             rep["status"] = "timeout"
             rep["error"] = (

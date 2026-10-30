@@ -43,6 +43,7 @@ pytest python/tests/test_table_read.py -s -k "<expr>"          # one Python test
 make coverage-rust                                             # tarpaulin HTML at cov-reports/
 make parity                  # Spark-in-the-loop parity tests (needs SPARK_HOME; scripts/parity/README.md)
 benchmark/upsert/run.sh smoke --scenario uuid  # upsert benchmark at smoke scale (benchmark/upsert/README.md)
+make bench-upsert-test       # upsert benchmark harness tests (after benchmark/upsert/run.sh setup)
 
 # hudi-core without the spill backend — CI runs this leg, so check it before a PR
 # that touches the merge map or its dependencies.

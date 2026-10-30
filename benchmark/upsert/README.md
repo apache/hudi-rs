@@ -126,9 +126,8 @@ chat transcript), `label`, `source_chunk_id` and `updated_at` (ordering
 field). After each commit, outside its timed region, the harness also times
 the two reads a training job makes:
 
-- **Incremental read** from the instant the write returned. On table version 9
-  that bound is compared with completion times, so it selects only the new
-  commit. After an upsert it must equal the upsert's input; after a delete it
+- **Incremental read** from the previous commit's completion time to this
+  one's. After an upsert it must equal the upsert's input; after a delete it
   must be empty, since a Hudi incremental read does not return deletes.
 - **Time travel** to the load commit, which must equal the loaded table.
 

@@ -21,6 +21,7 @@ SHELL := /bin/bash
 
 VENV := .venv
 PYTHON_DIR = python
+UPSERT_BENCH_DIR := benchmark/upsert
 MATURIN_VERSION := $(shell grep 'requires =' $(PYTHON_DIR)/pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
 
@@ -101,7 +102,7 @@ format-rust: ## Format Rust code
 .PHONY: format-python
 format-python: ## Format Python code
 	$(info --- Format Python code ---)
-	ruff format $(PYTHON_DIR)
+	ruff format $(PYTHON_DIR) $(UPSERT_BENCH_DIR)
 
 .PHONY: check
 check: check-rust check-python ## Run check on Rust and Python
@@ -116,9 +117,9 @@ check-rust: ## Run check on Rust
 .PHONY: check-python
 check-python: ## Run check on Python
 	$(info --- Check Python format ---)
-	ruff format --check --diff $(PYTHON_DIR)
+	ruff format --check --diff $(PYTHON_DIR) $(UPSERT_BENCH_DIR)
 	$(info --- Check Python linting ---)
-	ruff check $(PYTHON_DIR)
+	ruff check $(PYTHON_DIR) $(UPSERT_BENCH_DIR)
 	$(info --- Check Python typing ---)
 	pushd $(PYTHON_DIR); mypy .; popd
 
@@ -207,6 +208,10 @@ endif
 .PHONY: tpch-compare
 tpch-compare: ## Compare persisted TPC-H benchmark results (ENGINES=datafusion,spark SF=0.001)
 	$(TPCH_DIR)/run.sh compare --scale-factor $(SF) --engines $(ENGINES) --format $(FORMAT)
+
+.PHONY: bench-upsert-test
+bench-upsert-test: ## Run the upsert benchmark's harness tests (after benchmark/upsert/run.sh setup)
+	$(UPSERT_BENCH_DIR)/.venv/bin/python -m pytest $(UPSERT_BENCH_DIR)/tests -q
 
 .PHONY: parity
 parity: ## Run Spark-in-the-loop parity tests (needs SPARK_HOME; see scripts/parity/README.md)
