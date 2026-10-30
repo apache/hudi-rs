@@ -14,6 +14,24 @@
 #  KIND, either express or implied.  See the License for the
 #  specific language governing permissions and limitations
 #  under the License.
+"""Type stubs and API reference for the ``hudi`` package.
+
+Resources:
+
+- Quick start: https://hudi.apache.org/docs/python-rust-quick-start-guide, and the shorter
+  README quick start at https://github.com/apache/hudi-rs#quick-start.
+- Python API reference: the docstrings in this file.
+- Rust API reference: https://docs.rs/hudi (also https://docs.rs/hudi-core and
+  https://docs.rs/hudi-datafusion).
+- Runnable Rust example:
+  https://github.com/apache/hudi-rs/blob/main/crates/core/examples/table_writes.rs.
+- Reader semantics: https://github.com/apache/hudi-rs/blob/main/docs/reader-spec.md.
+  Writer design: https://github.com/apache/hudi-rs/blob/main/docs/writer-design.md.
+- Packages: https://pypi.org/project/hudi/ and https://crates.io/crates/hudi.
+  Source: https://github.com/apache/hudi-rs.
+- Hudi concepts (timeline, table types, query types): https://hudi.apache.org/docs/overview.
+"""
+
 from dataclasses import dataclass
 from typing import Any, ClassVar, Dict, List, Optional, Protocol, Tuple, Union
 
@@ -45,9 +63,13 @@ class HudiQueryType:
     Incremental: ClassVar["HudiQueryType"]
 
     @property
-    def name(self) -> str: ...
+    def name(self) -> str:
+        """The member name, ``"Snapshot"`` or ``"Incremental"``."""
+        ...
     @property
-    def value(self) -> str: ...
+    def value(self) -> str:
+        """The config value stored under ``hoodie.read.query.type``, ``"snapshot"`` or ``"incremental"``."""
+        ...
 
 @dataclass(init=False)
 class HudiReadOptions:
@@ -76,28 +98,85 @@ class HudiReadOptions:
         filters: Optional[List[Tuple[str, str, str]]] = None,
         projection: Optional[List[str]] = None,
         hudi_options: Optional[Dict[str, str]] = None,
-    ): ...
+    ):
+        """
+        Initializes the HudiReadOptions.
+
+        Parameters:
+            filters (Optional[List[Tuple[str, str, str]]]): Column filters as ``(field, op, value)``
+                tuples. Parsed and cardinality-validated immediately; an unrecognized operator
+                or empty ``IN`` / ``NOT IN`` value list raises ``HudiCoreError``.
+            projection (Optional[List[str]]): Column names to read. If None, all columns are read.
+            hudi_options (Optional[Dict[str, str]]): Per-read Hudi configs (``hoodie.*``).
+        """
+        ...
 
     # Builders return a new HudiReadOptions for chaining.
-    def with_query_type(self, query_type: HudiQueryType) -> "HudiReadOptions": ...
-    def with_as_of_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
-    def with_start_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
-    def with_end_timestamp(self, timestamp: str) -> "HudiReadOptions": ...
+    def with_query_type(self, query_type: HudiQueryType) -> "HudiReadOptions":
+        """Set the query type. Stored under ``hoodie.read.query.type``; defaults to snapshot when unset."""
+        ...
+    def with_as_of_timestamp(self, timestamp: str) -> "HudiReadOptions":
+        """
+        Set the timestamp for a snapshot (time-travel) read. Stored under
+        ``hoodie.read.as.of.timestamp``; a snapshot read without it reads the latest commit.
+
+        The value is parsed when the read runs, not here. Accepted formats are the Hudi
+        timeline format (``yyyyMMddHHmmssSSS`` or ``yyyyMMddHHmmss``), epoch time in seconds,
+        milliseconds, microseconds or nanoseconds, and RFC 3339 (``2024-03-15T14:25:30Z``).
+        Epoch and RFC 3339 values are converted to the table's timeline timezone
+        (``hoodie.table.timeline.timezone``).
+        """
+        ...
+    def with_start_timestamp(self, timestamp: str) -> "HudiReadOptions":
+        """
+        Set the exclusive start of an incremental read window. Stored under
+        ``hoodie.read.start.timestamp``; when unset, the window has no lower bound.
+
+        On table version 8 and later this bounds each commit's completion time, so pass
+        :attr:`HudiWriteResult.completion_time` rather than its ``requested_time`` to read
+        the commits after a given write. On earlier table versions it bounds the requested
+        time. Accepts the same formats as :meth:`with_as_of_timestamp`.
+        """
+        ...
+    def with_end_timestamp(self, timestamp: str) -> "HudiReadOptions":
+        """
+        Set the inclusive end of an incremental read window. Stored under
+        ``hoodie.read.end.timestamp``; when unset, the window covers everything committed
+        so far.
+
+        Bounds the same timestamp as :meth:`with_start_timestamp` and accepts the same
+        formats as :meth:`with_as_of_timestamp`.
+        """
+        ...
     def with_batch_size(self, size: int) -> "HudiReadOptions":
         """Target rows per batch for streaming reads. Raises ``HudiCoreError`` if ``size == 0``."""
         ...
     def with_filters(self, filters: List[Tuple[str, str, str]]) -> "HudiReadOptions":
         """Set column filters as ``(field, op, value)`` tuples. Parses and cardinality-validates immediately; an unrecognized operator or empty ``IN`` / ``NOT IN`` value list raises ``HudiCoreError``."""
         ...
-    def with_projection(self, columns: List[str]) -> "HudiReadOptions": ...
-    def with_hudi_option(self, key: str, value: str) -> "HudiReadOptions": ...
-    def with_hudi_options(self, opts: Dict[str, str]) -> "HudiReadOptions": ...
+    def with_projection(self, columns: List[str]) -> "HudiReadOptions":
+        """Set the column names to read, replacing any previous projection."""
+        ...
+    def with_hudi_option(self, key: str, value: str) -> "HudiReadOptions":
+        """Set one Hudi config (``hoodie.*``) for this read only, replacing any existing value for ``key``."""
+        ...
+    def with_hudi_options(self, opts: Dict[str, str]) -> "HudiReadOptions":
+        """Set several Hudi configs (``hoodie.*``) for this read only. Keys already set and not in ``opts`` are kept."""
+        ...
 
     # Typed accessors read from hudi_options.
-    def query_type(self) -> HudiQueryType: ...
-    def as_of_timestamp(self) -> Optional[str]: ...
-    def start_timestamp(self) -> Optional[str]: ...
-    def end_timestamp(self) -> Optional[str]: ...
+    def query_type(self) -> HudiQueryType:
+        """The query type, ``HudiQueryType.Snapshot`` if unset. Raises ``HudiCoreError`` if the stored value is not a recognized query type."""
+        ...
+    def as_of_timestamp(self) -> Optional[str]:
+        """The snapshot (time-travel) timestamp as stored, or ``None`` if unset."""
+        ...
+    def start_timestamp(self) -> Optional[str]:
+        """The exclusive start of the incremental window as stored, or ``None`` if unset."""
+        ...
+    def end_timestamp(self) -> Optional[str]:
+        """The inclusive end of the incremental window as stored, or ``None`` if unset."""
+        ...
     def batch_size(self) -> Optional[int]:
         """Target batch size for streaming reads, or ``None`` if unset. Raises ``HudiCoreError`` if the stored value is malformed."""
         ...
@@ -256,14 +335,49 @@ class HudiFileSlice:
 
 @dataclass(init=False)
 class HudiInstant:
+    """
+    An action on a table's timeline at one point in time, as returned by :class:`HudiTimeline`.
+    """
+
     @property
-    def timestamp(self) -> str: ...
+    def timestamp(self) -> str:
+        """
+        The instant time, i.e. when the action was requested, in the Hudi timeline format
+        (``yyyyMMddHHmmssSSS`` or ``yyyyMMddHHmmss``).
+
+        Returns:
+            str: The requested timestamp of the instant.
+        """
+        ...
     @property
-    def action(self) -> str: ...
+    def action(self) -> str:
+        """
+        The timeline action of the instant.
+
+        Returns:
+            str: ``"commit"``, ``"deltacommit"`` or ``"replacecommit"``.
+        """
+        ...
     @property
-    def state(self) -> str: ...
+    def state(self) -> str:
+        """
+        The state of the instant.
+
+        Returns:
+            str: ``"requested"``, ``"inflight"``, or an empty string for a completed instant.
+                Instants returned by :class:`HudiTimeline` are all completed.
+        """
+        ...
     @property
-    def epoch_mills(self) -> int: ...
+    def epoch_mills(self) -> int:
+        """
+        The instant time (:attr:`timestamp`) as milliseconds since the Unix epoch, reading it in
+        the table's timeline timezone (``hoodie.table.timeline.timezone``, UTC when unset).
+
+        Returns:
+            int: Milliseconds since the Unix epoch.
+        """
+        ...
 
 @dataclass(init=False)
 class HudiTable:
@@ -404,6 +518,9 @@ class HudiTable:
         - Snapshot: slices visible at ``options.as_of_timestamp`` (defaults to the
           latest commit). ``options.filters`` drive partition pruning; file-level
           stats pruning applies only for COW tables or MOR read-optimized mode.
+          With the record-level index, ``=`` or ``IN`` filters on the record key
+          keep only the file groups the index names (latest snapshot only, not in
+          read-optimized mode).
           When footer stats are loaded for pruning, exact ``num_records``,
           ``byte_size``, and column stats are attached to the returned slices.
         - Incremental: slices changed in ``(options.start_timestamp,
@@ -623,8 +740,8 @@ class HudiTable:
         ...
     def compact(self) -> "HudiCompactionResult":
         """
-        Compact a merge-on-read table: every file group whose latest file slice
-        carries log files gets a new base file holding its merged rows, under one
+        Compact a merge-on-read table (experimental): every file group whose latest
+        file slice carries log files gets a new base file holding its merged rows, under one
         compaction instant that completes as a commit. Rows keep their commit time,
         so incremental reads see no new rows from a compaction.
 
@@ -662,20 +779,20 @@ class HudiWriteResult:
     Outcome of a write on :class:`HudiTable`.
 
     Attributes:
-        instant_time (Optional[str]): Instant time of the completed commit, or ``None``
+        requested_time (Optional[str]): Requested time of the completed commit, or ``None``
             when no commit was made.
         completion_time (Optional[str]): When the commit completed, or ``None`` when no
             commit was made or the table's timeline records no completion times (table
             version 6). When set, incremental reads compare their start bound against
             completion times, so ``with_start_timestamp(completion_time)`` returns the
-            commits after this one while passing ``instant_time`` would include this commit.
+            commits after this one while passing ``requested_time`` would include this commit.
         num_writes (int): Rows written to data files.
         num_updates (int): Input rows that replaced existing records.
         num_inserts (int): Input rows that were new records.
         num_deletes (int): Records deleted.
     """
 
-    instant_time: Optional[str]
+    requested_time: Optional[str]
     completion_time: Optional[str]
     num_writes: int
     num_updates: int
@@ -688,7 +805,7 @@ class HudiCompactionResult:
     Outcome of :meth:`HudiTable.compact`.
 
     Attributes:
-        instant_time (Optional[str]): Instant time of the completed compaction commit,
+        requested_time (Optional[str]): Requested time of the completed compaction commit,
             or ``None`` when no file group had log files and nothing was written.
         completion_time (Optional[str]): When the commit completed, or ``None`` when
             nothing was written or the timeline records no completion times.
@@ -697,7 +814,7 @@ class HudiCompactionResult:
         num_writes (int): Rows written to the new base files.
     """
 
-    instant_time: Optional[str]
+    requested_time: Optional[str]
     completion_time: Optional[str]
     num_file_groups: int
     num_log_files: int
@@ -705,16 +822,105 @@ class HudiCompactionResult:
 
 @dataclass(init=False)
 class HudiTimeline:
-    def get_completed_commits(self, desc: bool = False) -> List[HudiInstant]: ...
-    def get_completed_deltacommits(self, desc: bool = False) -> List[HudiInstant]: ...
-    def get_completed_replacecommits(self, desc: bool = False) -> List[HudiInstant]: ...
-    def get_completed_clustering_commits(
-        self, desc: bool = False
-    ) -> List[HudiInstant]: ...
-    def get_instant_metadata_in_json(self, instant: HudiInstant) -> str: ...
-    def get_latest_commit_timestamp(self) -> str: ...
-    def get_latest_avro_schema(self) -> str: ...
-    def get_latest_schema(self) -> "pyarrow.Schema": ...
+    """
+    The timeline of a Hudi table, obtained from :meth:`HudiTable.get_timeline`.
+
+    Only the active timeline is read; archived instants are not returned.
+    """
+
+    def get_completed_commits(self, desc: bool = False) -> List[HudiInstant]:
+        """
+        Returns the completed ``commit`` instants. On a MOR table, compactions complete as commits.
+
+        Parameters:
+            desc (bool): Sort by instant time in descending order instead of ascending.
+
+        Returns:
+            List[HudiInstant]: The completed commit instants.
+        """
+        ...
+    def get_completed_deltacommits(self, desc: bool = False) -> List[HudiInstant]:
+        """
+        Returns the completed ``deltacommit`` instants. Empty for a COW table.
+
+        Parameters:
+            desc (bool): Sort by instant time in descending order instead of ascending.
+
+        Returns:
+            List[HudiInstant]: The completed delta commit instants.
+        """
+        ...
+    def get_completed_replacecommits(self, desc: bool = False) -> List[HudiInstant]:
+        """
+        Returns the completed ``replacecommit`` instants, such as overwrites and clustering.
+
+        Parameters:
+            desc (bool): Sort by instant time in descending order instead of ascending.
+
+        Returns:
+            List[HudiInstant]: The completed replace commit instants.
+        """
+        ...
+    def get_completed_clustering_commits(self, desc: bool = False) -> List[HudiInstant]:
+        """
+        Returns the completed ``replacecommit`` instants whose commit metadata has
+        ``operationType`` ``cluster``.
+
+        Reads the commit metadata of every completed replace commit, and raises
+        ``HudiCoreError`` if one of them has no operation type.
+
+        Parameters:
+            desc (bool): Sort by instant time in descending order instead of ascending.
+
+        Returns:
+            List[HudiInstant]: The completed clustering instants.
+        """
+        ...
+    def get_instant_metadata_in_json(self, instant: HudiInstant) -> str:
+        """
+        Returns the commit metadata stored in the instant's timeline file, as JSON.
+
+        Parameters:
+            instant (HudiInstant): A completed instant from this timeline.
+
+        Returns:
+            str: The commit metadata as a JSON string.
+        """
+        ...
+    def get_latest_commit_timestamp(self) -> str:
+        """
+        Returns the instant time of the latest completed commit, delta commit, or replace
+        commit. Raises ``HudiCoreError`` if the table has no completed commit.
+
+        Returns:
+            str: The instant time in the Hudi timeline format.
+        """
+        ...
+    def get_latest_avro_schema(self) -> str:
+        """
+        Returns the Avro schema recorded in the latest completed commit's metadata.
+
+        Raises ``HudiCoreError`` if the table has no completed commit or the commit metadata
+        holds no schema. :meth:`HudiTable.get_schema_in_avro_str` instead falls back to the
+        schema in the table config when the table has no completed commit.
+
+        Returns:
+            str: The Avro schema as a JSON string.
+        """
+        ...
+    def get_latest_schema(self) -> "pyarrow.Schema":
+        """
+        Returns the data schema, without Hudi meta fields, of the latest completed commit.
+
+        Taken from the commit metadata, or, when the metadata holds no schema, from a base
+        file referenced by the commit's write stats. Raises ``HudiCoreError`` if the table
+        has no completed commit; :meth:`HudiTable.get_schema` instead falls back to the
+        schema in the table config.
+
+        Returns:
+            pyarrow.Schema: The schema of the latest commit.
+        """
+        ...
 
 def build_hudi_table(
     base_uri: str,
@@ -738,6 +944,13 @@ def build_hudi_table(
 
 @dataclass(init=False)
 class HudiDataFusionDataSource:
+    """
+    A Hudi table as a DataFusion table provider.
+
+    Register it on a ``datafusion.SessionContext`` with ``register_table`` and query it with
+    SQL. Requires the ``datafusion`` package, installed with the ``hudi[datafusion]`` extra.
+    """
+
     def __init__(
         self,
         base_uri: str,

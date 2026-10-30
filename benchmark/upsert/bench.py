@@ -259,7 +259,7 @@ class HudiCase(Case):
     def _marker(r):
         # Time travel resolves requested instants; incremental bounds on table
         # version 9 are completion times.
-        return {"instant": r.instant_time, "completion": r.completion_time}
+        return {"instant": r.requested_time, "completion": r.completion_time}
 
     def upsert(self, batch):
         r = self.t.upsert(batch)
@@ -267,7 +267,7 @@ class HudiCase(Case):
         return {
             "num_updated": r.num_updates,
             "num_inserted": r.num_inserts,
-            "instant": r.instant_time,
+            "instant": r.requested_time,
         }
 
     def record_keys(self, keys):
@@ -283,7 +283,7 @@ class HudiCase(Case):
     def delete(self, keys):
         r = self.t.delete_keys(self.record_keys(keys))
         self.last = self._marker(r)
-        return {"num_deleted": r.num_deletes, "instant": r.instant_time}
+        return {"num_deleted": r.num_deletes, "instant": r.requested_time}
 
     def _read(self, opts=None):
         batches = self.t.read(opts)

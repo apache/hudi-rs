@@ -1059,7 +1059,7 @@ impl HudiTable {
 #[cfg(not(tarpaulin_include))]
 #[pyclass(frozen, get_all)]
 pub struct HudiCompactionResult {
-    instant_time: Option<String>,
+    requested_time: Option<String>,
     completion_time: Option<String>,
     num_file_groups: usize,
     num_log_files: usize,
@@ -1075,8 +1075,8 @@ impl HudiCompactionResult {
                 .map_or_else(|| "None".to_string(), |t| format!("'{t}'"))
         };
         format!(
-            "HudiCompactionResult(instant_time={}, completion_time={}, num_file_groups={}, num_log_files={}, num_writes={})",
-            quoted(&self.instant_time),
+            "HudiCompactionResult(requested_time={}, completion_time={}, num_file_groups={}, num_log_files={}, num_writes={})",
+            quoted(&self.requested_time),
             quoted(&self.completion_time),
             self.num_file_groups,
             self.num_log_files,
@@ -1088,7 +1088,7 @@ impl HudiCompactionResult {
 impl From<CompactionResult> for HudiCompactionResult {
     fn from(r: CompactionResult) -> Self {
         Self {
-            instant_time: r.requested_time,
+            requested_time: r.requested_time,
             completion_time: r.completion_time,
             num_file_groups: r.num_file_groups,
             num_log_files: r.num_log_files,
@@ -1101,7 +1101,7 @@ impl From<CompactionResult> for HudiCompactionResult {
 #[cfg(not(tarpaulin_include))]
 #[pyclass(frozen, get_all)]
 pub struct HudiWriteResult {
-    instant_time: Option<String>,
+    requested_time: Option<String>,
     completion_time: Option<String>,
     num_writes: usize,
     num_updates: usize,
@@ -1118,8 +1118,8 @@ impl HudiWriteResult {
                 .map_or_else(|| "None".to_string(), |t| format!("'{t}'"))
         };
         format!(
-            "HudiWriteResult(instant_time={}, completion_time={}, num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
-            quoted(&self.instant_time),
+            "HudiWriteResult(requested_time={}, completion_time={}, num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
+            quoted(&self.requested_time),
             quoted(&self.completion_time),
             self.num_writes,
             self.num_updates,
@@ -1132,7 +1132,7 @@ impl HudiWriteResult {
 impl From<WriteResult> for HudiWriteResult {
     fn from(r: WriteResult) -> Self {
         Self {
-            instant_time: r.requested_time,
+            requested_time: r.requested_time,
             completion_time: r.completion_time,
             num_writes: r.num_writes,
             num_updates: r.num_updates,
@@ -2065,7 +2065,7 @@ mod tests {
             num_inserts: 2,
             num_deletes: 3,
         });
-        assert_eq!(rewrite.instant_time.as_deref(), Some("20240101000000000"));
+        assert_eq!(rewrite.requested_time.as_deref(), Some("20240101000000000"));
         assert_eq!(
             (
                 rewrite.num_writes,

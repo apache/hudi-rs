@@ -15,6 +15,28 @@
 #  specific language governing permissions and limitations
 #  under the License.
 
+"""Apache Hudi for Python, backed by the native Rust implementation hudi-rs.
+
+Start with :class:`HudiTable`: ``HudiTable.create`` makes a table and ``HudiTable(base_uri)``
+opens an existing one; both return a handle that reads, writes, and, on a merge-on-read table,
+compacts (:meth:`HudiTable.compact`, experimental).
+
+Resources:
+
+- Quick start: https://hudi.apache.org/docs/python-rust-quick-start-guide, and the shorter
+  README quick start at https://github.com/apache/hudi-rs#quick-start.
+- Python API reference: the docstrings in the bundled type stubs, ``hudi/_internal.pyi``
+  (https://github.com/apache/hudi-rs/blob/main/python/hudi/_internal.pyi).
+- Rust API reference: https://docs.rs/hudi (also https://docs.rs/hudi-core and
+  https://docs.rs/hudi-datafusion).
+- Runnable Rust example:
+  https://github.com/apache/hudi-rs/blob/main/crates/core/examples/table_writes.rs.
+- Reader semantics: https://github.com/apache/hudi-rs/blob/main/docs/reader-spec.md.
+  Writer design: https://github.com/apache/hudi-rs/blob/main/docs/writer-design.md.
+- Packages: https://pypi.org/project/hudi/ and https://crates.io/crates/hudi.
+  Source: https://github.com/apache/hudi-rs.
+- Hudi concepts (timeline, table types, query types): https://hudi.apache.org/docs/overview.
+"""
 
 from hudi._config import HudiPlanConfig, HudiReadConfig, HudiTableConfig
 from hudi._internal import (

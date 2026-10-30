@@ -452,7 +452,7 @@ groups.
 
 ```python
 result = table.upsert(batch)
-print(f"instant={result.instant_time} updates={result.num_updates} inserts={result.num_inserts}")
+print(f"requested_time={result.requested_time} updates={result.num_updates} inserts={result.num_inserts}")
 
 # Partial upsert (copy-on-write only): matched rows take only these columns from the input.
 table.upsert(batch, update_columns=["fare"])
@@ -463,7 +463,7 @@ table.upsert(batch, update_columns=["fare"])
 ```rust
 let result = table.upsert([batch]).await?;
 println!(
-    "instant={} updates={} inserts={}",
+    "requested_time={} updates={} inserts={}",
     result.requested_time.as_deref().unwrap_or("none"),
     result.num_updates,
     result.num_inserts
