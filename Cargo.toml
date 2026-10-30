@@ -48,7 +48,7 @@ arrow-json = { version = "59.2.0" }
 arrow-ord = { version = "59.2.0" }
 arrow-row = { version = "59.2.0" }
 arrow-schema = { version = "59.2.0", features = ["serde"] }
-arrow-select = { version = "59.2.0" }
+arrow-select = { version = "60.0.0" }
 object_store = { version = "0.13.2", features = ["aws", "azure", "gcp"] }
 parquet = { version = "59.2.0", features = ["async", "object_store"] }
 
