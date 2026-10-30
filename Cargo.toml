@@ -44,7 +44,7 @@ arrow-array = { version = "59.2.0" }
 arrow-buffer = { version = "59.2.0" }
 arrow-cast = { version = "59.2.0" }
 arrow-ipc = { version = "59.2.0" }
-arrow-json = { version = "59.2.0" }
+arrow-json = { version = "60.0.0" }
 arrow-ord = { version = "59.2.0" }
 arrow-row = { version = "59.2.0" }
 arrow-schema = { version = "59.2.0", features = ["serde"] }
