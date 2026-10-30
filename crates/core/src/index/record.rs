@@ -18,12 +18,13 @@
  */
 //! Record-level index backed by the metadata table `record_index` partition.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::Result;
 use crate::config::read::HudiReadConfig;
 use crate::error::CoreError;
+use crate::file_group::base_file::BaseFile;
 use crate::file_group::base_file::reader::{KeyMatcher, KeyPredicate};
 use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::hfile::{HFileReader, HFileRecord};
@@ -85,23 +86,72 @@ struct LoadedLocation {
     instant_time_millis: i64,
 }
 
-/// Locations of `record_keys`, read from only the index shards and HFile
-/// blocks that can hold them.
-///
-/// Keys are hashed to their `record_index` file group the way the writer
-/// placed them, so a lookup opens the touched shards rather than the whole
-/// partition, and inside a shard the HFile block index narrows the read to the
-/// blocks the keys fall in. Values are Avro-decoded only for the requested keys.
+/// Locations of `record_keys` in the index's latest state.
 async fn lookup_record_index(
     table: &Table,
     storage: Arc<Storage>,
     record_keys: &[&str],
 ) -> Result<HashMap<String, LoadedLocation>> {
+    Ok(lookup_as_of(table, storage, record_keys, None)
+        .await?
+        .unwrap_or_default())
+}
+
+/// The file groups holding `record_keys` in the snapshot whose latest commit
+/// is `as_of`, or `None` when the index cannot answer for that snapshot.
+pub(crate) async fn locate_file_groups(
+    table: &Table,
+    record_keys: &[&str],
+    as_of: &str,
+) -> Result<Option<HashSet<(String, String)>>> {
+    let storage = table.file_system_view.storage.clone();
+    Ok(lookup_as_of(table, storage, record_keys, Some(as_of))
+        .await?
+        .map(|found| {
+            found
+                .into_values()
+                .map(|location| (location.partition_path, location.file_id))
+                .collect()
+        }))
+}
+
+/// Locations of `record_keys`, read from only the index shards and HFile
+/// blocks that can hold them; with `as_of`, as of the snapshot whose latest
+/// commit that is, and `None` when the index cannot describe it.
+///
+/// Keys are hashed to their `record_index` file group the way the writer
+/// placed them, so a lookup opens the touched shards rather than the whole
+/// partition, and inside a shard the HFile block index narrows the read to the
+/// blocks the keys fall in. Values are Avro-decoded only for the requested keys.
+async fn lookup_as_of(
+    table: &Table,
+    storage: Arc<Storage>,
+    record_keys: &[&str],
+    as_of: Option<&str>,
+) -> Result<Option<HashMap<String, LoadedLocation>>> {
     let partition = MetadataPartitionType::RecordIndex.partition_name();
     // Slice-resolved: only each file group's LIVE slice (multi-base aware
     // after a Spark MDT compaction), logs in version order. One listing serves
     // both the shard modulus and the routing, so the two cannot disagree.
     let slices = mdt_partition_latest_slices(storage.as_ref(), partition).await?;
+    if let Some(as_of) = as_of {
+        // An empty partition answers every key with "absent", and a base file
+        // compacted after the snapshot may hold later commits' changes, which
+        // no instant filter can take back out.
+        let compacted_after = |base: &str| {
+            base.rsplit('/')
+                .next()
+                .and_then(|name| name.parse::<BaseFile>().ok())
+                .is_none_or(|base| base.commit_timestamp.as_str() > as_of)
+        };
+        if slices.is_empty()
+            || slices
+                .iter()
+                .any(|(_, base, _)| base.as_deref().is_some_and(compacted_after))
+        {
+            return Ok(None);
+        }
+    }
     let num_groups = shard_count_from_slices(
         &slices,
         RECORD_INDEX_FILE_ID_PREFIX,
@@ -135,10 +185,15 @@ async fn lookup_record_index(
     // Only trust log blocks whose instant completed on the data timeline
     // (Java getValidInstantTimestamps): orphan MDT commits are skipped.
     let range = if touched.iter().any(|(_, _, logs)| !logs.is_empty()) {
-        Some(InstantRange::exact_match(
-            table.valid_metadata_instants().await?,
-            "UTC",
-        ))
+        let mut valid = table.valid_metadata_instants().await?;
+        if let Some(as_of) = as_of {
+            // The snapshot holds the commits that had completed by `as_of` when
+            // the table was opened; one pending then may have completed since.
+            valid.retain(|instant| {
+                instant.as_str() <= as_of && !table.timeline.pending_instants.contains(instant)
+            });
+        }
+        Some(InstantRange::exact_match(valid, "UTC"))
     } else {
         None
     };
@@ -190,7 +245,7 @@ async fn lookup_record_index(
         }
     })
     .await?;
-    Ok(per_shard.into_iter().flatten().collect())
+    Ok(Some(per_shard.into_iter().flatten().collect()))
 }
 
 /// Fold `records` into `merged`, later records overriding earlier ones and a

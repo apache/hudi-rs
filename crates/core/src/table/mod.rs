@@ -129,7 +129,7 @@ use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -721,12 +721,140 @@ impl Table {
             )
             .await?;
 
+        // The index describes merged rows, which a read-optimized read of a
+        // merge-on-read table does not see.
+        let read_optimized = base_file_only && self.is_mor();
+        if !read_optimized
+            && let Some(located) = self
+                .file_groups_for_record_keys(filters, timestamp, &table_schema)
+                .await
+        {
+            let planned: HashSet<(&str, &str)> = file_slices
+                .iter()
+                .map(|fs| (fs.partition_path.as_str(), fs.file_id()))
+                .collect();
+            // A file group the index names that this plan lacks (another
+            // filter pruned it, or the index disagrees with the snapshot)
+            // leaves the plan as it is.
+            if located.iter().all(|(partition, file_id)| {
+                planned.contains(&(partition.as_str(), file_id.as_str()))
+            }) {
+                file_slices.retain(|fs| {
+                    located.contains(&(fs.partition_path.clone(), fs.file_id().to_string()))
+                });
+            }
+        }
+
         if base_file_only {
             for fs in &mut file_slices {
                 fs.log_files.clear();
             }
         }
         Ok(file_slices)
+    }
+
+    /// The file groups the record-level index names for the record keys
+    /// `filters` ask for, or `None` when the index cannot answer.
+    ///
+    /// Only an equality or `IN` filter on the table's single string record key
+    /// field (or on `_hoodie_record_key`) is a key lookup, and only for a read
+    /// of the latest commit on table version 8 or later, whose metadata table
+    /// this reader can list. Anything the lookup cannot handle, including an
+    /// error, leaves the full scan in place; the row-level mask still applies
+    /// the filter to whatever is read.
+    async fn file_groups_for_record_keys(
+        &self,
+        filters: &[Filter],
+        timestamp: &str,
+        table_schema: &Schema,
+    ) -> Option<HashSet<(String, String)>> {
+        use crate::expr::ExprOperator;
+        use crate::index::is_record_index_enabled;
+        use crate::keygen::{KeyGeneratorKind, key_generator_kind};
+
+        let metadata_off = self
+            .hudi_configs
+            .get_raw(HudiTableConfig::MetadataTableEnabled.as_ref())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
+        if filters.is_empty()
+            || metadata_off
+            || !self.is_metadata_table_enabled()
+            || !is_record_index_enabled(self)
+            || self.timeline.get_latest_commit_timestamp_as_option() != Some(timestamp)
+        {
+            return None;
+        }
+        let version: isize = self
+            .hudi_configs
+            .try_get(HudiTableConfig::TableVersion)
+            .ok()
+            .flatten()
+            .map(Into::into)?;
+        if version < 8 {
+            return None;
+        }
+        let key_fields: Vec<String> = self
+            .hudi_configs
+            .try_get(HudiTableConfig::RecordKeyFields)
+            .ok()
+            .flatten()
+            .map(Into::into)?;
+        let [key_field] = key_fields.as_slice() else {
+            return None;
+        };
+        // The index stores the key as a string; only a string column's filter
+        // value is that same text.
+        let key_is_string = matches!(
+            table_schema.field_with_name(key_field).ok()?.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
+        // A complex key generator stores a single-field key as `field:value`
+        // from table version 9; below it the stored form depends on the writer
+        // release, so the index cannot be asked.
+        let prefixed = match key_generator_kind(&self.hudi_configs).ok()? {
+            KeyGeneratorKind::Simple | KeyGeneratorKind::NonPartitioned => false,
+            KeyGeneratorKind::Complex | KeyGeneratorKind::SparkSql if version >= 9 => true,
+            _ => return None,
+        };
+        let mut keys: Option<HashSet<String>> = None;
+        for filter in filters {
+            if !matches!(filter.operator, ExprOperator::Eq | ExprOperator::In) {
+                continue;
+            }
+            let values: HashSet<String> = if filter.field == *key_field {
+                if !key_is_string {
+                    return None;
+                }
+                filter
+                    .values
+                    .iter()
+                    .map(|v| {
+                        if prefixed {
+                            format!("{key_field}:{v}")
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect()
+            } else if filter.field == MetaField::RecordKey.as_ref() {
+                filter.values.iter().cloned().collect()
+            } else {
+                continue;
+            };
+            keys = Some(match keys {
+                Some(prior) => prior.intersection(&values).cloned().collect(),
+                None => values,
+            });
+        }
+        let keys = keys?;
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        match crate::index::locate_file_groups(self, &keys, timestamp).await {
+            Ok(located) => located,
+            Err(e) => {
+                log::warn!("record index lookup failed, reading every file slice: {e}");
+                None
+            }
+        }
     }
 
     async fn get_file_slices_between_inner(
