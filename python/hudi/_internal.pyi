@@ -133,9 +133,9 @@ class HudiReadOptions:
         ``hoodie.read.start.timestamp``; when unset, the window has no lower bound.
 
         On table version 8 and later this bounds each commit's completion time, so pass
-        :attr:`HudiWriteResult.completion_time` rather than the instant time to read the
-        commits after a given write. On earlier table versions it bounds the instant
-        (requested) time. Accepts the same formats as :meth:`with_as_of_timestamp`.
+        :attr:`HudiWriteResult.completion_time` rather than its ``requested_time`` to read
+        the commits after a given write. On earlier table versions it bounds the requested
+        time. Accepts the same formats as :meth:`with_as_of_timestamp`.
         """
         ...
     def with_end_timestamp(self, timestamp: str) -> "HudiReadOptions":
