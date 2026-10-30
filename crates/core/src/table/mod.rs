@@ -460,8 +460,9 @@ impl Table {
     /// under one compaction instant that completes as a `commit`.
     ///
     /// Rows keep their `_hoodie_commit_time`, so incremental reads see no new
-    /// rows from a compaction. Returns a result with an empty instant when no
-    /// file group had log files, in which case nothing is written.
+    /// rows from a compaction. Returns a result whose `requested_time` is
+    /// `None` when no file group had log files, in which case nothing is
+    /// written.
     ///
     /// Compaction also runs on its own after a delta commit when
     /// `hoodie.compact.inline` is `true` and the completed delta commits since
