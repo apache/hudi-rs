@@ -34,10 +34,7 @@ Commands:
                 install the pinned packages.
   install-hudi  Build the hudi Python binding from this checkout into the venv
                 (maturin, release profile), or install the wheel paths given.
-                The write API comes from apache/hudi-rs#878, which is not on
-                main yet: build from a checkout that includes it, or pass a
-                wheel built from one. Fails if the installed hudi has no
-                HudiTable.create.
+                Fails if the installed hudi has no HudiTable.create.
   smoke         The scenario's smoke scale, every leg; writes
                 <work-dir>/smoke-<scenario>.json. A busy machine only warns.
   full          The scenario's default scale; pass --scenario/--legs/--out as needed.
@@ -84,8 +81,8 @@ for d in ("pyarrow", "numpy", "psutil", "duckdb", "pytest", "hudi"):
     if ! "$PY" -c 'import sys, hudi
 print("hudi", hudi.__version__)
 sys.exit(0 if hasattr(hudi.HudiTable, "create") else 1)'; then
-      echo "the installed hudi has no write API (HudiTable.create); build from a" \
-        "checkout that includes apache/hudi-rs#878 or pass a wheel built from one" >&2
+      echo "the installed hudi has no write API (HudiTable.create); build it from" \
+        "this checkout or pass a wheel built from one" >&2
       exit 1
     fi
     ;;

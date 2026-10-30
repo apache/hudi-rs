@@ -196,11 +196,6 @@ def load_extra_legs(paths):
         module.register(api)
 
 
-# What hudi-core's key generator raises for a multi-field record key before
-# apache/hudi-rs#871 (crates/core/src/write/keygen.rs).
-COMPOSITE_KEY_REJECTION = "writes currently require exactly one record key field"
-
-
 class HudiLeg(Leg):
     def __init__(self, name, table_type, record_index):
         self.name = name
@@ -214,7 +209,7 @@ class HudiLeg(Leg):
             "table_type": self.table_type,
             "record_index": self.record_index,
             "record_key": plan["key_cols"],
-            "ordering_field": plan["ordering"],
+            "ordering_fields": plan["ordering"],
             "target_file_size": "library default",
             "upsert": "HudiTable.upsert(arrow_table)",
             "delete": "HudiTable.delete_keys(keys)",
@@ -245,40 +240,17 @@ class HudiLeg(Leg):
             )
         return hudi
 
-    def _check_capabilities(self, hudi, root, plan):
-        if len(plan["key_cols"]) < 2:
-            return
-        probe = Path(root).parent / f".{Path(root).name}-key-probe"
-        shutil.rmtree(probe, ignore_errors=True)
-        try:
-            hudi.HudiTable.create(str(probe), record_key=["k1", "k2"]).append(
-                pa.table({"k1": ["a"], "k2": ["b"], "v": [1]})
-            )
-        except Exception as e:
-            # Only the writer's own rejection of a multi-field key means the
-            # capability is missing; anything else is a real failure.
-            rejected = type(e).__name__ == "HudiCoreError"
-            if not rejected or COMPOSITE_KEY_REJECTION not in str(e):
-                raise
-            raise LegUnavailable(
-                "hudi rejected a one-row write with a two-field record key "
-                f"({type(e).__name__}: {e}); composite keys need apache/hudi-rs#871"
-            ) from e
-        finally:
-            shutil.rmtree(probe, ignore_errors=True)
-
     def load(self, root, base, plan):
         hudi = self._hudi()
-        self._check_capabilities(hudi, root, plan)
         t = hudi.HudiTable.create(
             str(root),
             record_key=plan["key_cols"],
-            ordering_field=plan["ordering"],
+            ordering_fields=plan["ordering"],
             table_type=self.table_type,
-            record_index=self.record_index,
+            enable_record_index=self.record_index,
         )
         r = t.append(base)
-        return {"marker": r.instant}
+        return {"marker": r.instant_time}
 
     def open(self, root, plan):
         self.plan = plan
@@ -287,11 +259,11 @@ class HudiLeg(Leg):
 
     def upsert(self, batch):
         r = self.t.upsert(batch)
-        self.last_instant = r.instant
+        self.last_instant = r.instant_time
         return {
             "num_updated": r.num_updates,
             "num_inserted": r.num_inserts,
-            "instant": r.instant,
+            "instant": r.instant_time,
         }
 
     def record_keys(self, keys):
@@ -306,8 +278,8 @@ class HudiLeg(Leg):
 
     def delete(self, keys):
         r = self.t.delete_keys(self.record_keys(keys))
-        self.last_instant = r.instant
-        return {"num_deleted": r.num_deletes, "instant": r.instant}
+        self.last_instant = r.instant_time
+        return {"num_deleted": r.num_deletes, "instant": r.instant_time}
 
     def _read(self, opts=None):
         batches = self.t.read(opts)

@@ -19,7 +19,6 @@
 capability checks, which decide unavailable-versus-failed before any write."""
 
 import textwrap
-from pathlib import Path
 
 import bench
 import pyarrow as pa
@@ -78,66 +77,7 @@ def test_extra_legs_module_without_register_is_refused(tmp_path, registry):
         bench.load_extra_legs([path])
 
 
-class FakeHudi:
-    def __init__(self, error):
-        self.error = error
-        test = self
-
-        class HudiTable:
-            @staticmethod
-            def create(path, record_key):
-                test.created = (path, record_key)
-                return HudiTable()
-
-            def append(self, table):
-                if test.error:
-                    raise test.error
-
-        self.HudiTable = HudiTable
-
-
 COMPOSITE = {"key_cols": ["a", "b"], "ordering": None}
-
-
-class HudiCoreError(Exception):
-    """Stands in for hudi's exception class, which the binding does not export."""
-
-
-def test_hudi_composite_key_probe_rejection_is_unavailable(tmp_path):
-    leg = bench.HudiLeg("hudi-cow", "cow", True)
-    rejection = HudiCoreError(
-        "writes currently require exactly one record key field (or none for auto keys)"
-    )
-    with pytest.raises(bench.LegUnavailable, match=r"apache/hudi-rs#871"):
-        leg._check_capabilities(FakeHudi(rejection), tmp_path / "t", COMPOSITE)
-
-
-@pytest.mark.parametrize(
-    "error",
-    [OSError("disk full"), HudiCoreError("some other write error")],
-    ids=["os error", "other hudi error"],
-)
-def test_hudi_composite_key_probe_other_errors_fail_the_leg(tmp_path, error):
-    leg = bench.HudiLeg("hudi-cow", "cow", True)
-    with pytest.raises(type(error)):
-        leg._check_capabilities(FakeHudi(error), tmp_path / "t", COMPOSITE)
-
-
-def test_hudi_composite_key_probe_success_writes_a_two_field_key_and_cleans_up(
-    tmp_path,
-):
-    leg = bench.HudiLeg("hudi-cow", "cow", True)
-    fake = FakeHudi(None)
-    leg._check_capabilities(fake, tmp_path / "t", COMPOSITE)
-    path, record_key = fake.created
-    assert path.endswith("-key-probe") and record_key == ["k1", "k2"]
-    assert not Path(path).exists()
-
-
-def test_hudi_single_key_needs_no_probe(tmp_path):
-    bench.HudiLeg("hudi-cow", "cow", True)._check_capabilities(
-        None, tmp_path / "t", {"key_cols": ["id"]}
-    )
 
 
 def test_hudi_record_keys_use_the_complex_key_form_for_composite_keys():

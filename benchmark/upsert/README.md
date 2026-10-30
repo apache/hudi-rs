@@ -243,20 +243,16 @@ benchmark/upsert/run.sh smoke --scenario training-set
 
 ### Known limitations
 
-- Composite record keys (`tpcds-web-returns`) need apache/hudi-rs#871. Before
-  the load, a scenario with a multi-field key probes the writer with a one-row
-  write to a scratch table keyed on two fields; if that is rejected, the legs
-  are `unavailable` with a reason naming #871. The legs pass the key as a list
-  and delete by `f1:v1,f2:v2` record key strings, the form that change writes.
+- Composite record keys (`tpcds-web-returns`): the legs pass the key as a list
+  and delete by `f1:v1,f2:v2` record key strings, the form the writer stores.
 
 Any other exception from the hudi package fails the leg.
 
 ## Reproduce
 
-The write API the legs call (`HudiTable.create`, `upsert`, `delete_keys`) is in
-apache/hudi-rs#878, which is not on `main` yet. Build from a checkout that
-includes it, or pass a wheel built from one; `run.sh install-hudi` exits with
-an error when the installed `hudi` has no `HudiTable.create`.
+The legs call the Python write API (`HudiTable.create`, `upsert`,
+`delete_keys`); `run.sh install-hudi` builds it from this checkout and exits
+with an error when the installed `hudi` has no `HudiTable.create`.
 
 Prerequisites: [`uv`](https://docs.astral.sh/uv/) (it provides Python 3.13 for
 the venv) and, to build hudi from source, the Rust toolchain this repository
