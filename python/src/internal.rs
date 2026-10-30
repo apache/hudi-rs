@@ -1121,7 +1121,7 @@ fn last_path_segment(base_uri: &str) -> String {
 fn to_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     collect_batches(data)?
         .into_iter()
-        .map(normalize_batch)
+        .map(|batch| normalize_batch(batch).map_err(PyValueError::new_err))
         .collect()
 }
 
@@ -1129,7 +1129,9 @@ fn to_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
 /// adds for an unnamed index, and cast view and large string, binary and
 /// list types (Polars exports `Utf8View`, pandas exports `LargeUtf8`) and
 /// dictionaries to their plain forms at any nesting depth.
-fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
+///
+/// Errors are plain strings so the function runs without an interpreter.
+fn normalize_batch(batch: RecordBatch) -> Result<RecordBatch, String> {
     let schema = batch.schema();
     let from_pandas = schema.metadata().contains_key("pandas");
     let mut changed = false;
@@ -1144,19 +1146,19 @@ fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
             Some(target) => {
                 // The cast to microseconds truncates silently.
                 if has_sub_microsecond(column.as_ref()) {
-                    return Err(PyValueError::new_err(format!(
+                    return Err(format!(
                         "column '{}' has timestamps with sub-microsecond precision, \
                          which Hudi tables cannot store",
                         field.name()
-                    )));
+                    ));
                 }
                 let casted = cast(column.as_ref(), target.data_type()).map_err(|e| {
-                    PyValueError::new_err(format!(
+                    format!(
                         "failed to cast column '{}' from {} to {}: {e}",
                         field.name(),
                         field.data_type(),
                         target.data_type()
-                    ))
+                    )
                 })?;
                 fields.push(target);
                 columns.push(casted);
@@ -1177,7 +1179,7 @@ fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
         columns,
         &options,
     )
-    .map_err(|e| PyValueError::new_err(format!("failed to rebuild record batch: {e}")))
+    .map_err(|e| format!("failed to rebuild record batch: {e}"))
 }
 
 /// Whether a nanosecond timestamp anywhere in `array` is not a whole microsecond.
@@ -1988,7 +1990,11 @@ mod tests {
             Arc::new(nanos(vec![Some(1)])) as ArrayRef,
             struct_of(nanos(vec![Some(1_000_001)])),
         ] {
-            assert!(normalize_batch(batch(vec![("ts", column)], false)).is_err());
+            let err = normalize_batch(batch(vec![("ts", column)], false)).unwrap_err();
+            assert!(
+                err.contains("column 'ts' has timestamps with sub-microsecond"),
+                "{err}"
+            );
         }
     }
 
