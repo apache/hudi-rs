@@ -211,7 +211,7 @@ def test_append_then_read(tmp_path, table_type):
     )
     res = table.append(trips(("t1", "sf", 1, 30.0), ("t2", "nyc", 1, 45.0)))
     assert isinstance(res, HudiWriteResult)
-    assert res.instant_time
+    assert res.requested_time
     assert (res.num_writes, res.num_inserts, res.num_updates, res.num_deletes) == (
         2,
         2,
@@ -219,7 +219,7 @@ def test_append_then_read(tmp_path, table_type):
         0,
     )
     assert "num_inserts=2" in repr(res)
-    assert f"instant_time='{res.instant_time}'" in repr(res)
+    assert f"requested_time='{res.requested_time}'" in repr(res)
     assert f"completion_time='{res.completion_time}'" in repr(res)
     with pytest.raises(AttributeError):
         res.num_inserts = 0
@@ -258,11 +258,11 @@ def test_completion_time_bounds_incremental_reads(tmp_path):
     table = HudiTable.create(str(tmp_path / "t"), record_key="id", ordering_fields="ts")
     base = table.append(trips(("t1", "sf", 1, 30.0), ("t2", "sf", 1, 45.0)))
     assert base.completion_time is not None
-    assert base.completion_time > base.instant_time
+    assert base.completion_time > base.requested_time
     upsert = table.upsert(trips(("t2", "sf", 2, 50.0), ("t3", "nyc", 2, 15.0)))
     assert upsert.completion_time > base.completion_time
     no_op = table.delete_keys(["missing"])
-    assert (no_op.instant_time, no_op.completion_time) == (None, None)
+    assert (no_op.requested_time, no_op.completion_time) == (None, None)
     assert "completion_time=None" in repr(no_op)
 
     def changed_after(bound):
@@ -278,7 +278,7 @@ def test_completion_time_bounds_incremental_reads(tmp_path):
     # The bound is compared against completion times: the requested time of
     # the base commit admits the base commit itself.
     assert changed_after(base.completion_time) == ["t2", "t3"]
-    assert changed_after(base.instant_time) == ["t1", "t2", "t3"]
+    assert changed_after(base.requested_time) == ["t1", "t2", "t3"]
     assert changed_after(upsert.completion_time) == []
 
 
@@ -328,8 +328,8 @@ def test_update_no_match_creates_no_commit(tmp_path):
     table = new_table(tmp_path)
     commits = len(table.get_timeline().get_completed_commits())
     res = table.update("city = 'la'", {"fare": 1.0})
-    assert (res.instant_time, res.num_updates) == (None, 0)
-    assert "instant_time=None" in repr(res)
+    assert (res.requested_time, res.num_updates) == (None, 0)
+    assert "requested_time=None" in repr(res)
     assert len(table.get_timeline().get_completed_commits()) == commits
 
 
@@ -526,7 +526,7 @@ def test_delete_by_non_key_predicate(tmp_path):
     assert res.num_deletes == 1
     assert set(snapshot(table)) == {"t1", "t3"}
     res = table.delete("fare > 1000")
-    assert (res.instant_time, res.num_deletes) == (None, 0)
+    assert (res.requested_time, res.num_deletes) == (None, 0)
 
 
 @pytest.mark.parametrize("table_type", ["cow", "mor"])
@@ -536,7 +536,7 @@ def test_delete_keys(tmp_path, table_type):
     assert res.num_deletes == 2
     assert set(snapshot(table)) == {"t2"}
     res = table.delete_keys(["missing"])
-    assert (res.instant_time, res.num_deletes) == (None, 0)
+    assert (res.requested_time, res.num_deletes) == (None, 0)
     res = table.delete_keys(k for k in ("t2",))
     assert res.num_deletes == 1
     assert snapshot(table) == {}
@@ -556,7 +556,7 @@ def test_delete_keys_rejects_bad_input(tmp_path):
 def test_overwrite(tmp_path, table_type):
     table = new_table(tmp_path, table_type)
     res = table.overwrite(trips(("t9", "sf", 9, 10.0)))
-    assert res.instant_time
+    assert res.requested_time
     assert snapshot(table) == {"t9": ("sf", 9, 10.0)}
 
 
@@ -564,7 +564,7 @@ def test_overwrite(tmp_path, table_type):
 def test_dynamic_partition_overwrite(tmp_path, table_type):
     table = new_table(tmp_path, table_type)
     res = table.dynamic_partition_overwrite(trips(("t8", "sf", 9, 11.0)))
-    assert res.instant_time
+    assert res.requested_time
     assert snapshot(table) == {"t8": ("sf", 9, 11.0), "t3": ("nyc", 1, 20.0)}
 
 
@@ -819,12 +819,12 @@ def test_compact_folds_logs_and_keeps_rows(tmp_path):
     before = snapshot(table)
     result = table.compact()
     assert isinstance(result, HudiCompactionResult)
-    assert result.instant_time is not None and result.completion_time is not None
+    assert result.requested_time is not None and result.completion_time is not None
     assert (result.num_file_groups, result.num_log_files) == (1, 1)
     assert result.num_writes == 2
     assert snapshot(table) == before
     nothing = table.compact()
-    assert nothing.instant_time is None and nothing.num_file_groups == 0
+    assert nothing.requested_time is None and nothing.num_file_groups == 0
     assert table.await_compaction() is None
 
 

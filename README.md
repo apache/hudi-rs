@@ -452,7 +452,7 @@ groups.
 
 ```python
 result = table.upsert(batch)
-print(f"instant={result.instant_time} updates={result.num_updates} inserts={result.num_inserts}")
+print(f"instant={result.requested_time} updates={result.num_updates} inserts={result.num_inserts}")
 
 # Partial upsert (copy-on-write only): matched rows take only these columns from the input.
 table.upsert(batch, update_columns=["fare"])

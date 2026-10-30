@@ -779,20 +779,20 @@ class HudiWriteResult:
     Outcome of a write on :class:`HudiTable`.
 
     Attributes:
-        instant_time (Optional[str]): Instant time of the completed commit, or ``None``
+        requested_time (Optional[str]): Requested time of the completed commit, or ``None``
             when no commit was made.
         completion_time (Optional[str]): When the commit completed, or ``None`` when no
             commit was made or the table's timeline records no completion times (table
             version 6). When set, incremental reads compare their start bound against
             completion times, so ``with_start_timestamp(completion_time)`` returns the
-            commits after this one while passing ``instant_time`` would include this commit.
+            commits after this one while passing ``requested_time`` would include this commit.
         num_writes (int): Rows written to data files.
         num_updates (int): Input rows that replaced existing records.
         num_inserts (int): Input rows that were new records.
         num_deletes (int): Records deleted.
     """
 
-    instant_time: Optional[str]
+    requested_time: Optional[str]
     completion_time: Optional[str]
     num_writes: int
     num_updates: int
@@ -805,7 +805,7 @@ class HudiCompactionResult:
     Outcome of :meth:`HudiTable.compact`.
 
     Attributes:
-        instant_time (Optional[str]): Instant time of the completed compaction commit,
+        requested_time (Optional[str]): Requested time of the completed compaction commit,
             or ``None`` when no file group had log files and nothing was written.
         completion_time (Optional[str]): When the commit completed, or ``None`` when
             nothing was written or the timeline records no completion times.
@@ -814,7 +814,7 @@ class HudiCompactionResult:
         num_writes (int): Rows written to the new base files.
     """
 
-    instant_time: Optional[str]
+    requested_time: Optional[str]
     completion_time: Optional[str]
     num_file_groups: int
     num_log_files: int
