@@ -44,8 +44,7 @@
 </p>
 
 hudi-rs is a native Rust implementation of [Apache Hudi](https://github.com/apache/hudi) with Python and C++
-bindings. From Rust and Python it creates Hudi tables, writes upserts, updates, and deletes to them, and reads them
-back as Arrow, all from a single process with no JVM.
+bindings. It creates, writes, and reads Hudi tables from Rust and Python in a single process, with no JVM.
 
 | Source                  | Downloads                   | Installation Command |
 |-------------------------|-----------------------------|----------------------|
@@ -66,7 +65,7 @@ fails instead.
 
 ## Quick start
 
-Create a table, upsert and delete rows, then read back the records written after the first commit.
+Create a table, upsert and delete rows, then read what changed after the first commit.
 
 ```python
 import tempfile
@@ -101,9 +100,8 @@ snapshot = pa.Table.from_batches(table.read())
 print(sorted(snapshot.column("doc_id").to_pylist()))  # ['doc1', 'doc2', 'doc4']
 ```
 
-See [Writing Tables](#writing-tables) for the full write API. For the Rust write API, see
-[`crates/core/examples/table_writes.rs`](crates/core/examples/table_writes.rs)
-(`cargo run -p hudi-core --example table_writes`).
+See [Writing Tables](#writing-tables) for the full write API, and
+[`table_writes.rs`](crates/core/examples/table_writes.rs) for a Rust example.
 
 ## Reading Tables
 
