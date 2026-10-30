@@ -413,38 +413,24 @@ impl HFileReader {
         }
     }
 
-    /// The records of one data block, from a resident source.
+    /// The records of one data block whose key `admits`, from a resident source.
     ///
     /// The synchronous counterpart to [`Self::read_records_batched`], which needs a
     /// ranged source because it fetches. An HFile arriving as a log block's content
     /// is already in memory, so a caller that has narrowed the blocks with
     /// [`Self::blocks_for_predicate`] wants to parse just those rather than walk the
-    /// file — the saving is parsing and decompression, not I/O.
-    pub fn records_in_block(&self, entry: &BlockIndexEntry) -> Result<Vec<HFileRecord>> {
-        let data_block = self.data_block(entry)?;
-        // Records carry the file's own writer schema so a decoder can honor the
-        // shape this file was written with rather than a vendored one.
-        let schema = self.get_avro_schema_arc()?;
-        // The shared helper, not a second copy of it: two places building an
-        // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
-        // would drift on what a record key is.
-        Ok(data_block
-            .iter()
-            .map(|kv| Self::key_value_to_record(&kv, schema.clone()))
-            .collect())
-    }
-
-    /// The records of one data block whose key `admits`.
-    ///
-    /// Keys are compared in place and only the admitted entries are copied out,
-    /// so a lookup of a few keys in a block of thousands costs the key
-    /// comparisons rather than a record allocation per entry.
-    pub fn records_in_block_admitted(
+    /// file — the saving is parsing and decompression, not I/O. Keys are compared
+    /// in place and only the admitted entries are copied out, so a lookup of a few
+    /// keys in a block of thousands costs the key comparisons rather than a record
+    /// allocation per entry.
+    pub fn records_in_block(
         &self,
         entry: &BlockIndexEntry,
         admits: impl Fn(&str) -> bool,
     ) -> Result<Vec<HFileRecord>> {
         let data_block = self.data_block(entry)?;
+        // Records carry the file's own writer schema so a decoder can honor the
+        // shape this file was written with rather than a vendored one.
         let schema = self.get_avro_schema_arc()?;
         let mut records = Vec::new();
         for entry in data_block.entries() {
@@ -2023,45 +2009,39 @@ mod tests {
     }
 
     /// The in-place key walk sees the same entries as the copying iterator,
-    /// and the admitted records are the full records' subset.
+    /// and an admitting predicate keeps exactly the entries it admits.
     #[test]
-    fn test_records_in_block_admitted_matches_the_full_block() {
+    fn test_records_in_block_matches_the_copying_iterator() {
         let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
         let reader = HFileReader::new(bytes).expect("Failed to create reader");
         let entry = reader.blocks_for_keys(&["hudi-key-000000100"])[0].clone();
-        let all = reader.records_in_block(&entry).unwrap();
-        assert!(all.len() > 1);
-        let block = reader.data_block(&entry).unwrap();
-        let walked: Vec<(Vec<u8>, Vec<u8>)> = block
-            .entries()
-            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap())
-            .collect();
-        let copied: Vec<(Vec<u8>, Vec<u8>)> = block
+        let pairs = |records: Vec<HFileRecord>| -> Vec<(Vec<u8>, Vec<u8>)> {
+            records
+                .iter()
+                .map(|r| (r.key().to_vec(), r.value().to_vec()))
+                .collect()
+        };
+        let copied: Vec<(Vec<u8>, Vec<u8>)> = reader
+            .data_block(&entry)
+            .unwrap()
             .iter()
             .map(|kv| (kv.key().content().to_vec(), kv.value().to_vec()))
             .collect();
-        assert_eq!(walked, copied);
+        assert!(copied.len() > 1);
+        assert_eq!(
+            pairs(reader.records_in_block(&entry, |_| true).unwrap()),
+            copied
+        );
 
-        let admitted = reader
-            .records_in_block_admitted(&entry, |key| key.ends_with("100") || key.ends_with("101"))
-            .unwrap();
-        let expected: Vec<&HFileRecord> = all
-            .iter()
-            .filter(|r| {
-                r.key_as_str()
-                    .is_some_and(|k| k.ends_with("100") || k.ends_with("101"))
-            })
+        let wanted = |key: &str| key.ends_with("100") || key.ends_with("101");
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = copied
+            .into_iter()
+            .filter(|(k, _)| wanted(std::str::from_utf8(k).unwrap()))
             .collect();
-        assert_eq!(admitted.len(), expected.len());
-        for (got, want) in admitted.iter().zip(expected) {
-            assert_eq!(got.key(), want.key());
-            assert_eq!(got.value(), want.value());
-        }
-        assert!(
-            reader
-                .records_in_block_admitted(&entry, |_| false)
-                .unwrap()
-                .is_empty()
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            pairs(reader.records_in_block(&entry, wanted).unwrap()),
+            expected
         );
     }
 

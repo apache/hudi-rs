@@ -21,7 +21,7 @@
 use crate::hfile::block_type::{HFileBlockType, MAGIC_LENGTH};
 use crate::hfile::compression::CompressionCodec;
 use crate::hfile::error::{HFileError, Result};
-use crate::hfile::key::{KEY_VALUE_HEADER_SIZE, Key, KeyValue, SIZEOF_INT16};
+use crate::hfile::key::{KEY_VALUE_HEADER_SIZE, Key, KeyValue, key_content};
 
 /// Size constants for block header
 const SIZEOF_INT32: usize = 4;
@@ -306,20 +306,7 @@ impl<'a> Iterator for DataBlockEntries<'a> {
             return Some(Err(truncated()));
         }
         self.offset = end + 1;
-        // A key is a 2-byte content length, the content, then the row-key
-        // suffix; the same rule as `Key::content`, which reads the length as
-        // signed and gives an empty content for a length the key cannot hold.
-        let content_length = if key_length >= SIZEOF_INT16 {
-            i16::from_be_bytes([data[key_start], data[key_start + 1]]) as usize
-        } else {
-            0
-        };
-        let content_start = key_start + SIZEOF_INT16;
-        let content = if key_length >= SIZEOF_INT16 && content_length <= key_length - SIZEOF_INT16 {
-            &data[content_start..content_start + content_length]
-        } else {
-            &data[0..0]
-        };
+        let content = key_content(&data[key_start..value_start]);
         Some(Ok((content, &data[value_start..end])))
     }
 }

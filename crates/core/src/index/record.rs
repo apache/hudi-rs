@@ -378,7 +378,7 @@ mod tests {
         let mut firsts = Vec::new();
         let mut lasts = Vec::new();
         for e in &entries {
-            let recs = reader.records_in_block(e).unwrap();
+            let recs = reader.records_in_block(e, |_| true).unwrap();
             firsts.push(recs.first().unwrap().key_as_str().unwrap().to_string());
             lasts.push(recs.last().unwrap().key_as_str().unwrap().to_string());
         }

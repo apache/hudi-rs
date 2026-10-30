@@ -678,7 +678,7 @@ impl Decoder {
                 // holds keys nobody asked for; only the admitted ones are built.
                 records.extend(
                     hfile_reader
-                        .records_in_block_admitted(&entry, |key| matcher.admits(key))
+                        .records_in_block(&entry, |key| matcher.admits(key))
                         .map_err(|e| CoreError::HFile(e.to_string()))?,
                 );
             }
