@@ -305,6 +305,53 @@ async fn test_append_writes_column_stats_and_partition_stats_mdt() {
 }
 
 #[tokio::test]
+async fn test_write_result_completion_time_matches_timeline() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("trips")
+            .with_table_type(table_type.clone())
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        let append = table.append([sample_batch()]).await.unwrap();
+        let upsert = table
+            .upsert([batch(vec![("a", 10), ("d", 4)])])
+            .await
+            .unwrap();
+        let delete = table.delete("id = 'a'").await.unwrap();
+        assert_eq!(delete.num_deletes, 1, "{table_type:?}");
+
+        let timeline = table.get_timeline();
+        let instants = match table_type {
+            TableTypeValue::CopyOnWrite => timeline.get_completed_commits(false).await,
+            TableTypeValue::MergeOnRead => timeline.get_completed_deltacommits(false).await,
+        }
+        .unwrap();
+        for (verb, instant, completion_time) in [
+            ("append", &append.instant, &append.completion_time),
+            ("upsert", &upsert.instant, &upsert.completion_time),
+            ("delete", &delete.instant, &delete.completion_time),
+        ] {
+            let completed = instants
+                .iter()
+                .find(|i| &i.timestamp == instant)
+                .unwrap_or_else(|| panic!("{table_type:?}: {verb} instant not on the timeline"));
+            assert!(completion_time.is_some(), "{table_type:?} {verb}");
+            assert_eq!(
+                completion_time, &completed.completion_timestamp,
+                "{table_type:?} {verb}"
+            );
+        }
+
+        let noop = table.delete("id = 'missing'").await.unwrap();
+        assert_eq!(noop.num_deletes, 0, "{table_type:?}");
+        assert_eq!(noop.completion_time, None, "{table_type:?}");
+    }
+}
+
+#[tokio::test]
 async fn test_upsert_delete_and_overwrite() {
     let dir = tempdir().unwrap();
     let base_uri = dir.path().to_str().unwrap();

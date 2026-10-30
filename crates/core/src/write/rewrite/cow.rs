@@ -372,7 +372,7 @@ pub(super) async fn finalize_rewrite_commit(
         },
         schema.as_ref(),
     )?;
-    crate::write::complete_write(
+    let completed = crate::write::complete_write(
         table,
         instant,
         action,
@@ -389,6 +389,7 @@ pub(super) async fn finalize_rewrite_commit(
     .await?;
     Ok(WriteResult {
         instant: instant.to_string(),
+        completion_time: completed.completion_time,
         num_writes,
         num_updates: updates,
         num_inserts: inserts,
