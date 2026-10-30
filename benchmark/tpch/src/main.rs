@@ -40,7 +40,13 @@ use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::prelude::SessionConfig;
 use hudi::HudiDataSource;
+use hudi::config::ReadOptions;
+use hudi::config::read::HudiReadConfig;
+use hudi::config::table::HudiTableConfig;
+use hudi::table::Table as HudiTable;
 use serde::{Deserialize, Serialize};
+
+use config::TableType;
 
 /// The 8 TPC-H tables.
 const TPCH_TABLES: &[&str] = &[
@@ -85,12 +91,32 @@ enum Commands {
         /// Hudi output base path (e.g., /opt/hudi or gs://bucket/path)
         #[arg(long)]
         hudi_base: String,
+
+        /// Table type to create
+        #[arg(long, value_enum, default_value_t = TableType::Cow)]
+        table_type: TableType,
+    },
+    /// Render the update commit for merge-on-read tables (one UPDATE per table)
+    RenderUpdates {
+        /// TPC-H scale factor (loads config/sf{N}.yaml)
+        #[arg(long)]
+        scale_factor: f64,
+
+        /// Fraction of each table's rows to update, in (0, 1]; applied as one row in
+        /// every round(1/F) by key hash, so it is exact only when 1/F is whole
+        #[arg(long, default_value_t = 0.001)]
+        update_fraction: f64,
     },
     /// Verify every TPC-H Hudi table is readable at a base path
     CheckTables {
         /// Hudi tables base path (e.g., /opt/hudi or s3://bucket/path)
         #[arg(long)]
         hudi_base: String,
+
+        /// Also require this table type; `mor` requires a log file in every
+        /// file group and prints the file layout per table
+        #[arg(long, value_enum)]
+        table_type: Option<TableType>,
     },
     /// Render benchmark SQL (table registrations + query iterations)
     RenderBenchSql {
@@ -171,6 +197,10 @@ enum Commands {
         /// Display name for charts (e.g., "datafusion+hudi-rs"); defaults to engine_label
         #[arg(long)]
         display_name: Option<String>,
+
+        /// File group reader version to read Hudi tables with (1 or 2; hudi-rs default if omitted)
+        #[arg(long)]
+        reader_version: Option<u8>,
     },
     /// Validate Hudi query results against Parquet (runs each query once, compares output)
     Validate {
@@ -193,6 +223,10 @@ enum Commands {
         /// DataFusion memory limit (e.g., "3g", "512m"); unlimited if not set
         #[arg(long)]
         memory_limit: Option<String>,
+
+        /// File group reader version to read Hudi tables with (1 or 2; hudi-rs default if omitted)
+        #[arg(long)]
+        reader_version: Option<u8>,
     },
     /// Parse Spark benchmark JSON output into a timing table
     ParseSparkOutput {
@@ -230,6 +264,11 @@ enum Commands {
         #[arg(long)]
         runs: String,
     },
+}
+
+/// Carry a hudi-rs error through the DataFusion result type the commands share.
+fn core_error(e: hudi::error::CoreError) -> datafusion::error::DataFusionError {
+    datafusion::error::DataFusionError::External(Box::new(e))
 }
 
 /// Check if a path string is a cloud URL.
@@ -354,13 +393,38 @@ async fn main() -> Result<()> {
             scale_factor,
             parquet_base,
             hudi_base,
+            table_type,
         } => {
             let cfg = config::ScaleFactorConfig::load(scale_factor)
                 .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
-            print!("{}", cfg.render_ctas_sql(&parquet_base, &hudi_base));
+            print!(
+                "{}",
+                cfg.render_ctas_sql(&parquet_base, &hudi_base, table_type)
+            );
             Ok(())
         }
-        Commands::CheckTables { hudi_base } => {
+        Commands::RenderUpdates {
+            scale_factor,
+            update_fraction,
+        } => {
+            let cfg = config::ScaleFactorConfig::load(scale_factor)
+                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
+            let sql = cfg
+                .render_update_sql(update_fraction)
+                .map_err(datafusion::error::DataFusionError::Plan)?;
+            print!("{sql}");
+            Ok(())
+        }
+        Commands::CheckTables {
+            hudi_base,
+            table_type,
+        } => {
+            // With a type to check, the layout check opens each table itself
+            // and names the one that fails, so the presence check would only
+            // open them all a second time.
+            if let Some(expected) = table_type {
+                return check_table_layout(&hudi_base, expected).await;
+            }
             let missing = missing_hudi_tables(&hudi_base).await?;
             if missing.is_empty() {
                 Ok(())
@@ -419,6 +483,7 @@ async fn main() -> Result<()> {
             engine_label,
             format_label,
             display_name,
+            reader_version,
         } => {
             let cfg = config::ScaleFactorConfig::load(scale_factor)
                 .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
@@ -440,6 +505,7 @@ async fn main() -> Result<()> {
                 engine_label.as_deref(),
                 format_label.as_deref(),
                 display_name.as_deref(),
+                &hudi_read_options(reader_version),
             )
             .await
         }
@@ -449,6 +515,7 @@ async fn main() -> Result<()> {
             scale_factor,
             queries,
             memory_limit,
+            reader_version,
         } => {
             let cfg = config::ScaleFactorConfig::load(scale_factor)
                 .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
@@ -456,7 +523,15 @@ async fn main() -> Result<()> {
             if memory_limit.is_some() {
                 df_conf.memory_limit = memory_limit;
             }
-            run_validate(&hudi_dir, &parquet_dir, scale_factor, queries, &df_conf).await
+            run_validate(
+                &hudi_dir,
+                &parquet_dir,
+                scale_factor,
+                queries,
+                &df_conf,
+                &hudi_read_options(reader_version),
+            )
+            .await
         }
         Commands::ParseSparkOutput {
             input,
@@ -539,16 +614,184 @@ fn hudi_table_uri(resolved_base: &str, table_name: &str) -> Result<String> {
     }
 }
 
+/// Hudi read options the benchmark passes to every table it opens.
+///
+/// Only the file group reader version is settable, and only when asked for:
+/// an omitted version leaves hudi-rs's own default in charge, so the
+/// benchmark measures what a consumer gets without configuring anything.
+fn hudi_read_options(reader_version: Option<u8>) -> Vec<(String, String)> {
+    reader_version
+        .map(|v| {
+            vec![(
+                HudiReadConfig::FileGroupReaderVersion.as_ref().to_string(),
+                v.to_string(),
+            )]
+        })
+        .unwrap_or_default()
+}
+
 /// Register all 8 TPC-H Hudi tables. Supports local paths and cloud URLs.
-async fn register_hudi_tables(ctx: &SessionContext, base_dir: &str) -> Result<()> {
+async fn register_hudi_tables(
+    ctx: &SessionContext,
+    base_dir: &str,
+    hudi_options: &[(String, String)],
+) -> Result<()> {
     let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
+
+    let pins_version_one = hudi_options
+        .iter()
+        .any(|(k, v)| k == HudiReadConfig::FileGroupReaderVersion.as_ref() && v.trim() == "1");
 
     for table_name in TPCH_TABLES {
         let table_uri = hudi_table_uri(&resolved, table_name)?;
-        let hudi = HudiDataSource::new(&table_uri).await?;
+        if pins_version_one {
+            refuse_append_only_baseline(&table_uri, table_name).await?;
+        }
+        let hudi = HudiDataSource::new_with_options(&table_uri, hudi_options.to_vec()).await?;
         ctx.register_table(*table_name, Arc::new(hudi))?;
     }
     Ok(())
+}
+
+/// Refuse a reader version 1 baseline on a merge-on-read table it would not merge.
+///
+/// Version 1 has no commit-time merge: a table without an ordering field is
+/// read append-only, base rows and log rows both returned. A benchmark of that
+/// would be labelled a merge baseline while merging nothing, and `validate`
+/// would only catch it after the fact through duplicate rows. Version 2 infers
+/// commit-time ordering for the same table, so this applies to the pin alone.
+async fn refuse_append_only_baseline(table_uri: &str, table_name: &str) -> Result<()> {
+    let table = HudiTable::new(table_uri).await.map_err(core_error)?;
+    if !table.is_mor() {
+        return Ok(());
+    }
+    let options = table.hudi_options();
+    // The deprecated alias too: a table written before the rename carries only that.
+    let has_ordering_field = [
+        HudiTableConfig::OrderingFields.as_ref(),
+        "hoodie.table.precombine.field",
+    ]
+    .iter()
+    .any(|key| options.get(*key).is_some_and(|v| !v.trim().is_empty()));
+    if has_ordering_field {
+        return Ok(());
+    }
+    Err(datafusion::error::DataFusionError::Plan(format!(
+        "{table_name} is merge-on-read with no ordering field, which file group reader \
+         version 1 reads append-only rather than merging by commit time; a version 1 \
+         baseline on it would measure no merge. Give the table a pre_combine_field in \
+         tables.yaml and rebuild it, or drop --reader-version."
+    )))
+}
+
+/// Bytes as a short human-readable size.
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b >= KIB * KIB * KIB {
+        format!("{:.1} GiB", b / (KIB * KIB * KIB))
+    } else if b >= KIB * KIB {
+        format!("{:.1} MiB", b / (KIB * KIB))
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// What one table's file slices look like on storage.
+struct TableLayout {
+    file_groups: usize,
+    slices_with_logs: usize,
+    log_files: usize,
+    log_bytes: u64,
+}
+
+async fn table_layout(table: &HudiTable) -> Result<TableLayout> {
+    let slices = table
+        .get_file_slices(&ReadOptions::new())
+        .await
+        .map_err(core_error)?;
+    let mut layout = TableLayout {
+        file_groups: slices.len(),
+        slices_with_logs: 0,
+        log_files: 0,
+        log_bytes: 0,
+    };
+    for slice in &slices {
+        if slice.has_log_file() {
+            layout.slices_with_logs += 1;
+        }
+        layout.log_files += slice.log_files.len();
+        layout.log_bytes += slice
+            .log_files
+            .iter()
+            .filter_map(|log| log.file_metadata.as_ref())
+            .map(|meta| meta.size)
+            .sum::<u64>();
+    }
+    Ok(layout)
+}
+
+/// Check every table is of `expected` type and, for merge-on-read, that every
+/// file group carries a log file — the layout the update commit exists to
+/// produce. A merge-on-read table whose file groups have nothing to merge would
+/// benchmark as copy-on-write while being labelled otherwise.
+async fn check_table_layout(base_dir: &str, expected: TableType) -> Result<()> {
+    let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
+    let mut problems = Vec::new();
+
+    for table_name in TPCH_TABLES {
+        let table_uri = hudi_table_uri(&resolved, table_name)?;
+        let table = match HudiTable::new(&table_uri).await {
+            Ok(table) => table,
+            Err(e) => {
+                problems.push(format!("{table_name}: cannot be opened: {e}"));
+                continue;
+            }
+        };
+        let table_type = table.table_type();
+        let is_expected = match expected {
+            TableType::Cow => !table.is_mor(),
+            TableType::Mor => table.is_mor(),
+        };
+        if !is_expected {
+            problems.push(format!(
+                "{table_name}: table type is {table_type}, expected {}",
+                expected.as_str()
+            ));
+            continue;
+        }
+        if expected == TableType::Cow {
+            continue;
+        }
+        let layout = table_layout(&table).await?;
+        println!(
+            "{table_name}: {} file groups, {} with log files ({} log files, {})",
+            layout.file_groups,
+            layout.slices_with_logs,
+            layout.log_files,
+            format_bytes(layout.log_bytes)
+        );
+        if layout.file_groups == 0 {
+            problems.push(format!("{table_name}: no file groups"));
+        } else if layout.slices_with_logs < layout.file_groups {
+            problems.push(format!(
+                "{table_name}: {} of {} file groups have no log file",
+                layout.file_groups - layout.slices_with_logs,
+                layout.file_groups
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(datafusion::error::DataFusionError::Plan(format!(
+            "Hudi tables at {base_dir} do not have the expected layout:\n  {}",
+            problems.join("\n  ")
+        )))
+    }
 }
 
 /// Register all 8 TPC-H parquet tables. Supports local paths and cloud URLs.
@@ -836,6 +1079,7 @@ async fn run_bench(
     engine_label: Option<&str>,
     format_label: Option<&str>,
     display_name: Option<&str>,
+    hudi_options: &[(String, String)],
 ) -> Result<()> {
     if hudi_dir.is_none() && parquet_dir.is_none() {
         return Err(datafusion::error::DataFusionError::Plan(
@@ -854,7 +1098,7 @@ async fn run_bench(
         let ctx =
             create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
         println!("Registering Hudi tables from {hudi_dir}");
-        register_hudi_tables(&ctx, hudi_dir).await?;
+        register_hudi_tables(&ctx, hudi_dir, hudi_options).await?;
         println!("Benchmarking Hudi...");
         let results = bench_source(&ctx, &query_nums, warmup, iterations, scale_factor).await;
         print_single_table("Hudi", &results);
@@ -886,12 +1130,16 @@ async fn run_bench(
 }
 
 /// Run validation: query both Hudi and Parquet once, compare results.
+///
+/// For merge-on-read tables, also check that the update commit's records
+/// surface in the merged rows — see [`verify_merged_updates`].
 async fn run_validate(
     hudi_dir: &str,
     parquet_dir: &str,
     scale_factor: f64,
     queries: Option<String>,
     df_conf: &config::DataFusionConfig,
+    hudi_options: &[(String, String)],
 ) -> Result<()> {
     let query_nums = parse_query_numbers(queries);
 
@@ -902,7 +1150,7 @@ async fn run_validate(
     println!("Registering Hudi tables from {hudi_dir}");
     let hudi_ctx =
         create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
-    register_hudi_tables(&hudi_ctx, hudi_dir).await?;
+    register_hudi_tables(&hudi_ctx, hudi_dir, hudi_options).await?;
 
     println!("Registering Parquet tables from {parquet_dir}");
     let parquet_ctx =
@@ -917,13 +1165,139 @@ async fn run_validate(
 
     let failed = print_validation_table(&query_nums, &hudi_results, &parquet_results);
 
+    if !failed.is_empty() {
+        let names: Vec<String> = failed.iter().map(|qn| format!("Q{qn:02}")).collect();
+        return Err(datafusion::error::DataFusionError::Plan(format!(
+            "Hudi results differ from parquet for {}",
+            names.join(", ")
+        )));
+    }
+
+    verify_merged_updates(&hudi_ctx, hudi_dir).await
+}
+
+/// Total records the write stats of one commit report as updates.
+fn update_records_in_commit(metadata_json: &str) -> std::result::Result<u64, String> {
+    let metadata: serde_json::Value =
+        serde_json::from_str(metadata_json).map_err(|e| format!("Invalid commit metadata: {e}"))?;
+    let partitions = metadata
+        .get("partitionToWriteStats")
+        .and_then(|v| v.as_object())
+        .ok_or("Commit metadata has no partitionToWriteStats")?;
+    Ok(partitions
+        .values()
+        .filter_map(|stats| stats.as_array())
+        .flatten()
+        .filter_map(|stat| stat.get("numUpdateWrites").and_then(|v| v.as_u64()))
+        .sum())
+}
+
+/// Check that each merge-on-read table's latest delta commit is what the
+/// reader returns for the rows it touched.
+///
+/// The update commit rewrites rows with their own values, so no query can tell
+/// whether the log records were merged or ignored — the results are identical
+/// either way. `_hoodie_commit_time` can: a row that came from the log carries
+/// the delta commit's time, one served from the base file the bulk insert's.
+/// So the rows stamped with the delta commit must number exactly the update
+/// records that commit wrote. Fewer means log records were dropped or lost a
+/// tie they should have won; more means duplicates.
+///
+/// Copy-on-write tables have no delta commits and are skipped.
+async fn verify_merged_updates(ctx: &SessionContext, hudi_dir: &str) -> Result<()> {
+    let resolved = resolve_path(hudi_dir).map_err(datafusion::error::DataFusionError::Plan)?;
+
+    let mut table = Table::new();
+    table.set_header(vec![
+        "Table",
+        "Delta commit",
+        "Update records",
+        "Rows merged",
+        "Status",
+    ]);
+    let mut checked = 0;
+    let mut failed = Vec::new();
+
+    for table_name in TPCH_TABLES {
+        let hudi_table = HudiTable::new(&hudi_table_uri(&resolved, table_name)?)
+            .await
+            .map_err(core_error)?;
+        if !hudi_table.is_mor() {
+            continue;
+        }
+        let timeline = hudi_table.get_timeline();
+        let Some(delta_commit) = timeline
+            .get_completed_deltacommits(true)
+            .await
+            .map_err(core_error)?
+            .into_iter()
+            .next()
+        else {
+            table.add_row(vec![
+                Cell::new(table_name),
+                Cell::new("-"),
+                Cell::new("-"),
+                Cell::new("-"),
+                Cell::new("no delta commit"),
+            ]);
+            failed.push(table_name.to_string());
+            continue;
+        };
+        let metadata = timeline
+            .get_instant_metadata_in_json(&delta_commit)
+            .await
+            .map_err(core_error)?;
+        let expected = update_records_in_commit(&metadata)
+            .map_err(datafusion::error::DataFusionError::Plan)?;
+
+        let sql = format!(
+            "SELECT count(*) FROM {table_name} WHERE _hoodie_commit_time = '{}'",
+            delta_commit.timestamp
+        );
+        let batches = ctx.sql(&sql).await?.collect().await?;
+        let merged = batches
+            .first()
+            .and_then(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::Int64Array>()
+            })
+            .filter(|col| !col.is_empty())
+            .map(|col| col.value(0))
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Plan(format!(
+                    "count query on {table_name} returned no row"
+                ))
+            })?;
+        let merged = u64::try_from(merged).unwrap_or(0);
+
+        let status = if merged == expected { "OK" } else { "MISMATCH" };
+        if merged != expected {
+            failed.push(table_name.to_string());
+        }
+        checked += 1;
+        table.add_row(vec![
+            Cell::new(table_name),
+            Cell::new(&delta_commit.timestamp),
+            Cell::new(expected),
+            Cell::new(merged),
+            Cell::new(status),
+        ]);
+    }
+
+    if checked == 0 && failed.is_empty() {
+        return Ok(());
+    }
+    println!();
+    println!("Merge-on-read update records merged by the reader:");
+    println!("{table}");
+
     if failed.is_empty() {
         Ok(())
     } else {
-        let names: Vec<String> = failed.iter().map(|qn| format!("Q{qn:02}")).collect();
         Err(datafusion::error::DataFusionError::Plan(format!(
-            "Hudi results differ from parquet for {}",
-            names.join(", ")
+            "Update records not fully merged for {}",
+            failed.join(", ")
         )))
     }
 }
