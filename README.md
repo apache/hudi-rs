@@ -464,7 +464,9 @@ table.upsert(batch, update_columns=["fare"])
 let result = table.upsert([batch]).await?;
 println!(
     "instant={} updates={} inserts={}",
-    result.instant, result.num_updates, result.num_inserts
+    result.requested_time.as_deref().unwrap_or("none"),
+    result.num_updates,
+    result.num_inserts
 );
 ```
 

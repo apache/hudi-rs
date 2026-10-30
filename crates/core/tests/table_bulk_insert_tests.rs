@@ -107,16 +107,13 @@ async fn append_only_writes_records_and_commit() -> Result<()> {
     // Instants other writers mint before this write must order before it.
     let earlier_instant = chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
     let result = table.append([batch]).await?;
-    assert_eq!(result.num_rows, 3);
-    assert_eq!(
-        result.commit_relative_path,
-        format!(".hoodie/{}.commit", result.instant)
-    );
+    assert_eq!((result.num_writes, result.num_inserts), (3, 3));
+    assert_eq!(result.completion_time, None);
+    let instant = result.requested_time.as_deref().expect("append commits");
     assert!(
-        chrono::NaiveDateTime::parse_from_str(&result.instant, "%Y%m%d%H%M%S%3f").is_ok()
-            && result.instant >= earlier_instant,
-        "instant {} must be a yyyyMMddHHmmssSSS time at or after {earlier_instant}",
-        result.instant
+        chrono::NaiveDateTime::parse_from_str(instant, "%Y%m%d%H%M%S%3f").is_ok()
+            && instant >= earlier_instant.as_str(),
+        "instant {instant} must be a yyyyMMddHHmmssSSS time at or after {earlier_instant}"
     );
 
     let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
@@ -140,7 +137,7 @@ async fn append_only_writes_records_and_commit() -> Result<()> {
     assert_eq!(names.value(1), "bob");
     assert_eq!(names.value(2), "carol");
 
-    let commit_file = temp_dir.path().join(&result.commit_relative_path);
+    let commit_file = temp_dir.path().join(format!(".hoodie/{instant}.commit"));
     assert!(commit_file.exists(), "commit file should exist");
 
     Ok(())
@@ -185,10 +182,14 @@ async fn append_only_writes_layout_v2_commit() -> Result<()> {
     )?;
 
     let result = table.append([batch]).await?;
-    assert!(result.commit_relative_path.starts_with(".hoodie/timeline/"));
-    assert!(result.commit_relative_path.ends_with(".commit"));
-
-    let commit_file = temp_dir.path().join(&result.commit_relative_path);
+    let commit_file = temp_dir.path().join(format!(
+        ".hoodie/timeline/{}_{}.commit",
+        result.requested_time.as_deref().expect("append commits"),
+        result
+            .completion_time
+            .as_deref()
+            .expect("layout v2 records completion")
+    ));
     assert!(commit_file.exists(), "layout v2 commit file should exist");
 
     let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
@@ -236,7 +237,7 @@ async fn append_only_writes_multiple_batches_as_one_file() -> Result<()> {
     )?;
 
     let result = table.append([first, second]).await?;
-    assert_eq!(result.num_rows, 3);
+    assert_eq!((result.num_writes, result.num_inserts), (3, 3));
 
     let reopened = Table::new(temp_dir.path().to_str().expect("valid temp path")).await?;
     let records = reopened.read(&ReadOptions::new()).await?;
@@ -404,7 +405,7 @@ async fn append_only_accepts_cleared_metadata_partitions_property() -> Result<()
     let result = table
         .append([id_name_batch(vec![1], vec!["alice"])])
         .await?;
-    assert_eq!(result.num_rows, 1);
+    assert_eq!((result.num_writes, result.num_inserts), (1, 1));
 
     Ok(())
 }
@@ -419,8 +420,9 @@ async fn append_only_writes_version_6_commit_metadata() -> Result<()> {
         .append([id_name_batch(vec![1, 2, 3], vec!["alice", "bob", "carol"])])
         .await?;
 
+    let instant = result.requested_time.as_deref().expect("append commits");
     let commit: serde_json::Value = serde_json::from_slice(&fs::read(
-        temp_dir.path().join(&result.commit_relative_path),
+        temp_dir.path().join(format!(".hoodie/{instant}.commit")),
     )?)
     .expect("v1 commit metadata is JSON");
     assert_eq!(commit["operationType"], "BULK_INSERT");
@@ -430,15 +432,12 @@ async fn append_only_writes_version_6_commit_metadata() -> Result<()> {
     assert_eq!(stats.len(), 1);
     let stat = &stats[0];
     let file_id = stat["fileId"].as_str().expect("fileId");
-    assert_eq!(
-        result.base_file_path,
-        format!("{file_id}_0-0-0_{}.parquet", result.instant)
-    );
-    assert_eq!(stat["path"], result.base_file_path.as_str());
+    let base_file = format!("{file_id}_0-0-0_{instant}.parquet");
+    assert_eq!(stat["path"], base_file.as_str());
     assert_eq!(stat["partitionPath"], "");
     assert_eq!(stat["numWrites"], 3);
     assert_eq!(stat["numInserts"], 3);
-    let file_size = fs::metadata(temp_dir.path().join(&result.base_file_path))?.len();
+    let file_size = fs::metadata(temp_dir.path().join(&base_file))?.len();
     assert_eq!(stat["fileSizeInBytes"], file_size);
 
     let schema: serde_json::Value = serde_json::from_str(
@@ -573,13 +572,16 @@ async fn append_only_version_6_commits_support_time_travel_and_incremental_reads
         .await?;
 
     let as_of = |instant: &str| ReadOptions::new().with_as_of_timestamp(instant);
-    assert_eq!(ids_read_with(uri, as_of(&first.instant)).await?, vec![1, 2]);
     assert_eq!(
-        ids_read_with(uri, as_of(&second.instant)).await?,
+        ids_read_with(uri, as_of(first.requested_time.as_deref().unwrap())).await?,
+        vec![1, 2]
+    );
+    assert_eq!(
+        ids_read_with(uri, as_of(second.requested_time.as_deref().unwrap())).await?,
         vec![1, 2, 3]
     );
     assert_eq!(
-        ids_read_with(uri, as_of(&third.instant)).await?,
+        ids_read_with(uri, as_of(third.requested_time.as_deref().unwrap())).await?,
         vec![1, 2, 3, 4, 5]
     );
 
@@ -591,17 +593,18 @@ async fn append_only_version_6_commits_support_time_travel_and_incremental_reads
     assert_eq!(
         ids_read_with(
             uri,
-            incremental(&first.instant).with_end_timestamp(&second.instant)
+            incremental(first.requested_time.as_deref().unwrap())
+                .with_end_timestamp(second.requested_time.as_deref().unwrap())
         )
         .await?,
         vec![3]
     );
     assert_eq!(
-        ids_read_with(uri, incremental(&first.instant)).await?,
+        ids_read_with(uri, incremental(first.requested_time.as_deref().unwrap())).await?,
         vec![3, 4, 5]
     );
     assert_eq!(
-        ids_read_with(uri, incremental(&third.instant)).await?,
+        ids_read_with(uri, incremental(third.requested_time.as_deref().unwrap())).await?,
         Vec::<i32>::new()
     );
 
@@ -735,9 +738,12 @@ async fn append_only_without_table_version_takes_the_version_6_path() -> Result<
     let result = table
         .append([id_name_batch(vec![1, 2], vec!["alice", "bob"])])
         .await?;
-    assert_eq!(
-        result.commit_relative_path,
-        format!(".hoodie/{}.commit", result.instant)
+    let instant = result.requested_time.as_deref().expect("append commits");
+    assert!(
+        temp_dir
+            .path()
+            .join(format!(".hoodie/{instant}.commit"))
+            .is_file()
     );
     let rows: usize = table
         .read(&ReadOptions::new())

@@ -243,7 +243,7 @@ async fn test_simple_index_tags_virtual_composite_keys() {
         .create()
         .await
         .unwrap();
-    let append = table
+    table
         .append([order_batch(&[(1, "a", 10), (1, "b", 20)])])
         .await
         .unwrap();
@@ -254,7 +254,9 @@ async fn test_simple_index_tags_virtual_composite_keys() {
         .await
         .unwrap();
     let location = locations[&stored].as_ref().expect("stored key is tagged");
-    assert!(append.base_file_path.contains(&location.file_id));
+    let slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
+    assert_eq!(slices.len(), 1);
+    assert_eq!(slices[0].file_id(), location.file_id);
     assert!(locations[&absent].is_none());
 }
 

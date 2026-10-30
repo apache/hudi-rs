@@ -98,7 +98,6 @@ pub(crate) mod validation;
 pub use crate::config::read_options::{QueryType, ReadOptions};
 pub use crate::index::{HoodieKey, SimpleIndex};
 pub use crate::write::TableCreateBuilder;
-pub use crate::write::append::AppendResult;
 pub use crate::write::{CompactionResult, UpsertOptions, WriteResult};
 
 use crate::Result;
@@ -461,8 +460,9 @@ impl Table {
     /// under one compaction instant that completes as a `commit`.
     ///
     /// Rows keep their `_hoodie_commit_time`, so incremental reads see no new
-    /// rows from a compaction. Returns a result with an empty instant when no
-    /// file group had log files, in which case nothing is written.
+    /// rows from a compaction. Returns a result whose `requested_time` is
+    /// `None` when no file group had log files, in which case nothing is
+    /// written.
     ///
     /// Compaction also runs on its own after a delta commit when
     /// `hoodie.compact.inline` is `true` and the completed delta commits since
@@ -1590,7 +1590,7 @@ impl Table {
     pub async fn append(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
-    ) -> Result<AppendResult> {
+    ) -> Result<WriteResult> {
         let batches: Vec<RecordBatch> = batches.into_iter().collect();
         crate::write::append_batches(self, &batches).await
     }

@@ -1369,7 +1369,7 @@ async fn parity_k_rs_compaction_spark_interop() {
     );
     assert_eq!(rs_read(path).await, expected, "rs read after rs compaction");
     assert_eq!(
-        spark_read_as_of(&env, path, &delete.instant),
+        spark_read_as_of(&env, path, delete.requested_time.as_deref().unwrap()),
         expected,
         "spark time travel to the delta commit before the compaction"
     );

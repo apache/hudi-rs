@@ -50,7 +50,7 @@ use hudi::file_group::reader::FileGroupReader;
 use hudi::storage::error::StorageError;
 use hudi::table::CompactionResult;
 use hudi::table::builder::TableBuilder;
-use hudi::table::{AppendResult, QueryType, ReadOptions, Table};
+use hudi::table::{QueryType, ReadOptions, Table};
 use hudi::timeline::Timeline;
 use hudi::timeline::instant::Instant;
 use hudi::{HoodieKey, UpsertOptions, WriteResult};
@@ -1088,7 +1088,7 @@ impl HudiCompactionResult {
 impl From<CompactionResult> for HudiCompactionResult {
     fn from(r: CompactionResult) -> Self {
         Self {
-            instant_time: committed(r.instant),
+            instant_time: r.requested_time,
             completion_time: r.completion_time,
             num_file_groups: r.num_file_groups,
             num_log_files: r.num_log_files,
@@ -1132,7 +1132,7 @@ impl HudiWriteResult {
 impl From<WriteResult> for HudiWriteResult {
     fn from(r: WriteResult) -> Self {
         Self {
-            instant_time: committed(r.instant),
+            instant_time: r.requested_time,
             completion_time: r.completion_time,
             num_writes: r.num_writes,
             num_updates: r.num_updates,
@@ -1140,24 +1140,6 @@ impl From<WriteResult> for HudiWriteResult {
             num_deletes: r.num_deletes,
         }
     }
-}
-
-impl From<AppendResult> for HudiWriteResult {
-    fn from(r: AppendResult) -> Self {
-        Self {
-            instant_time: committed(r.instant),
-            completion_time: r.completion_time,
-            num_writes: r.num_rows,
-            num_updates: 0,
-            num_inserts: r.num_rows,
-            num_deletes: 0,
-        }
-    }
-}
-
-/// The core reports a write that made no commit with an empty instant.
-fn committed(instant: String) -> Option<String> {
-    (!instant.is_empty()).then_some(instant)
 }
 
 /// A Python argument that is either one string or a list of strings.
@@ -1821,7 +1803,6 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
     use arrow::record_batch::RecordBatch;
     use hudi::WriteResult;
-    use hudi::table::AppendResult;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -2077,7 +2058,7 @@ mod tests {
     #[test]
     fn write_results_convert_to_python_counts() {
         let rewrite = HudiWriteResult::from(WriteResult {
-            instant: "20240101000000000".to_string(),
+            requested_time: Some("20240101000000000".to_string()),
             completion_time: None,
             num_writes: 4,
             num_updates: 1,
@@ -2094,35 +2075,6 @@ mod tests {
             ),
             (4, 1, 2, 3)
         );
-
-        let append = HudiWriteResult::from(AppendResult {
-            instant: "20240101000000001".to_string(),
-            completion_time: None,
-            commit_relative_path: String::new(),
-            base_file_path: String::new(),
-            num_rows: 5,
-        });
-        assert_eq!(append.instant_time.as_deref(), Some("20240101000000001"));
-        assert_eq!(
-            (
-                append.num_writes,
-                append.num_updates,
-                append.num_inserts,
-                append.num_deletes
-            ),
-            (5, 0, 5, 0)
-        );
-
-        // A write that matched nothing reports no instant.
-        let noop = HudiWriteResult::from(WriteResult {
-            instant: String::new(),
-            completion_time: None,
-            num_writes: 0,
-            num_updates: 0,
-            num_inserts: 0,
-            num_deletes: 0,
-        });
-        assert_eq!(noop.instant_time, None);
     }
 
     #[test]

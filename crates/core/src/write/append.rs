@@ -45,6 +45,7 @@ use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::Table;
 use crate::timeline::instant::{Action, Instant};
+use crate::write::WriteResult;
 use crate::write::keygen::{
     hoodie_keys_for_batch, hoodie_keys_for_batch_with_offset, relative_data_path,
 };
@@ -52,23 +53,8 @@ use crate::write::metadata::is_column_stats_enabled;
 
 static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
-/// What an append wrote.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AppendResult {
-    /// Timestamp of the completed instant (the requested time).
-    pub instant: String,
-    /// Completion time of the instant on timeline layout v2; `None` on v1.
-    pub completion_time: Option<String>,
-    /// Path of the completed instant, relative to the table base.
-    pub commit_relative_path: String,
-    /// Path of the first base file written, relative to the table base.
-    pub base_file_path: String,
-    /// Rows written.
-    pub num_rows: usize,
-}
-
 /// Append one or more record batches as a single INSERT commit.
-pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
     let batches = &crate::write::normalize_for_write(batches)?;
     if table_version(table) < 8 {
         return append_version_6(table, batches).await;
@@ -131,7 +117,6 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         .then(|| crate::write::metadata::instant_millis(&table.hudi_configs, &request_instant));
     let mut stats_updates = Vec::new();
     let mut written_paths: Vec<String> = Vec::new();
-    let mut primary_base_path = String::new();
     let max_records = max_records_per_file(table);
     // Monotonic auto-key row id across partitions and size-split chunks in this commit.
     let mut auto_key_row_offset = 0usize;
@@ -227,9 +212,6 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                     ))
                 })?;
             let base_file_path = relative_data_path(&partition_path, &file_name);
-            if primary_base_path.is_empty() {
-                primary_base_path = base_file_path.clone();
-            }
             let prepared = prepare_batches_for_write_with_offset(
                 &table.hudi_configs,
                 &[chunk],
@@ -357,12 +339,12 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         crate::write::maybe_compact_inline(table).await;
     }
 
-    Ok(AppendResult {
-        instant: request_instant,
+    Ok(WriteResult {
+        requested_time: Some(request_instant),
         completion_time: completed.completion_time,
-        commit_relative_path: completed.commit_relative_path,
-        base_file_path: primary_base_path,
-        num_rows,
+        num_writes: num_rows,
+        num_inserts: num_rows,
+        ..Default::default()
     })
 }
 
@@ -457,7 +439,7 @@ fn ensure_rows_present(batches: &[RecordBatch]) -> Result<usize> {
 /// failed write, and writes no markers and no archival, so it does not share
 /// `complete_write` with the version 8 path, and a crashed write leaves
 /// nothing on the timeline for a later writer to roll back.
-async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<AppendResult> {
+async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
     ensure_batches_share_schema(batches)?;
     let batches = &match_table_schema(table, batches).await?;
     let schema = batches[0].schema();
@@ -525,12 +507,11 @@ async fn append_version_6(table: &mut Table, batches: &[RecordBatch]) -> Result<
     // The commit is durable; a failed refresh must not turn it into an error.
     let _ = table.timeline.reload_completed_commits().await;
     table.clear_read_caches();
-    Ok(AppendResult {
-        instant,
-        completion_time: None,
-        commit_relative_path,
-        base_file_path,
-        num_rows,
+    Ok(WriteResult {
+        requested_time: Some(instant),
+        num_writes: num_rows,
+        num_inserts: num_rows,
+        ..Default::default()
     })
 }
 

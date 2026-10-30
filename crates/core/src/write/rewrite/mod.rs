@@ -45,6 +45,7 @@ use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::{ReadOptions, Table};
 use crate::timeline::instant::Action;
+use crate::write::WriteResult;
 use crate::write::append::{
     ensure_copy_on_write, generate_instant_time, is_layout_two, prepare_batches_for_write,
     timeline_dir,
@@ -67,27 +68,6 @@ use mor::*;
 use rows::*;
 pub(crate) use validate::ensure_writable_table_version;
 use validate::*;
-
-/// Result of an upsert, delete, or overwrite write.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WriteResult {
-    /// Completed instant timestamp (the requested time).
-    pub instant: String,
-    /// Completion time of the instant on timeline layout v2, which is what an
-    /// incremental read's start bound is compared against on that layout.
-    /// `None` on layout v1 and when no commit was written.
-    pub completion_time: Option<String>,
-    /// Rows in the data files this write produced: every row of each
-    /// rewritten copy-on-write base file, or each row appended to a
-    /// merge-on-read log (deletes append none).
-    pub num_writes: usize,
-    /// Number of input keys that replaced existing rows.
-    pub num_updates: usize,
-    /// Number of input keys not previously present.
-    pub num_inserts: usize,
-    /// Number of rows deleted.
-    pub num_deletes: usize,
-}
 
 /// Options controlling an upsert.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

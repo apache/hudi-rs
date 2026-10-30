@@ -456,7 +456,8 @@ async fn plant_pending_then_archive(
         .append([batch(vec![("k0", "sf", 0)])])
         .await
         .unwrap()
-        .instant;
+        .requested_time
+        .unwrap();
 
     let pending_ts = next_instant(&first);
     let timeline = dir.join(".hoodie/timeline");

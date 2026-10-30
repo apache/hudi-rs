@@ -117,7 +117,10 @@ async fn test_marker_dir_removed_after_successful_commit() {
     let mut table = create_partitioned(dir.path()).await;
     let result = table.append([batch(vec![("a", "sf", 1)])]).await.unwrap();
 
-    let marker_dir = dir.path().join(".hoodie/.temp").join(&result.instant);
+    let marker_dir = dir
+        .path()
+        .join(".hoodie/.temp")
+        .join(result.requested_time.as_deref().unwrap());
     let leftovers = std::fs::read_dir(&marker_dir)
         .map(|entries| entries.count())
         .unwrap_or(0);
@@ -789,13 +792,13 @@ async fn test_pending_rollback_of_completed_instant_is_refused() {
     let rollback_ts = "30000101000000017";
     let plan = HoodieRollbackPlan {
         instant_to_rollback: Some(HoodieInstantInfo {
-            commit_time: committed.instant.clone(),
+            commit_time: committed.requested_time.clone().unwrap(),
             action: "commit".to_string(),
         }),
         rollback_requests: Some(vec![HoodieRollbackRequest {
             partition_path: "city=sf".to_string(),
             file_id: Some(data_file.split('_').next().unwrap().to_string()),
-            latest_base_instant: Some(committed.instant.clone()),
+            latest_base_instant: Some(committed.requested_time.clone().unwrap()),
             files_to_be_deleted: vec![absolute(&table, &relative)],
             log_blocks_to_be_deleted: Some(Default::default()),
         }]),
@@ -815,7 +818,7 @@ async fn test_pending_rollback_of_completed_instant_is_refused() {
     let err = result.unwrap_err();
     assert!(
         matches!(&err, CoreError::Unsupported(msg)
-            if msg.contains(rollback_ts) && msg.contains(&committed.instant)),
+            if msg.contains(rollback_ts) && msg.contains(committed.requested_time.as_deref().unwrap())),
         "{err}"
     );
     assert_eq!(pending_rollbacks(&timeline), vec![rollback_ts.to_string()]);

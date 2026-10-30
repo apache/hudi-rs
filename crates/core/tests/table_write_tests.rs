@@ -137,6 +137,13 @@ fn rows_by_id(batches: &[RecordBatch]) -> Vec<(String, i64)> {
     rows
 }
 
+/// The base file of the table's only file slice, relative to the table base.
+async fn only_base_file(table: &Table) -> String {
+    let slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
+    assert_eq!(slices.len(), 1);
+    slices[0].base_file_relative_path().unwrap().unwrap()
+}
+
 #[tokio::test]
 async fn test_create_and_append_then_read() {
     let dir = tempdir().unwrap();
@@ -150,28 +157,31 @@ async fn test_create_and_append_then_read() {
         .unwrap();
 
     let result = table.append([sample_batch()]).await.unwrap();
-    assert_eq!(result.num_rows, 3);
+    assert_eq!((result.num_writes, result.num_inserts), (3, 3));
+    let instant = result.requested_time.as_deref().unwrap();
+    let base_file = only_base_file(&table).await;
     assert!(
-        dir.path().join(&result.base_file_path).is_file(),
-        "base file should exist at {}",
-        result.base_file_path
-    );
-    assert!(
-        dir.path().join(&result.commit_relative_path).is_file(),
-        "commit file should exist at {}",
-        result.commit_relative_path
+        dir.path().join(&base_file).is_file(),
+        "base file should exist at {base_file}"
     );
     let timeline = dir.path().join(".hoodie/timeline");
+    let commit_file = timeline.join(format!(
+        "{instant}_{}.commit",
+        result.completion_time.as_deref().unwrap()
+    ));
+    assert!(
+        commit_file.is_file(),
+        "commit file should exist at {}",
+        commit_file.display()
+    );
     assert!(
         timeline
-            .join(format!("{}.commit.requested", result.instant))
+            .join(format!("{instant}.commit.requested"))
             .is_file(),
         "data timeline should fence with .commit.requested"
     );
     assert!(
-        timeline
-            .join(format!("{}.inflight", result.instant))
-            .is_file(),
+        timeline.join(format!("{instant}.inflight")).is_file(),
         "data timeline should fence with .inflight"
     );
 
@@ -395,7 +405,7 @@ async fn test_create_with_metadata_and_append_updates_files_partition() {
         .create()
         .await
         .unwrap();
-    let result = table.append([sample_batch()]).await.unwrap();
+    table.append([sample_batch()]).await.unwrap();
     assert!(table.is_metadata_table_enabled());
 
     let reopened = Table::new(base_uri).await.unwrap();
@@ -407,7 +417,13 @@ async fn test_create_with_metadata_and_append_updates_files_partition() {
         .await
         .unwrap();
     let files = records.get("").unwrap();
-    assert!(files.has_active_file(&result.base_file_path));
+    let written: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".parquet"))
+        .collect();
+    assert_eq!(written.len(), 1);
+    assert!(files.has_active_file(&written[0]));
 }
 
 #[tokio::test]
@@ -477,13 +493,13 @@ async fn test_write_result_completion_time_matches_timeline() {
         }
         .unwrap();
         for (verb, instant, completion_time) in [
-            ("append", &append.instant, &append.completion_time),
-            ("upsert", &upsert.instant, &upsert.completion_time),
-            ("delete", &delete.instant, &delete.completion_time),
+            ("append", &append.requested_time, &append.completion_time),
+            ("upsert", &upsert.requested_time, &upsert.completion_time),
+            ("delete", &delete.requested_time, &delete.completion_time),
         ] {
             let completed = instants
                 .iter()
-                .find(|i| &i.timestamp == instant)
+                .find(|i| Some(&i.timestamp) == instant.as_ref())
                 .unwrap_or_else(|| panic!("{table_type:?}: {verb} instant not on the timeline"));
             assert!(completion_time.is_some(), "{table_type:?} {verb}");
             assert_eq!(
@@ -1443,8 +1459,16 @@ async fn test_merge_on_read_writes_parquet_logs_and_merges_snapshot() {
         .append([ordered_batch(vec![("a", 1, 1), ("b", 2, 1)])])
         .await
         .unwrap();
-    assert!(append.commit_relative_path.ends_with(".deltacommit"));
-    assert!(dir.path().join(&append.base_file_path).is_file());
+    assert!(
+        dir.path()
+            .join(format!(
+                ".hoodie/timeline/{}_{}.deltacommit",
+                append.requested_time.as_deref().unwrap(),
+                append.completion_time.as_deref().unwrap()
+            ))
+            .is_file()
+    );
+    assert!(dir.path().join(only_base_file(&table).await).is_file());
     let incremental = table
         .read(
             &ReadOptions::new()
@@ -1593,7 +1617,7 @@ async fn test_upsert_deduplicates_keys_and_delete_missing_key_is_noop() {
         .await
         .unwrap();
     assert_eq!(result.num_deletes, 0);
-    assert!(result.instant.is_empty());
+    assert!(result.requested_time.is_none());
 }
 
 #[tokio::test]
@@ -1890,7 +1914,11 @@ async fn test_input_meta_columns_are_replaced() {
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        assert_eq!(commit_times.value(0), result.instant, "{table_type:?}");
+        assert_eq!(
+            Some(commit_times.value(0)),
+            result.requested_time.as_deref(),
+            "{table_type:?}"
+        );
 
         let mut fields = vec![Field::new("_hoodie_record_key", DataType::Utf8, true)];
         fields.extend(
@@ -3232,7 +3260,7 @@ async fn test_mor_unsupported_verbs_error_clearly() {
         .count();
     let result = table.delete("value = 12345").await.unwrap();
     assert_eq!(result.num_deletes, 0);
-    assert_eq!(result.instant, "");
+    assert_eq!(result.requested_time, None);
     let commits_after = std::fs::read_dir(dir.path().join(".hoodie/timeline"))
         .unwrap()
         .count();
@@ -4247,7 +4275,12 @@ async fn upserts_into_spark_written_table_read_through_metadata_table() {
         // Spark leaves the timeline timezone unset, which Java reads as LOCAL.
         let local_now = || chrono::Local::now().format("%Y%m%d%H%M%S%3f").to_string();
         let before = local_now();
-        let instant = table.upsert([rows.clone()]).await.unwrap().instant;
+        let instant = table
+            .upsert([rows.clone()])
+            .await
+            .unwrap()
+            .requested_time
+            .unwrap();
         let after = local_now();
         assert!(
             before <= instant && instant <= after,
@@ -4539,7 +4572,7 @@ async fn test_delete_keys_in_wrong_partition_is_noop() {
             .await
             .unwrap();
         assert_eq!(result.num_deletes, 0, "{table_type:?}");
-        assert!(result.instant.is_empty(), "{table_type:?}");
+        assert!(result.requested_time.is_none(), "{table_type:?}");
         assert_eq!(timeline_file_count(dir.path()), before, "{table_type:?}");
     }
 }

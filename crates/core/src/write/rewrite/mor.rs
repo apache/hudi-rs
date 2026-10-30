@@ -594,7 +594,7 @@ pub(super) async fn mor_upsert_batches(
     .await?;
     crate::write::maybe_compact_inline(table).await;
     Ok(WriteResult {
-        instant,
+        requested_time: Some(instant),
         completion_time: completed.completion_time,
         num_writes: incoming.num_rows(),
         num_updates: updates,
@@ -771,7 +771,7 @@ pub(super) async fn mor_delete_keys(
     .await?;
     crate::write::maybe_compact_inline(table).await;
     Ok(WriteResult {
-        instant,
+        requested_time: Some(instant),
         completion_time: completed.completion_time,
         num_writes: 0,
         num_updates: 0,
