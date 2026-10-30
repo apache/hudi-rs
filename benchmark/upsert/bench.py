@@ -247,7 +247,7 @@ class HudiLeg(Leg):
             record_key=plan["key_cols"],
             ordering_fields=plan["ordering"],
             table_type=self.table_type,
-            enable_record_index=self.record_index,
+            record_index_enabled=self.record_index,
         )
         r = t.append(base)
         return {"marker": r.instant_time}
