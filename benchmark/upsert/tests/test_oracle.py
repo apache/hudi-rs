@@ -148,7 +148,9 @@ def test_duplicate_row_is_reported(oracle):
 
 def test_extra_key_is_reported(oracle):
     work, exp = oracle
-    extra = exp.slice(0, 1).set_column(0, exp.schema.field(0), pa.array(["zzz"]))
+    extra = exp.slice(0, 1).set_column(
+        0, exp.schema.field(0), pa.array(["zzz"], exp.schema.field(0).type)
+    )
     r = compare(work, pa.concat_tables([exp.slice(1), extra]))
     assert r["mismatches"][0]["keys_extra_examples"] == ["zzz"]
 
@@ -233,3 +235,20 @@ def test_sampled_check_also_requires_exact_types(tmp_path):
     c = bench.check_readback(got, tmp_path, plan)
     assert not c["passed"]
     assert c["type_mismatches"][0]["got_type"] == "float"
+
+
+def test_oracle_strings_use_64_bit_offsets():
+    # A 10M-row text column passes 2 GiB, past what 32-bit string offsets index
+    # once the oracle is sorted or its chunks combined.
+    s = oracle_schema(
+        pa.schema(
+            [
+                pa.field("a", pa.string()),
+                pa.field("b", pa.binary_view()),
+                pa.field("c", pa.list_(pa.string())),
+            ]
+        )
+    )
+    assert s.field("a").type == pa.large_string()
+    assert s.field("b").type == pa.large_binary()
+    assert s.field("c").type == pa.list_(pa.large_string())

@@ -601,13 +601,21 @@ def _with_key(sc, t):
 
 
 def plain_type(t):
-    """The type a leg's output is compared in: view and large variants become
-    their plain form, and list item fields are named and nullable as pyarrow's
-    default."""
-    if pa.types.is_string_view(t) or pa.types.is_large_string(t):
-        return pa.string()
-    if pa.types.is_binary_view(t) or pa.types.is_large_binary(t):
-        return pa.binary()
+    """The type a leg's output is compared in: strings and binaries in their
+    large form, whose 64-bit offsets hold a column past 2 GiB, and list item
+    fields named and nullable as pyarrow's default."""
+    if (
+        pa.types.is_string(t)
+        or pa.types.is_string_view(t)
+        or pa.types.is_large_string(t)
+    ):
+        return pa.large_string()
+    if (
+        pa.types.is_binary(t)
+        or pa.types.is_binary_view(t)
+        or pa.types.is_large_binary(t)
+    ):
+        return pa.large_binary()
     if pa.types.is_list(t) or pa.types.is_large_list(t) or pa.types.is_list_view(t):
         return pa.list_(plain_type(t.value_type))
     return t
@@ -628,8 +636,9 @@ def oracle_dir(sc, work_dir, p, wd):
 
 
 def write_oracle(sc, state, path):
-    t = sorted_by_key(state.drop_columns([KEY_COL]), sc.key_cols)
-    pq.write_table(t.cast(oracle_schema(t.schema)), path)
+    t = state.drop_columns([KEY_COL])
+    t = sorted_by_key(t.cast(oracle_schema(t.schema)), sc.key_cols)
+    pq.write_table(t, path)
 
 
 def ensure_workload(sc, work_dir, p, seed, verify_sample):

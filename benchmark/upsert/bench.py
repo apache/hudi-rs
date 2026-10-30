@@ -60,6 +60,7 @@ from scenarios import (
     all_knobs,
     ensure_workload,
     key_strings,
+    oracle_schema,
     plain_type,
     read_base,
     resolve_params,
@@ -767,12 +768,12 @@ def _first_diffs(keys, got, want, limit):
 
 def type_mismatches(got_schema, exp_schema, cols):
     """Columns whose read-back type differs from the expected one after the only
-    normalizations allowed: view and large types to plain, list item names."""
+    normalizations allowed: the plain, large and view forms of strings and
+    binaries are one type, and list item names are ignored."""
     out = []
     for c in cols:
-        g = plain_type(got_schema.field(c).type)
-        e = plain_type(exp_schema.field(c).type)
-        if g != e:
+        g, e = got_schema.field(c).type, exp_schema.field(c).type
+        if plain_type(g) != plain_type(e):
             out.append({"column": c, "expected_type": str(e), "got_type": str(g)})
     return out
 
@@ -786,7 +787,7 @@ def compare_to_oracle(table, work_dir, plan):
 
 
 def compare_tables(table, exp, key_cols):
-    exp = exp.combine_chunks()
+    exp = exp.cast(oracle_schema(exp.schema)).combine_chunks()
     res = {
         "rows_expected": exp.num_rows,
         "rows_read": table.num_rows,
