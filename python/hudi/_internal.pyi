@@ -35,6 +35,9 @@ WriteData = Union[
 
 def _config_keys() -> Dict[str, List[Tuple[str, str]]]: ...
 
+class HudiCoreError(Exception):
+    """Raised for errors from the Hudi core library."""
+
 class HudiQueryType:
     """Selects the read semantic on :class:`HudiReadOptions`."""
 

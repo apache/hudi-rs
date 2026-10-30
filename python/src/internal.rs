@@ -62,7 +62,7 @@ use std::error::Error;
 
 type RecordBatchBoxStream = BoxStream<'static, HudiResult<RecordBatch>>;
 
-create_exception!(_internal, HudiCoreError, PyException);
+create_exception!(hudi._internal, HudiCoreError, PyException);
 
 fn convert_to_py_err<I>(err: I) -> PyErr
 where
