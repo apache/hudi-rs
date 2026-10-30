@@ -18,6 +18,7 @@
 """Tests for the HudiTable write API."""
 
 import datetime
+import math
 from decimal import Decimal
 
 import pyarrow as pa
@@ -73,6 +74,16 @@ class StreamOnly:
         return self._table.__arrow_c_stream__(requested_schema)
 
 
+class ArrayOnly:
+    """Exposes only the Arrow PyCapsule array interface for one record batch."""
+
+    def __init__(self, batch):
+        self._batch = batch
+
+    def __arrow_c_array__(self, requested_schema=None):
+        return self._batch.__arrow_c_array__(requested_schema)
+
+
 @pytest.mark.parametrize(
     "table_type, expected_type",
     [
@@ -121,11 +132,57 @@ def test_create_on_existing_table_raises(tmp_path):
         HudiTable.create(str(tmp_path / "t"), record_key="id")
 
 
-def test_create_rejects_inconsistent_index_options(tmp_path):
-    with pytest.raises(Exception, match="record index requires the metadata table"):
-        HudiTable.create(
-            str(tmp_path / "t"), record_key="id", metadata=False, record_index=True
-        )
+@pytest.mark.parametrize(
+    "flags, error",
+    [
+        (dict(metadata=False, record_index=True), "record index requires the metadata"),
+        (dict(metadata=False, column_stats=True), "column_stats requires the metadata"),
+        # The explicit partition_stats choice is applied after column_stats,
+        # so it is reported rather than silently turned off.
+        (dict(column_stats=False, partition_stats=True), "partition_stats requires"),
+    ],
+)
+def test_create_rejects_inconsistent_index_options(tmp_path, flags, error):
+    with pytest.raises(Exception, match=error):
+        HudiTable.create(str(tmp_path / "t"), record_key="id", **flags)
+    assert not (tmp_path / "t").exists()
+
+
+def test_create_index_options(tmp_path):
+    base = tmp_path / "t"
+    table = HudiTable.create(
+        str(base),
+        record_key="id",
+        partition_by="city",
+        record_index=False,
+        column_stats=True,
+        partition_stats=False,
+    )
+    partitions = table.hudi_options()["hoodie.table.metadata.partitions"].split(",")
+    assert "column_stats" in partitions
+    assert "partition_stats" not in partitions
+    assert "record_index" not in partitions
+    # Without the record index, upserts tag records through the simple index.
+    table.append(trips(("t1", "sf", 1, 30.0)))
+    assert table.upsert(trips(("t1", "sf", 2, 31.0))).num_updates == 1
+    assert snapshot(table) == {"t1": ("sf", 2, 31.0)}
+
+
+def test_create_with_multiple_fields(tmp_path):
+    table = HudiTable.create(
+        str(tmp_path / "t"),
+        record_key=["id"],
+        partition_by=["city", "ts"],
+        ordering_field=["ts"],
+        storage_options={"allow_http": "true"},
+    )
+    options = table.hudi_options()
+    assert options["hoodie.table.recordkey.fields"] == "id"
+    assert options["hoodie.table.partition.fields"] == "city,ts"
+    assert options["hoodie.table.ordering.fields"] == "ts"
+    assert table.storage_options()["allow_http"] == "true"
+    table.append(trips(("t1", "sf", 1, 30.0)))
+    assert (tmp_path / "t" / "city=sf" / "ts=1").is_dir()
 
 
 @pytest.mark.parametrize("table_type", ["cow", "mor"])
@@ -146,6 +203,8 @@ def test_append_then_read(tmp_path, table_type):
         0,
     )
     assert "num_inserts=2" in repr(res)
+    with pytest.raises(AttributeError):
+        res.num_inserts = 0
     assert snapshot(table) == {"t1": ("sf", 1, 30.0), "t2": ("nyc", 1, 45.0)}
     # A fresh handle sees the same committed data.
     assert snapshot(HudiTable(str(tmp_path / "trips"))) == snapshot(table)
@@ -187,8 +246,9 @@ def test_update_with_dict(tmp_path, table_type):
     assert snapshot(table)["t1"] == ("sf", 1, 30.0)
 
 
-def test_update_with_batch(tmp_path):
-    table = new_table(tmp_path)
+@pytest.mark.parametrize("table_type", ["cow", "mor"])
+def test_update_with_batch(tmp_path, table_type):
+    table = new_table(tmp_path, table_type)
     set_batch = pa.record_batch(
         {"fare": pa.array([7.5]), "ts": pa.array([3], pa.int64())}
     )
@@ -196,6 +256,26 @@ def test_update_with_batch(tmp_path):
     assert snapshot(table)["t1"] == ("sf", 3, 7.5)
     table.update("id = 't2'", pa.table({"fare": [8.5]}))
     assert snapshot(table)["t2"] == ("sf", 1, 8.5)
+    table.update("id = 't3'", [pa.record_batch({"fare": [9.5]})])
+    assert snapshot(table)["t3"] == ("nyc", 1, 9.5)
+
+
+def test_update_set_batches_must_hold_one_row(tmp_path):
+    table = new_table(tmp_path)
+    with pytest.raises(ValueError, match="got no batches"):
+        table.update("id = 't1'", [])
+    two = [pa.record_batch({"fare": [1.0]}), pa.record_batch({"fare": [2.0]})]
+    with pytest.raises(Exception, match="single-row"):
+        table.update("id = 't1'", two)
+    assert snapshot(table)["t1"] == ("sf", 1, 30.0)
+
+
+def test_update_dict_null_and_nan(tmp_path):
+    table = new_table(tmp_path)
+    table.update("id = 't1'", {"fare": None})
+    assert snapshot(table)["t1"] == ("sf", 1, None)
+    table.update("id = 't2'", {"fare": float("nan")})
+    assert math.isnan(snapshot(table)["t2"][2])
 
 
 def test_update_no_match_creates_no_commit(tmp_path):
@@ -410,25 +490,32 @@ def test_delete_keys(tmp_path, table_type):
     assert set(snapshot(table)) == {"t2"}
     res = table.delete_keys(["missing"])
     assert (res.instant, res.num_deletes) == ("", 0)
+    res = table.delete_keys(k for k in ("t2",))
+    assert res.num_deletes == 1
+    assert snapshot(table) == {}
 
 
 def test_delete_keys_rejects_bad_input(tmp_path):
     table = new_table(tmp_path)
     with pytest.raises(TypeError, match="not a single str"):
         table.delete_keys("t1")
-    with pytest.raises(TypeError, match="each key must be a str"):
-        table.delete_keys([1])
+    for bad in ([1], [("t1",)], [("t1", "city=sf", "x")]):
+        with pytest.raises(TypeError, match="each key must be a str"):
+            table.delete_keys(bad)
+    assert len(snapshot(table)) == 3
 
 
-def test_overwrite(tmp_path):
-    table = new_table(tmp_path)
+@pytest.mark.parametrize("table_type", ["cow", "mor"])
+def test_overwrite(tmp_path, table_type):
+    table = new_table(tmp_path, table_type)
     res = table.overwrite(trips(("t9", "sf", 9, 10.0)))
     assert res.instant
     assert snapshot(table) == {"t9": ("sf", 9, 10.0)}
 
 
-def test_dynamic_partition_overwrite(tmp_path):
-    table = new_table(tmp_path)
+@pytest.mark.parametrize("table_type", ["cow", "mor"])
+def test_dynamic_partition_overwrite(tmp_path, table_type):
+    table = new_table(tmp_path, table_type)
     res = table.dynamic_partition_overwrite(trips(("t8", "sf", 9, 11.0)))
     assert res.instant
     assert snapshot(table) == {"t8": ("sf", 9, 11.0), "t3": ("nyc", 1, 20.0)}
@@ -442,6 +529,12 @@ def test_dynamic_partition_overwrite(tmp_path):
         pytest.param(lambda t: t.to_reader(), id="record_batch_reader"),
         pytest.param(lambda t: t.to_batches(), id="list"),
         pytest.param(StreamOnly, id="arrow_c_stream"),
+        pytest.param(
+            lambda t: ArrayOnly(t.combine_chunks().to_batches()[0]), id="arrow_c_array"
+        ),
+        pytest.param(
+            lambda t: [ArrayOnly(b) for b in t.to_batches()], id="list_of_arrow_c_array"
+        ),
         pytest.param(lambda t: polars().from_arrow(t), id="polars"),
         pytest.param(
             lambda t: t.to_pandas(types_mapper=pandas().ArrowDtype), id="pandas_arrow"
@@ -597,6 +690,81 @@ def test_pandas_named_index_is_kept(tmp_path):
     assert res.num_updates == 1
     read = pa.Table.from_batches(table.read()).sort_by("id")
     assert read.column("fare").to_pylist() == [1.0, 5.0]
+
+
+def test_write_errors_leave_the_table_unchanged(tmp_path):
+    table = new_table(tmp_path)
+    no_key = pa.table({"city": ["sf"], "ts": [2], "fare": [1.0]})
+    with pytest.raises(Exception, match="schema does not match"):
+        table.upsert(no_key)
+    with pytest.raises(Exception, match="nope"):
+        table.upsert(trips(("t1", "sf", 2, 1.0)), update_columns=["nope"])
+    with pytest.raises(Exception):
+        table.delete("no_such_column = 1")
+    assert snapshot(table)["t1"] == ("sf", 1, 30.0)
+
+
+def test_binary_large_list_and_dictionary_columns_are_cast(tmp_path):
+    table = HudiTable.create(str(tmp_path / "t"), record_key="id")
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("blob", pa.large_binary()),
+            ("view", pa.binary_view()),
+            ("code", pa.dictionary(pa.int8(), pa.int64())),
+        ]
+    )
+
+    def rows(id_, blob, code):
+        return pa.table(
+            {"id": [id_], "blob": [blob], "view": [blob], "code": [code]},
+            schema=schema,
+        )
+
+    table.append(rows("t1", b"a", 7))
+    written = table.get_schema()
+    assert written.field("blob").type == pa.binary()
+    assert written.field("view").type == pa.binary()
+    assert written.field("code").type == pa.int64()
+    assert table.upsert(rows("t1", b"b", 8)).num_updates == 1
+    read = pa.Table.from_batches(table.read()).select(["blob", "view", "code"])
+    assert read.to_pylist() == [{"blob": b"b", "view": b"b", "code": 8}]
+
+    # List upserts are covered by test_polars_nested_columns_upsert (#868).
+    lists = HudiTable.create(str(tmp_path / "lists"), record_key="id")
+    lists.append(
+        pa.table({"id": ["t1"], "xs": pa.array([[1, 2]], pa.large_list(pa.int64()))})
+    )
+    assert lists.get_schema().field("xs").type.value_type == pa.int64()
+    assert pa.types.is_list(lists.get_schema().field("xs").type)
+    read = pa.Table.from_batches(lists.read()).column("xs").to_pylist()
+    assert read == [[1, 2]]
+
+
+def test_nested_nanosecond_timestamps_are_checked(tmp_path):
+    table = HudiTable.create(str(tmp_path / "t"), record_key="id")
+    ns = pa.timestamp("ns")
+    whole = pa.table(
+        {"id": ["t1"], "ts": pa.array([[1_000]], pa.list_(ns))},
+    )
+    table.append(whole)
+    assert table.get_schema().field("ts").type == pa.list_(pa.timestamp("us"))
+    partial = pa.table(
+        {"id": ["t1"], "st": pa.array([{"ts": 1_001}], pa.struct([("ts", ns)]))},
+    )
+    with pytest.raises(ValueError, match="column 'st' has timestamps"):
+        table.append(partial)
+
+
+def test_update_dict_struct_value_by_position(tmp_path):
+    table = HudiTable.create(str(tmp_path / "t"), record_key="id")
+    st = pa.struct([("k", pa.int64()), ("v", pa.string())])
+    table.append(pa.table({"id": ["t1"], "st": pa.array([{"k": 1, "v": "a"}], st)}))
+    table.update("id = 't1'", {"st": (2, "b")})
+    with pytest.raises(ValueError, match="column 'st'"):
+        table.update("id = 't1'", {"st": (2.5, "c")})
+    read = pa.Table.from_batches(table.read()).select(["st"]).to_pylist()
+    assert read == [{"st": {"k": 2, "v": "b"}}]
 
 
 def test_unsupported_data_type_raises(tmp_path):

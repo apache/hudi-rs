@@ -1083,12 +1083,14 @@ impl From<AppendResult> for HudiWriteResult {
 }
 
 /// A Python argument that is either one string or a list of strings.
+#[cfg(not(tarpaulin_include))]
 #[derive(FromPyObject)]
 enum OneOrMany {
     One(String),
     Many(Vec<String>),
 }
 
+#[cfg(not(tarpaulin_include))]
 impl OneOrMany {
     fn into_vec(self) -> Vec<String> {
         match self {
@@ -1113,6 +1115,7 @@ fn last_path_segment(base_uri: &str) -> String {
 /// `__arrow_c_array__`) are imported zero-copy, which covers pyarrow, polars
 /// and pandas >= 2.2. The pyarrow class checks serve pyarrow releases that
 /// predate the PyCapsule interface.
+#[cfg(not(tarpaulin_include))]
 fn to_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     collect_batches(data)?
         .into_iter()
@@ -1242,6 +1245,7 @@ fn writable_type(dt: &DataType) -> Option<DataType> {
     }
 }
 
+#[cfg(not(tarpaulin_include))]
 fn collect_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     let py = data.py();
     if let Ok(list) = data.cast::<PyList>() {
@@ -1280,6 +1284,7 @@ fn collect_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     )))
 }
 
+#[cfg(not(tarpaulin_include))]
 fn collect_stream(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
     ArrowArrayStreamReader::from_pyarrow_bound(data)?
         .collect::<Result<Vec<_>, _>>()
@@ -1288,6 +1293,7 @@ fn collect_stream(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
 
 /// Build the one-row `SET` batch for `update`, typing each value by the
 /// table schema so that e.g. a Python int lands in a float64 column.
+#[cfg(not(tarpaulin_include))]
 fn one_row_batch_from_dict(
     py: Python,
     schema: &Schema,
@@ -1353,6 +1359,7 @@ fn one_row_batch_from_dict(
 
 /// `value` with every `pyarrow.Scalar`, at any depth of dicts, lists and
 /// tuples, replaced by its `as_py()`.
+#[cfg(not(tarpaulin_include))]
 fn unwrap_scalars<'py>(
     value: &Bound<'py, PyAny>,
     scalar: &Bound<'py, PyAny>,
@@ -1393,6 +1400,7 @@ fn unwrap_scalars<'py>(
 /// accepts exact conversions (3 == 3.0);
 /// timestamps are not compared whole because a naive input never equals its
 /// UTC-aware stored form.
+#[cfg(not(tarpaulin_include))]
 fn misfit(
     dt: &DataType,
     value: &Bound<'_, PyAny>,
@@ -1482,6 +1490,7 @@ fn misfit(
     }
 }
 
+#[cfg(not(tarpaulin_include))]
 fn is_bool(value: &Bound<'_, PyAny>) -> PyResult<bool> {
     if value.is_instance_of::<PyBool>() {
         return Ok(true);
@@ -1493,6 +1502,7 @@ fn is_bool(value: &Bound<'_, PyAny>) -> PyResult<bool> {
 }
 
 /// Accept record keys as `str` (empty partition path) or `(record_key, partition_path)`.
+#[cfg(not(tarpaulin_include))]
 fn to_hoodie_keys(keys: &Bound<'_, PyAny>) -> PyResult<Vec<HoodieKey>> {
     if keys.is_instance_of::<PyString>() {
         return Err(PyTypeError::new_err(
@@ -1705,8 +1715,19 @@ pub fn rt() -> &'static Runtime {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_unnamed_pandas_index, pascal_to_screaming_snake, writable_field};
-    use arrow::datatypes::{DataType, Field, Fields};
+    use super::{
+        HudiWriteResult, has_sub_microsecond, is_unnamed_pandas_index, last_path_segment,
+        normalize_batch, pascal_to_screaming_snake, writable_field, writable_type,
+    };
+    use arrow::array::{
+        Array, ArrayRef, DictionaryArray, Int8Array, Int64Array, LargeListArray, LargeStringArray,
+        ListArray, StringArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    };
+    use arrow::buffer::OffsetBuffer;
+    use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+    use arrow::record_batch::RecordBatch;
+    use hudi::WriteResult;
+    use hudi::table::AppendResult;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1766,6 +1787,223 @@ mod tests {
         assert!(!is_unnamed_pandas_index("__index_level___"));
         assert!(!is_unnamed_pandas_index("__index_level_x__"));
         assert!(!is_unnamed_pandas_index("id"));
+    }
+
+    #[test]
+    fn writable_type_maps_leaf_types() {
+        let utc: Option<Arc<str>> = Some("UTC".into());
+        for (from, to) in [
+            (DataType::LargeBinary, Some(DataType::Binary)),
+            (DataType::BinaryView, Some(DataType::Binary)),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, utc.clone()),
+                Some(DataType::Timestamp(TimeUnit::Microsecond, utc.clone())),
+            ),
+            (
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64)),
+                Some(DataType::Int64),
+            ),
+            (DataType::Timestamp(TimeUnit::Microsecond, utc), None),
+            (DataType::Binary, None),
+            (DataType::Int64, None),
+            (
+                DataType::Struct(Fields::from(vec![Field::new("n", DataType::Int64, true)])),
+                None,
+            ),
+        ] {
+            assert_eq!(writable_type(&from), to, "for {from}");
+        }
+
+        // A large list narrows to a list even when its item is already writable.
+        let item = Arc::new(Field::new("element", DataType::Int64, false));
+        assert_eq!(
+            writable_type(&DataType::LargeList(item.clone())),
+            Some(DataType::List(item))
+        );
+    }
+
+    fn nanos(values: Vec<Option<i64>>) -> TimestampNanosecondArray {
+        TimestampNanosecondArray::from(values)
+    }
+
+    fn list_of(values: TimestampNanosecondArray) -> ArrayRef {
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let offsets = OffsetBuffer::from_lengths([values.len()]);
+        Arc::new(ListArray::new(field, offsets, Arc::new(values), None))
+    }
+
+    fn large_list_of(values: TimestampNanosecondArray) -> ArrayRef {
+        let field = Arc::new(Field::new("item", values.data_type().clone(), true));
+        let offsets = OffsetBuffer::from_lengths([values.len()]);
+        Arc::new(LargeListArray::new(field, offsets, Arc::new(values), None))
+    }
+
+    fn struct_of(values: TimestampNanosecondArray) -> ArrayRef {
+        let field = Arc::new(Field::new("ts", values.data_type().clone(), true));
+        Arc::new(StructArray::from(vec![(
+            field,
+            Arc::new(values) as ArrayRef,
+        )]))
+    }
+
+    fn dictionary_of(values: TimestampNanosecondArray) -> ArrayRef {
+        let keys = Int8Array::from_iter_values(0..values.len() as i8);
+        Arc::new(DictionaryArray::new(keys, Arc::new(values)))
+    }
+
+    #[test]
+    fn has_sub_microsecond_checks_values_at_any_depth() {
+        let whole = || nanos(vec![Some(2_000), None]);
+        let partial = || nanos(vec![Some(2_000), Some(2_001)]);
+        assert!(!has_sub_microsecond(&whole()));
+        assert!(has_sub_microsecond(&partial()));
+        for wrap in [list_of, large_list_of, struct_of, dictionary_of] {
+            assert!(!has_sub_microsecond(wrap(whole()).as_ref()));
+            assert!(has_sub_microsecond(wrap(partial()).as_ref()));
+        }
+        // Only nanosecond timestamps can hold sub-microsecond digits.
+        assert!(!has_sub_microsecond(&TimestampMicrosecondArray::from(
+            vec![1]
+        )));
+        assert!(!has_sub_microsecond(&Int64Array::from(vec![1])));
+    }
+
+    fn batch(columns: Vec<(&str, ArrayRef)>, pandas: bool) -> RecordBatch {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, c)| Field::new(*name, c.data_type().clone(), true))
+            .collect();
+        let metadata = if pandas {
+            HashMap::from([("pandas".to_string(), "{}".to_string())])
+        } else {
+            HashMap::new()
+        };
+        let schema = Arc::new(Schema::new_with_metadata(fields, metadata));
+        RecordBatch::try_new(schema, columns.into_iter().map(|(_, c)| c).collect()).unwrap()
+    }
+
+    #[test]
+    fn normalize_batch_returns_a_writable_batch_unchanged() {
+        let input = batch(
+            vec![
+                ("id", Arc::new(StringArray::from(vec!["a"]))),
+                ("__index_level_0__", Arc::new(Int64Array::from(vec![0]))),
+            ],
+            false,
+        );
+        let output = normalize_batch(input.clone()).unwrap();
+        assert!(Arc::ptr_eq(&input.schema(), &output.schema()));
+    }
+
+    #[test]
+    fn normalize_batch_drops_pandas_index_and_casts_columns() {
+        let input = batch(
+            vec![
+                ("__index_level_0__", Arc::new(Int64Array::from(vec![5]))),
+                ("id", Arc::new(LargeStringArray::from(vec!["a"]))),
+                ("ts", list_of(nanos(vec![Some(3_000), None]))),
+            ],
+            true,
+        );
+        let output = normalize_batch(input.clone()).unwrap();
+        assert_eq!(output.schema().metadata(), input.schema().metadata());
+        let names: Vec<_> = output
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, ["id", "ts"]);
+        assert_eq!(output.column(0).data_type(), &DataType::Utf8);
+        let DataType::List(item) = output.column(1).data_type() else {
+            panic!("expected list, got {}", output.column(1).data_type());
+        };
+        assert_eq!(
+            item.data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+        let values = output
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let values = values
+            .values()
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), [Some(3), None]);
+    }
+
+    #[test]
+    fn normalize_batch_keeps_row_count_when_only_the_index_was_present() {
+        let input = batch(
+            vec![(
+                "__index_level_0__",
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+            )],
+            true,
+        );
+        let output = normalize_batch(input).unwrap();
+        assert_eq!((output.num_columns(), output.num_rows()), (0, 3));
+    }
+
+    #[test]
+    fn normalize_batch_rejects_sub_microsecond_timestamps() {
+        for column in [
+            Arc::new(nanos(vec![Some(1)])) as ArrayRef,
+            struct_of(nanos(vec![Some(1_000_001)])),
+        ] {
+            assert!(normalize_batch(batch(vec![("ts", column)], false)).is_err());
+        }
+    }
+
+    #[test]
+    fn write_results_convert_to_python_counts() {
+        let rewrite = HudiWriteResult::from(WriteResult {
+            instant: "20240101000000000".to_string(),
+            completion_time: None,
+            num_writes: 4,
+            num_updates: 1,
+            num_inserts: 2,
+            num_deletes: 3,
+        });
+        assert_eq!(rewrite.instant, "20240101000000000");
+        assert_eq!(
+            (
+                rewrite.num_writes,
+                rewrite.num_updates,
+                rewrite.num_inserts,
+                rewrite.num_deletes
+            ),
+            (4, 1, 2, 3)
+        );
+
+        let append = HudiWriteResult::from(AppendResult {
+            instant: "20240101000000001".to_string(),
+            completion_time: None,
+            commit_relative_path: String::new(),
+            base_file_path: String::new(),
+            num_rows: 5,
+        });
+        assert_eq!(append.instant, "20240101000000001");
+        assert_eq!(
+            (
+                append.num_writes,
+                append.num_updates,
+                append.num_inserts,
+                append.num_deletes
+            ),
+            (5, 0, 5, 0)
+        );
+    }
+
+    #[test]
+    fn last_path_segment_names_the_table_directory() {
+        assert_eq!(last_path_segment("/data/trips"), "trips");
+        assert_eq!(last_path_segment("file:///data/trips//"), "trips");
+        assert_eq!(last_path_segment("s3://bucket/warehouse/trips"), "trips");
+        assert_eq!(last_path_segment("trips"), "trips");
     }
 
     #[test]
