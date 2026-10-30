@@ -682,7 +682,10 @@ pub(crate) async fn complete_write(
     storage
         .put_file_if_absent(&commit_relative_path, commit_bytes)
         .await?;
-    let _ = post_complete_bookkeeping(table, storage.as_ref(), instant).await;
+    // The commit is durable; bookkeeping retries on the next write.
+    if let Err(error) = post_complete_bookkeeping(table, storage.as_ref(), instant).await {
+        log::warn!("post-commit bookkeeping for {instant} failed: {error}");
+    }
     drop(critical_section);
 
     let _ = table.timeline.reload_completed_commits().await;
