@@ -69,6 +69,8 @@ fails instead.
 Create a table, upsert and delete rows, then read back the records written after the first commit.
 
 ```python
+import tempfile
+
 import pyarrow as pa
 from hudi import HudiQueryType, HudiReadOptions, HudiTable
 
@@ -79,7 +81,7 @@ def docs(ids, version):
         "version": pa.array([version] * len(ids), pa.int64()),
     })
 
-table = HudiTable.create("/tmp/docs_table", record_key="doc_id", ordering_field="version")
+table = HudiTable.create(f"{tempfile.mkdtemp()}/docs", record_key="doc_id", ordering_fields="version")
 first = table.append(docs(["doc1", "doc2", "doc3"], version=1))
 
 result = table.upsert(docs(["doc2", "doc4"], version=2))
