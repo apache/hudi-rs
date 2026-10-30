@@ -102,6 +102,7 @@ pub use crate::write::append::AppendResult;
 pub use crate::write::{UpsertOptions, WriteResult};
 
 use crate::Result;
+use crate::config::ConfigParser;
 use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
@@ -1001,8 +1002,11 @@ impl Table {
     /// carries its own merge map and, on spill, its own RocksDB instance.
     ///
     /// The same budget derivation the DataFusion plan uses, so the two paths
-    /// cannot budget a scan differently; only the default ceiling differs (see
-    /// [`Self::file_slice_read_ceiling`]). This is the **only** way to obtain a
+    /// cannot budget a scan differently. Only the default ceiling differs: a
+    /// `Table` read is the whole scan, with no caller dividing it into
+    /// partitions, so it defaults to the available cores, while the DataFusion
+    /// plan applies the config's own default per partition, where the partitions
+    /// already spread the scan across cores. This is the **only** way to obtain a
     /// concurrency for a read: the raw `hoodie.read.file.slice.read.concurrency`
     /// lookup lives inside it rather than in a method of its own, so a read
     /// cannot reach the ceiling while bypassing the budget. A test can miss that
@@ -1015,29 +1019,11 @@ impl Table {
     /// tested elsewhere in isolation, which says nothing about whether anything
     /// calls it.
     fn bounded_read_concurrency(&self, file_slices: &[FileSlice]) -> usize {
+        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
         self.bounded_read_concurrency_from_log_bytes(
-            self.file_slice_read_ceiling(),
+            cores,
             file_slices.iter().map(FileSlice::log_size_bytes),
         )
-    }
-
-    /// `hoodie.read.file.slice.read.concurrency` when set, otherwise the
-    /// available cores.
-    ///
-    /// A `Table` read is the whole scan, with no caller dividing it into
-    /// partitions, so its default is the machine. The DataFusion plan applies the
-    /// config's own default per partition instead, where the partitions already
-    /// spread the scan across cores.
-    fn file_slice_read_ceiling(&self) -> usize {
-        self.hudi_configs
-            .as_options()
-            .get(HudiReadConfig::FileSliceReadConcurrency.as_ref())
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(std::num::NonZeroUsize::get)
-                    .unwrap_or(4)
-            })
     }
 
     /// [`Self::bounded_read_concurrency`] over a borrowed selection.
@@ -1051,12 +1037,11 @@ impl Table {
     /// caller's task, so a wider fan-out would open more readers without
     /// adding cores.
     pub(crate) fn bounded_read_concurrency_for(&self, file_slices: &[&FileSlice]) -> usize {
-        let ceiling: usize = self
-            .hudi_configs
-            .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
-            .into();
+        let config_default = HudiReadConfig::FileSliceReadConcurrency
+            .default_value()
+            .map_or(1, usize::from);
         self.bounded_read_concurrency_from_log_bytes(
-            ceiling,
+            config_default,
             file_slices.iter().map(|s| s.log_size_bytes()),
         )
     }
@@ -1068,9 +1053,13 @@ impl Table {
     /// to own or copy one.
     fn bounded_read_concurrency_from_log_bytes(
         &self,
-        ceiling: usize,
+        default_ceiling: usize,
         slice_log_bytes: impl Iterator<Item = Option<u64>>,
     ) -> usize {
+        let ceiling = self
+            .hudi_configs
+            .get(HudiReadConfig::FileSliceReadConcurrency)
+            .map_or(default_ceiling, usize::from);
         let slice_log_bytes: Vec<Option<u64>> = slice_log_bytes.collect();
         crate::file_group::admission::slices_in_flight(
             self.scan_max_memory_size(),
@@ -1728,6 +1717,12 @@ mod tests {
             cores,
             "with no budget and no configured ceiling, the core count stands"
         );
+        let slice_refs: Vec<&FileSlice> = slices.iter().collect();
+        assert_eq!(
+            unbounded.bounded_read_concurrency_for(&slice_refs),
+            4,
+            "the metadata read keeps the config's own default"
+        );
         let configured = Table::new_with_options(
             base_url.path(),
             [(HudiReadConfig::FileSliceReadConcurrency.as_ref(), "3")],
@@ -1738,6 +1733,11 @@ mod tests {
             configured.bounded_read_concurrency(&slices),
             3,
             "with no budget the configured ceiling stands"
+        );
+        assert_eq!(
+            configured.bounded_read_concurrency_for(&slice_refs),
+            3,
+            "a configured ceiling applies to the metadata read too"
         );
 
         // Each slice estimates at 33 MiB + 4 x 8 MiB = 65 MiB, so 128 MiB admits one.
