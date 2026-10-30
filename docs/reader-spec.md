@@ -38,7 +38,7 @@ For tutorials and end-to-end examples, see the [README](../README.md). Covers Ru
 The two `QueryType` variants on `ReadOptions`:
 
 - **Snapshot** — latest table state at one commit (the latest by default; an explicit `as_of_timestamp` for time-travel).
-- **Incremental** — records changed in the half-open range (`start_timestamp`, `end_timestamp`].
+- **Incremental** — records changed in the half-open range (`start_timestamp`, `end_timestamp`]. On timeline layout v2 (table version 8 and later) the bounds are commit completion times, so pass a write result's `completion_time` as the start; on layout v1 they are requested times.
 
 Snapshot reads have an **eager** form returning all batches and a **streaming** form yielding batches as they're read. Incremental reads currently expose only the eager form.
 
@@ -59,7 +59,7 @@ Per-slice reads — reading a single `FileSlice` the caller already selected (ty
 | `with_query_type(QueryType)` | `hoodie.read.query.type`                     | `snapshot`                                |
 | `with_as_of_timestamp(ts)`   | `hoodie.read.as.of.timestamp`                | latest commit (Snapshot only)             |
 | `with_start_timestamp(ts)`   | `hoodie.read.start.timestamp`                | `19700101000000000` (Incremental only)    |
-| `with_end_timestamp(ts)`     | `hoodie.read.end.timestamp`                  | latest commit (Incremental only)          |
+| `with_end_timestamp(ts)`     | `hoodie.read.end.timestamp`                  | everything committed so far (Incremental only) |
 | `with_batch_size(n)`         | `hoodie.read.stream.batch_size`              | `1024` (streaming, base-file-only slices) |
 
 `with_batch_size` scope: it sizes the batches of a slice that has **no log files**, which is read straight from the base file. A slice **with** log files is merged, and the merge sizes its own chunks (`MERGE_CHUNK_ROWS`) so that one chunk of merging is a bounded amount of synchronous work; `hoodie.read.stream.batch_size` has no effect there. The two happen to agree at 1024 today.
@@ -98,11 +98,12 @@ For `IN` / `NOT IN`, the value string is split on unescaped commas and trimmed: 
 
 `with_filters` parses and cardinality-validates upfront; an unrecognized operator or empty `IN` / `NOT IN` value list errors at the builder rather than at read time.
 
-The `field` may be any column. Filters drive three things:
+The `field` may be any column. Filters drive these:
 
 - **Partition pruning** when the field is a partition column. Always applied.
-- **File-level stats pruning** when the field is a data column with min/max stats in the metadata table. Snapshot/time-travel only — incremental file planning does not stats-prune.
-- **Row-group pruning** inside a base file, from the parquet footer's own statistics. Conservative: a row group that cannot match is never fetched, and one that might match is kept.
+- **File-level stats pruning** when the field is a data column with min/max stats, from the metadata table's column stats, falling back to the parquet footer for a file without a stats record. Copy-on-write tables and read-optimized reads only, since a merged slice's rows are not described by its base file's stats. Snapshot/time-travel only — incremental file planning does not stats-prune.
+- **Record-index file-group selection** when the record-level index is enabled and an `=` / `IN` filter names the record key: a latest-snapshot read (not time travel, not read-optimized) keeps only the file groups the index names.
+- **Parquet pushdown** inside a base file: row groups that cannot match are skipped using the footer's statistics, and a row filter decodes the filter columns first and the rest only for rows that pass. A slice without log files pushes every filter; one that merges log files pushes only the record-key filters. Conservative: a row group or row that might match is kept.
 - **Row-level mask** applied to every returned batch. This is the authoritative filter; pruning is best-effort.
 
 Values are strings; they are cast to the target column's Arrow type at filter time. Unparseable values (e.g. `"abc"` against `Int64`) error.
@@ -297,7 +298,7 @@ A single-use iterator returned by streaming APIs. `for batch in stream:` or `nex
 
 ### Snapshot atomicity
 
-A snapshot read is pinned to one completed commit timestamp; mid-read writes are not visible. The timeline is loaded once when `Table` / `HudiTable` is constructed and reused for every subsequent read on that instance — commits that land *after* construction require building a new instance to observe. When `as_of_timestamp` is unset, "latest commit" means the latest commit in the cached timeline, not in storage at call time.
+A snapshot read is pinned to one completed commit timestamp; mid-read writes are not visible. The timeline is loaded once when `Table` / `HudiTable` is constructed and reused for every subsequent read on that instance. Writes, `compact`, and `await_compaction` through that instance refresh it; commits made by other writers or other instances after construction require building a new instance to observe. When `as_of_timestamp` is unset, "latest commit" means the latest commit in the cached timeline, not in storage at call time.
 
 ### Incremental semantics
 

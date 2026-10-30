@@ -37,7 +37,7 @@ design as implemented in `crates/core/src/write/`.
 - Table versions 8 (Hudi 1.0.x) and 9 (Hudi 1.1.x, the default), timeline
   layout v2 with completion-time instants. The one exception is
   `append` on a table below version 8 (timeline layout v1), which takes
-  a narrow path in `table/writer.rs`: unpartitioned append-only tables with
+  a narrow path in `write/append.rs`: unpartitioned append-only tables with
   `hoodie.populate.meta.fields=false` and no metadata table, one base file
   per call.
 - Metadata table (MDT) with `files`, `column_stats`, `partition_stats`, and
@@ -49,7 +49,8 @@ design as implemented in `crates/core/src/write/`.
 
 **Not yet implemented**
 
-- Write bindings for Python / C++ / DataFusion (the read path covers those).
+- Write bindings for C++ / DataFusion (the read path covers those; Python has the
+  full write API).
 - Clustering and cleaning as *drivers* (hudi-rs interoperates with Spark-run
   clustering and cleaning, but does not schedule or execute them natively);
   log compaction; compaction strategies other than "every file slice with log
@@ -176,7 +177,7 @@ deltacommit (§3.3).
 | Verb | Semantics |
 |------|-----------|
 | `append` | Bulk-insert-like: new file groups per call, no index lookup, size-split into `hoodie.parquet.max.file.size` buckets. Below version 8, one base file per call on unpartitioned append-only tables (see §1). |
-| `upsert` / `upsert_with` | Index-tagged updates + inserts. Updates rewrite their file group (COW) or append log blocks to their file slice (MOR). Inserts pack into existing small files first. |
+| `upsert` / `upsert_with` | Index-tagged updates + inserts. Updates rewrite their file group (COW) or append log blocks to their file slice (MOR). Inserts pack into existing small files first on COW; on MOR they always form new file groups (§4.3). |
 | `update` | SQL-style column update on rows matching a filter. |
 | `delete` / `delete_keys` | Filter- or key-based deletes. A file group left empty still receives an empty base file version so the deletion is durable for all readers. |
 | `overwrite` | `INSERT_OVERWRITE_TABLE`: replaces all file groups via a replacecommit. |
@@ -218,7 +219,18 @@ and assembled in plan order, so results are deterministic.
 - Commit metadata records the **data schema** (no `_hoodie_*` meta fields).
 - Incoming batches may differ from the table schema in nullability only
   (Spark evolves table schemas to all-nullable); such batches are aligned
-  rather than rejected. Name/type/order changes still error.
+  rather than rejected. Fixed-size lists are written as lists and list item
+  fields are named `element`, as Java's Avro conversion reads them back.
+  Name/type/order changes still error.
+- Record keys: one or more key fields of string, boolean, or integer type.
+  Several fields form a composite key encoded as Java's complex key
+  generator does (`field:value` pairs joined by commas). Date, decimal,
+  timestamp, and floating-point key fields are rejected, since Java writers
+  store them in more than one form (`keygen/record_key.rs`).
+- Base file footers carry the record-key bloom filter only when
+  `hoodie.parquet.bloom.filter.enabled=true` or `hoodie.index.type` names a
+  bloom index: the record index locates keys without it. A Java writer that
+  tags with a BLOOM or SIMPLE index needs it set on tables hudi-rs writes.
 
 ### 4.6 Compaction
 
@@ -328,7 +340,8 @@ the next one runs.
 - **Incremental** reads follow Hudi 1.x completion-time semantics: instants
   are selected by *completion* time in `(start, end]`; rows and MOR log blocks
   are then filtered by membership in the exact selected instant set. The
-  default `end` is the latest completion time. This matches the Spark reader,
+  default `end` is the greatest completion time, so it covers everything
+  committed so far. This matches the Spark reader,
   including the boundary case where an instant's request time equals `start`
   but its completion is later.
 
@@ -378,6 +391,13 @@ The acceptance gate for interop lives in
   Spark-created and to an rs-created partitioned table; filtered Spark reads
   with data skipping (column_stats + partition_stats pruning) must match the
   same reads without it.
+- **I — Spark indexes on rs tables**: Spark upserts with SIMPLE, BLOOM, and
+  GLOBAL_BLOOM indexes on rs-written COW/MOR tables find every key rs wrote
+  and re-insert a key rs deleted without duplicates. These tables set
+  `hoodie.parquet.bloom.filter.enabled=true`, since rs leaves the footer
+  bloom filter out by default.
+- **J — Spark SQL DML on rs tables**: Spark SQL UPDATE/DELETE/INSERT on
+  rs-written COW/MOR tables in a non-default database, then rs writes on top.
 - **K — rs compaction**: rs compacts an rs-written MOR table, and its handles
   compact the metadata table inline every two delta commits; Spark reads the
   result (snapshot and time travel, with and without the metadata table),
@@ -393,8 +413,10 @@ crates/core/src/write/
                 schema alignment, log/parquet file tasks
   create.rs     Table::create builder, hoodie.properties, MDT bootstrap
   append.rs     append verb, instant time generation, parquet writer props
-  rewrite.rs    upsert/update/delete/overwrite engines (COW rewrite groups,
-                MOR delta logs), instant request/complete helpers
+  rewrite/      upsert/update/delete/overwrite engines: mod.rs (instant
+                request/complete helpers), cow.rs (COW rewrite groups),
+                mor.rs (MOR delta logs), rows.rs (row selection and merging),
+                validate.rs (write preconditions)
   sizing.rs     small-file packing: SizingConfig, insert bucket assignment
   metadata.rs   MDT updates: files, record_index, column/partition stats
   metadata_compaction.rs
@@ -405,7 +427,8 @@ crates/core/src/write/
   rollback.rs   eager rollback of failed writes
   archival.rs   LSM timeline archival
   lock.rs       LockProvider + InProcessLockProvider
-  keygen.rs     record key generation
+  keygen.rs     record keys and partition paths for write batches
+                (key encoding shared with readers: crates/core/src/keygen/)
 
 crates/core/src/metadata/
   payload_merger.rs   HoodieMetadataPayload-equivalent record merger

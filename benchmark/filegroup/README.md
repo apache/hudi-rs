@@ -40,7 +40,7 @@ cargo build -p fg-bench --release
     --columns id,ts,value --iterations 5 --output-json run.json
 
 # Override the streaming chunk size (hoodie.read.stream.batch_size). Omit to use
-# the reader default (4096 rows).
+# the reader default (1024 rows).
 ./target/release/fg-bench --table /abs/path/to/table --batch-size 1024
 ```
 
