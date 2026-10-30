@@ -519,18 +519,25 @@ pub(super) fn merge_file_group_task(
                 } else {
                     concat_batches(&old.schema(), [&old, &incoming])?
                 };
-                let merges = ctx.event_time && !matched_old.is_empty();
-                // A touched key's stored duplicates resolve to their winner,
-                // which is also the baseline of a partial update.
-                let old_winners = if merges {
-                    merge_with_event_time(ctx.hudi_configs.clone(), &combined, matched_old.clone())?
-                } else {
-                    matched_old.clone()
-                };
-                let old_by_key: HashMap<String, u32> = old_winners
+                let mut old_by_key: HashMap<String, u32> = matched_old
+                    .iter()
+                    .map(|&index| (old_keys[index as usize].clone(), index))
+                    .collect();
+                // A partial update takes unselected columns from the touched
+                // key's stored row, which for a repeated key is its winner.
+                if ctx.event_time
+                    && partial_columns.is_some()
+                    && old_by_key.len() < matched_old.len()
+                {
+                    old_by_key = merge_with_event_time(
+                        ctx.hudi_configs.clone(),
+                        &combined,
+                        matched_old.clone(),
+                    )?
                     .into_iter()
                     .map(|index| (old_keys[index as usize].clone(), index))
                     .collect();
+                }
                 let matched = incoming_keys
                     .iter()
                     .filter(|key| old_by_key.contains_key(*key))
