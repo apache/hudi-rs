@@ -56,16 +56,26 @@ bindings. It creates, writes, and reads Hudi tables from Rust and Python in a si
 [crates]: https://crates.io/crates/hudi
 [crates-badge]: https://img.shields.io/crates/d/hudi?style=flat-square&color=163669
 
-The `hudi` crate carries two features: `datafusion` (off by default, see
-[Apache DataFusion](#apache-datafusion)) and `spill-rocksdb` (on by default), the merge map's
-on-disk tier, which a merge-on-read merge spills to when a file group's log records exceed
-`hoodie.memory.merge.max.size`. RocksDB is built from source with `bindgen`, so it needs `libclang`
-and a C++ toolchain; `default-features = false` drops it, and a merge that would have spilled then
-fails instead.
+## Features
+
+| Area              | Supported                                                                                                       |
+|-------------------|-----------------------------------------------------------------------------------------------------------------|
+| Table types       | Copy-on-Write (COW), Merge-on-Read (MOR)                                                                        |
+| Table versions    | Read: 6, 8, 9 (Hudi 0.14 and later). Write: 8, 9 (Hudi 1.0 and later), plus a narrow append path on 6           |
+| Queries           | Snapshot, time travel, incremental, read-optimized (MOR), streaming snapshot reads, column filters with pruning |
+| Writes            | Create, append, upsert, update, delete (by predicate or key), overwrite, dynamic partition overwrite            |
+| Table services    | Merge-on-read compaction (experimental: on demand, inline, or in the background), rollback of failed writes, timeline archival |
+| Metadata table    | File listings, column and partition stats, record-level index, kept up to date on every write and compacted as it grows (on by default) |
+| Base file formats | Parquet (read and write), Lance (read), HFile (metadata table)                                                  |
+| Storage           | Local file system, Amazon S3, Azure Blob Storage, Google Cloud Storage                                          |
+| APIs              | Rust and Python (read and write); C++ and a C ABI (`hudi-ffi`) for file-slice reads                              |
+| Query engines     | [Apache DataFusion](#apache-datafusion) (`datafusion` feature in Rust, included in Python); see [Other Integrations](#other-integrations) |
 
 ## Quick start
 
 Create a table, upsert and delete rows, then read what changed after the first commit.
+
+### Python
 
 ```python
 import tempfile
@@ -100,8 +110,102 @@ snapshot = pa.Table.from_batches(table.read())
 print(sorted(snapshot.column("doc_id").to_pylist()))  # ['doc1', 'doc2', 'doc4']
 ```
 
+### Rust
+
+```shell
+cargo add hudi
+cargo add arrow@59
+cargo add tokio@1 --features macros,rt-multi-thread
+```
+
+```rust
+use std::sync::Arc;
+
+use arrow::array::{Int64Array, RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use hudi::error::Result;
+use hudi::table::{QueryType, ReadOptions, Table};
+
+fn docs(ids: &[&str], version: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc_id", DataType::Utf8, false),
+        Field::new("title", DataType::Utf8, false),
+        Field::new("version", DataType::Int64, false),
+    ]));
+    let titles: Vec<String> = ids.iter().map(|d| format!("{d} v{version}")).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(ids.to_vec())),
+            Arc::new(StringArray::from(titles)),
+            Arc::new(Int64Array::from(vec![version; ids.len()])),
+        ],
+    )
+    .unwrap()
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let base_uri = std::env::temp_dir().join(format!("docs_{}", std::process::id()));
+    let mut table = Table::create(base_uri.to_str().unwrap())
+        .with_table_name("docs")
+        .with_record_key_fields(["doc_id"])
+        .with_ordering_fields(["version"])
+        .create()
+        .await?;
+    let first = table.append([docs(&["doc1", "doc2", "doc3"], 1)]).await?;
+
+    let result = table.upsert([docs(&["doc2", "doc4"], 2)]).await?;
+    println!("{} {}", result.num_updates, result.num_inserts); // 1 1
+
+    table.delete("doc_id = 'doc3'").await?;
+
+    // Commits that completed after the first one.
+    let options = ReadOptions::new()
+        .with_query_type(QueryType::Incremental)
+        .with_start_timestamp(first.completion_time.unwrap());
+    let changed = table.read(&options).await?;
+    let snapshot = table.read(&ReadOptions::new()).await?;
+    let num_rows = |batches: &[RecordBatch]| batches.iter().map(|b| b.num_rows()).sum::<usize>();
+    println!("{} {}", num_rows(&changed), num_rows(&snapshot)); // 2 3
+    Ok(())
+}
+```
+
 See [Writing Tables](#writing-tables) for the full write API, and
-[`table_writes.rs`](crates/core/examples/table_writes.rs) for a Rust example.
+[`crates/core/examples/table_writes.rs`](crates/core/examples/table_writes.rs)
+(`cargo run -p hudi-core --example table_writes`) for a runnable Rust tour of it. The
+[Python/Rust quick start guide](https://hudi.apache.org/docs/python-rust-quick-start-guide) on the
+Hudi website goes further, with DuckDB, Polars, and DataFusion queries. API references are listed
+under [Documentation](#documentation).
+
+## Requirements
+
+- Python 3.10 or later. Wheels are published to PyPI.
+- Rust 1.94.1 or later.
+- The `hudi` crate carries two features: `datafusion` (off by default, see
+  [Apache DataFusion](#apache-datafusion)) and `spill-rocksdb` (on by default), the merge map's
+  on-disk tier, which a merge-on-read merge spills to when a file group's log records exceed
+  `hoodie.memory.merge.max.size`. RocksDB is built from source with `bindgen`, so it needs
+  `libclang` and a C++ toolchain; `default-features = false` drops it, and a merge that would have
+  spilled then fails instead.
+
+## Documentation
+
+- Quick start: the [Python and Rust quick start guide](https://hudi.apache.org/docs/python-rust-quick-start-guide)
+  on the Hudi website, and the shorter [quick start above](https://github.com/apache/hudi-rs#quick-start).
+- Rust API reference: [docs.rs/hudi](https://docs.rs/hudi) (the `hudi` crate re-exports
+  [`hudi-core`](https://docs.rs/hudi-core) and, with the `datafusion` feature,
+  [`hudi-datafusion`](https://docs.rs/hudi-datafusion)).
+- Python API reference: the package ships type stubs with docstrings
+  ([`python/hudi/_internal.pyi`](https://github.com/apache/hudi-rs/blob/main/python/hudi/_internal.pyi)), which IDEs and
+  type checkers read.
+- Runnable Rust example: [`crates/core/examples/table_writes.rs`](https://github.com/apache/hudi-rs/blob/main/crates/core/examples/table_writes.rs).
+- Reader semantics (read options, filters, guarantees): [`docs/reader-spec.md`](https://github.com/apache/hudi-rs/blob/main/docs/reader-spec.md).
+- Writer design: [`docs/writer-design.md`](https://github.com/apache/hudi-rs/blob/main/docs/writer-design.md).
+- Packages: [PyPI](https://pypi.org/project/hudi/) and [crates.io](https://crates.io/crates/hudi).
+  Source: [github.com/apache/hudi-rs](https://github.com/apache/hudi-rs). Contributing: [`CONTRIBUTING.md`](https://github.com/apache/hudi-rs/blob/main/CONTRIBUTING.md).
+- Hudi concepts (timeline, table types, query types): [hudi.apache.org/docs/overview](https://hudi.apache.org/docs/overview).
 
 ## Reading Tables
 
@@ -214,7 +318,10 @@ Timestamp strings without a timezone offset (for example `yyyy-MM-dd'T'HH:mm:ss`
 
 ### Incremental Query
 
-Incremental query reads the changed data from the table for a given time range.
+Incremental query reads the changed data from the table for a given time range, half-open
+`(start, end]`. On table version 8 and later (timeline layout v2) the bounds are commit
+completion times, so start from a write result's `completion_time`; on older tables they are
+requested times. The end defaults to everything committed so far.
 
 #### Python
 
@@ -229,7 +336,7 @@ batches = hudi_table.read(
     .with_end_timestamp(t2)
 )
 
-# read the records after t1 (end defaults to the latest commit)
+# read the records after t1 (end defaults to everything committed so far)
 batches = hudi_table.read(
     HudiReadOptions()
     .with_query_type(HudiQueryType.Incremental)
@@ -257,7 +364,7 @@ let options = ReadOptions::new()
     .with_end_timestamp(t2);
 let batches = hudi_table.read(&options).await?;
 
-// read the records after t1 (end defaults to the latest commit)
+// read the records after t1 (end defaults to everything committed so far)
 let options = ReadOptions::new()
     .with_query_type(QueryType::Incremental)
     .with_start_timestamp(t1);
@@ -365,8 +472,9 @@ ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path
 ## Writing Tables
 
 hudi-rs includes a native, single-node write path that is storage-compatible
-with the Apache Hudi Spark writer: tables written here are readable — and
-serviceable (compaction, clustering, cleaning) — by Spark, and vice versa.
+with the Apache Hudi Spark writer: Spark reads tables written here and runs
+its table services on them (compaction, clustering, cleaning), and hudi-rs reads
+and writes tables Spark wrote.
 Writes target COPY_ON_WRITE and MERGE_ON_READ tables at table version 9
 (Hudi 1.1.x; version 8 via `with_table_version(8)`), and maintain the
 metadata table (file listings, column/partition stats, record-level index) on
@@ -434,19 +542,19 @@ table.append(batch)
 #### Rust
 
 ```rust
-use arrow_array::RecordBatch;
+use arrow::array::RecordBatch;
 
-let batch: RecordBatch = /* columns: uuid, city, ts, fare, ... */
-# unimplemented!();
+let batch: RecordBatch = todo!("columns: uuid, city, ts, fare, ...");
 table.append([batch]).await?;
 ```
 
 ### Upsert
 
-`upsert` tags incoming records against the record-level index: existing keys
+`upsert` tags incoming records against the table's index (the record-level
+index when enabled, otherwise a scan of the base files' keys): existing keys
 update their file group in place (a rewritten base file on COW, a log file on
-MOR); new keys pack into existing small files first and then form new file
-groups.
+MOR). On COW, new keys fill existing small files first and then form new file
+groups; on MOR, they always form new file groups.
 
 #### Python
 
@@ -529,6 +637,55 @@ table.overwrite([batch]).await?;
 table.dynamic_partition_overwrite([batch]).await?;
 ```
 
+### Compaction (Experimental)
+
+On a merge-on-read table, upserts, updates, and deletes land in log files. `compact` folds
+them into new base files: every file group whose latest file slice has log files gets a new
+base file of its merged rows, under one compaction commit. Rows keep their commit time, so
+incremental reads see no new rows from a compaction. When no file group has log files,
+nothing is written. A copy-on-write table has nothing to compact and returns an error.
+
+Compaction can also run after delta commits once the number since the latest compaction
+reaches `hoodie.compact.inline.max.delta.commits` (default 5): in the write call with
+`hoodie.compact.inline=true`, or on a background task with
+`hoodie.datasource.compaction.async.enable=true`, which `await_compaction` waits for. Both
+are off by default. The metadata table compacts itself as commits accumulate.
+
+#### Python
+
+```python
+mor = HudiTable.create(
+    "/tmp/trips_mor",
+    record_key="uuid",
+    table_type="mor",
+    # Optional: also compact in the write call every 5 delta commits.
+    hudi_options={"hoodie.compact.inline": "true"},
+)
+mor.append(batch)
+mor.upsert(batch)  # updates go to log files
+
+result = mor.compact()
+print(result.num_file_groups, result.num_log_files, result.num_writes)
+```
+
+#### Rust
+
+```rust
+let mut mor = Table::create("/tmp/trips_mor")
+    .with_table_name("trips")
+    .with_table_type(TableTypeValue::MergeOnRead)
+    .with_record_key_fields(["uuid"])
+    // Optional: also compact in the write call every 5 delta commits.
+    .with_option("hoodie.compact.inline", "true")
+    .create()
+    .await?;
+mor.append([batch.clone()]).await?;
+mor.upsert([batch]).await?; // updates go to log files
+
+let result = mor.compact().await?;
+println!("{} {} {}", result.num_file_groups, result.num_log_files, result.num_writes);
+```
+
 ### Behavior Notes
 
 - Every write runs as a full Hudi transaction: instants are requested and
@@ -552,11 +709,11 @@ Create a Hudi table instance using its constructor or the `TableBuilder` API.
 All read APIs accept a `ReadOptions` (Rust) / `HudiReadOptions` (Python) value. It stores three fields — `filters`, `projection`, and `hudi_options` — and exposes chainable `with_*` builders for the rest. The available knobs:
 
 - `query_type` (`with_query_type`) — `Snapshot` (default) or `Incremental`. Drives dispatch in `read`, `read_stream`, and `get_file_slices`.
-- `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning (snapshot only), and row-level filtering.
+- `filters` — column filters as `(field, op, value)` tuples. The field can be any column (partition or data). Used for partition pruning, file-level stats pruning (copy-on-write and read-optimized reads), file-group selection through the record-level index for `=`/`IN` filters on the record key (latest snapshot, not read-optimized), predicate pushdown into the parquet reader, and row-level filtering.
 - `projection` — columns to return. Streaming pushes the projection down to the parquet reader; eager reads project after merging.
 - `batch_size` (`with_batch_size`) — rows per batch (streaming only; eager reads return one batch per file slice).
 - `as_of_timestamp` (`with_as_of_timestamp`) — snapshot/time-travel timestamp (defaults to latest commit).
-- `start_timestamp` / `end_timestamp` (`with_start_timestamp` / `with_end_timestamp`) — incremental range (defaults to earliest…latest).
+- `start_timestamp` / `end_timestamp` (`with_start_timestamp` / `with_end_timestamp`) — incremental range, bounding completion times on table version 8 and later (defaults to the beginning of the timeline…everything committed so far).
 - `hudi_options` — Hudi configs for this read (e.g. `hoodie.read.use.read_optimized.mode`). A config that selects *which* read to perform — `hoodie.read.query.type` and the as-of/start/end timestamps — is per-read only and is dropped when set on the table. The rest describe *how* to read: set them on the table and override them here. See [Read configs](#read-configs).
 
 | Stage           | API                                                              | Description                                                                                              |
@@ -577,7 +734,7 @@ silently redirect every later read.
 |-----------------------------------------------------------------|---------------|---------------|--------------------------------------------------------------------------------------------------------------------------|
 | `hoodie.read.query.type`                                        | `snapshot`    | per read      | `snapshot` or `incremental`.                                                                                             |
 | `hoodie.read.as.of.timestamp`                                   | latest commit | per read      | Snapshot time-travel point.                                                                                              |
-| `hoodie.read.start.timestamp` / `hoodie.read.end.timestamp`     | earliest / latest | per read  | Incremental window, half-open `(start, end]`.                                                                            |
+| `hoodie.read.start.timestamp` / `hoodie.read.end.timestamp`     | earliest / latest | per read  | Incremental window, half-open `(start, end]`; completion times on table version 8 and later, requested times before. |
 | `hoodie.read.file.group.reader.version`                         | `2`           | table or read | Which file group reader merges a slice. Version 2 is the default; a read it cannot serve falls back to version 1.        |
 | `hoodie.read.use.read_optimized.mode`                           | `false`       | table or read | Read base files only, skipping the log files, on MOR tables.                                                             |
 | `hoodie.read.stream.batch_size`                                 | `1024`        | table or read | Rows per batch for streaming reads.                                                                                      |
@@ -619,7 +776,7 @@ bindings) are not tied to these versions. The `hudi[datafusion]` extra first shi
 
 | hudi-rs | DataFusion | arrow | Python `datafusion` package |
 |---------|------------|-------|-----------------------------|
-| 0.6 (unreleased) | 55 | 59 | `>=55.0.0,<56` |
+| 0.6 | 55 | 59 | `>=55.0.0,<56` |
 | 0.5 | 54 | 58 | `>=54.0.0,<55` |
 | 0.4 | 46 | 54 | not available |
 | 0.3 | 43 | 53 | not available |
@@ -642,7 +799,7 @@ slows compilation noticeably. It goes away once a Lance release shares the works
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@55
+cargo add tokio@1 datafusion@55  # the DataFusion major that pairs with the hudi release, see the table above
 cargo add hudi --features datafusion
 ```
 
@@ -734,6 +891,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+## Project layout
+
+| Path                | Contents                                                                    |
+|---------------------|-----------------------------------------------------------------------------|
+| `crates/hudi`       | The `hudi` crate: re-exports `hudi-core`, and `hudi-datafusion` with the `datafusion` feature |
+| `crates/core`       | `hudi-core`: tables, timeline, file groups, metadata table, readers, writers |
+| `crates/datafusion` | `hudi-datafusion`: the DataFusion `TableProvider`                           |
+| `crates/ffi`        | `hudi-ffi`: a C ABI for engines, over the Arrow C Data Interface             |
+| `python`            | The `hudi` Python package (PyO3)                                            |
+| `cpp`               | The C++ binding (`cxx`)                                                     |
+| `crates/test`       | Shared test fixtures                                                        |
+| `benchmark`         | Benchmark harnesses                                                         |
+| `docs`              | Reader spec and writer design                                               |
 
 ## Contributing
 

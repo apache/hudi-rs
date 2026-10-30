@@ -30,7 +30,7 @@ in https://github.com/apache/hudi-rs/contribute.
 ## File an issue
 
 Testing and reporting bugs are also valueable contributions. Please follow
-the [issue template](https://github.com/apache/hudi-rs/issues/new?template=bug_report.yml) to file bug reports.
+the [issue template](https://github.com/apache/hudi-rs/issues/new?template=1-bug.yml) to file bug reports.
 
 ## Issue tracking
 
