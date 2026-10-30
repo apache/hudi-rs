@@ -89,7 +89,7 @@ pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
 
 /// The actions a read loads from the timeline.
 ///
-/// Narrowing this is no longer only a listing decision: [`Timeline::completion_gate_inputs`]
+/// Narrowing this is no longer only a listing decision: `Timeline::completion_gate_inputs`
 /// derives the log scan's committed set from these, so an action that completes outside this
 /// list and wrote data or delete log blocks would have its rows dropped from a merge-on-read
 /// read — silently, since the gate excludes rather than errors. The three here cover every
@@ -423,8 +423,8 @@ impl Timeline {
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
     ///
     /// ### Note
-    /// This API behaves differently from [crate::table::Table::get_avro_schema],
-    /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
+    /// This API behaves differently from [crate::table::Table::get_schema_in_avro_str],
+    /// which additionally looks for [HudiTableConfig::CreateSchema](crate::config::table::HudiTableConfig::CreateSchema) in the table config.
     pub async fn get_latest_avro_schema(&self) -> Result<String> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
         resolve_avro_schema_from_commit_metadata(&commit_metadata)
@@ -434,7 +434,7 @@ impl Timeline {
     ///
     /// ### Note
     /// This API behaves differently from [crate::table::Table::get_schema],
-    /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
+    /// which additionally looks for [HudiTableConfig::CreateSchema](crate::config::table::HudiTableConfig::CreateSchema) in the table config.
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
         resolve_data_schema_from_commit_metadata(&commit_metadata, self.storage.clone()).await

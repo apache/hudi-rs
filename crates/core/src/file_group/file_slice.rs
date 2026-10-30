@@ -16,6 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! [`FileSlice`], the unit a file group reader reads.
+
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
@@ -43,7 +45,9 @@ pub struct FileSlice {
     /// The instant that created this slice: its base file's commit, or — with
     /// no base file — the earliest log file's own instant.
     creation_instant_time: String,
+    /// The log files that apply on top of the base file, in [`LogFile`] order.
     pub log_files: BTreeSet<LogFile>,
+    /// The partition path relative to the table base, empty for an unpartitioned table.
     pub partition_path: String,
     /// Column statistics from the base file's Parquet footer.
     ///
@@ -74,6 +78,8 @@ impl PartialEq for FileSlice {
 impl Eq for FileSlice {}
 
 impl FileSlice {
+    /// A slice with `base_file` and no log files, taking its file id and creation instant from
+    /// the base file.
     pub fn new(base_file: BaseFile, partition_path: String) -> Self {
         Self {
             file_id: base_file.file_id.clone(),
@@ -101,11 +107,18 @@ impl FileSlice {
         }
     }
 
+    /// Whether the slice has any log files.
     #[inline]
     pub fn has_log_file(&self) -> bool {
         !self.log_files.is_empty()
     }
 
+    /// Adds the log files of `other`, which must be the same slice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::FileGroup`] when `other` differs in base file, partition path, file
+    /// id, or creation instant.
     pub fn merge(&mut self, other: &FileSlice) -> Result<()> {
         if self != other {
             return Err(CoreError::FileGroup(format!(
@@ -139,7 +152,7 @@ impl FileSlice {
         self.relative_path_for_file(file_name)
     }
 
-    /// Returns the enclosing [FileGroup]'s id.
+    /// Returns the enclosing [FileGroup](crate::file_group::FileGroup)'s id.
     #[inline]
     pub fn file_id(&self) -> &str {
         &self.file_id
@@ -147,7 +160,7 @@ impl FileSlice {
 
     /// Returns the instant time that marks the [FileSlice] creation.
     ///
-    /// This is also an instant time stored in the [Timeline].
+    /// This is also an instant time stored in the [Timeline](crate::timeline::Timeline).
     #[inline]
     pub fn creation_instant_time(&self) -> &str {
         &self.creation_instant_time
@@ -157,7 +170,7 @@ impl FileSlice {
     ///
     /// Use this for I/O cost estimation and split sizing (e.g., balancing
     /// parallel read splits by storage volume). For estimated in-memory size
-    /// and record count for query planning, use [`Table::compute_table_stats`]
+    /// and record count for query planning, use [`Table::compute_table_stats`](crate::table::Table::compute_table_stats)
     /// instead — it returns values derived from the base file only.
     ///
     /// Files whose `file_metadata` is `None` contribute 0 to the sum.

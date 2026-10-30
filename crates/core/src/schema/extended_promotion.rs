@@ -44,7 +44,7 @@
 //!
 //! ## Union handling — keyed on the reader, throws on malformed
 //! Like Java, the UNION case is keyed on the READER type (Java line 1482): only when
-//! the reader is a union are both sides unwrapped via [`actual_schema_from_union`]
+//! the reader is a union are both sides unwrapped via `actual_schema_from_union`
 //! (Java's `getActualSchemaFromUnion(.., null)`). A writer union feeding a *plain*
 //! reader is therefore NOT unwrapped — `physical_type` reports it as `UNION`, so a
 //! `[null,int]` writer → plain `long` reader rewrites, matching Java's
@@ -237,7 +237,7 @@ fn needs_rewrite_to_string(writer: &Schema, reader_is_enum: bool) -> bool {
 /// See module docs. Port of Java's `recordNeedsRewriteForExtendedAvroTypePromotion`
 /// (`HoodieAvroUtils.java:1451-1494`).
 ///
-/// Returns `Err` for a malformed union (see [`actual_schema_from_union`]), exactly
+/// Returns `Err` for a malformed union (see `actual_schema_from_union`), exactly
 /// where Java throws `HoodieAvroSchemaException`.
 pub fn record_needs_rewrite_for_extended_promotion(
     writer: &Schema,

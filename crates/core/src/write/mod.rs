@@ -16,7 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Write APIs for Hudi tables (`Table` verbs).
+//! Write APIs for Hudi tables.
+//!
+//! The writes are methods on [`Table`](crate::table::Table): `append`, `upsert`, `upsert_with`,
+//! `update`, `delete`, `delete_keys`, `overwrite`, and `dynamic_partition_overwrite`. A write that
+//! changes data is one commit, and updates the metadata table (when enabled) in the same
+//! transaction. Merge-on-read tables also compact (experimental) with `compact` and
+//! `await_compaction`. This module holds [`WriteResult`], [`UpsertOptions`],
+//! [`CompactionResult`], the [`TableCreateBuilder`] behind
+//! [`Table::create`](crate::table::Table::create), and the lock provider types. Every write
+//! returns a [`WriteResult`].
 
 pub(crate) mod append;
 pub(crate) mod archival;

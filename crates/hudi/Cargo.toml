@@ -48,4 +48,10 @@ datafusion = [
 ]
 
 [dev-dependencies]
-tokio = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+features = ["datafusion"]

@@ -359,10 +359,14 @@ impl ConfigParser for HudiTableConfig {
 }
 
 /// Config value for [HudiTableConfig::TableType].
+///
+/// Parsing is case-insensitive and also accepts `cow` / `mor` and hyphenated forms.
 #[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum TableTypeValue {
+    /// `COPY_ON_WRITE`: updates rewrite base files.
     #[strum(serialize = "COPY_ON_WRITE")]
     CopyOnWrite,
+    /// `MERGE_ON_READ`: updates go to log files, merged with base files when read.
     #[strum(serialize = "MERGE_ON_READ")]
     MergeOnRead,
 }
@@ -382,11 +386,13 @@ impl FromStr for TableTypeValue {
 /// Config value for [HudiTableConfig::BaseFileFormat].
 #[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum BaseFileFormatValue {
+    /// Config value `parquet`, the default.
     #[strum(serialize = "parquet")]
     Parquet,
     /// HFile format - only valid for metadata tables.
     #[strum(serialize = "hfile")]
     HFile,
+    /// Config value `lance`.
     #[strum(serialize = "lance")]
     Lance,
 }
@@ -471,9 +477,11 @@ impl FromStr for BaseFileFormatValue {
 /// Config value for [HudiTableConfig::TimelineTimezone].
 #[derive(Clone, Debug, PartialEq, AsRefStr, Default)]
 pub enum TimelineTimezoneValue {
+    /// Instant times are in UTC, assumed when the config is unset.
     #[strum(serialize = "utc")]
     #[default]
     UTC,
+    /// Instant times are in the local timezone of the process.
     #[strum(serialize = "local")]
     Local,
 }

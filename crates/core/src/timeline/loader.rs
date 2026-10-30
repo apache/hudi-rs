@@ -156,7 +156,7 @@ impl TimelineLoader {
     /// Every instant time that has a `requested` or `inflight` file and no
     /// completed one, for **any** action.
     ///
-    /// Deliberately not built on [`TimelineSelector`], which resolves the action
+    /// Deliberately not built on `TimelineSelector`, which resolves the action
     /// through [`Action`](crate::timeline::instant::Action) and so can only see
     /// the three commit actions the enum names. Java's `getValidInstantTimestamps`
     /// takes its `datasetPendingInstants` from `filterInflightsAndRequested()`

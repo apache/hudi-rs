@@ -63,6 +63,7 @@ pub struct InProcessLockProvider {
 }
 
 impl InProcessLockProvider {
+    /// A provider for the table at `base_path`. Providers for the same path share one lock.
     pub fn new(base_path: impl Into<String>) -> Self {
         Self {
             base_path: base_path.into(),

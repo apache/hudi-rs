@@ -113,7 +113,7 @@ pub enum HudiReadConfig {
 
     /// Number of input partitions to read the data in parallel.
     ///
-    /// For processing 100 files, [InputPartitions] being 5 will produce 5 partitions, with each partition having 20 files.
+    /// For processing 100 files, [Self::InputPartitions] being 5 will produce 5 partitions, with each partition having 20 files.
     ///
     /// On the parquet-source path (copy-on-write, or read-optimized merge-on-read)
     /// DataFusion may split these buckets further once one exceeds

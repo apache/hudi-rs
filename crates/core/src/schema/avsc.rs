@@ -63,7 +63,7 @@ fn parse_vendored(avsc: &str, name: &str) -> Result<Schema> {
 
 /// Serialize `value` to Avro OCF using a Java writer schema.
 ///
-/// Goes JSON → untyped Avro [`Value`] → [`Value::resolve`] so union indexes and
+/// Goes JSON → untyped Avro `Value` → `Value::resolve` so union indexes and
 /// field order match the schema (unlike `to_value`/`append_ser`, which assume
 /// null-first Option unions and Serialize field order).
 pub fn encode_with_schema<T: serde::Serialize>(value: &T, schema: &Schema) -> Result<Vec<u8>> {

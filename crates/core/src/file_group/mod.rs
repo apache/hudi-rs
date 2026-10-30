@@ -23,9 +23,11 @@
 pub mod admission;
 pub mod base_file;
 pub mod builder;
+#[warn(missing_docs)]
 pub mod file_slice;
 pub mod log_file;
 pub(crate) mod pushdown;
+#[warn(missing_docs)]
 pub mod reader;
 pub(crate) mod reader_v2;
 pub mod record_batches;

@@ -26,12 +26,12 @@ pub struct FileMetadata {
     pub size: u64,
 
     /// Uncompressed size in bytes in memory.
-    /// Currently populated using [crate::statistics::estimator::FileStatsEstimator]
+    /// Currently populated using `FileStatsEstimator`
     /// when an estimator is available; otherwise stays 0.
     pub byte_size: i64,
 
     /// Number of records in the file.
-    /// Currently populated using [crate::statistics::estimator::FileStatsEstimator]
+    /// Currently populated using `FileStatsEstimator`
     /// when an estimator is available; otherwise stays 0.
     pub num_records: i64,
 }
