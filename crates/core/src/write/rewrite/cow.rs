@@ -468,11 +468,29 @@ pub(super) fn merge_file_group_task(
         let old = reader
             .read_file_slice(&plan.slice, &ReadOptions::new())
             .await?;
+        let storage = ctx.storage.clone();
+        let path = relative_data_path(&plan.partition, &plan.out_name);
+        // The merge and encode are long synchronous sections; on the blocking
+        // pool they cannot stall the async workers other tasks run on.
+        let (output, bytes) = tokio::task::spawn_blocking(move || plan.merge(ctx, old))
+            .await
+            .map_err(|e| CoreError::Write(format!("merge task panicked: {e}")))??;
+        if let Some(bytes) = bytes {
+            storage.put_file(&path, bytes).await?;
+        }
+        Ok(output)
+    })
+}
+
+impl MergePlan {
+    /// Apply the op to the group's current rows `old`, stamp meta, and encode;
+    /// the bytes are `None` when the op matched nothing and no file is written.
+    fn merge(self, ctx: MergeCtx, old: RecordBatch) -> Result<(MergeOutput, Option<Vec<u8>>)> {
         let key_field = MetaField::RecordKey.as_ref();
         let mut rli_deletes = Vec::new();
         let mut marker_deletes = 0usize;
         let mut inserted = 0;
-        let (merged, matched) = match plan.op {
+        let (merged, matched) = match self.op {
             GroupOp::Upsert {
                 incoming,
                 partial_columns,
@@ -613,7 +631,7 @@ pub(super) fn merge_file_group_task(
                 }
                 let matched = old.num_rows() - selected.len();
                 if matched == 0 {
-                    return Ok(MergeOutput::unchanged());
+                    return Ok((MergeOutput::unchanged(), None));
                 }
                 (take_batch(&old, &selected)?, matched)
             }
@@ -635,7 +653,7 @@ pub(super) fn merge_file_group_task(
                     }
                 }
                 if matched == 0 {
-                    return Ok(MergeOutput::unchanged());
+                    return Ok((MergeOutput::unchanged(), None));
                 }
                 (take_batch(&old, &selected)?, matched)
             }
@@ -643,7 +661,7 @@ pub(super) fn merge_file_group_task(
                 let mask = filters_to_row_mask(std::slice::from_ref(&filter), &old)?;
                 let (updated, matched) = apply_set_updates(&old, &mask, &set)?;
                 if matched == 0 {
-                    return Ok(MergeOutput::unchanged());
+                    return Ok((MergeOutput::unchanged(), None));
                 }
                 let updated = restamp_matched_rows(&updated, &mask, &ctx.instant)?;
                 // Setting the delete marker deletes the row, as an upsert does.
@@ -670,39 +688,29 @@ pub(super) fn merge_file_group_task(
                 (updated, matched)
             }
         };
-        let merged = restamp_file_name(&merged, &plan.out_name)?;
-        let path = relative_data_path(&plan.partition, &plan.out_name);
+        let merged = restamp_file_name(&merged, &self.out_name)?;
         let num_rows = merged.num_rows();
-        let props = ctx.props.clone();
-        let bloom = ctx.bloom;
-        let collect_ranges = ctx.collect_ranges;
-        let (bytes, ranges) = tokio::task::spawn_blocking(move || -> Result<_> {
-            let bytes =
-                crate::write::append::write_parquet_bytes_with_props(props, bloom, &[merged])?;
-            let ranges = if collect_ranges {
-                Some(
-                    crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
-                )
-            } else {
-                None
-            };
-            Ok((bytes, ranges))
-        })
-        .await
-        .map_err(|e| CoreError::Write(format!("merge task panicked: {e}")))??;
-        let size = bytes.len() as i64;
-        ctx.storage.put_file(&path, bytes).await?;
-        Ok(MergeOutput {
-            wrote: true,
-            size,
-            num_rows,
-            matched,
-            inserted,
-            marker_deletes,
-            ranges,
-            rli_deletes,
-        })
-    })
+        let bytes =
+            crate::write::append::write_parquet_bytes_with_props(ctx.props, ctx.bloom, &[merged])?;
+        let ranges = if ctx.collect_ranges {
+            Some(crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?)
+        } else {
+            None
+        };
+        Ok((
+            MergeOutput {
+                wrote: true,
+                size: bytes.len() as i64,
+                num_rows,
+                matched,
+                inserted,
+                marker_deletes,
+                ranges,
+                rli_deletes,
+            },
+            Some(bytes),
+        ))
+    }
 }
 
 /// Abort a fenced-but-empty instant: delete the fencing files and marker dir
