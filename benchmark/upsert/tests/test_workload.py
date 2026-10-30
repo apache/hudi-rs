@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""The workload replay is the source of truth every leg is judged against, so
+"""The workload replay is the source of truth every case is judged against, so
 it must be deterministic and must agree with applying the commit files to the
 base table independently."""
 

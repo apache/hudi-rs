@@ -22,7 +22,7 @@ A file whose run was forced past the headroom gate (headroom_violated) is
 refused unless --allow-loaded is passed, so loaded-machine timings do not end up
 in a table by accident.
 
-Every leg of every file becomes one row, labelled with the scale it ran at, so
+Every case of every file becomes one row, labelled with the scale it ran at, so
 results from different scales can sit in one table without being mistaken for
 each other. Timings show the median (or, with --stat mean, the mean) across
 repetitions with the min to max range, and a note flags any timing whose
@@ -42,7 +42,7 @@ MIB = 1024 * 1024
 COLUMNS = [
     "Scenario",
     "Scale",
-    "Leg",
+    "Case",
     "Status",
     "Reps",
     "Load",
@@ -97,11 +97,11 @@ def _correct(s):
     return f"FAIL (sampled {sampled}, oracle {oracle})"
 
 
-def readings(leg):
-    """Every headroom reading the gate took for a leg; the per-reading
+def readings(case):
+    """Every headroom reading the gate took for a case; the per-reading
     headroom_violated flag is the only one the harness records."""
     out = []
-    for rep in leg.get("repetitions", []):
+    for rep in case.get("repetitions", []):
         if rep.get("headroom_before"):
             out.append(rep["headroom_before"])
         for ph in rep.get("phases", {}).values():
@@ -118,27 +118,27 @@ def readings(leg):
     return out
 
 
-def violated(leg):
-    return any(r.get("headroom_violated") for r in readings(leg))
+def violated(case):
+    return any(r.get("headroom_violated") for r in readings(case))
 
 
-def leg_row(name, leg, scenario, scale, stat):
-    s = leg.get("summary", {})
+def case_row(name, case, scenario, scale, stat):
+    s = case.get("summary", {})
     st = s.get("stats", {})
     by_phase = s.get("peak_rss_bytes_by_phase", {})
     write_rss = [by_phase[p] for p in ("upsert", "delete") if p in by_phase]
     files = s.get("upsert_data_files_created_per_commit")
-    ok = leg.get("status") == "ok"
+    ok = case.get("status") == "ok"
     inc = timing(st.get("incremental_mean_s"), stat)
     if inc != "-" and "incremental_rows_mean" in s:
         inc += f" ({s['incremental_rows_mean']:,.0f})"
-    ran = any("readback" in r.get("phases", {}) for r in leg.get("repetitions", []))
+    ran = any("readback" in r.get("phases", {}) for r in case.get("repetitions", []))
     return [
         scenario,
         scale,
         name,
-        leg.get("status", "?"),
-        f"{s.get('repetitions', 0)}/{leg.get('repeat', '?')}",
+        case.get("status", "?"),
+        f"{s.get('repetitions', 0)}/{case.get('repeat', '?')}",
         timing(st.get("load_s"), stat),
         timing(st.get("upsert_mean_s"), stat),
         timing(st.get("delete_mean_s"), stat),
@@ -155,8 +155,8 @@ def leg_row(name, leg, scenario, scale, stat):
     ]
 
 
-def leg_notes(scenario, name, leg):
-    s = leg.get("summary", {})
+def case_notes(scenario, name, case):
+    s = case.get("summary", {})
     out = []
     noisy = [
         f"{label} {st['cv']:.0%}"
@@ -241,7 +241,7 @@ def main():
         with open(path) as f:
             res = json.load(f)
         if not a.allow_loaded and any(
-            violated(leg) for leg in res.get("legs", {}).values()
+            violated(case) for case in res.get("cases", {}).values()
         ):
             print(
                 f"{path}: run was forced past the headroom gate (the machine was not "
@@ -254,10 +254,10 @@ def main():
         notes.append(machine_line(path, res))
         if res.get("label"):
             notes.append(f"{path}: {res['label']}")
-        for name, leg in res.get("legs", {}).items():
-            rows.append(leg_row(name, leg, scenario, scale, a.stat))
-            notes += leg_notes(scenario, name, leg)
-            h = leg.get("summary", {}).get("headroom")
+        for name, case in res.get("cases", {}).items():
+            rows.append(case_row(name, case, scenario, scale, a.stat))
+            notes += case_notes(scenario, name, case)
+            h = case.get("summary", {}).get("headroom")
             if h:
                 mem = h.get("min_mem_available_bytes")
                 notes.append(
@@ -265,10 +265,10 @@ def main():
                     f"max load1 {h['max_load1']:.2f}, min available memory "
                     f"{'-' if mem is None else f'{mem / 1024**3:.1f} GiB'}, min free disk "
                     f"{h['min_disk_free_bytes'] / 1024**3:.1f} GiB"
-                    + (" (HEADROOM VIOLATED)" if violated(leg) else "")
+                    + (" (HEADROOM VIOLATED)" if violated(case) else "")
                 )
-            if leg.get("error"):
-                errors.append(f"{scenario} {name} ({leg['status']}): {leg['error']}")
+            if case.get("error"):
+                errors.append(f"{scenario} {name} ({case['status']}): {case['error']}")
 
     print(render(rows, a.markdown))
     print()

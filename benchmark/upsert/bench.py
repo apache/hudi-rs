@@ -18,15 +18,15 @@
 
 """Single-node upsert / delete benchmark for hudi-rs writes.
 
-Every leg runs the same scenario against the same generated data: a bulk load,
+Every case runs the same scenario against the same generated data: a bulk load,
 K upsert commits, K delete commits, then a full read-back that is checked
-against the expected end state. Each phase of each leg runs in its own
-subprocess, so peak RSS is per phase and one leg's memory never shows up in
+against the expected end state. Each phase of each case runs in its own
+subprocess, so peak RSS is per phase and one case's memory never shows up in
 another's numbers.
 
 Usage:
     bench.py --scenario uuid|tpcds-web-returns|nyc-taxi|rag-chunks|training-set
-             [--smoke] [--legs hudi-cow,hudi-mor,...] [--extra-legs PATH]
+             [--smoke] [--cases hudi-cow,hudi-mor,...] [--extra-cases PATH]
              [--out results.json]
 """
 
@@ -85,8 +85,8 @@ EXIT_REFUSED = 4
 DISK_FACTOR = 3
 
 
-class LegUnavailable(Exception):
-    """The leg's library, or a capability the scenario needs, is not available."""
+class CaseUnavailable(Exception):
+    """The case's library, or a capability the scenario needs, is not available."""
 
 
 class CheckFailed(Exception):
@@ -104,11 +104,11 @@ def _version(dist):
         return None
 
 
-class Leg:
-    """An engine leg: one way of writing and reading the scenario's table.
+class Case:
+    """An engine case: one way of writing and reading the scenario's table.
 
-    Subclass it and register the subclass with ``register_leg``, in this file or
-    in a module passed with ``--extra-legs``. Methods a scenario does not use
+    Subclass it and register the subclass with ``register_case``, in this file or
+    in a module passed with ``--extra-cases``. Methods a scenario does not use
     (``marker``, ``incremental``, ``time_travel`` outside training-set) may be
     left as they are.
     """
@@ -141,7 +141,7 @@ class Leg:
         raise NotImplementedError
 
     def marker(self):
-        raise LegUnavailable(f"{self.name} does not expose table versions")
+        raise CaseUnavailable(f"{self.name} does not expose table versions")
 
     def incremental(self, prev, cur):
         """``(rows returned, changed rows, deleted keys)`` for the commits after
@@ -149,10 +149,10 @@ class Leg:
         deletes removed, or None for the deleted keys when the read does not
         return deletes (declare which with ``incremental_emits_deletes`` in
         ``config``)."""
-        raise LegUnavailable(f"{self.name} has no incremental read")
+        raise CaseUnavailable(f"{self.name} has no incremental read")
 
     def time_travel(self, marker):
-        raise LegUnavailable(f"{self.name} has no time travel read")
+        raise CaseUnavailable(f"{self.name} has no time travel read")
 
     def live_data_files(self, root):
         """Data files the current snapshot references, relative to ``root``."""
@@ -164,39 +164,39 @@ class Leg:
 
     def crash_cause(self, plan, phase, in_flight):
         """A one-line explanation when the phase process dies on a signal, if
-        the leg knows one; ``in_flight`` names the commit that was running."""
+        the case knows one; ``in_flight`` names the commit that was running."""
         return None
 
 
-LEGS = {}
+CASES = {}
 
 
-def register_leg(name, factory):
-    """Make a leg available to ``--legs``; ``factory()`` returns a ``Leg``."""
-    if name in LEGS:
-        raise ValueError(f"leg {name!r} is already registered")
-    LEGS[name] = factory
+def register_case(name, factory):
+    """Make a case available to ``--cases``; ``factory()`` returns a ``Case``."""
+    if name in CASES:
+        raise ValueError(f"case {name!r} is already registered")
+    CASES[name] = factory
 
 
-def load_extra_legs(paths):
+def load_extra_cases(paths):
     """Import each module and call its ``register(api)``; ``api`` carries
-    ``Leg``, ``LegUnavailable`` and ``register_leg``."""
+    ``Case``, ``CaseUnavailable`` and ``register_case``."""
     api = types.SimpleNamespace(
-        Leg=Leg, LegUnavailable=LegUnavailable, register_leg=register_leg
+        Case=Case, CaseUnavailable=CaseUnavailable, register_case=register_case
     )
     for path in paths:
         path = Path(path).resolve()
-        spec = importlib.util.spec_from_file_location(f"extra_legs_{path.stem}", path)
+        spec = importlib.util.spec_from_file_location(f"extra_cases_{path.stem}", path)
         if spec is None:
-            raise SystemExit(f"--extra-legs {path}: not a Python module")
+            raise SystemExit(f"--extra-cases {path}: not a Python module")
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         if not hasattr(module, "register"):
-            raise SystemExit(f"--extra-legs {path}: defines no register(api)")
+            raise SystemExit(f"--extra-cases {path}: defines no register(api)")
         module.register(api)
 
 
-class HudiLeg(Leg):
+class HudiCase(Case):
     def __init__(self, name, table_type, record_index):
         self.name = name
         self.table_type = table_type
@@ -227,12 +227,12 @@ class HudiLeg(Leg):
         try:
             import hudi
         except ImportError as e:
-            raise LegUnavailable(
+            raise CaseUnavailable(
                 f"hudi write API not installed: cannot import hudi ({e}); install a hudi "
                 "build with HudiTable.create into the benchmark venv"
             ) from e
         if not hasattr(hudi.HudiTable, "create"):
-            raise LegUnavailable(
+            raise CaseUnavailable(
                 f"hudi write API not installed: hudi {_version('hudi')} has no "
                 "HudiTable.create; install a hudi build with the write API into the "
                 "benchmark venv"
@@ -331,9 +331,9 @@ class HudiLeg(Leg):
         return "meta"
 
 
-register_leg("hudi-cow", lambda: HudiLeg("hudi-cow", "cow", True))
-register_leg("hudi-mor", lambda: HudiLeg("hudi-mor", "mor", True))
-register_leg("hudi-cow-noindex", lambda: HudiLeg("hudi-cow-noindex", "cow", False))
+register_case("hudi-cow", lambda: HudiCase("hudi-cow", "cow", True))
+register_case("hudi-mor", lambda: HudiCase("hudi-mor", "mor", True))
+register_case("hudi-cow-noindex", lambda: HudiCase("hudi-cow-noindex", "cow", False))
 
 
 # ---------------------------------------------------------------------------
@@ -383,15 +383,15 @@ def diff(before, after, classify):
     return res
 
 
-def reclaim(leg, root, after):
+def reclaim(case, root, after):
     """Delete data files the table's current snapshot no longer references.
 
     Old versions are never read by a later commit or by the read-back, so this
     changes no measured operation; it keeps a 10M-row copy-on-write run from
     needing a full table copy of disk per commit.
     """
-    live = leg.live_data_files(root)
-    stale = [rel for rel in after if leg.classify(rel) == "data" and rel not in live]
+    live = case.live_data_files(root)
+    stale = [rel for rel in after if case.classify(rel) == "data" and rel not in live]
     if stale and not live:
         raise RuntimeError("live file listing came back empty; refusing to reclaim")
     freed = 0
@@ -537,7 +537,7 @@ def _key_set(table, key_cols):
 
 
 def measure_reads(
-    leg, plan, prev, cur, first, kind, arg, base, emits_deletes, gate_before=None
+    case, plan, prev, cur, first, kind, arg, base, emits_deletes, gate_before=None
 ):
     """The two reads a training-data consumer makes after a commit: what changed,
     and the table as it was when first loaded. Neither is in the commit time;
@@ -545,7 +545,7 @@ def measure_reads(
     keys = plan["key_cols"]
     room = gate_before(f"incremental read after {kind}") if gate_before else None
     t0 = time.perf_counter()
-    rows, changed, deleted = leg.incremental(prev, cur)
+    rows, changed, deleted = case.incremental(prev, cur)
     inc = {"wall_s": time.perf_counter() - t0, "rows": rows}
     if room is not None:
         inc["headroom"] = room
@@ -567,7 +567,7 @@ def measure_reads(
         ok = n_changed == 0 and n_deleted == arg.num_rows
         ok = ok and _key_set(deleted, keys) == want
     else:
-        expected = "no rows: this leg's incremental read does not return deletes"
+        expected = "no rows: this case's incremental read does not return deletes"
         ok = n_changed == 0 and n_deleted == 0
     inc.update(changed_rows=n_changed, deleted_rows=n_deleted, expected=expected)
     if not ok:
@@ -577,7 +577,7 @@ def measure_reads(
         )
     room = gate_before("time travel read") if gate_before else None
     t0 = time.perf_counter()
-    tt = leg.time_travel(first)
+    tt = case.time_travel(first)
     wall = time.perf_counter() - t0
     if tt is None:
         tt = base.schema.empty_table()
@@ -598,14 +598,14 @@ def measure_reads(
     return out
 
 
-def run_commits(leg, root, wd, plan, kind, w, a):
-    leg.open(root, plan)
+def run_commits(case, root, wd, plan, kind, w, a):
+    case.open(root, plan)
     if plan["incremental_reads"]:
         base = pq.read_table(Path(a.work_dir) / plan["oracle_base"])
-        emits_deletes = leg.config(plan).get("incremental_emits_deletes")
+        emits_deletes = case.config(plan).get("incremental_emits_deletes")
         if emits_deletes is None:
             raise CheckFailed(
-                f"{leg.name} config does not declare incremental_emits_deletes"
+                f"{case.name} config does not declare incremental_emits_deletes"
             )
     w.rec["rss_before_bytes"] = current_rss_bytes()
     w.rec["commits"] = []
@@ -618,7 +618,7 @@ def run_commits(leg, root, wd, plan, kind, w, a):
         w.rec["in_flight"] = {"commit": c, "input_rows": arg.num_rows}
         w.flush()
         t0 = time.perf_counter()
-        info = leg.upsert(arg) if kind == "upsert" else leg.delete(arg)
+        info = case.upsert(arg) if kind == "upsert" else case.delete(arg)
         wall = time.perf_counter() - t0
         after = snapshot(root)
         rec = {
@@ -626,7 +626,7 @@ def run_commits(leg, root, wd, plan, kind, w, a):
             "wall_s": wall,
             "input_rows": arg.num_rows,
             "headroom": room,
-            **diff(before, after, leg.classify),
+            **diff(before, after, case.classify),
             "engine": info,
         }
         w.rec.pop("in_flight", None)
@@ -641,9 +641,9 @@ def run_commits(leg, root, wd, plan, kind, w, a):
         else:
             _expect(f"delete {c} deleted rows", info.get("num_deleted"), exp["deleted"])
         if plan["incremental_reads"]:
-            cur = leg.marker()
+            cur = case.marker()
             rec["reads"] = measure_reads(
-                leg,
+                case,
                 plan,
                 prev,
                 cur,
@@ -657,7 +657,7 @@ def run_commits(leg, root, wd, plan, kind, w, a):
             prev = w.rec["marker"] = cur
             w.flush()
         if a.reclaim:
-            rec.update(reclaim(leg, root, after))
+            rec.update(reclaim(case, root, after))
             w.flush()
 
 
@@ -759,7 +759,7 @@ def type_mismatches(got_schema, exp_schema, cols):
 
 
 def compare_to_oracle(table, work_dir, plan):
-    """Compare the leg's whole table with the oracle written by the workload
+    """Compare the case's whole table with the oracle written by the workload
     replay: same rows, same keys, same types, every column value equal, floats
     and embeddings included, with no tolerance."""
     exp = pq.read_table(Path(work_dir) / plan["oracle"])
@@ -815,7 +815,7 @@ def compare_tables(table, exp, key_cols):
 
 def phase_main(argv):
     p = argparse.ArgumentParser(prog="bench.py _phase")
-    p.add_argument("--leg", required=True)
+    p.add_argument("--case", required=True)
     p.add_argument("--phase", required=True, choices=PHASES)
     p.add_argument("--root", required=True)
     p.add_argument("--base-dir", required=True)
@@ -824,18 +824,18 @@ def phase_main(argv):
     p.add_argument("--reclaim", action="store_true")
     p.add_argument("--first-marker", default=None)
     p.add_argument("--prev-marker", default=None)
-    p.add_argument("--extra-legs", action="append", default=[])
+    p.add_argument("--extra-cases", action="append", default=[])
     p.add_argument("--work-dir", required=True)
     add_headroom_args(p)
     p.add_argument("--base-bytes", type=int, required=True)
     a = p.parse_args(argv)
-    load_extra_legs(a.extra_legs)
+    load_extra_cases(a.extra_cases)
     if a.first_marker is not None:
         a.first_marker = json.loads(a.first_marker)
     if a.prev_marker is not None:
         a.prev_marker = json.loads(a.prev_marker)
 
-    leg = LEGS[a.leg]()
+    case = CASES[a.case]()
     root = Path(a.root)
     wd = Path(a.workload_dir)
     plan = json.loads((wd / "plan.json").read_text())
@@ -847,18 +847,18 @@ def phase_main(argv):
             before = snapshot(root)
             w.rec["headroom"] = gate(root, a.base_bytes, a, "load")
             t0 = time.perf_counter()
-            info = leg.load(root, base, plan)
+            info = case.load(root, base, plan)
             w.rec["wall_s"] = time.perf_counter() - t0
-            w.rec.update(diff(before, snapshot(root), leg.classify))
+            w.rec.update(diff(before, snapshot(root), case.classify))
             w.rec["engine"] = info
         elif a.phase in ("upsert", "delete"):
-            run_commits(leg, root, wd, plan, a.phase, w, a)
+            run_commits(case, root, wd, plan, a.phase, w, a)
         else:
-            leg.open(root, plan)
+            case.open(root, plan)
             w.rec["rss_before_bytes"] = current_rss_bytes()
             w.rec["headroom"] = gate(root, a.base_bytes, a, "read-back")
             t0 = time.perf_counter()
-            table = leg.read()
+            table = case.read()
             w.rec["wall_s"] = time.perf_counter() - t0
             if table is None:
                 raise CheckFailed("read-back returned no batches")
@@ -883,7 +883,7 @@ def phase_main(argv):
         w.rec["refused"] = str(e)
         w.flush()
         return EXIT_REFUSED
-    except LegUnavailable as e:
+    except CaseUnavailable as e:
         w.rec["unavailable"] = str(e)
         w.flush()
         return EXIT_UNAVAILABLE
@@ -899,9 +899,9 @@ def phase_main(argv):
 # ---------------------------------------------------------------------------
 
 
-def all_readings(leg):
+def all_readings(case):
     out = []
-    for rep in leg.get("repetitions", []):
+    for rep in case.get("repetitions", []):
         if rep.get("headroom_before"):
             out.append(rep["headroom_before"])
         for ph in rep.get("phases", {}).values():
@@ -919,7 +919,7 @@ def all_readings(leg):
 
 
 def summarize_rep(phases):
-    """One repetition's numbers; the leg summary aggregates these."""
+    """One repetition's numbers; the case summary aggregates these."""
     ph = phases
     s = {}
     if "load" in ph and "wall_s" in ph["load"]:
@@ -975,7 +975,7 @@ TIMINGS = (
 )
 
 # Fields a commit writes that do not depend on timing, so every repetition of a
-# leg should reproduce them. File counts must match exactly; byte counts may
+# case should reproduce them. File counts must match exactly; byte counts may
 # drift by WRITE_BYTES_TOLERANCE, because instant times, commit metadata and file
 # names embedded in the files differ from run to run.
 WRITE_BYTES_TOLERANCE = 0.01
@@ -1057,8 +1057,8 @@ def write_mismatches(reps):
     return out
 
 
-def summarize_leg(leg):
-    reps = leg.get("repetitions", [])
+def summarize_case(case):
+    reps = case.get("repetitions", [])
     done = [r for r in reps if r.get("status") == "ok"]
     s = {"repetitions": len(done), "stats": {}}
     for m in TIMINGS:
@@ -1090,7 +1090,7 @@ def summarize_leg(leg):
     for k in ("sampled_correct", "oracle_correct"):
         vals = [r["summary"].get(k) for r in reps if r.get("summary")]
         s[k] = None if not vals or None in vals else all(vals)
-    readings = all_readings(leg)
+    readings = all_readings(case)
     if readings:
         s["headroom"] = {
             "readings": len(readings),
@@ -1137,21 +1137,21 @@ class RunLock:
         self.path.unlink(missing_ok=True)
 
 
-def run_leg(name, a, plan, bd, wd, log_dir):
-    """Runs the leg --repeat times, one repetition after another; each rebuilds
+def run_case(name, a, plan, bd, wd, log_dir):
+    """Runs the case --repeat times, one repetition after another; each rebuilds
     the table from the base data and replays the whole workload."""
-    leg = LEGS[name]()
+    case = CASES[name]()
     root = Path(a.work_dir) / "tables" / run_slug(bd, wd) / name
     rec = {
         "status": "ok",
-        "config": leg.config(plan),
+        "config": case.config(plan),
         "table_dir": str(root.relative_to(a.work_dir)),
         "reclaim": a.reclaim,
         "repeat": a.repeat,
         "repetitions": [],
     }
     for r in range(1, a.repeat + 1):
-        rep = run_rep(name, leg, r, a, plan, bd, wd, root, log_dir)
+        rep = run_rep(name, case, r, a, plan, bd, wd, root, log_dir)
         rec["repetitions"].append(rep)
         if rep["status"] != "ok":
             rec["status"] = rep["status"]
@@ -1160,7 +1160,7 @@ def run_leg(name, a, plan, bd, wd, log_dir):
                 if k in rep:
                     rec[k] = rep[k]
             break
-    rec["summary"] = summarize_leg(rec)
+    rec["summary"] = summarize_case(rec)
     if rec["status"] == "ok" and not rec["summary"]["correct"]:
         rec["status"] = "failed"
     if not a.keep_tables:
@@ -1169,12 +1169,12 @@ def run_leg(name, a, plan, bd, wd, log_dir):
     return rec
 
 
-def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
+def run_rep(name, case, r, a, plan, bd, wd, root, log_dir):
     rep = {"rep": r, "status": "ok", "phases": {}}
     tag = f"[{name} {r}/{a.repeat}]"
     try:
         rep["headroom_before"] = gate(
-            a.work_dir, a.base_bytes, a, f"leg {name} repetition {r}"
+            a.work_dir, a.base_bytes, a, f"case {name} repetition {r}"
         )
     except HeadroomRefused as e:
         rep["status"] = "refused"
@@ -1201,7 +1201,7 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
             sys.executable,
             str(Path(__file__).resolve()),
             "_phase",
-            "--leg", name,
+            "--case", name,
             "--phase", phase,
             "--root", str(root),
             "--base-dir", str(bd),
@@ -1212,7 +1212,7 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
             "--settle-timeout", str(a.settle_timeout),
             "--base-bytes", str(a.base_bytes),
             "--work-dir", str(a.work_dir),
-            *(x for path in a.extra_legs for x in ("--extra-legs", str(path))),
+            *(x for path in a.extra_cases for x in ("--extra-cases", str(path))),
         ]  # fmt: skip
         if a.reclaim:
             cmd.append("--reclaim")
@@ -1223,11 +1223,11 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
         if prev_marker is not None:
             cmd += ["--prev-marker", json.dumps(prev_marker)]
         timeout = None
-        if a.leg_timeout:
-            timeout = a.leg_timeout - (time.monotonic() - start)
+        if a.case_timeout:
+            timeout = a.case_timeout - (time.monotonic() - start)
             if timeout <= 0:
                 rep["status"] = "timeout"
-                rep["error"] = f"budget of {a.leg_timeout}s spent before phase {phase}"
+                rep["error"] = f"budget of {a.case_timeout}s spent before phase {phase}"
                 break
         print(f"{tag} {phase} ...", flush=True)
         with open(log, "w") as lf:
@@ -1249,7 +1249,7 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
         if rc is None:
             rep["status"] = "timeout"
             rep["error"] = (
-                f"leg exceeded --leg-timeout {a.leg_timeout}s during phase {phase}; killed"
+                f"case exceeded --case-timeout {a.case_timeout}s during phase {phase}; killed"
             )
             break
         if rc == EXIT_REFUSED:
@@ -1267,7 +1267,7 @@ def run_rep(name, leg, r, a, plan, bd, wd, root, log_dir):
             if rc < 0:
                 rep["signal"] = signal.Signals(-rc).name
                 how = f"was killed by {rep['signal']} (no Python traceback)"
-                cause = leg.crash_cause(plan, phase, result.get("in_flight"))
+                cause = case.crash_cause(plan, phase, result.get("in_flight"))
                 if cause:
                     how += f": {cause}"
             rep["error"] = result.get("error") or (
@@ -1352,16 +1352,16 @@ def main():
         help="keys checked per category (updated, inserted, deleted, untouched)",
     )
     p.add_argument(
-        "--legs",
+        "--cases",
         default="hudi-cow,hudi-mor,hudi-cow-noindex",
-        help="comma-separated registered legs",
+        help="comma-separated registered cases",
     )
     p.add_argument(
-        "--extra-legs",
+        "--extra-cases",
         action="append",
         default=[],
         metavar="PATH",
-        help="load additional leg modules from a path; each defines register(api) "
+        help="load additional case modules from a path; each defines register(api) "
         "(repeatable)",
     )
     p.add_argument(
@@ -1384,19 +1384,19 @@ def main():
         default=3,
         choices=range(1, 6),
         metavar="N",
-        help="run each leg N times (1 to 5), one repetition after another, each "
+        help="run each case N times (1 to 5), one repetition after another, each "
         "from a fresh table; timings are aggregated across repetitions (default 3)",
     )
     p.add_argument(
-        "--leg-timeout",
+        "--case-timeout",
         type=float,
         default=0,
-        help="wall-clock budget per leg repetition in seconds; 0 disables",
+        help="wall-clock budget per case repetition in seconds; 0 disables",
     )
     p.add_argument(
         "--keep-tables",
         action="store_true",
-        help="keep each leg's table after the run (removed by default to save disk)",
+        help="keep each case's table after the run (removed by default to save disk)",
     )
     p.add_argument(
         "--reclaim",
@@ -1410,12 +1410,12 @@ def main():
     add_headroom_args(p)
     a = p.parse_args()
 
-    legs = [x.strip() for x in a.legs.split(",") if x.strip()]
-    a.extra_legs = [str(Path(x).resolve()) for x in a.extra_legs]
-    load_extra_legs(a.extra_legs)
-    unknown = [x for x in legs if x not in LEGS]
+    cases = [x.strip() for x in a.cases.split(",") if x.strip()]
+    a.extra_cases = [str(Path(x).resolve()) for x in a.extra_cases]
+    load_extra_cases(a.extra_cases)
+    unknown = [x for x in cases if x not in CASES]
     if unknown:
-        p.error(f"unknown legs {unknown}; choose from {sorted(LEGS)}")
+        p.error(f"unknown cases {unknown}; choose from {sorted(CASES)}")
 
     sc = SCENARIOS[a.scenario]
     params = resolve_params(sc, a, a.smoke)
@@ -1435,17 +1435,17 @@ def main():
     bd, wd = workload_paths(sc, work, params, a.seed, a.verify_sample)
     slug = run_slug(bd, wd)
     with RunLock(work, slug):
-        results = run(a, sc, params, legs, work, slug, out)
+        results = run(a, sc, params, cases, work, slug, out)
     print(f"wrote {out}")
     failed = [
         n
-        for n, r in results["legs"].items()
+        for n, r in results["cases"].items()
         if r["status"] in ("failed", "timeout", "refused")
     ]
     return 1 if failed else 0
 
 
-def run(a, sc, params, legs, work, slug, out):
+def run(a, sc, params, cases, work, slug, out):
     started = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
     t0 = time.perf_counter()
     # Workloads at different knobs share a base table; building it is guarded
@@ -1471,10 +1471,10 @@ def run(a, sc, params, legs, work, slug, out):
             **params,
             "verify_sample": a.verify_sample,
             "seed": a.seed,
-            "leg_timeout_s": a.leg_timeout,
+            "case_timeout_s": a.case_timeout,
             "repeat": a.repeat,
             "reclaim": a.reclaim,
-            "extra_legs": [Path(x).name for x in a.extra_legs],
+            "extra_cases": [Path(x).name for x in a.extra_cases],
             "headroom_limits": {
                 "max_load1": a.max_load1,
                 "min_mem_available_gib": a.min_mem_gib,
@@ -1486,22 +1486,22 @@ def run(a, sc, params, legs, work, slug, out):
         "plan": plan,
         "data_prep_s": prep_s,
         "machine": machine_info(work),
-        "legs": {},
+        "cases": {},
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     print(f"{sc.name}: {plan['scale']}, {plan['base_rows']:,} base rows", flush=True)
-    for name in legs:
+    for name in cases:
         run_one(name, a, plan, bd, wd, log_dir, results, out)
     return results
 
 
 def run_one(name, a, plan, bd, wd, log_dir, results, out):
-    rec = run_leg(name, a, plan, bd, wd, log_dir)
-    results["legs"][name] = rec
+    rec = run_case(name, a, plan, bd, wd, log_dir)
+    results["cases"][name] = rec
     results["headroom_violated"] = any(
         r.get("headroom_violated")
-        for leg in results["legs"].values()
-        for r in all_readings(leg)
+        for case in results["cases"].values()
+        for r in all_readings(case)
     )
     out.write_text(json.dumps(results, indent=2, default=str))
     s = rec["summary"]

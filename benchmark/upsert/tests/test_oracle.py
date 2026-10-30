@@ -15,9 +15,9 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""The full-table oracle comparison decides whether a leg is correct.
+"""The full-table oracle comparison decides whether a case is correct.
 
-It has to accept every representation a correct leg legitimately returns (rows
+It has to accept every representation a correct case legitimately returns (rows
 in any order, engine meta columns, view/large types, renamed list items) and
 reject every wrong end state, naming the key and both values.
 """

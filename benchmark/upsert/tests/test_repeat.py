@@ -16,7 +16,7 @@
 # under the License.
 
 """Aggregation across --repeat repetitions, and the results shape a run
-produces, end to end through a plain-parquet leg loaded with --extra-legs."""
+produces, end to end through a plain-parquet case loaded with --extra-cases."""
 
 import json
 import statistics
@@ -120,7 +120,7 @@ def test_write_mismatches_needs_two_repetitions():
     assert bench.write_mismatches([rep(1, 50)]) == []
 
 
-PARQUET_LEG = '''
+PARQUET_CASE = '''
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -128,7 +128,7 @@ from pathlib import Path
 
 
 def register(api):
-    class ParquetLeg(api.Leg):
+    class ParquetCase(api.Case):
         """Copy-on-write over one parquet file per version."""
 
         name = "parquet"
@@ -174,7 +174,7 @@ def register(api):
             return pq.read_table(self._latest())
 
         def marker(self):
-            # Like the Hudi leg, known only from this process's own writes.
+            # Like the Hudi case, known only from this process's own writes.
             return self.written
 
         def incremental(self, prev, cur):
@@ -192,14 +192,14 @@ def register(api):
         def live_data_files(self, root):
             return {self._latest().relative_to(root)}
 
-    api.register_leg("parquet", ParquetLeg)
+    api.register_case("parquet", ParquetCase)
 '''
 
 
 def run_bench(tmp_path, repeat, scenario="uuid"):
     tmp_path.mkdir(parents=True, exist_ok=True)
-    plugin = tmp_path / "parquet_leg.py"
-    plugin.write_text(textwrap.dedent(PARQUET_LEG))
+    plugin = tmp_path / "parquet_case.py"
+    plugin.write_text(textwrap.dedent(PARQUET_CASE))
     out = tmp_path / f"r{repeat}.json"
     cmd = [
         sys.executable,
@@ -211,8 +211,8 @@ def run_bench(tmp_path, repeat, scenario="uuid"):
         "--insert-batch", "10",
         "--delete-batch", "20",
         "--verify-sample", "20",
-        "--legs", "parquet",
-        "--extra-legs", str(plugin),
+        "--cases", "parquet",
+        "--extra-cases", str(plugin),
         "--repeat", str(repeat),
         "--force",
         "--settle-timeout", "0",
@@ -237,7 +237,7 @@ def runs(tmp_path_factory):
 def test_repeat_one_and_two_produce_the_same_shape(runs):
     one, two = runs
     assert keys(one) == keys(two)
-    l1, l2 = one["legs"]["parquet"], two["legs"]["parquet"]
+    l1, l2 = one["cases"]["parquet"], two["cases"]["parquet"]
     assert keys(l1) == keys(l2)
     assert keys(l1["summary"]) == keys(l2["summary"])
     assert keys(l1["summary"]["stats"]) == keys(l2["summary"]["stats"])
@@ -247,15 +247,15 @@ def test_repeat_one_and_two_produce_the_same_shape(runs):
 
 def test_every_repetition_is_checked_and_aggregated(runs):
     _, two = runs
-    leg = two["legs"]["parquet"]
-    assert leg["status"] == "ok"
-    for r in leg["repetitions"]:
+    case = two["cases"]["parquet"]
+    assert case["status"] == "ok"
+    for r in case["repetitions"]:
         checks = r["phases"]["readback"]["checks"]
         assert checks["sampled_passed"] and checks["oracle"]["passed"]
-    s = leg["summary"]
+    s = case["summary"]
     assert s["correct"] and s["repetitions"] == 2
     assert s["stats"]["upsert_mean_s"]["n"] == 2
-    upsert_means = [r["summary"]["upsert_mean_s"] for r in leg["repetitions"]]
+    upsert_means = [r["summary"]["upsert_mean_s"] for r in case["repetitions"]]
     assert s["stats"]["upsert_mean_s"]["mean"] == pytest.approx(
         statistics.fmean(upsert_means)
     )
@@ -264,9 +264,9 @@ def test_every_repetition_is_checked_and_aggregated(runs):
 
 
 def test_incremental_reads_start_at_the_previous_commit_in_every_phase(tmp_path):
-    leg = run_bench(tmp_path, 1, scenario="training-set")["legs"]["parquet"]
-    assert leg["status"] == "ok", leg.get("error")
-    phases = leg["repetitions"][0]["phases"]
+    case = run_bench(tmp_path, 1, scenario="training-set")["cases"]["parquet"]
+    assert case["status"] == "ok", case.get("error")
+    phases = case["repetitions"][0]["phases"]
     for kind in ("upsert", "delete"):
         for c in phases[kind]["commits"]:
             assert c["reads"]["incremental"]["rows"] == c["input_rows"]

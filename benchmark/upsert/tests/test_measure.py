@@ -55,7 +55,7 @@ def test_diff_never_counts_a_shrunk_file_as_written():
     assert d["bytes_written"] == 0
 
 
-class FakeLeg:
+class FakeCase:
     def __init__(self, live):
         self.live = live
 
@@ -75,7 +75,7 @@ def test_reclaim_deletes_only_unreferenced_data_files(tmp_path):
     for rel, size in (("old.parquet", 5), ("live.parquet", 7), ("_log/0.json", 3)):
         touch(tmp_path, rel, size)
     r = bench.reclaim(
-        FakeLeg({Path("live.parquet")}), tmp_path, bench.snapshot(tmp_path)
+        FakeCase({Path("live.parquet")}), tmp_path, bench.snapshot(tmp_path)
     )
     assert r == {"reclaimed_files": 1, "reclaimed_bytes": 5}
     assert sorted(p.name for p in tmp_path.rglob("*") if p.is_file()) == [
@@ -87,7 +87,7 @@ def test_reclaim_deletes_only_unreferenced_data_files(tmp_path):
 def test_reclaim_refuses_when_the_live_listing_is_empty(tmp_path):
     touch(tmp_path, "a.parquet", 5)
     with pytest.raises(RuntimeError, match="empty"):
-        bench.reclaim(FakeLeg(set()), tmp_path, bench.snapshot(tmp_path))
+        bench.reclaim(FakeCase(set()), tmp_path, bench.snapshot(tmp_path))
     assert (tmp_path / "a.parquet").exists()
 
 

@@ -26,7 +26,7 @@ PLAN = {"key_cols": ["id"]}
 BASE = pa.table({"id": ["a", "b", "c"], "updated_at": pa.array([1, 2, 3], pa.int64())})
 
 
-class FakeLeg:
+class FakeCase:
     def __init__(self, changed=None, deleted=None, travel=BASE):
         self.changed, self.deleted, self.travel = changed, deleted, travel
 
@@ -38,8 +38,8 @@ class FakeLeg:
         return self.travel
 
 
-def reads(leg, kind, arg, emits_deletes=False):
-    return bench.measure_reads(leg, PLAN, 0, 1, 0, kind, arg, BASE, emits_deletes)
+def reads(case, kind, arg, emits_deletes=False):
+    return bench.measure_reads(case, PLAN, 0, 1, 0, kind, arg, BASE, emits_deletes)
 
 
 UPSERT = pa.table({"id": ["a", "z"], "updated_at": pa.array([10, 11], pa.int64())})
@@ -47,7 +47,7 @@ DELETE = pa.table({"id": ["b"]})
 
 
 def test_upsert_returning_exactly_its_keys_passes():
-    out = reads(FakeLeg(changed=UPSERT), "upsert", UPSERT)
+    out = reads(FakeCase(changed=UPSERT), "upsert", UPSERT)
     assert out["incremental"]["changed_rows"] == 2
     assert out["time_travel"]["matches_load"]
 
@@ -64,24 +64,24 @@ def test_upsert_returning_exactly_its_keys_passes():
 )
 def test_upsert_returning_anything_else_fails(changed):
     with pytest.raises(bench.CheckFailed, match="after upsert"):
-        reads(FakeLeg(changed=changed), "upsert", UPSERT)
+        reads(FakeCase(changed=changed), "upsert", UPSERT)
 
 
 def test_upsert_input_in_any_order_matches_sorted_changed_rows():
     unsorted = UPSERT.take(pa.array([1, 0]))
-    out = reads(FakeLeg(changed=UPSERT), "upsert", unsorted)
+    out = reads(FakeCase(changed=UPSERT), "upsert", unsorted)
     assert out["incremental"]["changed_rows"] == 2
 
 
 def test_upsert_with_the_right_keys_but_stale_values_fails():
     stale = UPSERT.set_column(1, "updated_at", pa.array([10, 2], pa.int64()))
     with pytest.raises(bench.CheckFailed, match="updated_at"):
-        reads(FakeLeg(changed=stale), "upsert", UPSERT)
+        reads(FakeCase(changed=stale), "upsert", UPSERT)
 
 
 def test_upsert_returning_only_the_key_column_fails():
     with pytest.raises(bench.CheckFailed, match="columns_missing"):
-        reads(FakeLeg(changed=UPSERT.select(["id"])), "upsert", UPSERT)
+        reads(FakeCase(changed=UPSERT.select(["id"])), "upsert", UPSERT)
 
 
 def test_reads_are_gated_and_the_readings_recorded():
@@ -92,7 +92,7 @@ def test_reads_are_gated_and_the_readings_recorded():
         return {"load1": 0.5}
 
     out = bench.measure_reads(
-        FakeLeg(changed=UPSERT),
+        FakeCase(changed=UPSERT),
         PLAN,
         0,
         1,
@@ -111,29 +111,29 @@ def test_reads_are_gated_and_the_readings_recorded():
     )
 
 
-def test_delete_for_a_leg_without_delete_rows_must_return_nothing():
-    reads(FakeLeg(), "delete", DELETE)
+def test_delete_for_a_case_without_delete_rows_must_return_nothing():
+    reads(FakeCase(), "delete", DELETE)
     with pytest.raises(bench.CheckFailed, match="does not return deletes"):
-        reads(FakeLeg(changed=BASE.slice(0, 1)), "delete", DELETE)
+        reads(FakeCase(changed=BASE.slice(0, 1)), "delete", DELETE)
 
 
-def test_delete_for_a_leg_with_delete_rows_must_return_exactly_the_keys():
-    reads(FakeLeg(deleted=DELETE), "delete", DELETE, emits_deletes=True)
+def test_delete_for_a_case_with_delete_rows_must_return_exactly_the_keys():
+    reads(FakeCase(deleted=DELETE), "delete", DELETE, emits_deletes=True)
     with pytest.raises(bench.CheckFailed, match="deleted keys"):
-        reads(FakeLeg(), "delete", DELETE, emits_deletes=True)
+        reads(FakeCase(), "delete", DELETE, emits_deletes=True)
     with pytest.raises(bench.CheckFailed, match="deleted keys"):
         reads(
-            FakeLeg(deleted=BASE.select(["id"])), "delete", DELETE, emits_deletes=True
+            FakeCase(deleted=BASE.select(["id"])), "delete", DELETE, emits_deletes=True
         )
 
 
 def test_time_travel_must_carry_the_loaded_values_not_just_the_count():
     changed = BASE.set_column(1, "updated_at", pa.array([1, 20, 3], pa.int64()))
     with pytest.raises(bench.CheckFailed, match="time travel") as e:
-        reads(FakeLeg(changed=UPSERT, travel=changed), "upsert", UPSERT)
+        reads(FakeCase(changed=UPSERT, travel=changed), "upsert", UPSERT)
     assert '"key": "b"' in str(e.value) and '"got": "20"' in str(e.value)
 
 
 def test_time_travel_returning_nothing_fails():
     with pytest.raises(bench.CheckFailed, match="keys_missing"):
-        reads(FakeLeg(changed=UPSERT, travel=None), "upsert", UPSERT)
+        reads(FakeCase(changed=UPSERT, travel=None), "upsert", UPSERT)

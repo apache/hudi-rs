@@ -35,15 +35,15 @@ Commands:
   install-hudi  Build the hudi Python binding from this checkout into the venv
                 (maturin, release profile), or install the wheel paths given.
                 Fails if the installed hudi has no HudiTable.create.
-  smoke         The scenario's smoke scale, every leg; writes
+  smoke         The scenario's smoke scale, every case; writes
                 <work-dir>/smoke-<scenario>.json. A busy machine only warns.
-  full          The scenario's default scale; pass --scenario/--legs/--out as needed.
+  full          The scenario's default scale; pass --scenario/--cases/--out as needed.
   summarize     Print a table from results files (pass --markdown for the README).
 
 Examples:
   $(basename "$0") setup
   $(basename "$0") smoke --scenario rag-chunks
-  $(basename "$0") full --scenario uuid --legs hudi-mor --out results/uuid-hudi-mor-10M.json
+  $(basename "$0") full --scenario uuid --cases hudi-mor --out results/uuid-hudi-mor-10M.json
   $(basename "$0") summarize results/*.json --markdown
 USAGE
 }

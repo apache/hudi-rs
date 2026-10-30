@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-"""Leg registration, modules loaded with --extra-legs, and the Hudi leg's
+"""Case registration, modules loaded with --extra-cases, and the Hudi case's
 record key form."""
 
 import textwrap
@@ -24,66 +24,66 @@ import bench
 import pyarrow as pa
 import pytest
 
-HUDI_LEGS = {"hudi-cow", "hudi-mor", "hudi-cow-noindex"}
+HUDI_CASES = {"hudi-cow", "hudi-mor", "hudi-cow-noindex"}
 
 
 @pytest.fixture
 def registry(monkeypatch):
-    monkeypatch.setattr(bench, "LEGS", dict(bench.LEGS))
-    return bench.LEGS
+    monkeypatch.setattr(bench, "CASES", dict(bench.CASES))
+    return bench.CASES
 
 
-def test_built_in_legs_are_the_hudi_legs():
-    assert set(bench.LEGS) == HUDI_LEGS
-    assert all(isinstance(f(), bench.Leg) for f in bench.LEGS.values())
+def test_built_in_cases_are_the_hudi_cases():
+    assert set(bench.CASES) == HUDI_CASES
+    assert all(isinstance(f(), bench.Case) for f in bench.CASES.values())
 
 
-def test_register_leg_rejects_a_duplicate_name(registry):
+def test_register_case_rejects_a_duplicate_name(registry):
     with pytest.raises(ValueError, match="already registered"):
-        bench.register_leg("hudi-cow", lambda: None)
+        bench.register_case("hudi-cow", lambda: None)
 
 
 def write_module(tmp_path, body):
-    path = tmp_path / "more_legs.py"
+    path = tmp_path / "more_cases.py"
     path.write_text(textwrap.dedent(body))
     return path
 
 
-def test_extra_legs_module_registers_through_the_api(tmp_path, registry):
+def test_extra_cases_module_registers_through_the_api(tmp_path, registry):
     path = write_module(
         tmp_path,
         """
         def register(api):
-            class Probe(api.Leg):
+            class Probe(api.Case):
                 name = "probe"
 
                 def load(self, root, table, plan):
-                    raise api.LegUnavailable("probe only")
+                    raise api.CaseUnavailable("probe only")
 
-            api.register_leg("probe", Probe)
+            api.register_case("probe", Probe)
         """,
     )
-    bench.load_extra_legs([path])
-    leg = registry["probe"]()
-    assert isinstance(leg, bench.Leg)
-    with pytest.raises(bench.LegUnavailable, match="probe only"):
-        leg.load(None, None, None)
-    assert leg.crash_cause({}, "upsert", None) is None
+    bench.load_extra_cases([path])
+    case = registry["probe"]()
+    assert isinstance(case, bench.Case)
+    with pytest.raises(bench.CaseUnavailable, match="probe only"):
+        case.load(None, None, None)
+    assert case.crash_cause({}, "upsert", None) is None
 
 
-def test_extra_legs_module_without_register_is_refused(tmp_path, registry):
+def test_extra_cases_module_without_register_is_refused(tmp_path, registry):
     path = write_module(tmp_path, "X = 1\n")
     with pytest.raises(SystemExit, match="register"):
-        bench.load_extra_legs([path])
+        bench.load_extra_cases([path])
 
 
 COMPOSITE = {"key_cols": ["a", "b"], "ordering": None}
 
 
 def test_hudi_record_keys_use_the_complex_key_form_for_composite_keys():
-    leg = bench.HudiLeg("hudi-cow", "cow", True)
+    case = bench.HudiCase("hudi-cow", "cow", True)
     keys = pa.table({"a": pa.array([1, 2], pa.int64()), "b": ["x", "y"]})
-    leg.plan = COMPOSITE
-    assert leg.record_keys(keys) == ["a:1,b:x", "a:2,b:y"]
-    leg.plan = {"key_cols": ["a"]}
-    assert leg.record_keys(keys) == ["1", "2"]
+    case.plan = COMPOSITE
+    assert case.record_keys(keys) == ["a:1,b:x", "a:2,b:y"]
+    case.plan = {"key_cols": ["a"]}
+    assert case.record_keys(keys) == ["1", "2"]

@@ -24,7 +24,7 @@ commits on a large Hudi table, written by one Python process through the
 `hudi` package's write API (`HudiTable.create`, `append`, `upsert`,
 `delete_keys`).
 
-| leg                | table type    | record-level index |
+| case               | table type    | record-level index |
 |--------------------|---------------|--------------------|
 | `hudi-cow`         | copy-on-write | on                 |
 | `hudi-mor`         | merge-on-read | on                 |
@@ -37,12 +37,12 @@ file-level key ranges prune nothing, so without the index locating the keys
 touches the whole table; with it, the lookup cost follows the batch size, and
 index upkeep shows up as `meta_bytes_written`.
 
-Every leg's final table is checked against a Parquet oracle, and a leg that
+Every case's final table is checked against a Parquet oracle, and a case that
 does not match is reported as failed, not timed.
 
 ## Workload
 
-All legs run the same commits on the same data, generated from `--seed`:
+All cases run the same commits on the same data, generated from `--seed`:
 
 1. **Load**: create the table and write the base data in one call (timed, but
    not the subject).
@@ -158,11 +158,11 @@ for s in uuid tpcds-web-returns nyc-taxi rag-chunks training-set; do
   benchmark/upsert/run.sh smoke --scenario "$s"
 done
 
-# Full scale: one leg per invocation, one at a time, on an idle machine.
+# Full scale: one case per invocation, one at a time, on an idle machine.
 for s in uuid tpcds-web-returns nyc-taxi rag-chunks training-set; do
-  for leg in hudi-cow hudi-mor hudi-cow-noindex; do
-    benchmark/upsert/run.sh full --scenario "$s" --legs "$leg" --repeat 3 \
-      --out "benchmark/upsert/results/$s-$leg.json"
+  for c in hudi-cow hudi-mor hudi-cow-noindex; do
+    benchmark/upsert/run.sh full --scenario "$s" --cases "$c" --repeat 3 \
+      --out "benchmark/upsert/results/$s-$c.json"
   done
 done
 
@@ -171,9 +171,9 @@ benchmark/upsert/run.sh summarize benchmark/upsert/results/*.json --markdown
 
 `bench.py --help` lists every option. Data, tables and logs go under
 `--work-dir` (default `$TMPDIR/hudi-upsert-bench`, or `UPSERT_BENCH_WORK_DIR`);
-the 10M-row `uuid` data is about 0.7 GB. Tables are deleted after each leg
+the 10M-row `uuid` data is about 0.7 GB. Tables are deleted after each case
 unless `--keep-tables` is set. A lock stops two runs of the same scenario,
-scale and workload from sharing tables, and `--leg-timeout SECONDS` records a
+scale and workload from sharing tables, and `--case-timeout SECONDS` records a
 repetition that runs too long as `timeout`.
 
 ## What is measured
@@ -194,14 +194,14 @@ peak RSS is per phase.
 Not measured: object storage (everything is local disk, so the numbers are
 CPU-bound), concurrency, and table services.
 
-**Repetitions.** `--repeat N` (1 to 5, default 3) rebuilds each leg's table and
+**Repetitions.** `--repeat N` (1 to 5, default 3) rebuilds each case's table and
 replays the workload N times in a row. Every repetition runs the correctness
 checks, and `summary.stats` reports mean, median, min, max and coefficient of
 variation per timing. Bytes and files come from the first repetition; file
 counts must match across repetitions and byte counts within 1 percent,
 otherwise `summary.writes_consistent` is false.
 
-**Headroom gate.** Before each leg and each timed call, the harness refuses to
+**Headroom gate.** Before each case and each timed call, the harness refuses to
 go on if the 1-minute load average is above `--max-load1` (2.0), available
 memory is below `--min-mem-gib` (16), or free disk is below 3x the base data.
 A high load average alone is first given `--settle-timeout` seconds (180) to
@@ -230,19 +230,19 @@ range across repetitions (`--stat mean` for the mean), flags timings with a
 coefficient of variation above 10 percent, and prints the gate's readings
 under the table.
 
-## Adding a leg
+## Adding a case
 
-A leg subclasses `Leg` in `bench.py` and registers with
-`register_leg(name, factory)`. A leg outside this directory loads with
-`--extra-legs PATH`, which calls the module's `register(api)`:
+A case subclasses `Case` in `bench.py` and registers with
+`register_case(name, factory)`. A case outside this directory loads with
+`--extra-cases PATH`, which calls the module's `register(api)`:
 
 ```python
 def register(api):
-    class MyLeg(api.Leg):
-        name = "my-leg"
+    class MyCase(api.Case):
+        name = "my-case"
         ...
 
-    api.register_leg("my-leg", MyLeg)
+    api.register_case("my-case", MyCase)
 ```
 
 `plan` is the scenario's `plan.json` (key columns, ordering field, check
@@ -263,4 +263,4 @@ columns, whether incremental reads run).
 | `classify(relpath)` | `"data"` or `"meta"` |
 | `crash_cause(plan, phase, in_flight)` | optional cause when a phase dies on a signal |
 
-Raising `LegUnavailable` records the leg as unavailable instead of failed.
+Raising `CaseUnavailable` records the case as unavailable instead of failed.

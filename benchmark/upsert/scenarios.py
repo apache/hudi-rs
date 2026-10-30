@@ -17,7 +17,7 @@
 
 """Scenario data: the base table, every commit's input, and the expected end state.
 
-Every scenario is generated (or downloaded) once into the work dir, so all legs
+Every scenario is generated (or downloaded) once into the work dir, so all cases
 apply byte-identical inputs. The workload builder replays each commit against an
 in-memory copy of the table to know the exact end state, then samples keys from
 it for the read-back checks.
@@ -601,7 +601,7 @@ def _with_key(sc, t):
 
 
 def plain_type(t):
-    """The type a leg's output is compared in: strings and binaries in their
+    """The type a case's output is compared in: strings and binaries in their
     large form, whose 64-bit offsets hold a column past 2 GiB, and list item
     fields named and nullable as pyarrow's default."""
     if (
@@ -622,7 +622,7 @@ def plain_type(t):
 
 
 def oracle_schema(schema):
-    # Every field is nullable: legs differ in the nullability they report, and
+    # Every field is nullable: cases differ in the nullability they report, and
     # whether a value is null is still compared row by row.
     return pa.schema([pa.field(f.name, plain_type(f.type)) for f in schema])
 
