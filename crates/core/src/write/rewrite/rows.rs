@@ -21,38 +21,24 @@
 
 use super::*;
 
-/// Indices into `combined` (the group's `num_old` stored rows, then the
-/// incoming rows) that survive an event-time merge, in `combined` order.
+/// The `candidates` of `combined` that survive an event-time merge, sorted.
 ///
-/// Only the stored rows whose key is incoming can change, so the merger sees
-/// just those and the incoming rows. A group with a repeated stored key sends
-/// every stored row through it, since the merger also collapses repeats.
+/// Only the candidates go through the merger, since it collapses every repeated
+/// key; rows left out are the caller's to keep or drop.
 pub(super) fn merge_with_event_time(
     hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
     combined: &RecordBatch,
-    num_old: usize,
-    old_by_key: &HashMap<String, u32>,
-    incoming_keys: &[String],
+    candidates: Vec<u32>,
 ) -> Result<Vec<u32>> {
-    let mut touched = vec![old_by_key.len() < num_old; num_old];
-    for key in incoming_keys {
-        if let Some(&index) = old_by_key.get(key) {
-            touched[index as usize] = true;
-        }
-    }
-    let (mut candidates, mut selected): (Vec<u32>, Vec<u32>) =
-        (0..num_old as u32).partition(|&index| touched[index as usize]);
-    candidates.extend(num_old as u32..combined.num_rows() as u32);
     let candidate_rows = take_batch(combined, &candidates)?;
     let merger = RecordMerger::new(combined.schema(), hudi_configs);
     let merged = merger.merge_record_batches(RecordBatches::new_with_data_batches([
         candidate_rows.clone(),
     ]))?;
-    selected.extend(
-        selected_indices_for_merged(&candidate_rows, &merged)?
-            .into_iter()
-            .map(|index| candidates[index as usize]),
-    );
+    let mut selected: Vec<u32> = selected_indices_for_merged(&candidate_rows, &merged)?
+        .into_iter()
+        .map(|index| candidates[index as usize])
+        .collect();
     selected.sort_unstable();
     Ok(selected)
 }
@@ -528,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_with_event_time_matches_full_merge() {
+    fn test_merge_with_event_time_merges_only_the_candidates() {
         let configs = Arc::new(HudiConfigs::new([
             (RecordMergeStrategy, "OVERWRITE_WITH_LATEST".to_string()),
             (OrderingFields, "ts".to_string()),
@@ -556,25 +542,25 @@ mod tests {
         for old in [unique, repeated] {
             let rows: Vec<_> = old.iter().chain(incoming.iter()).copied().collect();
             let combined = combined(&rows);
-            let keys = keys(&combined, MetaField::RecordKey.as_ref()).unwrap();
-            let num_old = old.len();
-            let old_by_key: HashMap<String, u32> = keys[..num_old]
-                .iter()
-                .enumerate()
-                .map(|(index, key)| (key.clone(), index as u32))
+            let num_old = old.len() as u32;
+            // Every stored row except e's is touched.
+            let (untouched, touched): (Vec<u32>, Vec<u32>) =
+                (0..num_old).partition(|&index| old[index as usize].1 == "e");
+            let candidates = touched
+                .into_iter()
+                .chain(num_old..combined.num_rows() as u32)
                 .collect();
-            let selected = merge_with_event_time(
-                configs.clone(),
-                &combined,
-                num_old,
-                &old_by_key,
-                &keys[num_old..],
-            )
-            .unwrap();
-            assert_eq!(selected, full_merge(configs.clone(), &combined), "{old:?}");
+            let mut selected =
+                merge_with_event_time(configs.clone(), &combined, candidates).unwrap();
+            selected.extend(untouched);
+            selected.sort_unstable();
             if num_old == 5 {
                 // e and a stored; b, c, the later d and the later f incoming.
                 assert_eq!(selected, vec![0, 1, 6, 7, 9, 11]);
+                assert_eq!(selected, full_merge(configs.clone(), &combined));
+            } else {
+                // Both stored e rows stay; the later stored a wins over both.
+                assert_eq!(selected, vec![0, 5, 6, 8, 9, 11, 13]);
             }
         }
     }

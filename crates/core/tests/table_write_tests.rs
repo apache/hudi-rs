@@ -566,6 +566,84 @@ async fn test_partial_upsert_preserves_unselected_columns() {
     assert_eq!(values.value(0), 2);
 }
 
+fn rows_with_event_time(batches: &[RecordBatch]) -> Vec<(String, i64, i64)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = |name| batch.column_by_name(name).unwrap().as_any();
+        let ids = column("id").downcast_ref::<StringArray>().unwrap();
+        let values = column("value").downcast_ref::<Int64Array>().unwrap();
+        let times = column("event_time").downcast_ref::<Int64Array>().unwrap();
+        for row in 0..batch.num_rows() {
+            rows.push((
+                ids.value(row).to_string(),
+                values.value(row),
+                times.value(row),
+            ));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// A copy-on-write merge copies the stored rows of keys it does not touch as
+/// they are, duplicates included, and a partial update takes its unselected
+/// columns from the winning stored duplicate.
+#[tokio::test]
+async fn test_cow_merge_keeps_untouched_duplicates_and_partial_baseline() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_batch(vec![
+            ("a", 1, 1),
+            ("a", 2, 2),
+            ("b", 100, 10),
+            ("b", 50, 5),
+        ])])
+        .await
+        .unwrap();
+
+    table
+        .upsert([ordered_batch(vec![("c", 3, 3)])])
+        .await
+        .unwrap();
+    let row = |id: &str, value, event_time| (id.to_string(), value, event_time);
+    assert_eq!(
+        rows_with_event_time(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            row("a", 1, 1),
+            row("a", 2, 2),
+            row("b", 50, 5),
+            row("b", 100, 10),
+            row("c", 3, 3),
+        ]
+    );
+
+    table
+        .upsert_with(
+            [ordered_batch(vec![("b", 999, 20)])],
+            UpsertOptions {
+                update_columns: Some(vec!["value".to_string()]),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_with_event_time(&table.read(&ReadOptions::new()).await.unwrap()),
+        vec![
+            row("a", 1, 1),
+            row("a", 2, 2),
+            row("b", 999, 10),
+            row("c", 3, 3)
+        ]
+    );
+}
+
 #[tokio::test]
 async fn test_partial_upsert_stale_event_time_keeps_lineage() {
     // A partial update whose ordering value LOSES the event-time merge must
