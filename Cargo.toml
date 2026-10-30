@@ -116,3 +116,10 @@ flate2 = { version = "1" }
 serial_test = { version = "4" }
 tempfile = { version = "3" }
 zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+# Dependency debug info (DataFusion, Arrow, Parquet, and RocksDB's C++ objects) is about a
+# third of a debug `target/` and is rarely stepped through. Workspace crates keep full debug
+# info, so debuggers and backtraces still resolve hudi-rs code. To step into a dependency,
+# build with `--config 'profile.dev.package."*".debug=true'`.
+[profile.dev.package."*"]
+debug = false
