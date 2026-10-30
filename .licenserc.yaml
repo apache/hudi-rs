@@ -23,6 +23,7 @@ header:
   paths-ignore:
     - 'LICENSE'
     - 'NOTICE'
+    - 'context7.json'
     - 'AGENTS.md'
     - 'CLAUDE.md'
     - '**/data/**'
