@@ -23,6 +23,7 @@ use crate::expr::ExprOperator;
 use arrow_arith::boolean;
 use arrow_array::cast::AsArray;
 use arrow_array::{ArrayAccessor, ArrayRef, BooleanArray, Datum, Scalar, StringArray};
+use arrow_buffer::BooleanBuffer;
 use arrow_cast::{CastOptions, cast_with_options};
 use arrow_ord::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow_schema::{DataType, Field, Schema};
@@ -416,21 +417,21 @@ impl SchemableFilter {
                 array.as_string_view_opt().map(|a| a.value(0))
             }
         }
-        let set: HashSet<&str> = self
+        // With std's SipHash the probe loses to the chain below about ten values.
+        let set: HashSet<&str, foldhash::fast::RandomState> = self
             .values
             .iter()
             .map(|scalar| first_str(scalar.get().0))
             .collect::<Option<_>>()?;
         fn probe<'a>(
             column: impl ArrayAccessor<Item = &'a str>,
-            set: &HashSet<&str>,
+            set: &HashSet<&str, foldhash::fast::RandomState>,
             negate: bool,
         ) -> BooleanArray {
-            (0..column.len())
-                .map(|row| {
-                    (!column.is_null(row)).then(|| set.contains(column.value(row)) != negate)
-                })
-                .collect()
+            let values = BooleanBuffer::collect_bool(column.len(), |row| {
+                set.contains(column.value(row)) != negate
+            });
+            BooleanArray::new(values, column.nulls().cloned())
         }
         if let Some(column) = column.as_string_opt::<i32>() {
             Some(probe(column, &set, negate))
