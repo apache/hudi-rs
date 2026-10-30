@@ -75,11 +75,6 @@ bindings. It creates, writes, and reads Hudi tables from Rust and Python in a si
 
 Create a table, upsert and delete rows, then read what changed after the first commit.
 
-> [!NOTE]
-> The write APIs ship in hudi-rs 0.6, which is not released yet. Until then, the Rust quick start
-> depends on the git repository, and the Python package is built from source (see the
-> [contributing guide](./CONTRIBUTING.md)).
-
 ### Python
 
 ```python
@@ -118,7 +113,7 @@ print(sorted(snapshot.column("doc_id").to_pylist()))  # ['doc1', 'doc2', 'doc4']
 ### Rust
 
 ```shell
-cargo add hudi --git https://github.com/apache/hudi-rs
+cargo add hudi
 cargo add arrow@59
 cargo add tokio@1 --features macros,rt-multi-thread
 ```
@@ -781,7 +776,7 @@ bindings) are not tied to these versions. The `hudi[datafusion]` extra first shi
 
 | hudi-rs | DataFusion | arrow | Python `datafusion` package |
 |---------|------------|-------|-----------------------------|
-| 0.6 (unreleased) | 55 | 59 | `>=55.0.0,<56` |
+| 0.6 | 55 | 59 | `>=55.0.0,<56` |
 | 0.5 | 54 | 58 | `>=54.0.0,<55` |
 | 0.4 | 46 | 54 | not available |
 | 0.3 | 43 | 53 | not available |
@@ -804,7 +799,7 @@ slows compilation noticeably. It goes away once a Lance release shares the works
 
 ```shell
 cargo new my_project --bin && cd my_project
-cargo add tokio@1 datafusion@54  # the DataFusion major that pairs with the hudi release, see the table above
+cargo add tokio@1 datafusion@55  # the DataFusion major that pairs with the hudi release, see the table above
 cargo add hudi --features datafusion
 ```
 
