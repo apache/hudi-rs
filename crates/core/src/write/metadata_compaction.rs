@@ -127,8 +127,11 @@ fn file_name(path: &str) -> &str {
 /// the data instant completed; returns the compaction instant, if one ran.
 ///
 /// Skips while any data instant is pending: its metadata log blocks would be
-/// named below the compaction instant and so attach to the superseded slice
-/// (Java holds compaction behind pending data instants the same way).
+/// named below the compaction instant, and this writer attaches metadata logs
+/// to slices by that name, so they would land on the superseded slice. Java
+/// does not skip: it schedules the compaction 1 ms below the earliest pending
+/// data instant whose metadata delta commit completed, and its planner leaves
+/// out log files that completed after that time.
 pub(crate) async fn compact_metadata_table_if_needed(table: &mut Table) -> Result<Option<String>> {
     if !table.is_metadata_table_enabled() {
         return Ok(None);

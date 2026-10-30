@@ -297,7 +297,11 @@ the writer compacts the metadata table once it holds
 `hoodie.metadata.compact.max.delta.commits` (default 10, as in Java) delta
 commits since its latest compaction, and only while no data instant is pending:
 a pending instant's metadata log blocks would otherwise sort below the
-compaction instant and attach to the superseded slice. Every slice of the
+compaction instant and attach to the superseded slice, since this writer
+places metadata logs by the instant in their name. Java instead schedules the
+compaction 1 ms below the earliest pending data instant whose metadata delta
+commit completed and leaves out logs that completed later; that rule is not
+yet implemented here. Every slice of the
 `files`, `column_stats`, `partition_stats` and `record_index` partitions with
 log files gets a new base HFile (1 MiB data blocks), under a `compaction`
 instant with a `HoodieCompactionPlan` that completes as a `commit`.
