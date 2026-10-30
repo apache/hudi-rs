@@ -1055,9 +1055,23 @@ fn schemas_equal_by_fields(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -
         .all(|(fa, fb)| fa.name() == fb.name() && fa.data_type() == fb.data_type())
 }
 
-/// `_hoodie_commit_seqno`, in Java's `HoodieRecord.generateSequenceId` form.
-pub(crate) fn commit_seqno(instant: &str, partition_id: u32, row: usize) -> String {
-    format!("{instant}_{partition_id}_{row}")
+/// `_hoodie_commit_seqno` for `rows` rows numbered from `row_id_offset`, in Java's
+/// `HoodieRecord.generateSequenceId` form, written straight into the array's buffer.
+pub(crate) fn commit_seqnos(
+    instant: &str,
+    partition_id: u32,
+    row_id_offset: usize,
+    rows: usize,
+) -> StringArray {
+    use std::fmt::Write;
+    let prefix = format!("{instant}_{partition_id}_");
+    let mut builder = arrow::array::StringBuilder::with_capacity(rows, rows * (prefix.len() + 10));
+    for row in row_id_offset..row_id_offset + rows {
+        // The builder's `fmt::Write` appends to its value buffer and never fails.
+        let _ = write!(builder, "{prefix}{row}");
+        builder.append_value("");
+    }
+    builder.finish()
 }
 
 pub(crate) fn prepare_batches_for_write(
@@ -1114,11 +1128,7 @@ pub(crate) fn prepare_batches_for_write_with_offset(
             fields.extend(batch.schema().fields().iter().cloned());
             let mut columns: Vec<ArrayRef> = vec![
                 Arc::new(StringArray::from(vec![instant; rows])),
-                Arc::new(StringArray::from(
-                    (0..rows)
-                        .map(|row| commit_seqno(instant, partition_id, row_id_offset + row))
-                        .collect::<Vec<_>>(),
-                )),
+                Arc::new(commit_seqnos(instant, partition_id, row_id_offset, rows)),
                 Arc::new(StringArray::from(key_strs)),
                 Arc::new(StringArray::from(partition_strs)),
                 Arc::new(StringArray::from(vec![file_name; rows])),
@@ -1159,6 +1169,22 @@ mod tests {
         assert_eq!(values(&take_rows(&batch, &[1, 3])?), [1, 3]);
         assert_eq!(take_rows(&batch, &[])?.num_rows(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_commit_seqnos_number_rows_from_the_offset() {
+        use arrow::array::Array;
+        let seqnos = commit_seqnos("20260101000000000", 3, 98, 3);
+        let got: Vec<&str> = seqnos.iter().map(Option::unwrap).collect();
+        assert_eq!(
+            got,
+            [
+                "20260101000000000_3_98",
+                "20260101000000000_3_99",
+                "20260101000000000_3_100",
+            ]
+        );
+        assert_eq!(commit_seqnos("20260101000000000", 0, 0, 0).len(), 0);
     }
 
     #[test]

@@ -443,10 +443,11 @@ pub(super) fn restamp_matched_rows(
         return Ok(batch.clone());
     };
     let new_ct: ArrayRef = std::sync::Arc::new(StringArray::from(vec![instant; batch.num_rows()]));
-    let new_sq: ArrayRef = std::sync::Arc::new(StringArray::from(
-        (0..batch.num_rows())
-            .map(|row| crate::write::append::commit_seqno(instant, 0, row))
-            .collect::<Vec<_>>(),
+    let new_sq: ArrayRef = std::sync::Arc::new(crate::write::append::commit_seqnos(
+        instant,
+        0,
+        0,
+        batch.num_rows(),
     ));
     let mut columns = batch.columns().to_vec();
     columns[ct_idx] = zip(mask, &new_ct, &columns[ct_idx])?;
