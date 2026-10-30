@@ -18,6 +18,7 @@
 
 from hudi._config import HudiPlanConfig, HudiReadConfig, HudiTableConfig
 from hudi._internal import (
+    HudiCoreError,
     HudiDataFusionDataSource,
     HudiFileGroupReader,
     HudiFileSlice,
@@ -33,6 +34,7 @@ from hudi._internal import __version__ as __version__
 from hudi.table.builder import HudiTableBuilder
 
 __all__ = [
+    "HudiCoreError",
     "HudiDataFusionDataSource",
     "HudiFileGroupReader",
     "HudiFileSlice",

@@ -24,7 +24,13 @@ from decimal import Decimal
 import pyarrow as pa
 import pytest
 
-from hudi import HudiQueryType, HudiReadOptions, HudiTable, HudiWriteResult
+from hudi import (
+    HudiCoreError,
+    HudiQueryType,
+    HudiReadOptions,
+    HudiTable,
+    HudiWriteResult,
+)
 
 SCHEMA = pa.schema(
     [
@@ -128,7 +134,7 @@ def test_create_rejects_bad_table_type(tmp_path):
 
 def test_create_on_existing_table_raises(tmp_path):
     HudiTable.create(str(tmp_path / "t"), record_key="id")
-    with pytest.raises(Exception, match="already exists"):
+    with pytest.raises(HudiCoreError, match="already exists"):
         HudiTable.create(str(tmp_path / "t"), record_key="id")
 
 
@@ -149,7 +155,7 @@ def test_create_on_existing_table_raises(tmp_path):
     ],
 )
 def test_create_rejects_inconsistent_index_options(tmp_path, flags, error):
-    with pytest.raises(Exception, match=error):
+    with pytest.raises(HudiCoreError, match=error):
         HudiTable.create(str(tmp_path / "t"), record_key="id", **flags)
     assert not (tmp_path / "t").exists()
 
@@ -301,7 +307,7 @@ def test_update_set_batches_must_hold_one_row(tmp_path):
     with pytest.raises(ValueError, match="got no batches"):
         table.update("id = 't1'", [])
     two = [pa.record_batch({"fare": [1.0]}), pa.record_batch({"fare": [2.0]})]
-    with pytest.raises(Exception, match="single-row"):
+    with pytest.raises(HudiCoreError, match="single-row"):
         table.update("id = 't1'", two)
     assert snapshot(table)["t1"] == ("sf", 1, 30.0)
 
@@ -744,11 +750,11 @@ def test_write_errors_leave_the_table_unchanged(tmp_path):
     timeline = tmp_path / "trips" / ".hoodie" / "timeline"
     instants = sorted(p.name for p in timeline.iterdir())
     no_key = pa.table({"city": ["sf"], "ts": [2], "fare": [1.0]})
-    with pytest.raises(Exception, match="schema does not match"):
+    with pytest.raises(HudiCoreError, match="schema does not match"):
         table.upsert(no_key)
-    with pytest.raises(Exception, match="nope"):
+    with pytest.raises(HudiCoreError, match="nope"):
         table.upsert(trips(("t1", "sf", 2, 1.0)), update_columns=["nope"])
-    with pytest.raises(Exception, match="'no_such_column' not found"):
+    with pytest.raises(HudiCoreError, match="'no_such_column' not found"):
         table.delete("no_such_column = 1")
     assert sorted(p.name for p in timeline.iterdir()) == instants
     assert snapshot(table)["t1"] == ("sf", 1, 30.0)

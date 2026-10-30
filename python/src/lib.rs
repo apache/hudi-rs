@@ -44,6 +44,10 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HudiTable>()?;
     m.add_class::<HudiTimeline>()?;
     m.add_class::<HudiWriteResult>()?;
+    m.add(
+        "HudiCoreError",
+        m.py().get_type::<internal::HudiCoreError>(),
+    )?;
 
     m.add_function(wrap_pyfunction!(internal::_config_keys, m)?)?;
 
