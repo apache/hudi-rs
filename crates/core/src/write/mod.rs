@@ -285,7 +285,8 @@ pub(crate) fn write_task_parallelism(table: &crate::table::Table) -> usize {
         })
 }
 
-/// Run write tasks with bounded concurrency; results come back in input order.
+/// Run write tasks with bounded concurrency on the runtime's worker threads;
+/// results come back in input order.
 pub(crate) async fn run_write_tasks<T: Send + 'static>(
     tasks: Vec<futures::future::BoxFuture<'static, Result<T>>>,
     parallelism: usize,
@@ -298,7 +299,12 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
     let indexed: Vec<_> = tasks
         .into_iter()
         .enumerate()
-        .map(|(index, task)| async move { (index, task.await) })
+        .map(|(index, task)| async move {
+            let result = AbortOnDrop(tokio::spawn(task))
+                .await
+                .unwrap_or_else(|e| Err(CoreError::Write(format!("write task failed: {e}"))));
+            (index, result)
+        })
         .collect();
     let mut stream = futures::stream::iter(indexed).buffer_unordered(parallelism.max(1));
     while let Some((index, result)) = stream.next().await {
@@ -308,6 +314,27 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
         .into_iter()
         .map(|r| r.unwrap_or_else(|| Err(CoreError::Write("write task vanished".to_string()))))
         .collect()
+}
+
+/// Aborts the spawned task when dropped. The task stops at its next await;
+/// work it already handed to the blocking pool still runs to completion.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
 }
 
 /// Output of one parquet base-file or log-file write task.
@@ -880,5 +907,96 @@ mod tests {
         assert_eq!(normalize_write_batch(&normalized).unwrap(), normalized);
         let ids = batch.project(&[0]).unwrap();
         assert_eq!(normalize_write_batch(&ids).unwrap(), ids);
+    }
+
+    /// CPU-bound tasks run on the runtime's workers, not the awaiting thread,
+    /// and results keep input order with errors in place.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_run_write_tasks_runs_on_workers_in_input_order() {
+        let caller = std::thread::current().id();
+        let tasks: Vec<futures::future::BoxFuture<'static, Result<std::thread::ThreadId>>> = (0
+            ..8u64)
+            .map(|i| {
+                let task: futures::future::BoxFuture<'static, _> = Box::pin(async move {
+                    // Later tasks finish first, so completion order differs from input order.
+                    let spin = std::time::Duration::from_millis(5 * (8 - i));
+                    let start = std::time::Instant::now();
+                    while start.elapsed() < spin {
+                        std::hint::spin_loop();
+                    }
+                    if i == 3 {
+                        Err(CoreError::Write("task 3".to_string()))
+                    } else {
+                        Ok(std::thread::current().id())
+                    }
+                });
+                task
+            })
+            .collect();
+
+        let results = run_write_tasks(tasks, 4).await;
+
+        assert_eq!(results.len(), 8);
+        let mut threads = std::collections::HashSet::new();
+        for (i, result) in results.into_iter().enumerate() {
+            match result {
+                Err(CoreError::Write(msg)) if i == 3 => assert_eq!(msg, "task 3"),
+                Ok(thread) if i != 3 => {
+                    assert_ne!(thread, caller, "task {i} ran on the awaiting thread");
+                    threads.insert(thread);
+                }
+                other => panic!("unexpected result for task {i}: {other:?}"),
+            }
+        }
+        assert!(
+            threads.len() > 1,
+            "tasks ran on {} thread(s)",
+            threads.len()
+        );
+    }
+
+    /// A panicking task surfaces as a write error; its siblings still complete.
+    #[tokio::test]
+    async fn test_run_write_tasks_maps_panic_to_write_error() {
+        let tasks: Vec<futures::future::BoxFuture<'static, Result<usize>>> = vec![
+            Box::pin(async { Ok(0) }),
+            Box::pin(async { panic!("boom") }),
+            Box::pin(async { Ok(2) }),
+        ];
+
+        let results = run_write_tasks(tasks, 2).await;
+
+        assert!(matches!(results[0], Ok(0)));
+        assert!(
+            matches!(&results[1], Err(CoreError::Write(msg)) if msg.contains("panicked")),
+            "{:?}",
+            results[1]
+        );
+        assert!(matches!(results[2], Ok(2)));
+    }
+
+    /// Dropping the write future aborts the tasks it spawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_run_write_tasks_aborts_spawned_tasks_on_drop() {
+        use futures::FutureExt;
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let task: futures::future::BoxFuture<'static, Result<()>> = Box::pin(async move {
+            let _tx = tx;
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+
+        assert!(run_write_tasks(vec![task], 1).now_or_never().is_none());
+
+        for _ in 0..500 {
+            if matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+            ) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("spawned write task kept running after the write was dropped");
     }
 }
