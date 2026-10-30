@@ -18,6 +18,7 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::file_group::base_file::reader::KeyPredicate;
 use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::record_batches::RecordBatches;
@@ -128,6 +129,8 @@ impl CollectedBlocks {
 pub struct LogFileScanner {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    /// Keys to narrow HFile log blocks to; see [`LogFileReader::with_key_predicate`].
+    key_predicate: Option<KeyPredicate>,
 }
 
 impl LogFileScanner {
@@ -135,7 +138,14 @@ impl LogFileScanner {
         Self {
             hudi_configs,
             storage,
+            key_predicate: None,
         }
+    }
+
+    /// Narrow HFile log blocks to `key_predicate` on every file this scanner reads.
+    pub(crate) fn with_key_predicate(mut self, key_predicate: Option<KeyPredicate>) -> Self {
+        self.key_predicate = key_predicate;
+        self
     }
 
     /// Read all blocks from multiple log files and collect rollback targets.
@@ -149,7 +159,9 @@ impl LogFileScanner {
 
         for path in relative_paths {
             let mut reader =
-                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path).await?;
+                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path)
+                    .await?
+                    .with_key_predicate(self.key_predicate.clone());
             let blocks = reader.read_all_blocks(instant_range).await?;
 
             // Collect rollback targets from command blocks
@@ -498,6 +510,66 @@ mod tests {
     const CHENNAI_UUID: &str = "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc";
     const SAN_FRANCISCO_UUID: &str = "036ded81-9ed4-479f-bcea-7145dfa0079b";
     const SAO_PAULO_UUID: &str = "8aa68f7e-afd6-4c94-b86c-8a886552e08d";
+
+    /// The key predicate narrows HFile data blocks but must leave delete
+    /// blocks whole: a tombstone for a requested key may sit in a block that
+    /// also names keys nobody asked for, and dropping it would bring the
+    /// deleted key back.
+    #[tokio::test]
+    async fn test_scan_hfile_records_key_predicate_keeps_delete_blocks_whole() -> crate::Result<()>
+    {
+        use crate::file_group::base_file::reader::KeyPredicate;
+        use crate::file_group::log_file::writer::write_log_block;
+        use crate::file_group::log_file::{BlockMetadataKey, BlockType};
+        use std::collections::{BTreeMap, HashMap};
+
+        let dir = tempfile::tempdir()?;
+        let instant = "20260101000000000";
+        let entries: Vec<(String, Vec<u8>)> = ["a", "b", "c"]
+            .iter()
+            .map(|k| (k.to_string(), k.as_bytes().to_vec()))
+            .collect();
+        let hfile = crate::hfile::HFileWriter::write(&entries, BTreeMap::new())
+            .map_err(|e| crate::error::CoreError::HFile(e.to_string()))?;
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())]);
+        let mut bytes = write_log_block(BlockType::HfileData, header, &hfile);
+        bytes.extend(crate::write::build_delete_log_block(
+            instant,
+            &[
+                ("b".to_string(), String::new()),
+                ("d".to_string(), String::new()),
+            ],
+            0,
+        )?);
+        let log = ".f-0_20260101000000000.log.1_0-0-0";
+        std::fs::write(dir.path().join(log), bytes)?;
+
+        let storage = Storage::new_with_base_url(parse_uri(dir.path().to_str().unwrap())?)?;
+        let scanner = LogFileScanner::new(Arc::new(HudiConfigs::empty()), storage)
+            .with_key_predicate(Some(KeyPredicate::Keys(vec!["b".to_string()])));
+        let records = scanner
+            .scan_hfile_records(
+                vec![log.to_string()],
+                &InstantRange::up_to("99991231235959999", "utc"),
+            )
+            .await?;
+        let mut keys: Vec<(String, bool)> = records
+            .iter()
+            .map(|r| (r.key_as_str().unwrap().to_string(), r.value().is_empty()))
+            .collect();
+        keys.sort();
+        // `b` from the data block, then the tombstones for `b` and `d`; `a`
+        // and `c` were narrowed away.
+        assert_eq!(
+            keys,
+            vec![
+                ("b".to_string(), false),
+                ("b".to_string(), true),
+                ("d".to_string(), true)
+            ]
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_scan_metadata_table_log_files() -> crate::Result<()> {
