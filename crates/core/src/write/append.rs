@@ -736,8 +736,11 @@ pub(crate) fn parquet_writer_props(table: &Table) -> parquet::file::properties::
         .build()
 }
 
-/// The record-key bloom filter a base file footer carries, resolved as Java's
-/// `HoodieFileWriterFactory#enableBloomFilter` and `#createBloomFilter` do.
+/// The record-key bloom filter a base file footer carries, sized as Java's
+/// `HoodieFileWriterFactory#createBloomFilter` does. Off unless
+/// `hoodie.parquet.bloom.filter.enabled` is true or the index type is a bloom
+/// index: the record index locates keys without it, and hashing every key
+/// costs a large share of a bulk load.
 pub(crate) fn base_file_bloom_filter_config(table: &Table) -> Option<BloomFilterConfig> {
     let populates_meta_fields: bool = table
         .hudi_configs
@@ -746,7 +749,7 @@ pub(crate) fn base_file_bloom_filter_config(table: &Table) -> Option<BloomFilter
     let options = table.hudi_configs.as_options();
     let enabled = options
         .get("hoodie.parquet.bloom.filter.enabled")
-        .is_none_or(|v| v.eq_ignore_ascii_case("true"))
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
         || options
             .get("hoodie.index.type")
             .is_some_and(|v| v.contains("BLOOM"));
@@ -1424,7 +1427,8 @@ mod tests {
         assert_eq!(rows, 64);
     }
 
-    /// The base file bloom filter follows Java's enable rule and sizing configs.
+    /// The base file bloom filter is off by default, on when asked for or when
+    /// the index type needs it, and sized by Java's configs.
     #[tokio::test]
     async fn test_base_file_bloom_filter_config_resolution() {
         async fn config(options: &[(&str, &str)]) -> Option<BloomFilterConfig> {
@@ -1437,7 +1441,9 @@ mod tests {
             }
             base_file_bloom_filter_config(&builder.create().await.unwrap())
         }
-        assert_eq!(config(&[]).await, Some(BloomFilterConfig::default()));
+        assert_eq!(config(&[]).await, None);
+        let enabled = ("hoodie.parquet.bloom.filter.enabled", "true");
+        assert_eq!(config(&[enabled]).await, Some(BloomFilterConfig::default()));
         let disabled = ("hoodie.parquet.bloom.filter.enabled", "false");
         assert_eq!(config(&[disabled]).await, None);
         assert_eq!(
@@ -1446,6 +1452,7 @@ mod tests {
         );
         assert_eq!(
             config(&[
+                enabled,
                 ("hoodie.bloom.index.filter.type", "simple"),
                 ("hoodie.index.bloom.num_entries", "100"),
                 ("hoodie.index.bloom.fpp", "0.01"),
