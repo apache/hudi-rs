@@ -85,7 +85,7 @@ async fn test_cow_upsert_merge_runs_off_the_async_worker() {
     let mut table = Table::create(dir.path().to_str().unwrap())
         .with_table_name("trips")
         .with_record_key_fields(["id"])
-        .with_metadata(false)
+        .with_metadata_table_enabled(false)
         .with_option("hoodie.parquet.small.file.limit", "0")
         .create()
         .await

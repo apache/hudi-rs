@@ -1,0 +1,139 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+"""The training-set reads: an incremental read must return exactly what the
+commit changed, and time travel to the load must return the loaded values."""
+
+import bench
+import pyarrow as pa
+import pytest
+
+PLAN = {"key_cols": ["id"]}
+BASE = pa.table({"id": ["a", "b", "c"], "updated_at": pa.array([1, 2, 3], pa.int64())})
+
+
+class FakeCase:
+    def __init__(self, changed=None, deleted=None, travel=BASE):
+        self.changed, self.deleted, self.travel = changed, deleted, travel
+
+    def incremental(self, prev, cur):
+        rows = sum(t.num_rows for t in (self.changed, self.deleted) if t is not None)
+        return rows, self.changed, self.deleted
+
+    def time_travel(self, marker):
+        return self.travel
+
+
+def reads(case, kind, arg, emits_deletes=False):
+    return bench.measure_reads(case, PLAN, 0, 1, 0, kind, arg, BASE, emits_deletes)
+
+
+UPSERT = pa.table({"id": ["a", "z"], "updated_at": pa.array([10, 11], pa.int64())})
+DELETE = pa.table({"id": ["b"]})
+
+
+def test_upsert_returning_exactly_its_keys_passes():
+    out = reads(FakeCase(changed=UPSERT), "upsert", UPSERT)
+    assert out["incremental"]["changed_rows"] == 2
+    assert out["time_travel"]["matches_load"]
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        UPSERT.slice(0, 1),
+        pa.concat_tables([UPSERT, BASE.slice(2, 1).cast(UPSERT.schema)]),
+        pa.concat_tables([UPSERT, UPSERT.slice(0, 1)]),
+        None,
+    ],
+    ids=["missing key", "extra key", "duplicate row", "nothing"],
+)
+def test_upsert_returning_anything_else_fails(changed):
+    with pytest.raises(bench.CheckFailed, match="after upsert"):
+        reads(FakeCase(changed=changed), "upsert", UPSERT)
+
+
+def test_upsert_input_in_any_order_matches_sorted_changed_rows():
+    unsorted = UPSERT.take(pa.array([1, 0]))
+    out = reads(FakeCase(changed=UPSERT), "upsert", unsorted)
+    assert out["incremental"]["changed_rows"] == 2
+
+
+def test_upsert_with_the_right_keys_but_stale_values_fails():
+    stale = UPSERT.set_column(1, "updated_at", pa.array([10, 2], pa.int64()))
+    with pytest.raises(bench.CheckFailed, match="updated_at"):
+        reads(FakeCase(changed=stale), "upsert", UPSERT)
+
+
+def test_upsert_returning_only_the_key_column_fails():
+    with pytest.raises(bench.CheckFailed, match="columns_missing"):
+        reads(FakeCase(changed=UPSERT.select(["id"])), "upsert", UPSERT)
+
+
+def test_reads_are_gated_and_the_readings_recorded():
+    seen = []
+
+    def gate_before(what):
+        seen.append(what)
+        return {"load1": 0.5}
+
+    out = bench.measure_reads(
+        FakeCase(changed=UPSERT),
+        PLAN,
+        0,
+        1,
+        0,
+        "upsert",
+        UPSERT,
+        BASE,
+        False,
+        gate_before,
+    )
+    assert seen == ["incremental read after upsert", "time travel read"]
+    assert (
+        out["incremental"]["headroom"]
+        == out["time_travel"]["headroom"]
+        == {"load1": 0.5}
+    )
+
+
+def test_delete_for_a_case_without_delete_rows_must_return_nothing():
+    reads(FakeCase(), "delete", DELETE)
+    with pytest.raises(bench.CheckFailed, match="does not return deletes"):
+        reads(FakeCase(changed=BASE.slice(0, 1)), "delete", DELETE)
+
+
+def test_delete_for_a_case_with_delete_rows_must_return_exactly_the_keys():
+    reads(FakeCase(deleted=DELETE), "delete", DELETE, emits_deletes=True)
+    with pytest.raises(bench.CheckFailed, match="deleted keys"):
+        reads(FakeCase(), "delete", DELETE, emits_deletes=True)
+    with pytest.raises(bench.CheckFailed, match="deleted keys"):
+        reads(
+            FakeCase(deleted=BASE.select(["id"])), "delete", DELETE, emits_deletes=True
+        )
+
+
+def test_time_travel_must_carry_the_loaded_values_not_just_the_count():
+    changed = BASE.set_column(1, "updated_at", pa.array([1, 20, 3], pa.int64()))
+    with pytest.raises(bench.CheckFailed, match="time travel") as e:
+        reads(FakeCase(changed=UPSERT, travel=changed), "upsert", UPSERT)
+    assert '"key": "b"' in str(e.value) and '"got": "20"' in str(e.value)
+
+
+def test_time_travel_returning_nothing_fails():
+    with pytest.raises(bench.CheckFailed, match="keys_missing"):
+        reads(FakeCase(changed=UPSERT, travel=None), "upsert", UPSERT)
