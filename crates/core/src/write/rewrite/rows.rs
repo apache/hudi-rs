@@ -165,23 +165,7 @@ pub(super) fn batch_record_keys(table: &Table, batch: &RecordBatch) -> Result<Ve
                 .to_string(),
         ));
     }
-    crate::write::record_keys_for_batch(&table.hudi_configs, batch)
-}
-
-/// The write filter parser splits an `IN` list on every `,`, and every
-/// composite record key contains one, so the list would name key fragments.
-pub(super) fn ensure_record_key_list_parsable(table: &Table, filter: &Filter) -> Result<()> {
-    if filter.field == MetaField::RecordKey.as_ref()
-        && matches!(filter.operator, ExprOperator::In | ExprOperator::NotIn)
-        && configured_record_key_fields(&table.hudi_configs)?.len() > 1
-    {
-        return Err(CoreError::Unsupported(format!(
-            "an IN list on {} cannot hold composite record keys, which contain ','; \
-             use one `=` predicate per key or a predicate on a non-key column",
-            filter.field
-        )));
-    }
-    Ok(())
+    record_keys_for_batch(&table.hudi_configs, batch)
 }
 
 /// If `filter` is `=` / `IN` on `_hoodie_record_key`, or on the record key
@@ -227,23 +211,29 @@ pub(super) async fn keys_from_record_key_filter(
             .zip(&filter.values)
             .all(|(rendered, given)| rendered == Some(given.as_str()))
     });
-    if !renders_as_given {
+    // An empty value names no key, as the writer refuses to store one.
+    if !renders_as_given || filter.values.iter().any(String::is_empty) {
         return Ok(None);
     }
-    let batch = RecordBatch::try_new(
-        std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
-            filter.field.as_str(),
-            key_type,
-            true,
-        )])),
-        vec![values],
-    )?;
-    // A generator the writer cannot reproduce falls back to the scan path.
-    Ok(
-        crate::write::record_keys_for_batch(&table.hudi_configs, &batch)
-            .ok()
-            .map(to_keys),
-    )
+    // A filter on the key column holds column values, which the complex key
+    // generator stores as `field:value`. A generator the writer cannot
+    // reproduce falls back to the scan path.
+    let Ok(encode_field_name) = encodes_single_key_field_name(&table.hudi_configs) else {
+        return Ok(None);
+    };
+    Ok(Some(to_keys(
+        filter
+            .values
+            .iter()
+            .map(|value| {
+                if encode_field_name {
+                    format!("{}:{value}", filter.field)
+                } else {
+                    value.clone()
+                }
+            })
+            .collect(),
+    )))
 }
 
 pub(super) fn partition_paths_for_batch(batch: &RecordBatch) -> Vec<String> {

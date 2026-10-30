@@ -16,19 +16,21 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Record key encoding shared by the writer and the virtual-key reader, so a
-//! key derived at read time equals the one a Java writer stored.
+//! Record key encoding shared by the writer, the index and the virtual-key
+//! reader, so a key derived at read time equals the one a Java writer stored.
 
 use arrow::array::{
-    Array, BooleanArray, Date32Array, Decimal128Array, Decimal256Array, Int8Array, Int16Array,
-    Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray,
+    StringArray, StringViewArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
-use chrono::NaiveDate;
+use arrow::record_batch::RecordBatch;
 
 use crate::Result;
+use crate::config::HudiConfigs;
+use crate::config::table::HudiTableConfig::RecordKeyFields;
 use crate::error::CoreError;
+use crate::keygen::{KeyGeneratorKind, encodes_single_key_field_name, key_generator_kind};
 
 /// Java `KeyGenerator.NULL_RECORDKEY_PLACEHOLDER`.
 pub(crate) const NULL_RECORDKEY_PLACEHOLDER: &str = "__null__";
@@ -39,17 +41,16 @@ const COLUMN_VALUE_SEPARATOR: char = ':';
 /// Java `KeyGenerator.DEFAULT_RECORD_KEY_PARTS_SEPARATOR`.
 const RECORD_KEY_PARTS_SEPARATOR: char = ',';
 
-/// Render a record key field column as the Spark and Avro key generators do:
-/// `toString` of the value after `HoodieAvroUtils.convertValueForAvroLogicalTypes`.
-/// Nulls stay null. A date renders as its ISO `LocalDate` and a decimal as
-/// `BigDecimal.toString`. Flink's `RowDataKeyGen` renders dates as the epoch
-/// day and decimals with `toPlainString`, so a Flink-written table keyed on
-/// those types does not round-trip.
+/// Render a string, boolean or integer record key field column as the Java
+/// key generators do: `toString` of the value. Nulls stay null.
 ///
-/// Every other type is [`CoreError::Unsupported`]: Java writers store
-/// timestamp keys in several forms (raw epoch count, JVM-zone
-/// `java.sql.Timestamp`, epoch millis) that the table does not record, and
-/// float keys depend on the JDK's `Double.toString` digits.
+/// Every other type is [`CoreError::Unsupported`]: Java writers store it in
+/// more than one form that the table does not record, and an encoding that
+/// does not match the table's would duplicate rows. Spark renders a date as
+/// its ISO `LocalDate` and Flink as the epoch day; decimals differ between
+/// `toString` and `toPlainString`; timestamps are stored as a raw epoch count,
+/// a JVM-zone `java.sql.Timestamp` or epoch millis; and float keys depend on
+/// the JDK's `Double.toString` digits.
 pub(crate) fn render_key_field(column: &dyn Array, field: &str) -> Result<StringArray> {
     macro_rules! render {
         ($array:ty, $render:expr) => {
@@ -72,24 +73,10 @@ pub(crate) fn render_key_field(column: &dyn Array, field: &str) -> Result<String
         DataType::UInt16 => render!(UInt16Array, |v: u16| v.to_string()),
         DataType::UInt32 => render!(UInt32Array, |v: u32| v.to_string()),
         DataType::UInt64 => render!(UInt64Array, |v: u64| v.to_string()),
-        DataType::Decimal128(_, scale) => {
-            render!(Decimal128Array, |v: i128| java_big_decimal(
-                &v.to_string(),
-                *scale
-            ))
-        }
-        DataType::Decimal256(_, scale) => render!(Decimal256Array, |v: arrow::datatypes::i256| {
-            java_big_decimal(&v.to_string(), *scale)
-        }),
-        DataType::Date32 => downcast::<Date32Array>(column, field)?
-            .iter()
-            .map(|days| days.map(|d| java_local_date(d, field)).transpose())
-            .collect::<Result<Vec<Option<String>>>>()?,
         other => {
             return Err(CoreError::Unsupported(format!(
                 "record key field '{field}' has type {other}, whose Java key rendering is not \
-                 reproduced; supported record key types are strings, booleans, integers, \
-                 Date32, and decimals"
+                 reproduced; supported record key types are strings, booleans, and integers"
             )));
         }
     };
@@ -133,6 +120,79 @@ pub(crate) fn construct_record_key(
     Ok(key)
 }
 
+/// Java `KeyGenUtils.getRecordKeyFields`: the configured record key fields,
+/// trimmed, with empty entries dropped. Empty means auto-generated keys.
+pub(crate) fn configured_record_key_fields(hudi_configs: &HudiConfigs) -> Result<Vec<String>> {
+    let fields: Vec<String> = hudi_configs
+        .try_get(RecordKeyFields)?
+        .map(Into::into)
+        .unwrap_or_default();
+    Ok(fields
+        .iter()
+        .map(|f| f.trim())
+        .filter(|f| !f.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Record keys of `batch` derived from the configured record key fields, as
+/// the table's key generator encodes them (Java `KeyGenerator.getRecordKey`).
+/// Fails on a table with auto-generated keys, which no row value determines.
+pub(crate) fn record_keys_for_batch(
+    hudi_configs: &HudiConfigs,
+    batch: &RecordBatch,
+) -> Result<Vec<String>> {
+    let record_key_fields = configured_record_key_fields(hudi_configs)?;
+    if record_key_fields.is_empty() {
+        return Err(CoreError::Unsupported(
+            "auto-generated record keys cannot be derived from row values".to_string(),
+        ));
+    }
+    encode_record_keys(hudi_configs, &record_key_fields, batch)
+}
+
+/// Several fields, or one field under the complex key generator, encode as
+/// `field:value` parts (Java `KeyGenUtils.getRecordKey(record, fields, ..)`);
+/// one field otherwise is the bare value, which may not be null or empty.
+pub(crate) fn encode_record_keys(
+    hudi_configs: &HudiConfigs,
+    fields: &[String],
+    batch: &RecordBatch,
+) -> Result<Vec<String>> {
+    if fields.len() > 1 && key_generator_kind(hudi_configs)? == KeyGeneratorKind::Simple {
+        return Err(CoreError::Unsupported(format!(
+            "the simple key generator expects a single record key field; got '{}'",
+            fields.join(",")
+        )));
+    }
+    let mut values = Vec::with_capacity(fields.len());
+    for field in fields {
+        let column = batch.column_by_name(field).ok_or_else(|| {
+            CoreError::Schema(format!(
+                "record key field '{field}' is missing from write batch"
+            ))
+        })?;
+        values.push(render_key_field(column.as_ref(), field)?);
+    }
+    if let ([field], [column]) = (fields, values.as_slice())
+        && !encodes_single_key_field_name(hudi_configs)?
+    {
+        return (0..batch.num_rows())
+            .map(|row| {
+                if column.is_null(row) || column.value(row).is_empty() {
+                    return Err(CoreError::Write(format!(
+                        "record key field '{field}' must be non-null and non-empty"
+                    )));
+                }
+                Ok(column.value(row).to_string())
+            })
+            .collect();
+    }
+    (0..batch.num_rows())
+        .map(|row| construct_record_key(fields, &values, row).map_err(CoreError::Write))
+        .collect()
+}
+
 fn downcast<'a, A: 'static>(column: &'a dyn Array, field: &str) -> Result<&'a A> {
     column.as_any().downcast_ref::<A>().ok_or_else(|| {
         CoreError::Schema(format!(
@@ -142,55 +202,13 @@ fn downcast<'a, A: 'static>(column: &'a dyn Array, field: &str) -> Result<&'a A>
     })
 }
 
-/// Java `LocalDate.ofEpochDay(days).toString()`.
-fn java_local_date(days: i32, field: &str) -> Result<String> {
-    // 719_163 days separate 0001-01-01 (day 1 of the common era) from the epoch.
-    days.checked_add(719_163)
-        .and_then(NaiveDate::from_num_days_from_ce_opt)
-        .map(|date| date.to_string())
-        .ok_or_else(|| {
-            CoreError::Unsupported(format!(
-                "record key field '{field}' holds date {days} days from the epoch, outside the \
-                 supported range"
-            ))
-        })
-}
-
-/// Java `BigDecimal.toString()` for an unscaled value and scale: plain notation
-/// unless the scale is negative or the adjusted exponent is below -6.
-fn java_big_decimal(unscaled: &str, scale: i8) -> String {
-    let (sign, digits) = match unscaled.strip_prefix('-') {
-        Some(digits) => ("-", digits),
-        None => ("", unscaled),
-    };
-    let scale = i64::from(scale);
-    let len = digits.len() as i64;
-    let adjusted = len - 1 - scale;
-    if scale >= 0 && adjusted >= -6 {
-        if scale == 0 {
-            return format!("{sign}{digits}");
-        }
-        if len > scale {
-            let (int_part, frac_part) = digits.split_at((len - scale) as usize);
-            return format!("{sign}{int_part}.{frac_part}");
-        }
-        let zeros = "0".repeat((scale - len) as usize);
-        return format!("{sign}0.{zeros}{digits}");
-    }
-    let (first, rest) = digits.split_at(1);
-    let point = if rest.is_empty() { "" } else { "." };
-    let exponent_sign = if adjusted > 0 { "+" } else { "" };
-    format!("{sign}{first}{point}{rest}E{exponent_sign}{adjusted}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use arrow::array::{
-        ArrayRef, BinaryArray, Float32Array, Float64Array, TimestampMicrosecondArray,
-        TimestampMillisecondArray,
+        ArrayRef, BinaryArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+        TimestampMicrosecondArray, TimestampMillisecondArray,
     };
-    use arrow::datatypes::i256;
     use std::sync::Arc;
 
     fn rendered(column: ArrayRef) -> Vec<Option<String>> {
@@ -226,51 +244,6 @@ mod tests {
     }
 
     #[test]
-    fn test_render_key_field_dates_match_local_date() {
-        // LocalDate.ofEpochDay: 4-digit years, sign outside 0..=9999.
-        assert_eq!(
-            rendered(Arc::new(Date32Array::from(vec![
-                0, 19_724, -719_528, -719_529, 2_932_897,
-            ]))),
-            some(&[
-                "1970-01-01",
-                "2024-01-02",
-                "0000-01-01",
-                "-0001-12-31",
-                "+10000-01-01"
-            ])
-        );
-    }
-
-    #[test]
-    fn test_render_key_field_decimals_match_big_decimal_to_string() {
-        let decimal = |values: Vec<i128>, precision: u8, scale: i8| -> ArrayRef {
-            Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(precision, scale)
-                    .unwrap(),
-            )
-        };
-        assert_eq!(
-            rendered(decimal(vec![12345, -5, 0, 7], 10, 2)),
-            some(&["123.45", "-0.05", "0.00", "0.07"])
-        );
-        // Adjusted exponent below -6 switches to scientific notation.
-        assert_eq!(
-            rendered(decimal(vec![1, 0, 123, 1_000_000], 20, 8)),
-            some(&["1E-8", "0E-8", "0.00000123", "0.01000000"])
-        );
-        assert_eq!(rendered(decimal(vec![42], 5, 0)), some(&["42"]));
-        assert_eq!(rendered(decimal(vec![42], 5, -2)), some(&["4.2E+3"]));
-        let wide: ArrayRef = Arc::new(
-            Decimal256Array::from(vec![i256::from_i128(-123_456)])
-                .with_precision_and_scale(40, 3)
-                .unwrap(),
-        );
-        assert_eq!(rendered(wide), some(&["-123.456"]));
-    }
-
-    #[test]
     fn test_render_key_field_rejects_unrendered_types() {
         let columns: Vec<ArrayRef> = vec![
             Arc::new(Float32Array::from(vec![1.0f32])),
@@ -278,6 +251,12 @@ mod tests {
             Arc::new(TimestampMicrosecondArray::from(vec![1])),
             Arc::new(TimestampMillisecondArray::from(vec![1]).with_timezone("UTC")),
             Arc::new(BinaryArray::from_vec(vec![b"x"])),
+            Arc::new(Date32Array::from(vec![0])),
+            Arc::new(
+                Decimal128Array::from(vec![1])
+                    .with_precision_and_scale(10, 2)
+                    .unwrap(),
+            ),
         ];
         for column in columns {
             let err = render_key_field(column.as_ref(), "k").unwrap_err();

@@ -33,8 +33,8 @@ pub use append::append_batches;
 pub(crate) use append::set_commit_timezone;
 pub use create::TableCreateBuilder;
 pub(crate) use keygen::{
-    complex_keygen_validation_enabled, encodes_single_key_field_name,
-    ensure_complex_keygen_validated, ensure_supported_key_generator, record_keys_for_batch,
+    complex_keygen_validation_enabled, ensure_complex_keygen_validated,
+    ensure_supported_key_generator,
 };
 pub use lock::{InProcessLockProvider, LockLease, LockProvider};
 pub(crate) use rewrite::ensure_writable_table_version;

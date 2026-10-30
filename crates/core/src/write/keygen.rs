@@ -24,12 +24,12 @@ use arrow::record_batch::RecordBatch;
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig::{
-    IsHiveStylePartitioning, IsPartitionPathUrlencoded, KeyGeneratorClass, KeyGeneratorType,
-    PartitionFields, RecordKeyFields, TableVersion,
+    IsHiveStylePartitioning, IsPartitionPathUrlencoded, PartitionFields, TableVersion,
 };
 use crate::error::CoreError;
 use crate::index::HoodieKey;
-use crate::keygen::record_key::{construct_record_key, render_key_field};
+use crate::keygen::record_key::{configured_record_key_fields, encode_record_keys};
+use crate::keygen::{declares_complex_key_generator, encodes_single_key_field_name};
 
 /// Build per-row [`HoodieKey`]s from a write batch.
 ///
@@ -55,103 +55,8 @@ pub(crate) const VALIDATION_INSTANT: &str = "00000000000000000";
 /// Java `PartitionPathEncodeUtils.DEFAULT_PARTITION_PATH`.
 const DEFAULT_PARTITION_PATH: &str = "__HIVE_DEFAULT_PARTITION__";
 
-/// Java `HoodieWriteConfig.COMPLEX_KEYGEN_NEW_ENCODING`.
-const COMPLEX_KEYGEN_NEW_ENCODING: &str = "hoodie.write.complex.keygen.new.encoding";
-
 /// Java `HoodieWriteConfig.ENABLE_COMPLEX_KEYGEN_VALIDATION`.
 pub(crate) const COMPLEX_KEYGEN_VALIDATION: &str = "hoodie.write.complex.keygen.validation.enable";
-
-/// The record key encodings of the key generators the writer reproduces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyGeneratorKind {
-    Simple,
-    NonPartitioned,
-    Complex,
-}
-
-/// The table's key generator, resolved like Java
-/// `KeyGeneratorType.getKeyGeneratorClassName`: the class wins over the type,
-/// and with neither it is inferred from the field lists
-/// (`KeyGenUtils.inferKeyGeneratorType`). Generators whose keys or partition
-/// paths the writer does not reproduce are rejected, since writing with a
-/// different encoding would split a key across two index entries.
-fn key_generator_kind(hudi_configs: &HudiConfigs) -> Result<KeyGeneratorKind> {
-    if let Some(class) = hudi_configs
-        .get_raw(KeyGeneratorClass.as_ref())
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-    {
-        return match class {
-            "org.apache.hudi.keygen.SimpleKeyGenerator"
-            | "org.apache.hudi.keygen.SimpleAvroKeyGenerator" => Ok(KeyGeneratorKind::Simple),
-            "org.apache.hudi.keygen.NonpartitionedKeyGenerator"
-            | "org.apache.hudi.keygen.NonpartitionedAvroKeyGenerator" => {
-                Ok(KeyGeneratorKind::NonPartitioned)
-            }
-            // Spark SQL's wrapper delegates to ComplexKeyGenerator when the table
-            // config names the wrapper itself rather than an origin class.
-            "org.apache.hudi.keygen.ComplexKeyGenerator"
-            | "org.apache.hudi.keygen.ComplexAvroKeyGenerator"
-            | "org.apache.spark.sql.hudi.command.SqlKeyGenerator" => Ok(KeyGeneratorKind::Complex),
-            other => Err(unsupported_key_generator(KeyGeneratorClass.as_ref(), other)),
-        };
-    }
-    if let Some(key_generator_type) = hudi_configs
-        .get_raw(KeyGeneratorType.as_ref())
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        return match key_generator_type {
-            "SIMPLE" | "SIMPLE_AVRO" => Ok(KeyGeneratorKind::Simple),
-            "NON_PARTITION" | "NON_PARTITION_AVRO" => Ok(KeyGeneratorKind::NonPartitioned),
-            "COMPLEX" | "COMPLEX_AVRO" | "SPARK_SQL" => Ok(KeyGeneratorKind::Complex),
-            other => Err(unsupported_key_generator(KeyGeneratorType.as_ref(), other)),
-        };
-    }
-    let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
-    if partition_fields.first().is_some_and(|f| f.contains(':')) {
-        return Err(unsupported_key_generator(
-            PartitionFields.as_ref(),
-            &partition_fields.join(","),
-        ));
-    }
-    Ok(match partition_fields.len() {
-        0 => KeyGeneratorKind::NonPartitioned,
-        1 if configured_record_key_fields(hudi_configs)?.len() > 1 => KeyGeneratorKind::Complex,
-        1 => KeyGeneratorKind::Simple,
-        _ => KeyGeneratorKind::Complex,
-    })
-}
-
-/// Java `KeyGenUtils.getRecordKeyFields`: the configured record key fields,
-/// trimmed, with empty entries dropped. Empty means auto-generated keys.
-pub(crate) fn configured_record_key_fields(hudi_configs: &HudiConfigs) -> Result<Vec<String>> {
-    let fields: Vec<String> = hudi_configs
-        .try_get(RecordKeyFields)?
-        .map(Into::into)
-        .unwrap_or_default();
-    Ok(fields
-        .iter()
-        .map(|f| f.trim())
-        .filter(|f| !f.is_empty())
-        .map(str::to_string)
-        .collect())
-}
-
-/// Whether the table's key generator stores a single-field record key as
-/// `field:value` (Java `ComplexKeyGenerator`) rather than the bare value
-/// (`SimpleKeyGenerator`, `NonpartitionedKeyGenerator`).
-pub(crate) fn encodes_single_key_field_name(hudi_configs: &HudiConfigs) -> Result<bool> {
-    if key_generator_kind(hudi_configs)? != KeyGeneratorKind::Complex {
-        return Ok(false);
-    }
-    // Java `KeyGenUtils.encodeSingleKeyFieldNameForComplexKeyGen`.
-    let table_version: Option<isize> = hudi_configs.try_get(TableVersion)?.map(Into::into);
-    let new_encoding = hudi_configs
-        .get_raw(COMPLEX_KEYGEN_NEW_ENCODING)
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
-    Ok(table_version.is_some_and(|v| v >= 9) || !new_encoding)
-}
 
 /// Fail a write on a table whose key generator the writer cannot reproduce.
 pub(crate) fn ensure_supported_key_generator(hudi_configs: &HudiConfigs) -> Result<()> {
@@ -188,30 +93,6 @@ pub(crate) fn complex_keygen_validation_enabled<'a>(
     get_raw: impl Fn(&str) -> Option<&'a str>,
 ) -> bool {
     !get_raw(COMPLEX_KEYGEN_VALIDATION).is_some_and(|v| v.trim().eq_ignore_ascii_case("false"))
-}
-
-/// Java `KeyGeneratorType.isComplexKeyGenerator`: only a declared type or
-/// class counts, never one inferred from the field lists.
-fn declares_complex_key_generator(hudi_configs: &HudiConfigs) -> bool {
-    if let Some(key_generator_type) = hudi_configs.get_raw(KeyGeneratorType.as_ref()) {
-        return matches!(key_generator_type.trim(), "COMPLEX" | "COMPLEX_AVRO");
-    }
-    matches!(
-        hudi_configs
-            .get_raw(KeyGeneratorClass.as_ref())
-            .map(str::trim),
-        Some(
-            "org.apache.hudi.keygen.ComplexKeyGenerator"
-                | "org.apache.hudi.keygen.ComplexAvroKeyGenerator"
-        )
-    )
-}
-
-fn unsupported_key_generator(config: &str, value: &str) -> CoreError {
-    CoreError::Unsupported(format!(
-        "writes do not support {config}={value}; supported key generators are SIMPLE, \
-         COMPLEX, NON_PARTITION, and SPARK_SQL"
-    ))
 }
 
 /// Run key/partition derivation for its error side only — call before fencing
@@ -278,64 +159,6 @@ pub fn hoodie_keys_for_batch_with_offset(
                 )?,
             })
         })
-        .collect()
-}
-
-/// Record keys of `batch` derived from the configured record key fields, as
-/// the table's key generator encodes them (Java `KeyGenerator.getRecordKey`).
-/// Fails on a table with auto-generated keys, which no row value determines.
-pub(crate) fn record_keys_for_batch(
-    hudi_configs: &HudiConfigs,
-    batch: &RecordBatch,
-) -> Result<Vec<String>> {
-    let record_key_fields = configured_record_key_fields(hudi_configs)?;
-    if record_key_fields.is_empty() {
-        return Err(CoreError::Unsupported(
-            "auto-generated record keys cannot be derived from row values".to_string(),
-        ));
-    }
-    encode_record_keys(hudi_configs, &record_key_fields, batch)
-}
-
-/// Several fields, or one field under the complex key generator, encode as
-/// `field:value` parts (Java `KeyGenUtils.getRecordKey(record, fields, ..)`);
-/// one field otherwise is the bare value, which may not be null or empty.
-fn encode_record_keys(
-    hudi_configs: &HudiConfigs,
-    fields: &[String],
-    batch: &RecordBatch,
-) -> Result<Vec<String>> {
-    if fields.len() > 1 && key_generator_kind(hudi_configs)? == KeyGeneratorKind::Simple {
-        return Err(CoreError::Unsupported(format!(
-            "the simple key generator expects a single record key field; got '{}'",
-            fields.join(",")
-        )));
-    }
-    let mut values = Vec::with_capacity(fields.len());
-    for field in fields {
-        let column = batch.column_by_name(field).ok_or_else(|| {
-            CoreError::Schema(format!(
-                "record key field '{field}' is missing from write batch"
-            ))
-        })?;
-        values.push(render_key_field(column.as_ref(), field)?);
-    }
-    if let ([field], [column]) = (fields, values.as_slice())
-        && !encodes_single_key_field_name(hudi_configs)?
-    {
-        return (0..batch.num_rows())
-            .map(|row| {
-                if column.is_null(row) || column.value(row).is_empty() {
-                    return Err(CoreError::Write(format!(
-                        "record key field '{field}' must be non-null and non-empty"
-                    )));
-                }
-                Ok(column.value(row).to_string())
-            })
-            .collect();
-    }
-    (0..batch.num_rows())
-        .map(|row| construct_record_key(fields, &values, row).map_err(CoreError::Write))
         .collect()
 }
 

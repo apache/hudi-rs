@@ -431,7 +431,7 @@ impl RecordContext {
         let configs = HudiConfigs::new(table_config.iter().map(|(k, v)| (k.as_str(), v.clone())));
         // The generators the writer does not reproduce (timestamp, custom) store a
         // single-field key as the bare value.
-        crate::write::encodes_single_key_field_name(&configs).unwrap_or(false)
+        crate::keygen::encodes_single_key_field_name(&configs).unwrap_or(false)
     }
 
     // =========================================================================

@@ -24,9 +24,9 @@ use arrow::array::StringArray;
 use crate::Result;
 use crate::error::CoreError;
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
+use crate::keygen::record_key::record_keys_for_batch;
 use crate::metadata::meta_field::MetaField;
 use crate::table::{ReadOptions, Table};
-use crate::write::record_keys_for_batch;
 
 /// A single-node index that scans latest file slices to locate record keys.
 #[derive(Clone, Debug, Default)]
