@@ -426,6 +426,10 @@ pub async fn upsert_batches(
         }
     }
 
+    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+        &instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     // RLI adds: every input row's final location is known from the plan. A
     // REJECTED cross-partition move keeps the old row, so its index entry
     // must carry the old partition, not the losing incoming value.
@@ -449,10 +453,7 @@ pub async fn upsert_batches(
                 record_key: key.record_key.clone(),
                 partition_path,
                 file_id,
-                instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                    &instant,
-                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                ),
+                instant_time_millis,
                 is_deleted: false,
             })
         })

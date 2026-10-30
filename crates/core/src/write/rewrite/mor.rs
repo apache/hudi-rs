@@ -123,6 +123,10 @@ pub(super) async fn mor_upsert_batches(
         std::slice::from_ref(&incoming),
     )?;
     let instant = request_deltacommit(table, "UPSERT").await?;
+    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+        &instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     let tagged_keys = hoodie_keys_for_batch(&table.hudi_configs, &incoming, Some(&instant))?;
     let incoming_keys: Vec<String> = tagged_keys.iter().map(|k| k.record_key.clone()).collect();
     let locations = mor_file_locations(table, &tagged_keys).await?;
@@ -450,10 +454,7 @@ pub(super) async fn mor_upsert_batches(
                         record_key: key.record_key.clone(),
                         partition_path: partition_path.clone(),
                         file_id: file_id.clone(),
-                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                            &instant,
-                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                        ),
+                        instant_time_millis,
                         is_deleted: false,
                     }
                 }));
@@ -524,10 +525,7 @@ pub(super) async fn mor_upsert_batches(
                 record_key: key.record_key.clone(),
                 partition_path: partition_path.clone(),
                 file_id: file_id.clone(),
-                instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                    &instant,
-                    &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                ),
+                instant_time_millis,
                 is_deleted: false,
             }
         }));
@@ -784,6 +782,10 @@ pub(super) async fn mor_delete_keys(
             ..Default::default()
         });
     }
+    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+        &instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     let record_index = delete_keys
         .iter()
         .filter(|key| locations.contains_key(&key.record_key))
@@ -791,10 +793,7 @@ pub(super) async fn mor_delete_keys(
             record_key: key.record_key.clone(),
             partition_path: key.partition_path.clone(),
             file_id: String::new(),
-            instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                &instant,
-                &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-            ),
+            instant_time_millis,
             is_deleted: true,
         })
         .collect::<Vec<_>>();

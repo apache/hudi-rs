@@ -291,6 +291,10 @@ pub(super) async fn rewrite(
         return Err(error);
     }
 
+    let instant_time_millis = crate::write::metadata::instant_to_epoch_millis_in(
+        instant,
+        &crate::write::metadata::timeline_timezone(&table.hudi_configs),
+    );
     let rli_entries = {
         let mut entries = if batch.num_rows() > 0 && is_record_index_enabled(table) {
             hoodie_keys_for_batch(&table.hudi_configs, batch, Some(instant))?
@@ -302,10 +306,7 @@ pub(super) async fn rewrite(
                         record_key: key.record_key,
                         partition_path: key.partition_path,
                         file_id,
-                        instant_time_millis: crate::write::metadata::instant_to_epoch_millis_in(
-                            instant,
-                            &crate::write::metadata::timeline_timezone(&table.hudi_configs),
-                        ),
+                        instant_time_millis,
                         is_deleted: false,
                     })
                 })
