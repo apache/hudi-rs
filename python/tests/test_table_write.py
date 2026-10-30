@@ -168,7 +168,7 @@ def test_create_index_options(tmp_path):
     assert snapshot(table) == {"t1": ("sf", 2, 31.0)}
 
 
-def test_create_with_multiple_fields(tmp_path):
+def test_create_with_field_lists_and_storage_options(tmp_path):
     table = HudiTable.create(
         str(tmp_path / "t"),
         record_key=["id"],
@@ -652,6 +652,21 @@ def test_nanosecond_timestamps_are_checked(tmp_path, source):
         table.upsert(frame(1))
 
 
+def test_unreferenced_nanosecond_values_are_ignored(tmp_path):
+    ns = pa.timestamp("ns")
+    sliced = pa.table(
+        {"id": ["a", "b"], "ts": pa.array([[1], [1_000]], pa.list_(ns))}
+    ).slice(1)
+    unused = pa.DictionaryArray.from_arrays(
+        pa.array([1], pa.int8()), pa.array([1, 1_000], ns)
+    )
+    table = HudiTable.create(str(tmp_path / "t"), record_key="id")
+    table.append(sliced.append_column("d", unused))
+    read = pa.Table.from_batches(table.read()).select(["id", "ts", "d"]).to_pylist()
+    one_us = datetime.datetime(1970, 1, 1, 0, 0, 0, 1)
+    assert read == [{"id": "b", "ts": [one_us], "d": one_us}]
+
+
 def test_pandas_category_and_index_columns(tmp_path):
     pd = pandas()
     table = HudiTable.create(str(tmp_path / "t"), record_key="id")
@@ -694,13 +709,16 @@ def test_pandas_named_index_is_kept(tmp_path):
 
 def test_write_errors_leave_the_table_unchanged(tmp_path):
     table = new_table(tmp_path)
+    timeline = tmp_path / "trips" / ".hoodie" / "timeline"
+    instants = sorted(p.name for p in timeline.iterdir())
     no_key = pa.table({"city": ["sf"], "ts": [2], "fare": [1.0]})
     with pytest.raises(Exception, match="schema does not match"):
         table.upsert(no_key)
     with pytest.raises(Exception, match="nope"):
         table.upsert(trips(("t1", "sf", 2, 1.0)), update_columns=["nope"])
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="'no_such_column' not found"):
         table.delete("no_such_column = 1")
+    assert sorted(p.name for p in timeline.iterdir()) == instants
     assert snapshot(table)["t1"] == ("sf", 1, 30.0)
 
 
@@ -730,7 +748,7 @@ def test_binary_large_list_and_dictionary_columns_are_cast(tmp_path):
     read = pa.Table.from_batches(table.read()).select(["blob", "view", "code"])
     assert read.to_pylist() == [{"blob": b"b", "view": b"b", "code": 8}]
 
-    # List upserts are covered by test_polars_nested_columns_upsert (#868).
+    # Upserting a list column is not yet supported (#868), so lists are only appended.
     lists = HudiTable.create(str(tmp_path / "lists"), record_key="id")
     lists.append(
         pa.table({"id": ["t1"], "xs": pa.array([[1, 2]], pa.large_list(pa.int64()))})
@@ -739,21 +757,6 @@ def test_binary_large_list_and_dictionary_columns_are_cast(tmp_path):
     assert pa.types.is_list(lists.get_schema().field("xs").type)
     read = pa.Table.from_batches(lists.read()).column("xs").to_pylist()
     assert read == [[1, 2]]
-
-
-def test_nested_nanosecond_timestamps_are_checked(tmp_path):
-    table = HudiTable.create(str(tmp_path / "t"), record_key="id")
-    ns = pa.timestamp("ns")
-    whole = pa.table(
-        {"id": ["t1"], "ts": pa.array([[1_000]], pa.list_(ns))},
-    )
-    table.append(whole)
-    assert table.get_schema().field("ts").type == pa.list_(pa.timestamp("us"))
-    partial = pa.table(
-        {"id": ["t1"], "st": pa.array([{"ts": 1_001}], pa.struct([("ts", ns)]))},
-    )
-    with pytest.raises(ValueError, match="column 'st' has timestamps"):
-        table.append(partial)
 
 
 def test_update_dict_struct_value_by_position(tmp_path):

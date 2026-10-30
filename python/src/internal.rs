@@ -17,7 +17,9 @@
  * under the License.
  */
 
-use arrow::array::{Array, ArrayData, AsArray, make_array};
+use arrow::array::{
+    Array, ArrayData, ArrayRef, AsArray, GenericListArray, OffsetSizeTrait, make_array,
+};
 use arrow::compute::{cast, concat_batches};
 use arrow::datatypes::TimestampNanosecondType;
 use arrow::datatypes::{DataType, FieldRef, Schema, TimeUnit};
@@ -1179,6 +1181,9 @@ fn normalize_batch(batch: RecordBatch) -> PyResult<RecordBatch> {
 }
 
 /// Whether a nanosecond timestamp anywhere in `array` is not a whole microsecond.
+///
+/// Only values the array references are checked: a sliced list keeps its
+/// whole child buffer and a dictionary may hold unused values.
 fn has_sub_microsecond(array: &dyn Array) -> bool {
     match array.data_type() {
         DataType::Timestamp(TimeUnit::Nanosecond, _) => array
@@ -1186,18 +1191,29 @@ fn has_sub_microsecond(array: &dyn Array) -> bool {
             .iter()
             .flatten()
             .any(|v| v % 1000 != 0),
-        DataType::List(_) => has_sub_microsecond(array.as_list::<i32>().values().as_ref()),
-        DataType::LargeList(_) => has_sub_microsecond(array.as_list::<i64>().values().as_ref()),
+        DataType::List(_) => {
+            has_sub_microsecond(referenced_values(array.as_list::<i32>()).as_ref())
+        }
+        DataType::LargeList(_) => {
+            has_sub_microsecond(referenced_values(array.as_list::<i64>()).as_ref())
+        }
         DataType::Struct(_) => array
             .as_struct()
             .columns()
             .iter()
             .any(|c| has_sub_microsecond(c.as_ref())),
-        DataType::Dictionary(_, _) => array
-            .as_any_dictionary_opt()
-            .is_some_and(|d| has_sub_microsecond(d.values().as_ref())),
+        DataType::Dictionary(_, value) => {
+            cast(array, value).is_ok_and(|plain| has_sub_microsecond(plain.as_ref()))
+        }
         _ => false,
     }
+}
+
+fn referenced_values<O: OffsetSizeTrait>(list: &GenericListArray<O>) -> ArrayRef {
+    let offsets = list.value_offsets();
+    let start = offsets[0].as_usize();
+    let end = offsets[offsets.len() - 1].as_usize();
+    list.values().slice(start, end - start)
 }
 
 /// pandas exports an unnamed index as `__index_level_N__`; a named index
@@ -1861,6 +1877,24 @@ mod tests {
             assert!(!has_sub_microsecond(wrap(whole()).as_ref()));
             assert!(has_sub_microsecond(wrap(partial()).as_ref()));
         }
+        // Values outside a slice and unused dictionary values are ignored.
+        let lists = ListArray::new(
+            Arc::new(Field::new(
+                "item",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                true,
+            )),
+            OffsetBuffer::from_lengths([1, 1]),
+            Arc::new(nanos(vec![Some(1), Some(2_000)])),
+            None,
+        );
+        assert!(!has_sub_microsecond(&lists.slice(1, 1)));
+        assert!(has_sub_microsecond(&lists.slice(0, 1)));
+        let unused = DictionaryArray::new(
+            Int8Array::from(vec![1]),
+            Arc::new(nanos(vec![Some(1), Some(2_000)])),
+        );
+        assert!(!has_sub_microsecond(&unused));
         // Only nanosecond timestamps can hold sub-microsecond digits.
         assert!(!has_sub_microsecond(&TimestampMicrosecondArray::from(
             vec![1]
