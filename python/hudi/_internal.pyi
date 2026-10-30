@@ -458,16 +458,16 @@ class HudiTable:
         *,
         record_key: Union[str, List[str]],
         partition_by: Optional[Union[str, List[str]]] = None,
-        ordering_field: Optional[Union[str, List[str]]] = None,
+        ordering_fields: Optional[Union[str, List[str]]] = None,
         table_type: str = "cow",
         table_name: Optional[str] = None,
         table_version: Optional[int] = None,
         record_index: Optional[bool] = None,
-        metadata: Optional[bool] = None,
+        metadata_table: Optional[bool] = None,
         column_stats: Optional[bool] = None,
         partition_stats: Optional[bool] = None,
         hive_style_partitioning: Optional[bool] = None,
-        options: Optional[Dict[str, str]] = None,
+        hudi_options: Optional[Dict[str, str]] = None,
         storage_options: Optional[Dict[str, str]] = None,
     ) -> "HudiTable":
         """
@@ -475,25 +475,25 @@ class HudiTable:
 
         Arguments left as ``None`` keep the native defaults: table version 9,
         metadata table on with the record index, column stats and partition
-        stats, and hive-style partition paths. Turning ``metadata`` off also
+        stats, and hive-style partition paths. Turning ``metadata_table`` off also
         turns off the indexes that live in it.
 
         Parameters:
             base_uri (str): Location of the new table.
             record_key (Union[str, List[str]]): Record key field(s).
             partition_by (Optional[Union[str, List[str]]]): Partition field(s); unpartitioned if omitted.
-            ordering_field (Optional[Union[str, List[str]]]): Field(s) that pick the winning
+            ordering_fields (Optional[Union[str, List[str]]]): Field(s) that pick the winning
                 record when a key is written more than once; commit order if omitted.
             table_type (str): ``"cow"``/``"COPY_ON_WRITE"`` or ``"mor"``/``"MERGE_ON_READ"``,
                 case-insensitive.
             table_name (Optional[str]): Defaults to the last path segment of ``base_uri``.
             table_version (Optional[int]): Table version to write, 8 or 9.
             record_index (Optional[bool]): Record-level index in the metadata table.
-            metadata (Optional[bool]): Metadata table.
+            metadata_table (Optional[bool]): Metadata table.
             column_stats (Optional[bool]): Column stats index in the metadata table.
             partition_stats (Optional[bool]): Partition stats index in the metadata table.
             hive_style_partitioning (Optional[bool]): Use ``field=value`` partition paths.
-            options (Optional[Dict[str, str]]): Extra ``hoodie.*`` table configs, written into
+            hudi_options (Optional[Dict[str, str]]): Extra ``hoodie.*`` table configs, written into
                 ``hoodie.properties``. Read options belong on the reader, not here.
             storage_options (Optional[Dict[str, str]]): Storage options such as cloud credentials.
 
@@ -538,8 +538,8 @@ class HudiTable:
         ...
     def update(
         self,
-        filter: str,
-        set: Union[
+        predicate: str,
+        updates: Union[
             Dict[str, Any],
             "pyarrow.RecordBatch",
             "pyarrow.Table",
@@ -547,11 +547,11 @@ class HudiTable:
         ],
     ) -> "HudiWriteResult":
         """
-        Set columns on the rows matching ``filter``.
+        Set columns on the rows matching ``predicate``.
 
         Parameters:
-            filter (str): A single binary predicate such as ``"city = 'nyc'"``.
-            set (Union[Dict[str, Any], pyarrow.RecordBatch, pyarrow.Table]): Column values to
+            predicate (str): A single binary predicate such as ``"city = 'nyc'"``.
+            updates (Union[Dict[str, Any], pyarrow.RecordBatch, pyarrow.Table]): Column values to
                 set, either as a dict or as a one-row batch carrying only those columns.
                 Dict values must fit their column's type exactly, except that a float32
                 column rounds to the nearest float32; a bool fits only a bool column. Date
@@ -570,12 +570,12 @@ class HudiTable:
                 hold exactly one row.
         """
         ...
-    def delete(self, filter: str) -> "HudiWriteResult":
+    def delete(self, predicate: str) -> "HudiWriteResult":
         """
-        Delete the rows matching ``filter``.
+        Delete the rows matching ``predicate``.
 
         Parameters:
-            filter (str): A single binary predicate such as ``"id IN ('t1', 't2')"``.
+            predicate (str): A single binary predicate such as ``"id IN ('t1', 't2')"``.
                 Predicates on the record key use the index; others scan the table.
 
         Returns:
@@ -625,14 +625,15 @@ class HudiWriteResult:
     Outcome of a write on :class:`HudiTable`.
 
     Attributes:
-        instant (str): Timestamp of the completed commit, or empty when no commit was made.
+        instant_time (Optional[str]): Instant time of the completed commit, or ``None``
+            when no commit was made.
         num_writes (int): Rows written to data files.
         num_updates (int): Input rows that replaced existing records.
         num_inserts (int): Input rows that were new records.
         num_deletes (int): Records deleted.
     """
 
-    instant: str
+    instant_time: Optional[str]
     num_writes: int
     num_updates: int
     num_inserts: int

@@ -867,16 +867,16 @@ impl HudiTable {
         *,
         record_key,
         partition_by=None,
-        ordering_field=None,
+        ordering_fields=None,
         table_type="cow",
         table_name=None,
         table_version=None,
         record_index=None,
-        metadata=None,
+        metadata_table=None,
         column_stats=None,
         partition_stats=None,
         hive_style_partitioning=None,
-        options=None,
+        hudi_options=None,
         storage_options=None,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -885,16 +885,16 @@ impl HudiTable {
         base_uri: &str,
         record_key: OneOrMany,
         partition_by: Option<OneOrMany>,
-        ordering_field: Option<OneOrMany>,
+        ordering_fields: Option<OneOrMany>,
         table_type: &str,
         table_name: Option<String>,
         table_version: Option<isize>,
         record_index: Option<bool>,
-        metadata: Option<bool>,
+        metadata_table: Option<bool>,
         column_stats: Option<bool>,
         partition_stats: Option<bool>,
         hive_style_partitioning: Option<bool>,
-        options: Option<HashMap<String, String>>,
+        hudi_options: Option<HashMap<String, String>>,
         storage_options: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         let table_type = TableTypeValue::from_str(table_type).map_err(|_| {
@@ -910,7 +910,7 @@ impl HudiTable {
         if let Some(fields) = partition_by {
             builder = builder.with_partition_fields(fields.into_vec());
         }
-        if let Some(fields) = ordering_field {
+        if let Some(fields) = ordering_fields {
             builder = builder.with_ordering_fields(fields.into_vec());
         }
         // Order matters: the version and metadata setters adjust the index
@@ -918,7 +918,7 @@ impl HudiTable {
         if let Some(version) = table_version {
             builder = builder.with_table_version(version);
         }
-        if let Some(enabled) = metadata {
+        if let Some(enabled) = metadata_table {
             builder = builder.with_metadata(enabled);
         }
         if let Some(enabled) = record_index {
@@ -933,7 +933,7 @@ impl HudiTable {
         if let Some(enabled) = hive_style_partitioning {
             builder = builder.with_hive_style_partitioning(enabled);
         }
-        for (k, v) in options.unwrap_or_default() {
+        for (k, v) in hudi_options.unwrap_or_default() {
             builder = builder.with_option(k, v);
         }
         for (k, v) in storage_options.unwrap_or_default() {
@@ -970,37 +970,37 @@ impl HudiTable {
 
     fn update(
         &mut self,
-        filter: &str,
-        set: &Bound<'_, PyAny>,
+        predicate: &str,
+        updates: &Bound<'_, PyAny>,
         py: Python,
     ) -> PyResult<HudiWriteResult> {
-        let updates = if let Ok(dict) = set.cast::<PyDict>() {
+        let updates = if let Ok(dict) = updates.cast::<PyDict>() {
             let schema = py.detach(|| {
                 rt().block_on(self.inner.get_schema())
                     .map_err(PythonError::from)
             })?;
             one_row_batch_from_dict(py, &schema, dict)?
         } else {
-            let batches = to_batches(set)?;
+            let batches = to_batches(updates)?;
             let Some(first) = batches.first() else {
                 return Err(PyValueError::new_err(
-                    "update `set` must contain exactly one row, got no batches",
+                    "`updates` must contain exactly one row, got no batches",
                 ));
             };
             concat_batches(&first.schema(), &batches).map_err(|e| {
-                PyValueError::new_err(format!("failed to combine update `set` batches: {e}"))
+                PyValueError::new_err(format!("failed to combine `updates` batches: {e}"))
             })?
         };
         let result = py.detach(|| {
-            rt().block_on(self.inner.update(filter, updates))
+            rt().block_on(self.inner.update(predicate, updates))
                 .map_err(PythonError::from)
         })?;
         Ok(HudiWriteResult::from(result))
     }
 
-    fn delete(&mut self, filter: &str, py: Python) -> PyResult<HudiWriteResult> {
+    fn delete(&mut self, predicate: &str, py: Python) -> PyResult<HudiWriteResult> {
         let result = py.detach(|| {
-            rt().block_on(self.inner.delete(filter))
+            rt().block_on(self.inner.delete(predicate))
                 .map_err(PythonError::from)
         })?;
         Ok(HudiWriteResult::from(result))
@@ -1042,7 +1042,7 @@ impl HudiTable {
 #[cfg(not(tarpaulin_include))]
 #[pyclass(frozen, get_all)]
 pub struct HudiWriteResult {
-    instant: String,
+    instant_time: Option<String>,
     num_writes: usize,
     num_updates: usize,
     num_inserts: usize,
@@ -1053,9 +1053,13 @@ pub struct HudiWriteResult {
 #[pymethods]
 impl HudiWriteResult {
     fn __repr__(&self) -> String {
+        let instant_time = self
+            .instant_time
+            .as_ref()
+            .map_or_else(|| "None".to_string(), |t| format!("'{t}'"));
         format!(
-            "HudiWriteResult(instant='{}', num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
-            self.instant, self.num_writes, self.num_updates, self.num_inserts, self.num_deletes,
+            "HudiWriteResult(instant_time={instant_time}, num_writes={}, num_updates={}, num_inserts={}, num_deletes={})",
+            self.num_writes, self.num_updates, self.num_inserts, self.num_deletes,
         )
     }
 }
@@ -1063,7 +1067,7 @@ impl HudiWriteResult {
 impl From<WriteResult> for HudiWriteResult {
     fn from(r: WriteResult) -> Self {
         Self {
-            instant: r.instant,
+            instant_time: committed(r.instant),
             num_writes: r.num_writes,
             num_updates: r.num_updates,
             num_inserts: r.num_inserts,
@@ -1075,13 +1079,18 @@ impl From<WriteResult> for HudiWriteResult {
 impl From<AppendResult> for HudiWriteResult {
     fn from(r: AppendResult) -> Self {
         Self {
-            instant: r.instant,
+            instant_time: committed(r.instant),
             num_writes: r.num_rows,
             num_updates: 0,
             num_inserts: r.num_rows,
             num_deletes: 0,
         }
     }
+}
+
+/// The core reports a write that made no commit with an empty instant.
+fn committed(instant: String) -> Option<String> {
+    (!instant.is_empty()).then_some(instant)
 }
 
 /// A Python argument that is either one string or a list of strings.
@@ -1315,17 +1324,17 @@ fn collect_stream(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
 fn one_row_batch_from_dict(
     py: Python,
     schema: &Schema,
-    set: &Bound<'_, PyDict>,
+    updates: &Bound<'_, PyDict>,
 ) -> PyResult<RecordBatch> {
-    if set.is_empty() {
+    if updates.is_empty() {
         return Err(PyValueError::new_err(
-            "update `set` must name at least one column",
+            "`updates` must name at least one column",
         ));
     }
     let pa = py.import(intern!(py, "pyarrow"))?;
-    let mut fields = Vec::with_capacity(set.len());
-    let mut columns = Vec::with_capacity(set.len());
-    for (key, value) in set.iter() {
+    let mut fields = Vec::with_capacity(updates.len());
+    let mut columns = Vec::with_capacity(updates.len());
+    for (key, value) in updates.iter() {
         let name: String = key.extract().map_err(|_| {
             PyValueError::new_err(format!(
                 "update column names must be str, got {}",
@@ -1372,7 +1381,7 @@ fn one_row_batch_from_dict(
         fields.push(field.clone());
     }
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-        .map_err(|e| PyValueError::new_err(format!("invalid update `set`: {e}")))
+        .map_err(|e| PyValueError::new_err(format!("invalid `updates`: {e}")))
 }
 
 /// `value` with every `pyarrow.Scalar`, at any depth of dicts, lists and
@@ -2008,7 +2017,7 @@ mod tests {
             num_inserts: 2,
             num_deletes: 3,
         });
-        assert_eq!(rewrite.instant, "20240101000000000");
+        assert_eq!(rewrite.instant_time.as_deref(), Some("20240101000000000"));
         assert_eq!(
             (
                 rewrite.num_writes,
@@ -2026,7 +2035,7 @@ mod tests {
             base_file_path: String::new(),
             num_rows: 5,
         });
-        assert_eq!(append.instant, "20240101000000001");
+        assert_eq!(append.instant_time.as_deref(), Some("20240101000000001"));
         assert_eq!(
             (
                 append.num_writes,
@@ -2036,6 +2045,17 @@ mod tests {
             ),
             (5, 0, 5, 0)
         );
+
+        // A write that matched nothing reports no instant.
+        let noop = HudiWriteResult::from(WriteResult {
+            instant: String::new(),
+            completion_time: None,
+            num_writes: 0,
+            num_updates: 0,
+            num_inserts: 0,
+            num_deletes: 0,
+        });
+        assert_eq!(noop.instant_time, None);
     }
 
     #[test]

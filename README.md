@@ -350,7 +350,7 @@ table = HudiTable.create(
     "/tmp/trips_table",
     record_key="uuid",
     partition_by="city",
-    ordering_field="ts",      # event-time ordering
+    ordering_fields="ts",     # event-time ordering
     table_type="cow",         # or "mor"
 )
 ```
@@ -412,7 +412,7 @@ groups.
 
 ```python
 result = table.upsert(batch)
-print(f"instant={result.instant} updates={result.num_updates} inserts={result.num_inserts}")
+print(f"instant={result.instant_time} updates={result.num_updates} inserts={result.num_inserts}")
 
 # Partial upsert (copy-on-write only): matched rows take only these columns from the input.
 table.upsert(batch, update_columns=["fare"])

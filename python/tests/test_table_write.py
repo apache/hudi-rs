@@ -55,7 +55,7 @@ def new_table(tmp_path, table_type="cow"):
         str(tmp_path / "trips"),
         record_key="id",
         partition_by="city",
-        ordering_field="ts",
+        ordering_fields="ts",
         table_type=table_type,
     )
     table.append(
@@ -109,9 +109,9 @@ def test_create_with_explicit_options(tmp_path):
         partition_by=["city"],
         table_name="renamed",
         table_version=8,
-        metadata=False,
+        metadata_table=False,
         hive_style_partitioning=False,
-        options={"hoodie.table.timeline.timezone": "UTC"},
+        hudi_options={"hoodie.table.timeline.timezone": "UTC"},
     )
     assert table.table_name == "renamed"
     assert table.hudi_options()["hoodie.table.version"] == "8"
@@ -135,8 +135,14 @@ def test_create_on_existing_table_raises(tmp_path):
 @pytest.mark.parametrize(
     "flags, error",
     [
-        (dict(metadata=False, record_index=True), "record index requires the metadata"),
-        (dict(metadata=False, column_stats=True), "column_stats requires the metadata"),
+        (
+            dict(metadata_table=False, record_index=True),
+            "record index requires the metadata",
+        ),
+        (
+            dict(metadata_table=False, column_stats=True),
+            "column_stats requires the metadata",
+        ),
         # The explicit partition_stats choice is applied after column_stats,
         # so it is reported rather than silently turned off.
         (dict(column_stats=False, partition_stats=True), "partition_stats requires"),
@@ -173,7 +179,7 @@ def test_create_with_field_lists_and_storage_options(tmp_path):
         str(tmp_path / "t"),
         record_key=["id"],
         partition_by=["city", "ts"],
-        ordering_field=["ts"],
+        ordering_fields=["ts"],
         storage_options={"allow_http": "true"},
     )
     options = table.hudi_options()
@@ -195,7 +201,7 @@ def test_append_then_read(tmp_path, table_type):
     )
     res = table.append(trips(("t1", "sf", 1, 30.0), ("t2", "nyc", 1, 45.0)))
     assert isinstance(res, HudiWriteResult)
-    assert res.instant
+    assert res.instant_time
     assert (res.num_writes, res.num_inserts, res.num_updates, res.num_deletes) == (
         2,
         2,
@@ -203,6 +209,7 @@ def test_append_then_read(tmp_path, table_type):
         0,
     )
     assert "num_inserts=2" in repr(res)
+    assert f"instant_time='{res.instant_time}'" in repr(res)
     with pytest.raises(AttributeError):
         res.num_inserts = 0
     assert snapshot(table) == {"t1": ("sf", 1, 30.0), "t2": ("nyc", 1, 45.0)}
@@ -240,7 +247,7 @@ def test_upsert_update_columns(tmp_path):
 def test_update_with_dict(tmp_path, table_type):
     table = new_table(tmp_path, table_type)
     # An int value lands in the float64 column.
-    res = table.update("city = 'nyc'", {"fare": 99})
+    res = table.update(predicate="city = 'nyc'", updates={"fare": 99})
     assert res.num_updates == 1
     assert snapshot(table)["t3"] == ("nyc", 1, 99.0)
     assert snapshot(table)["t1"] == ("sf", 1, 30.0)
@@ -282,7 +289,8 @@ def test_update_no_match_creates_no_commit(tmp_path):
     table = new_table(tmp_path)
     commits = len(table.get_timeline().get_completed_commits())
     res = table.update("city = 'la'", {"fare": 1.0})
-    assert (res.instant, res.num_updates) == ("", 0)
+    assert (res.instant_time, res.num_updates) == (None, 0)
+    assert "instant_time=None" in repr(res)
     assert len(table.get_timeline().get_completed_commits()) == commits
 
 
@@ -475,11 +483,11 @@ def test_delete_by_key_predicate(tmp_path, table_type):
 
 def test_delete_by_non_key_predicate(tmp_path):
     table = new_table(tmp_path)
-    res = table.delete("fare > 40")
+    res = table.delete(predicate="fare > 40")
     assert res.num_deletes == 1
     assert set(snapshot(table)) == {"t1", "t3"}
     res = table.delete("fare > 1000")
-    assert (res.instant, res.num_deletes) == ("", 0)
+    assert (res.instant_time, res.num_deletes) == (None, 0)
 
 
 @pytest.mark.parametrize("table_type", ["cow", "mor"])
@@ -489,7 +497,7 @@ def test_delete_keys(tmp_path, table_type):
     assert res.num_deletes == 2
     assert set(snapshot(table)) == {"t2"}
     res = table.delete_keys(["missing"])
-    assert (res.instant, res.num_deletes) == ("", 0)
+    assert (res.instant_time, res.num_deletes) == (None, 0)
     res = table.delete_keys(k for k in ("t2",))
     assert res.num_deletes == 1
     assert snapshot(table) == {}
@@ -509,7 +517,7 @@ def test_delete_keys_rejects_bad_input(tmp_path):
 def test_overwrite(tmp_path, table_type):
     table = new_table(tmp_path, table_type)
     res = table.overwrite(trips(("t9", "sf", 9, 10.0)))
-    assert res.instant
+    assert res.instant_time
     assert snapshot(table) == {"t9": ("sf", 9, 10.0)}
 
 
@@ -517,7 +525,7 @@ def test_overwrite(tmp_path, table_type):
 def test_dynamic_partition_overwrite(tmp_path, table_type):
     table = new_table(tmp_path, table_type)
     res = table.dynamic_partition_overwrite(trips(("t8", "sf", 9, 11.0)))
-    assert res.instant
+    assert res.instant_time
     assert snapshot(table) == {"t8": ("sf", 9, 11.0), "t3": ("nyc", 1, 20.0)}
 
 
