@@ -109,74 +109,29 @@ pub(crate) fn align_batch_to_schema(
     arrow_array::RecordBatch::try_new(target.clone(), batch.columns().to_vec()).ok()
 }
 
-/// The write's batches in the shape the rest of the write path compares exactly;
-/// see [`normalize_write_batch`].
+/// Bring a write's batches to the list shape the table schema reads back with.
 ///
-/// Call after the timeline reload, so the schema is the table's current one.
-/// The schema is read only when a batch carries a list column, which is the
-/// only shape this changes.
-pub(crate) async fn normalize_for_write(
-    table: &crate::table::Table,
+/// Fixed-size lists become lists, and every list item is named `element`, at
+/// any depth: Avro has only `array`, which reads back with an `element` item,
+/// while PyArrow and most Arrow producers name it `item`. The first write is
+/// included so that every file of the table carries the same item name, which
+/// a reader taking each file's own schema needs in order to combine them.
+/// Anything else about a column is left for the schema checks downstream.
+pub(crate) fn normalize_for_write(
     batches: &[arrow_array::RecordBatch],
 ) -> Result<Vec<arrow_array::RecordBatch>> {
-    let has_list = batches.iter().any(|b| {
-        b.schema()
-            .fields()
-            .iter()
-            .any(|f| contains_list(f.data_type()))
-    });
-    let table_schema = if has_list
-        && table
-            .timeline
-            .get_latest_commit_timestamp_as_option()
-            .is_some()
-    {
-        Some(table.get_schema().await?)
-    } else {
-        None
-    };
-    batches
-        .iter()
-        .cloned()
-        .map(|batch| normalize_write_batch(batch, table_schema.as_ref()))
-        .collect()
+    batches.iter().map(normalize_write_batch).collect()
 }
 
-fn contains_list(dt: &arrow_schema::DataType) -> bool {
-    use arrow_schema::DataType;
-    match dt {
-        DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _) => true,
-        DataType::Struct(fields) => fields.iter().any(|f| contains_list(f.data_type())),
-        DataType::Map(entries, _) => contains_list(entries.data_type()),
-        _ => false,
-    }
-}
-
-/// Bring a batch to the shape the rest of the write path compares exactly.
-///
-/// Fixed-size lists become lists at every nesting level, since Avro has only
-/// `array` and the readers hand lists back as `List`. Then, when the table
-/// already has a schema, a column whose type matches the table's up to list
-/// item names is cast to the table's type: a list read back from Avro names
-/// its item `element` while PyArrow names it `item`, and the cast only
-/// relabels. Columns that differ in any other way are left as they are, so
-/// the schema checks downstream reject them with their usual messages.
-fn normalize_write_batch(
-    batch: arrow_array::RecordBatch,
-    table_schema: Option<&arrow_schema::Schema>,
+pub(crate) fn normalize_write_batch(
+    batch: &arrow_array::RecordBatch,
 ) -> Result<arrow_array::RecordBatch> {
     use arrow_schema::Field;
     let mut changed = false;
     let mut fields = Vec::with_capacity(batch.num_columns());
     let mut columns = Vec::with_capacity(batch.num_columns());
     for (field, column) in batch.schema().fields().iter().zip(batch.columns()) {
-        let widened = widen_fixed_size_lists(field.data_type());
-        let target = match table_schema.and_then(|s| s.field_with_name(field.name()).ok()) {
-            Some(table_field) if same_up_to_list_item_names(&widened, table_field.data_type()) => {
-                table_field.data_type().clone()
-            }
-            _ => widened,
-        };
+        let target = normalize_list_type(field.data_type());
         if &target == field.data_type() {
             fields.push(field.clone());
             columns.push(column.clone());
@@ -197,7 +152,7 @@ fn normalize_write_batch(
         columns.push(casted);
     }
     if !changed {
-        return Ok(batch);
+        return Ok(batch.clone());
     }
     let schema = std::sync::Arc::new(arrow_schema::Schema::new_with_metadata(
         fields,
@@ -207,53 +162,31 @@ fn normalize_write_batch(
         .map_err(|e| CoreError::Schema(format!("cannot rebuild batch for writing: {e}")))
 }
 
-/// `dt` with every `FixedSizeList`, at any depth, replaced by a `List` of the
-/// same item.
-fn widen_fixed_size_lists(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
+/// `dt` with every `FixedSizeList` replaced by a `List` of the same item, and
+/// every list item named `element`, at any depth.
+fn normalize_list_type(dt: &arrow_schema::DataType) -> arrow_schema::DataType {
     use arrow_schema::{DataType, Field};
-    let widen_field = |f: &std::sync::Arc<Field>| {
+    let normalize_field = |f: &std::sync::Arc<Field>, name: &str| {
         std::sync::Arc::new(
-            Field::new(
-                f.name(),
-                widen_fixed_size_lists(f.data_type()),
-                f.is_nullable(),
-            )
-            .with_metadata(f.metadata().clone()),
+            Field::new(name, normalize_list_type(f.data_type()), f.is_nullable())
+                .with_metadata(f.metadata().clone()),
         )
     };
     match dt {
         DataType::FixedSizeList(item, _) | DataType::List(item) => {
-            DataType::List(widen_field(item))
+            DataType::List(normalize_field(item, "element"))
         }
-        DataType::LargeList(item) => DataType::LargeList(widen_field(item)),
-        DataType::Struct(fields) => DataType::Struct(fields.iter().map(widen_field).collect()),
-        DataType::Map(entries, sorted) => DataType::Map(widen_field(entries), *sorted),
+        DataType::LargeList(item) => DataType::LargeList(normalize_field(item, "element")),
+        DataType::Struct(fields) => DataType::Struct(
+            fields
+                .iter()
+                .map(|f| normalize_field(f, f.name()))
+                .collect(),
+        ),
+        DataType::Map(entries, sorted) => {
+            DataType::Map(normalize_field(entries, entries.name()), *sorted)
+        }
         other => other.clone(),
-    }
-}
-
-/// Whether two types are equal except for the names of list item fields.
-///
-/// Struct children must match by name as well as type: a positional cast
-/// between differently named children would silently reinterpret data.
-fn same_up_to_list_item_names(a: &arrow_schema::DataType, b: &arrow_schema::DataType) -> bool {
-    use arrow_schema::DataType;
-    let same_item = |x: &arrow_schema::Field, y: &arrow_schema::Field| {
-        x.is_nullable() == y.is_nullable()
-            && same_up_to_list_item_names(x.data_type(), y.data_type())
-    };
-    match (a, b) {
-        (DataType::List(x), DataType::List(y))
-        | (DataType::LargeList(x), DataType::LargeList(y)) => same_item(x, y),
-        (DataType::Struct(xs), DataType::Struct(ys)) => {
-            xs.len() == ys.len()
-                && xs
-                    .iter()
-                    .zip(ys.iter())
-                    .all(|(x, y)| x.name() == y.name() && same_item(x, y))
-        }
-        (DataType::Map(x, xs), DataType::Map(y, ys)) => xs == ys && same_item(x, y),
-        _ => a == b,
     }
 }
 
@@ -802,5 +735,113 @@ mod tests {
         assert_eq!(&avro[..4], b"Obj\x01");
         let json = inflight_commit_metadata_bytes("UPSERT", false).unwrap();
         assert!(std::str::from_utf8(&json).unwrap().contains("UPSERT"));
+    }
+
+    fn list_of(name: &str, item: arrow_schema::DataType) -> arrow_schema::DataType {
+        arrow_schema::DataType::List(std::sync::Arc::new(arrow_schema::Field::new(
+            name, item, true,
+        )))
+    }
+
+    #[test]
+    fn test_normalize_list_type_renames_items_and_widens_fixed_size_lists_at_any_depth() {
+        use arrow_schema::{DataType, Field, Fields};
+        let item = std::sync::Arc::new(Field::new("item", DataType::Float32, true));
+        let element = list_of("element", DataType::Float32);
+
+        assert_eq!(
+            normalize_list_type(&DataType::FixedSizeList(item.clone(), 2)),
+            element
+        );
+        assert_eq!(
+            normalize_list_type(&list_of("item", DataType::Float32)),
+            element
+        );
+        assert_eq!(
+            normalize_list_type(&DataType::LargeList(item.clone())),
+            DataType::LargeList(std::sync::Arc::new(Field::new(
+                "element",
+                DataType::Float32,
+                true
+            )))
+        );
+        assert_eq!(
+            normalize_list_type(&list_of("item", DataType::FixedSizeList(item.clone(), 2))),
+            list_of("element", element.clone())
+        );
+
+        // Struct children and map entries keep their names; only list items change.
+        let nested = |vec: DataType| {
+            let entries = Field::new(
+                "entries",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", vec.clone(), true),
+                ])),
+                false,
+            );
+            DataType::Struct(Fields::from(vec![
+                Field::new("vec", vec, true),
+                Field::new(
+                    "tags",
+                    DataType::Map(std::sync::Arc::new(entries), false),
+                    true,
+                ),
+            ]))
+        };
+        assert_eq!(
+            normalize_list_type(&nested(DataType::FixedSizeList(item, 2))),
+            nested(element.clone())
+        );
+
+        assert_eq!(normalize_list_type(&DataType::Int64), DataType::Int64);
+        assert_eq!(normalize_list_type(&element), element);
+    }
+
+    #[test]
+    fn test_normalize_write_batch_casts_list_columns_and_keeps_the_rest() {
+        use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, Int64Array};
+        use arrow_schema::{DataType, Field, Schema};
+        let item = std::sync::Arc::new(Field::new("item", DataType::Float32, true));
+        let embedding = FixedSizeListArray::new(
+            item.clone(),
+            2,
+            std::sync::Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0, 4.0])),
+            Some(vec![true, false].into()),
+        );
+        let field_metadata = HashMap::from([("k".to_string(), "v".to_string())]);
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("embedding", DataType::FixedSizeList(item, 2), true)
+                .with_metadata(field_metadata.clone()),
+        ]));
+        let batch = arrow_array::RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+                std::sync::Arc::new(embedding),
+            ],
+        )
+        .unwrap();
+
+        let normalized = normalize_write_batch(&batch).unwrap();
+        let field = normalized.schema().field(1).clone();
+        assert_eq!(field.data_type(), &list_of("element", DataType::Float32));
+        assert_eq!(field.metadata(), &field_metadata);
+        assert_eq!(normalized.schema().field(0), batch.schema().field(0));
+        let list = normalized
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow_array::ListArray>()
+            .unwrap();
+        assert!(list.is_null(1));
+        let first = list.value(0);
+        let first = first.as_any().downcast_ref::<Float32Array>().unwrap();
+        assert_eq!(first.values(), &[1.0, 2.0]);
+
+        // A batch without lists, or already normalized, comes back unchanged.
+        assert_eq!(normalize_write_batch(&normalized).unwrap(), normalized);
+        let ids = batch.project(&[0]).unwrap();
+        assert_eq!(normalize_write_batch(&ids).unwrap(), ids);
     }
 }

@@ -25,7 +25,9 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use hudi_core::config::read::HudiReadConfig;
 use hudi_core::config::table::TableTypeValue;
+use hudi_core::error::CoreError;
 use hudi_core::table::{ReadOptions, Table};
 use tempfile::tempdir;
 
@@ -90,8 +92,28 @@ fn fixed_batch(rows: &[(&str, f32)], version: i64) -> RecordBatch {
 }
 
 /// `(id, first embedding value)` for every row, sorted by id.
+///
+/// Read with both file group readers: version 1 takes each file's schema as it
+/// is, so it combines the files only when they all name the list item alike.
 async fn read_embeddings(table: &Table) -> Vec<(String, f32)> {
-    let batches = table.read(&ReadOptions::new()).await.unwrap();
+    let v1 = read_embeddings_with(table, "1").await;
+    assert_eq!(v1, read_embeddings_with(table, "2").await);
+    v1
+}
+
+async fn read_embeddings_with(table: &Table, reader_version: &str) -> Vec<(String, f32)> {
+    let options = ReadOptions::new().with_hudi_option(
+        HudiReadConfig::FileGroupReaderVersion.as_ref(),
+        reader_version,
+    );
+    let batches = table.read(&options).await.unwrap();
+    for batch in &batches {
+        assert_eq!(
+            batch.schema(),
+            batches[0].schema(),
+            "reader version {reader_version}"
+        );
+    }
     let mut rows = Vec::new();
     for batch in &batches {
         let ids = batch
@@ -309,8 +331,11 @@ async fn test_nested_fixed_size_list_is_widened_and_struct_child_names_stay_stri
         ],
     )
     .unwrap();
-    let err = table.upsert([batch]).await.unwrap_err().to_string();
-    assert!(err.contains("does not match"), "{err}");
+    let err = table.upsert([batch]).await.unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Schema(msg) if msg.contains("does not match")),
+        "{err}"
+    );
 }
 
 #[tokio::test]
@@ -347,4 +372,166 @@ async fn test_merge_on_read_update_sets_list_column() {
         read_embeddings(&table).await,
         vec![("a".into(), 7.0), ("b".into(), 2.0)]
     );
+}
+
+#[tokio::test]
+async fn test_appends_keep_one_list_item_name_across_files() {
+    let dir = tempdir().unwrap();
+    let mut table = new_table(&dir, TableTypeValue::CopyOnWrite).await;
+    table.append([list_batch(&[("a", 1.0)], 1)]).await.unwrap();
+    table.append([list_batch(&[("b", 2.0)], 1)]).await.unwrap();
+    assert_eq!(
+        read_embeddings(&table).await,
+        vec![("a".into(), 1.0), ("b".into(), 2.0)]
+    );
+}
+
+/// `batch` with a `part` column holding `part` on every row.
+fn with_part(batch: RecordBatch, part: &str) -> RecordBatch {
+    let mut fields = batch.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("part", DataType::Utf8, false)));
+    let mut columns = batch.columns().to_vec();
+    columns.push(Arc::new(StringArray::from(vec![part; batch.num_rows()])));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+}
+
+#[tokio::test]
+async fn test_dynamic_partition_overwrite_accepts_list_columns() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("chunks")
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["v"])
+        .with_partition_fields(["part"])
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([
+            with_part(list_batch(&[("a", 1.0)], 1), "p1"),
+            with_part(list_batch(&[("b", 2.0)], 1), "p2"),
+        ])
+        .await
+        .unwrap();
+    table
+        .dynamic_partition_overwrite([with_part(fixed_batch(&[("c", 3.0)], 2), "p2")])
+        .await
+        .unwrap();
+    assert_eq!(
+        read_embeddings(&table).await,
+        vec![("a".into(), 1.0), ("c".into(), 3.0)]
+    );
+}
+
+/// `id`, `payload: struct<vec: list<item: float32>>` (or a fixed-size list of
+/// 2 when `fixed`), `v`.
+fn payload_batch(rows: &[(&str, f32)], version: i64, fixed: bool) -> RecordBatch {
+    use arrow::array::StructArray;
+    let item = Arc::new(Field::new("item", DataType::Float32, true));
+    let values = Arc::new(embedding_values(rows));
+    let (vec_type, vec): (DataType, ArrayRef) = if fixed {
+        (
+            DataType::FixedSizeList(item.clone(), 2),
+            Arc::new(FixedSizeListArray::new(item, 2, values, None)),
+        )
+    } else {
+        let offsets = arrow::buffer::OffsetBuffer::from_lengths(rows.iter().map(|_| 2));
+        (
+            DataType::List(item.clone()),
+            Arc::new(ListArray::new(item, offsets, values, None)),
+        )
+    };
+    let vec_field = Arc::new(Field::new("vec", vec_type, true));
+    let payload = StructArray::from(vec![(vec_field.clone(), vec)]);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("payload", DataType::Struct(vec![vec_field].into()), true),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            )),
+            Arc::new(payload) as ArrayRef,
+            Arc::new(Int64Array::from(vec![version; rows.len()])),
+        ],
+    )
+    .unwrap()
+}
+
+/// `(id, first payload.vec value)` for every row, sorted by id, read with both
+/// file group readers.
+async fn read_payload_vecs(table: &Table) -> Vec<(String, f32)> {
+    let mut by_version = Vec::new();
+    for reader_version in ["1", "2"] {
+        let options = ReadOptions::new().with_hudi_option(
+            HudiReadConfig::FileGroupReaderVersion.as_ref(),
+            reader_version,
+        );
+        let mut rows = Vec::new();
+        for batch in table.read(&options).await.unwrap() {
+            let ids = batch
+                .column_by_name("id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone();
+            let payload = batch
+                .column_by_name("payload")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<arrow::array::StructArray>()
+                .unwrap()
+                .clone();
+            let vecs = payload
+                .column_by_name("vec")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<ListArray>()
+                .expect("payload.vec reads back as a variable-size list")
+                .clone();
+            for i in 0..batch.num_rows() {
+                let values = vecs.value(i);
+                let first = values
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap()
+                    .value(0);
+                rows.push((ids.value(i).to_string(), first));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        by_version.push(rows);
+    }
+    assert_eq!(by_version[0], by_version[1]);
+    by_version.remove(0)
+}
+
+#[tokio::test]
+async fn test_upsert_and_update_struct_containing_list() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table = new_table(&dir, table_type).await;
+        table
+            .append([payload_batch(&[("a", 1.0), ("b", 2.0)], 1, false)])
+            .await
+            .unwrap();
+        let result = table
+            .upsert([payload_batch(&[("b", 20.0), ("c", 3.0)], 2, true)])
+            .await
+            .unwrap();
+        assert_eq!((result.num_updates, result.num_inserts), (1, 1));
+        let set = payload_batch(&[("ignored", 7.0)], 3, false)
+            .project(&[1])
+            .unwrap();
+        let result = table.update("id = 'a'", set).await.unwrap();
+        assert_eq!(result.num_updates, 1);
+        assert_eq!(
+            read_payload_vecs(&table).await,
+            vec![("a".into(), 7.0), ("b".into(), 20.0), ("c".into(), 3.0)]
+        );
+    }
 }
