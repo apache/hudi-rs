@@ -37,7 +37,7 @@ use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::table::TableTypeValue;
 use hudi_core::index::HoodieKey;
-use hudi_core::metadata::compaction::{HoodieCompactionOperation, HoodieCompactionPlan};
+use hudi_core::metadata::compaction::{CompactionOperation, CompactionPlan};
 use hudi_core::table::{QueryType, ReadOptions, Table};
 use tempfile::tempdir;
 
@@ -1451,8 +1451,8 @@ async fn parity_k_rs_compaction_spark_interop() {
         .into_iter()
         .find(|slice| slice.has_log_file())
         .unwrap();
-    let plan = HoodieCompactionPlan {
-        operations: Some(vec![HoodieCompactionOperation {
+    let plan = CompactionPlan {
+        operations: Some(vec![CompactionOperation {
             base_instant_time: Some(slice.creation_instant_time().to_string()),
             delta_file_paths: Some(slice.log_files.iter().map(|log| log.file_name()).collect()),
             data_file_path: slice.base_file.as_ref().map(|base| base.file_name()),
@@ -1462,10 +1462,10 @@ async fn parity_k_rs_compaction_spark_interop() {
             bootstrap_file_path: None,
         }]),
         extra_metadata: Some(std::collections::HashMap::from([(
-            HoodieCompactionPlan::COMPACTOR_KEY.to_string(),
-            HoodieCompactionPlan::HUDI_RS_COMPACTOR.to_string(),
+            CompactionPlan::COMPACTOR_KEY.to_string(),
+            CompactionPlan::HUDI_RS_COMPACTOR.to_string(),
         )])),
-        version: Some(HoodieCompactionPlan::LATEST_VERSION),
+        version: Some(CompactionPlan::LATEST_VERSION),
         strategy: None,
         preserve_hoodie_metadata: Some(true),
         missing_schedule_partitions: None,

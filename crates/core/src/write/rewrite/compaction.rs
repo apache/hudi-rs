@@ -30,9 +30,7 @@ use super::*;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::LogFile;
-use crate::metadata::compaction::{
-    HoodieCompactionOperation, HoodieCompactionPlan, HoodieCompactionStrategy,
-};
+use crate::metadata::compaction::{CompactionOperation, CompactionPlan, CompactionStrategy};
 use crate::write::markers::Marker;
 
 /// Result of a compaction.
@@ -242,7 +240,7 @@ fn delta_commits_since_last_compaction(table: &Table) -> usize {
         .count()
 }
 
-fn compaction_plan(slices: &[FileSlice]) -> HoodieCompactionPlan {
+fn compaction_plan(slices: &[FileSlice]) -> CompactionPlan {
     let operations = slices
         .iter()
         .map(|slice| {
@@ -251,7 +249,7 @@ fn compaction_plan(slices: &[FileSlice]) -> HoodieCompactionPlan {
             if let Some(size) = slice.log_size_bytes() {
                 metrics.insert("TOTAL_LOG_FILES_SIZE".to_string(), size as f64);
             }
-            HoodieCompactionOperation {
+            CompactionOperation {
                 base_instant_time: Some(slice.creation_instant_time().to_string()),
                 delta_file_paths: Some(slice.log_files.iter().map(LogFile::file_name).collect()),
                 data_file_path: slice.base_file.as_ref().map(BaseFile::file_name),
@@ -262,14 +260,14 @@ fn compaction_plan(slices: &[FileSlice]) -> HoodieCompactionPlan {
             }
         })
         .collect();
-    HoodieCompactionPlan {
+    CompactionPlan {
         operations: Some(operations),
         extra_metadata: Some(HashMap::from([(
-            HoodieCompactionPlan::COMPACTOR_KEY.to_string(),
-            HoodieCompactionPlan::HUDI_RS_COMPACTOR.to_string(),
+            CompactionPlan::COMPACTOR_KEY.to_string(),
+            CompactionPlan::HUDI_RS_COMPACTOR.to_string(),
         )])),
-        version: Some(HoodieCompactionPlan::LATEST_VERSION),
-        strategy: Some(HoodieCompactionStrategy {
+        version: Some(CompactionPlan::LATEST_VERSION),
+        strategy: Some(CompactionStrategy {
             compactor_class_name: None,
             strategy_params: Some(HashMap::new()),
             version: Some(1),
@@ -708,7 +706,7 @@ mod tests {
 
         // Timeline: plan in the requested file, empty inflight, compacted commit.
         let timeline = dir.path().join(".hoodie/timeline");
-        let plan = HoodieCompactionPlan::from_avro_bytes(
+        let plan = CompactionPlan::from_avro_bytes(
             &std::fs::read(timeline.join(format!("{}.compaction.requested", result.instant)))
                 .unwrap(),
         )

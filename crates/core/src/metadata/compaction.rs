@@ -30,11 +30,12 @@ use crate::Result;
 use crate::error::CoreError;
 use crate::schema::avsc::{encode_with_schema, hoodie_compaction_plan_schema};
 
-/// One file group to compact: its latest base file (absent for a log-only
-/// group) and the log files to fold into the new base file, as file names.
+/// Java `HoodieCompactionOperation`: one file group to compact, its latest
+/// base file (absent for a log-only group) and the log files to fold into the
+/// new base file, as file names.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct HoodieCompactionOperation {
+pub struct CompactionOperation {
     pub base_instant_time: Option<String>,
     pub delta_file_paths: Option<Vec<String>>,
     pub data_file_path: Option<String>,
@@ -47,7 +48,7 @@ pub struct HoodieCompactionOperation {
 /// Java `HoodieCompactionStrategy`: which compactor runs the plan.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct HoodieCompactionStrategy {
+pub struct CompactionStrategy {
     pub compactor_class_name: Option<String>,
     pub strategy_params: Option<HashMap<String, String>>,
     pub version: Option<i32>,
@@ -56,16 +57,16 @@ pub struct HoodieCompactionStrategy {
 /// Java `HoodieCompactionPlan`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct HoodieCompactionPlan {
-    pub operations: Option<Vec<HoodieCompactionOperation>>,
+pub struct CompactionPlan {
+    pub operations: Option<Vec<CompactionOperation>>,
     pub extra_metadata: Option<HashMap<String, String>>,
     pub version: Option<i32>,
-    pub strategy: Option<HoodieCompactionStrategy>,
+    pub strategy: Option<CompactionStrategy>,
     pub preserve_hoodie_metadata: Option<bool>,
     pub missing_schedule_partitions: Option<Vec<String>>,
 }
 
-impl HoodieCompactionPlan {
+impl CompactionPlan {
     /// The plan version Java's `CompactionUtils.LATEST_COMPACTION_METADATA_VERSION` writes.
     pub const LATEST_VERSION: i32 = 2;
     /// `extraMetadata` key naming the writer that scheduled the plan.
@@ -109,9 +110,9 @@ mod tests {
     /// writer uses populated, including the double-valued metrics map.
     #[test]
     fn test_compaction_plan_avro_round_trip() {
-        let plan = HoodieCompactionPlan {
+        let plan = CompactionPlan {
             operations: Some(vec![
-                HoodieCompactionOperation {
+                CompactionOperation {
                     base_instant_time: Some("20260101000000000".to_string()),
                     delta_file_paths: Some(vec![
                         ".f1-0_20260101000001000.log.1_0-0-0".to_string(),
@@ -123,7 +124,7 @@ mod tests {
                     metrics: Some(HashMap::from([("TOTAL_LOG_FILES".to_string(), 2.0)])),
                     bootstrap_file_path: None,
                 },
-                HoodieCompactionOperation {
+                CompactionOperation {
                     base_instant_time: Some("20260101000003000".to_string()),
                     delta_file_paths: Some(vec![".f2-0_20260101000003000.log.1_0-0-0".to_string()]),
                     data_file_path: None,
@@ -134,8 +135,8 @@ mod tests {
                 },
             ]),
             extra_metadata: Some(HashMap::new()),
-            version: Some(HoodieCompactionPlan::LATEST_VERSION),
-            strategy: Some(HoodieCompactionStrategy {
+            version: Some(CompactionPlan::LATEST_VERSION),
+            strategy: Some(CompactionStrategy {
                 compactor_class_name: None,
                 strategy_params: Some(HashMap::new()),
                 version: Some(1),
@@ -145,11 +146,11 @@ mod tests {
         };
         let bytes = plan.to_avro_bytes().unwrap();
         assert_eq!(&bytes[..4], b"Obj\x01");
-        assert_eq!(HoodieCompactionPlan::from_avro_bytes(&bytes).unwrap(), plan);
+        assert_eq!(CompactionPlan::from_avro_bytes(&bytes).unwrap(), plan);
     }
 
     #[test]
     fn test_compaction_plan_rejects_non_avro_bytes() {
-        assert!(HoodieCompactionPlan::from_avro_bytes(b"not avro").is_err());
+        assert!(CompactionPlan::from_avro_bytes(b"not avro").is_err());
     }
 }

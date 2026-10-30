@@ -37,7 +37,7 @@ use crate::error::CoreError;
 use crate::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
 use crate::hfile::{HFileBuilder, HFileReader, HFileRecord};
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
-use crate::metadata::compaction::{HoodieCompactionOperation, HoodieCompactionPlan};
+use crate::metadata::compaction::{CompactionOperation, CompactionPlan};
 use crate::metadata::payload_merger::MetadataPayloadMerger;
 use crate::metadata::table::encode::{
     ColumnStatsMetadata, FilesMetadataEntry, StatsIndexVersion, decode_column_stats_entry,
@@ -306,10 +306,10 @@ async fn base_schemas_match(storage: &Storage, slices: &[SliceToCompact]) -> Res
     Ok(true)
 }
 
-fn compaction_plan(slices: &[SliceToCompact]) -> HoodieCompactionPlan {
+fn compaction_plan(slices: &[SliceToCompact]) -> CompactionPlan {
     let operations = slices
         .iter()
-        .map(|slice| HoodieCompactionOperation {
+        .map(|slice| CompactionOperation {
             base_instant_time: slice.base_instant().or_else(|| {
                 slice
                     .log_paths
@@ -334,10 +334,10 @@ fn compaction_plan(slices: &[SliceToCompact]) -> HoodieCompactionPlan {
             bootstrap_file_path: None,
         })
         .collect();
-    HoodieCompactionPlan {
+    CompactionPlan {
         operations: Some(operations),
         extra_metadata: Some(HashMap::new()),
-        version: Some(HoodieCompactionPlan::LATEST_VERSION),
+        version: Some(CompactionPlan::LATEST_VERSION),
         strategy: None,
         preserve_hoodie_metadata: Some(false),
         missing_schedule_partitions: None,
@@ -1329,7 +1329,7 @@ mod tests {
             MDT_TIMELINE,
             &crashed,
             Action::Compaction,
-            HoodieCompactionPlan::default().to_avro_bytes().unwrap(),
+            CompactionPlan::default().to_avro_bytes().unwrap(),
             Vec::new(),
         )
         .await

@@ -114,7 +114,7 @@ pub(crate) async fn rollback_pending_compactions(table: &Table) -> Result<()> {
     for instant in pending.iter().filter(|i| i.action == "compaction") {
         let requested = format!("{timeline}/{}.compaction.requested", instant.timestamp);
         let ours = match storage.get_file_data(&requested).await {
-            Ok(bytes) => crate::metadata::compaction::HoodieCompactionPlan::from_avro_bytes(&bytes)
+            Ok(bytes) => crate::metadata::compaction::CompactionPlan::from_avro_bytes(&bytes)
                 .is_ok_and(|plan| plan.is_scheduled_by_hudi_rs()),
             Err(_) => false,
         };
