@@ -131,6 +131,9 @@ fn build_reader(
     // from paths alone (the cxx bridge) can offer.
     context.completion_gate_inputs = completion_gate_inputs;
     if let Some(pushdown) = pushdown {
+        // `repair_risk_columns` stays empty: the pushdown refuses any file that
+        // stores a filter column in a type other than the table's, which covers
+        // every file the logical timestamp repair would reinterpret.
         context.row_filter_builder = Some(pushdown.row_filter);
         context.row_group_selector = Some(pushdown.row_groups);
         // A merge by row position pairs log records with base rows one to one,

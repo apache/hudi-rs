@@ -42,7 +42,8 @@ pub(crate) struct FilterPushdown {
     pub row_filter: RowFilterBuilder,
     pub row_groups: RowGroupSelector,
     /// Every filter is on a record key field, which no log record can change,
-    /// so the filter may drop base rows before a merge-on-read merge.
+    /// so the filter may drop base rows before a merge-on-read merge. Always
+    /// true for a slice that merges, which keeps only those filters.
     pub mor_pk_safe: bool,
 }
 
@@ -50,17 +51,28 @@ pub(crate) struct FilterPushdown {
 /// before a type widening stores a filter column in a narrower type, and a
 /// literal compared in that type can disagree with the same comparison in
 /// the table's type, so such a file gets nothing pushed.
+///
+/// A slice that `merges` log records into its base file pushes only the
+/// record key filters: a filter on any other column could drop a base row
+/// that a log record would have lost to.
 pub(crate) fn filter_pushdown(
     filters: &[Filter],
     record_key_fields: &[String],
     table_schema: &Schema,
+    merges: bool,
 ) -> Option<FilterPushdown> {
+    let is_key = |filter: &&Filter| {
+        filter.field == MetaField::RecordKey.as_ref() || record_key_fields.contains(&filter.field)
+    };
+    let filters: Vec<Filter> = if merges {
+        filters.iter().filter(is_key).cloned().collect()
+    } else {
+        filters.to_vec()
+    };
     if filters.is_empty() {
         return None;
     }
-    let mor_pk_safe = filters.iter().all(|filter| {
-        filter.field == MetaField::RecordKey.as_ref() || record_key_fields.contains(&filter.field)
-    });
+    let mor_pk_safe = filters.iter().all(|filter| is_key(&filter));
     let table_types: Vec<(String, DataType)> = filters
         .iter()
         .map(|filter| {
@@ -79,7 +91,7 @@ pub(crate) fn filter_pushdown(
                 .is_ok_and(|f| f.data_type() == data_type)
         })
     };
-    let for_rows = filters.to_vec();
+    let for_rows = filters.clone();
     let row_types = table_types.clone();
     // Checked against the schema the reader decodes with (its embedded Arrow
     // hint included), which is what the predicate sees.
@@ -216,22 +228,34 @@ mod tests {
     #[test]
     fn test_pushdown_selects_row_groups_and_rows() {
         let file = parquet_file();
-        let one = filter_pushdown(&[col("id").eq("k05")], &["id".to_string()], &schema()).unwrap();
+        let one = filter_pushdown(
+            &[col("id").eq("k05")],
+            &["id".to_string()],
+            &schema(),
+            false,
+        )
+        .unwrap();
         assert!(one.mor_pk_safe);
         assert_eq!(
             ids_through(&one, file.clone()),
             (vec![2], vec!["k05".to_string()])
         );
 
-        let two = filter_pushdown(&[col("id").in_list(["k01", "k08"])], &[], &schema()).unwrap();
+        let two =
+            filter_pushdown(&[col("id").in_list(["k01", "k08"])], &[], &schema(), false).unwrap();
         assert!(!two.mor_pk_safe);
         assert_eq!(
             ids_through(&two, file.clone()),
             (vec![0, 4], vec!["k01".to_string(), "k08".to_string()])
         );
 
-        let both =
-            filter_pushdown(&[col("v").gte("6"), col("id").ne("k07")], &[], &schema()).unwrap();
+        let both = filter_pushdown(
+            &[col("v").gte("6"), col("id").ne("k07")],
+            &[],
+            &schema(),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             ids_through(&both, file.clone()),
             (
@@ -240,8 +264,30 @@ mod tests {
             )
         );
 
-        let none = filter_pushdown(&[col("v").gt("100")], &[], &schema()).unwrap();
+        let none = filter_pushdown(&[col("v").gt("100")], &[], &schema(), false).unwrap();
         assert_eq!(ids_through(&none, file), (vec![], vec![]));
+    }
+
+    /// A slice that merges keeps only the record key half of a mixed filter.
+    #[test]
+    fn test_a_merging_slice_pushes_only_record_key_filters() {
+        let file = parquet_file();
+        let keys = ["id".to_string()];
+        let mixed = [col("id").in_list(["k01", "k08"]), col("v").eq("8")];
+
+        let merging = filter_pushdown(&mixed, &keys, &schema(), true).unwrap();
+        assert!(merging.mor_pk_safe);
+        assert_eq!(
+            ids_through(&merging, file.clone()),
+            (vec![0, 4], vec!["k01".to_string(), "k08".to_string()])
+        );
+        let plain = filter_pushdown(&mixed, &keys, &schema(), false).unwrap();
+        assert!(!plain.mor_pk_safe);
+        assert_eq!(
+            ids_through(&plain, file),
+            (vec![4], vec!["k08".to_string()])
+        );
+        assert!(filter_pushdown(&[col("v").eq("8")], &keys, &schema(), true).is_none());
     }
 
     /// A file holding a filter column in another type than the table (a file
@@ -254,7 +300,7 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("v", DataType::Decimal128(20, 0), false),
         ]);
-        let pushdown = filter_pushdown(&[col("v").gt("5")], &[], &wide).unwrap();
+        let pushdown = filter_pushdown(&[col("v").gt("5")], &[], &wide, false).unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
         assert!((pushdown.row_filter)(builder.parquet_schema(), builder.schema()).is_none());
         assert!((pushdown.row_groups)(builder.metadata()).is_none());
@@ -263,8 +309,13 @@ mod tests {
             Field::new("id", DataType::Utf8, false),
             Field::new("v", DataType::Float64, false),
         ]);
-        let pushdown =
-            filter_pushdown(&[col("v").gt("5"), col("id").eq("k01")], &[], &floats).unwrap();
+        let pushdown = filter_pushdown(
+            &[col("v").gt("5"), col("id").eq("k01")],
+            &[],
+            &floats,
+            false,
+        )
+        .unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         // The file stores `v` as Int64, so the type check skips the file; with
         // a Float64 file the selector would still ignore the `v` filter.
@@ -276,11 +327,11 @@ mod tests {
     #[test]
     fn test_pushdown_skips_a_column_the_file_lacks() {
         let file = parquet_file();
-        let pushdown = filter_pushdown(&[col("missing").eq("x")], &[], &schema()).unwrap();
+        let pushdown = filter_pushdown(&[col("missing").eq("x")], &[], &schema(), false).unwrap();
         let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
         assert!((pushdown.row_filter)(builder.parquet_schema(), builder.schema()).is_none());
         // No opinion on row groups either: the reader fetches them all.
         assert!((pushdown.row_groups)(builder.metadata()).is_none());
-        assert!(filter_pushdown(&[], &[], &schema()).is_none());
+        assert!(filter_pushdown(&[], &[], &schema(), false).is_none());
     }
 }

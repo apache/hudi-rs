@@ -127,8 +127,8 @@ pub struct ReaderContext {
     /// appear in one of those two, or it reads as unset.
     pub hoodie_reader_config: HashMap<String, String>,
     /// Optional parquet `RowFilter` builder for predicate pushdown into base
-    /// parquet files and parquet-format log blocks. Set by the FFI bridge from
-    /// the decoded substrait predicate; `None` when no predicate was pushed.
+    /// parquet files and parquet-format log blocks; `None` when no predicate was
+    /// pushed.
     ///
     /// Whether it actually gets installed is gated by whether the read merges:
     /// `HoodieFileGroupReader::base_read_pushdown_is_safe` for the base file

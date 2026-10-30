@@ -201,6 +201,10 @@ async fn test_a_losing_log_record_does_not_leak_through_a_pushed_filter() {
     );
     assert_eq!(rows(&table, &filters(&[("value", "=", "1")])).await, vec![]);
     assert_eq!(
+        rows(&table, &filters(&[("id", "=", "a1"), ("value", "=", "1")])).await,
+        vec![]
+    );
+    assert_eq!(
         rows(&table, &filters(&[("value", "=", "5")])).await,
         vec![("a1".to_string(), 5)]
     );
