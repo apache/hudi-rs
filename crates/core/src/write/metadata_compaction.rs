@@ -56,7 +56,9 @@ use crate::timeline::selector::InstantRange;
 const METADATA_BASE: &str = ".hoodie/metadata";
 const MDT_TIMELINE: &str = ".hoodie/metadata/.hoodie/timeline";
 const MAX_DELTA_COMMITS: &str = "hoodie.metadata.compact.max.delta.commits";
-const DEFAULT_MAX_DELTA_COMMITS: usize = 10;
+/// Twice Java's default: each compaction rewrites every metadata file group
+/// with log files under the write's lock, so fewer, larger ones cost writes less.
+const DEFAULT_MAX_DELTA_COMMITS: usize = 20;
 /// Java's default `hoodie.hfile.block.size`.
 const HFILE_BLOCK_SIZE: usize = 1024 * 1024;
 /// Slices compacted at once. Each holds its whole base file and its output in
@@ -1256,7 +1258,7 @@ mod tests {
     }
 
     /// With the default threshold, writes compact the metadata table on their
-    /// own once ten delta commits accumulate, and reads stay correct.
+    /// own once twenty delta commits accumulate, and reads stay correct.
     #[tokio::test]
     async fn test_writes_compact_the_metadata_table_inline() {
         let dir = tempfile::tempdir().unwrap();
@@ -1272,7 +1274,7 @@ mod tests {
             .await
             .unwrap();
         let mut expected = BTreeMap::new();
-        for round in 0..12i64 {
+        for round in 0..24i64 {
             let id = format!("k{}", round % 5);
             table
                 .upsert([batch(&[(id.as_str(), "sf", round, round)])])
@@ -1280,11 +1282,15 @@ mod tests {
                 .unwrap();
             expected.insert(id, round);
         }
-        let commits: Vec<String> = metadata_timeline_files(path)
-            .into_iter()
-            .filter(|n| n.ends_with(".commit"))
-            .collect();
+        let timeline = metadata_timeline_files(path);
+        let commits: Vec<&String> = timeline.iter().filter(|n| n.ends_with(".commit")).collect();
         assert_eq!(commits.len(), 1, "{commits:?}");
+        let compaction = &commits[0][..17];
+        let before = timeline
+            .iter()
+            .filter(|n| n.ends_with(".deltacommit") && n[..17] < *compaction)
+            .count();
+        assert_eq!(before, 20, "{timeline:?}");
         let rows = data_rows(path).await;
         let got: BTreeMap<String, i64> = rows.into_iter().map(|r| (r.0, r.3)).collect();
         assert_eq!(got, expected);

@@ -294,7 +294,7 @@ Java's metadata table writer schema: `HoodieMetadataRecord` with the five
 
 After a data write completes, still inside its completion critical section,
 the writer compacts the metadata table once it holds
-`hoodie.metadata.compact.max.delta.commits` (default 10, as in Java) delta
+`hoodie.metadata.compact.max.delta.commits` (default 20, twice Java's) delta
 commits since its latest compaction, and only while no data instant is pending:
 a pending instant's metadata log blocks would otherwise sort below the
 compaction instant and attach to the superseded slice, since this writer
