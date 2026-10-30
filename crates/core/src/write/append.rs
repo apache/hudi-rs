@@ -209,8 +209,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
         let mut offset = 0usize;
         while offset < total_rows {
             let end = (offset + max_records).min(total_rows);
-            let indices: Vec<u32> = (offset as u32..end as u32).collect();
-            let chunk = take_rows(&partition_batch, &indices)?;
+            let chunk = partition_batch.slice(offset, end - offset);
             let chunk_row_offset = auto_key_row_offset;
             let chunk_keys = hoodie_keys_for_batch_with_offset(
                 &table.hudi_configs,
@@ -245,7 +244,7 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
                 file_id,
                 file_name,
                 base_file_path,
-                row_count: indices.len() as i64,
+                row_count: (end - offset) as i64,
                 chunk_keys,
                 prepared,
             });
@@ -364,6 +363,15 @@ pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Resul
 }
 
 fn take_rows(batch: &RecordBatch, indices: &[u32]) -> Result<RecordBatch> {
+    // A batch's rows for one partition form a contiguous run when the input is
+    // non-partitioned or sorted by partition; a view avoids copying it.
+    if let Some(first) = indices.first()
+        && indices
+            .windows(2)
+            .all(|w| w[0].checked_add(1) == Some(w[1]))
+    {
+        return Ok(batch.slice(*first as usize, indices.len()));
+    }
     let indices = UInt32Array::from(indices.to_vec());
     let columns = batch
         .columns()
@@ -1045,6 +1053,32 @@ pub(crate) fn prepare_batches_for_write_with_offset(
 mod tests {
     use super::*;
     use arrow_schema::{DataType, Field, Schema, TimeUnit};
+
+    #[test]
+    fn test_take_rows_slices_a_contiguous_run_and_gathers_the_rest() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(arrow::array::Int64Array::from_iter_values(0..10))],
+        )?;
+        let values = |b: &RecordBatch| -> Vec<i64> {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .values()
+                .to_vec()
+        };
+        let values_ptr = |b: &RecordBatch| b.column(0).to_data().buffers()[0].as_ptr();
+        let run = take_rows(&batch, &[3, 4, 5])?;
+        assert_eq!(values(&run), [3, 4, 5]);
+        assert_eq!(values_ptr(&run), values_ptr(&batch).wrapping_add(3 * 8));
+        assert_eq!(values(&take_rows(&batch, &[0])?), [0]);
+        assert_eq!(values(&take_rows(&batch, &[9, 2, 2])?), [9, 2, 2]);
+        assert_eq!(values(&take_rows(&batch, &[1, 3])?), [1, 3]);
+        assert_eq!(take_rows(&batch, &[])?.num_rows(), 0);
+        Ok(())
+    }
 
     #[test]
     fn test_arrow_schema_to_avro_json_type_matrix() {
