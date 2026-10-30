@@ -59,6 +59,10 @@ const MAX_DELTA_COMMITS: &str = "hoodie.metadata.compact.max.delta.commits";
 const DEFAULT_MAX_DELTA_COMMITS: usize = 10;
 /// Java's default `hoodie.hfile.block.size`.
 const HFILE_BLOCK_SIZE: usize = 1024 * 1024;
+/// Slices compacted at once. Each holds its whole base file and its output in
+/// memory, so this keeps the peak near two record index shards however many
+/// cores the writer has.
+const MAX_CONCURRENT_SLICES: usize = 2;
 /// Java `HoodieAvroHFileWriter` records a base file's key range in its file info.
 const MIN_RECORD_KEY: &str = "minRecordKey";
 const MAX_RECORD_KEY: &str = "maxRecordKey";
@@ -118,53 +122,6 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The metadata timeline's instants by state.
-#[derive(Default)]
-struct MetadataTimeline {
-    /// (instant, action) of completed instants.
-    completed: Vec<(String, String)>,
-    /// Instant to (action, fencing file names) of instants with no completed
-    /// file.
-    pending: BTreeMap<String, (String, Vec<String>)>,
-}
-
-async fn load_metadata_timeline(storage: &Storage) -> Result<MetadataTimeline> {
-    let files = match storage.list_files(Some(MDT_TIMELINE)).await {
-        Ok(files) => files,
-        Err(crate::storage::error::StorageError::ObjectStoreError(
-            object_store::Error::NotFound { .. },
-        )) => return Ok(MetadataTimeline::default()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut timeline = MetadataTimeline::default();
-    let mut fenced: BTreeMap<String, (String, Vec<String>)> = BTreeMap::new();
-    let mut completed = HashSet::new();
-    for file in files {
-        let name = file.name;
-        if !name.starts_with(|c: char| c.is_ascii_digit()) {
-            continue;
-        }
-        let timestamp: String = name.chars().take_while(char::is_ascii_digit).collect();
-        if name.ends_with(".requested") || name.ends_with(".inflight") {
-            let action = crate::write::rollback::action_from_fencing_name(&name, &timestamp);
-            let entry = fenced.entry(timestamp).or_default();
-            if entry.0.is_empty() {
-                entry.0 = action;
-            }
-            entry.1.push(name);
-        } else if let Some((_, action)) = name.split_once('.') {
-            completed.insert(timestamp.clone());
-            timeline.completed.push((timestamp, action.to_string()));
-        }
-    }
-    timeline.pending = fenced
-        .into_iter()
-        .filter(|(timestamp, _)| !completed.contains(timestamp))
-        .collect();
-    timeline.completed.sort();
-    Ok(timeline)
-}
-
 /// Compact the metadata table when its delta commits since the latest
 /// compaction reach the threshold. Called with the table lock held, after
 /// the data instant completed; returns the compaction instant, if one ran.
@@ -184,11 +141,16 @@ pub(crate) async fn compact_metadata_table_if_needed(table: &mut Table) -> Resul
         .filter(|n| *n >= 1)
         .unwrap_or(DEFAULT_MAX_DELTA_COMMITS);
     let storage = table.file_system_view.storage.clone();
-    let timeline = load_metadata_timeline(storage.as_ref()).await?;
+    let timeline = crate::write::rollback::list_timeline(storage.as_ref(), MDT_TIMELINE).await?;
     let mut blocked = false;
-    for (instant, (action, fencing)) in &timeline.pending {
-        if action == "compaction" {
-            rollback_metadata_compaction(storage.as_ref(), instant, fencing).await?;
+    for pending in &timeline.pending {
+        if pending.action == "compaction" {
+            rollback_metadata_compaction(
+                storage.as_ref(),
+                &pending.timestamp,
+                &pending.fencing_files,
+            )
+            .await?;
         } else {
             blocked = true;
         }
@@ -218,7 +180,7 @@ pub(crate) async fn compact_metadata_table_if_needed(table: &mut Table) -> Resul
     }
 
     let slices = slices_to_compact(storage.as_ref()).await?;
-    if slices.is_empty() {
+    if slices.is_empty() || !base_schemas_match(storage.as_ref(), &slices).await? {
         return Ok(None);
     }
     table.timeline.reload_completed_commits().await?;
@@ -322,6 +284,28 @@ async fn slices_to_compact(storage: &Storage) -> Result<Vec<SliceToCompact>> {
     Ok(slices)
 }
 
+/// Whether every slice's base file was written with the output schema, read
+/// from its file info alone. [`compact_slice`] refuses a base written with
+/// another schema (one an older Java release wrote, before `valueType`);
+/// found here, the compaction is skipped before anything is fenced or read
+/// whole, which every write past the threshold would otherwise repeat.
+async fn base_schemas_match(storage: &Storage, slices: &[SliceToCompact]) -> Result<bool> {
+    let hfile_error = |e: crate::hfile::HFileError| CoreError::HFile(e.to_string());
+    let output = metadata_schema()?.canonical_form();
+    for path in slices.iter().filter_map(|slice| slice.base_path.as_deref()) {
+        let reader = HFileReader::open_ranged(storage, path)
+            .await
+            .map_err(hfile_error)?;
+        if let Some(schema) = reader.get_avro_schema().map_err(hfile_error)?
+            && schema.canonical_form() != output
+        {
+            log::debug!("metadata table compaction skipped: {path} has another schema");
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn compaction_plan(slices: &[SliceToCompact]) -> HoodieCompactionPlan {
     let operations = slices
         .iter()
@@ -361,7 +345,8 @@ fn compaction_plan(slices: &[SliceToCompact]) -> HoodieCompactionPlan {
 }
 
 /// Writes every slice's new base file on the write task pool and returns
-/// their write stats. A failure deletes what was written.
+/// their write stats. On a failure the caller's rollback deletes what was
+/// written.
 async fn write_compacted_slices(
     table: &Table,
     slices: &[SliceToCompact],
@@ -418,33 +403,11 @@ async fn write_compacted_slices(
             task
         })
         .collect();
-    let parallelism = std::thread::available_parallelism()
-        .map_or(4, std::num::NonZeroUsize::get)
-        .min(crate::write::write_task_parallelism(table));
-    let results = crate::write::run_write_tasks(tasks, parallelism).await;
-    let mut stats = Vec::with_capacity(results.len());
-    let mut first_error = None;
-    for result in results {
-        match result {
-            Ok(stat) => stats.push(stat),
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-    }
-    match first_error {
-        Some(error) => {
-            for stat in &stats {
-                if let Some(path) = &stat.path {
-                    let _ = storage
-                        .delete_file(&format!("{METADATA_BASE}/{path}"))
-                        .await;
-                }
-            }
-            Err(error)
-        }
-        None => Ok(stats),
-    }
+    let parallelism = MAX_CONCURRENT_SLICES.min(crate::write::write_task_parallelism(table));
+    crate::write::run_write_tasks(tasks, parallelism)
+        .await
+        .into_iter()
+        .collect()
 }
 
 async fn complete_metadata_compaction(
@@ -903,6 +866,42 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, CoreError::Unsupported(_)), "{error}");
+    }
+
+    /// A base file written with another schema is found from its file info,
+    /// before any compaction is fenced.
+    #[tokio::test]
+    async fn test_base_schemas_match_reads_the_file_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Storage::new_with_base_url(url::Url::from_directory_path(dir.path()).unwrap()).unwrap();
+        let other = r#"{"type":"record","name":"HoodieMetadataRecord","fields":[{"name":"key","type":"string"}]}"#;
+        let foreign = crate::hfile::HFileWriter::write(
+            &[("k".to_string(), b"v".to_vec())],
+            BTreeMap::from([("schema".to_string(), other.as_bytes().to_vec())]),
+        )
+        .unwrap();
+        let slice = |file_id: &str, base: Option<&str>| SliceToCompact {
+            partition: "record_index".to_string(),
+            file_id: file_id.to_string(),
+            kind: MergeKind::NewerWins,
+            base_path: base.map(str::to_string),
+            log_paths: vec![format!(
+                "{METADATA_BASE}/record_index/.{file_id}_2.log.1_0-0-0"
+            )],
+        };
+        let ours = format!("{METADATA_BASE}/record_index/a_0-0-0_1.hfile");
+        let theirs = format!("{METADATA_BASE}/record_index/b_0-0-0_1.hfile");
+        storage
+            .put_file(&ours, hfile(&[("k", b"v")]))
+            .await
+            .unwrap();
+        storage.put_file(&theirs, foreign).await.unwrap();
+
+        let matching = [slice("a", Some(&ours)), slice("c", None)];
+        assert!(base_schemas_match(&storage, &matching).await.unwrap());
+        let mixed = [slice("a", Some(&ours)), slice("b", Some(&theirs))];
+        assert!(!base_schemas_match(&storage, &mixed).await.unwrap());
     }
 
     /// A log-only slice and a slice whose every key is deleted both compact.

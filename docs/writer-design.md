@@ -307,10 +307,15 @@ log block touches is copied as its key and value bytes without being decoded.
 A touched record merges with `HoodieMetadataPayload` semantics; for
 `record_index` that is the newest record's bytes, so a record index compaction
 decodes nothing. A key whose last record is a delete-block tombstone is
-dropped. Records written with a schema other than the output schema are
-refused, since generic Avro resolution would retype stats bounds whose union
-branches share a shape. A crashed metadata compaction is rolled back (its base files
-and fencing files deleted) before the next one runs.
+dropped. A merged stats record decoded from a millisecond value type is
+written back with that type, as Java's merge keeps the newer record's. Records
+written with a schema other than the output schema are refused, since generic
+Avro resolution would retype stats bounds whose union branches share a shape;
+base files are checked from their file info first, so a table whose metadata
+an older Java release wrote skips compaction before anything is fenced. Each
+slice is compacted in memory, two slices at a time. A crashed metadata
+compaction is rolled back (its base files and fencing files deleted) before
+the next one runs.
 
 ## 6. Query semantics (writer-relevant)
 

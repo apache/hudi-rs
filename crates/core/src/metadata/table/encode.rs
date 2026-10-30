@@ -722,6 +722,34 @@ fn lift_stat_value(value: ColumnStatValue, ordinal: i32, info: Option<&str>) -> 
     }
 }
 
+/// The millisecond `ValueType` ordinal a decoded record carried, when its
+/// values were lifted from it to micros by [`lift_stat_value`]. Java's merge
+/// keeps the newer record's value type, so a re-encoded record writes it back.
+fn millis_value_type(decoded: Option<i32>, sample: Option<&ColumnStatValue>) -> Option<i32> {
+    match (decoded?, sample?) {
+        (13, ColumnStatValue::TimeMicros(_))
+        | (15, ColumnStatValue::TimestampMicros(_))
+        | (18, ColumnStatValue::LocalTimestampMicros(_)) => decoded,
+        _ => None,
+    }
+}
+
+/// Inverse of the millisecond lifts in [`lift_stat_value`]: `TIME_MILLIS` is
+/// an int, the timestamp types a long. Floors like Java's `toEpochMilli`.
+fn micros_to_millis(value: &ColumnStatValue) -> Result<ColumnStatValue> {
+    Ok(match value {
+        ColumnStatValue::TimeMicros(v) => {
+            ColumnStatValue::Int(i32::try_from(v.div_euclid(1_000)).map_err(|_| {
+                CoreError::MetadataTable(format!("time {v} micros does not fit TIME_MILLIS"))
+            })?)
+        }
+        ColumnStatValue::TimestampMicros(v) | ColumnStatValue::LocalTimestampMicros(v) => {
+            ColumnStatValue::Long(v.div_euclid(1_000))
+        }
+        other => other.clone(),
+    })
+}
+
 /// Inverse of [`wrap_stat_value`]: union branch → typed stat value.
 fn unwrap_stat_value(value: Value) -> Option<ColumnStatValue> {
     let Value::Union(branch, inner) = value else {
@@ -841,6 +869,17 @@ fn encode_column_stats_record(
     record_type: MetadataRecordType,
     version: StatsIndexVersion,
 ) -> Result<Vec<u8>> {
+    let sample = metadata.min_value.as_ref().or(metadata.max_value.as_ref());
+    let millis_ordinal = match version {
+        StatsIndexVersion::V1 => None,
+        StatsIndexVersion::V2 => millis_value_type(metadata.decoded_value_type_ordinal, sample),
+    };
+    let bound = |value: Option<&ColumnStatValue>| -> Result<Value> {
+        match (millis_ordinal, value) {
+            (Some(_), Some(value)) => wrap_stat_value(Some(&micros_to_millis(value)?), version),
+            _ => wrap_stat_value(value, version),
+        }
+    };
     let payload = Value::Union(
         1,
         Box::new(Value::Record(vec![
@@ -852,14 +891,8 @@ fn encode_column_stats_record(
                 "columnName".to_string(),
                 Value::Union(1, Box::new(Value::String(metadata.column_name.clone()))),
             ),
-            (
-                "minValue".to_string(),
-                wrap_stat_value(metadata.min_value.as_ref(), version)?,
-            ),
-            (
-                "maxValue".to_string(),
-                wrap_stat_value(metadata.max_value.as_ref(), version)?,
-            ),
+            ("minValue".to_string(), bound(metadata.min_value.as_ref())?),
+            ("maxValue".to_string(), bound(metadata.max_value.as_ref())?),
             (
                 "valueCount".to_string(),
                 Value::Union(1, Box::new(Value::Long(metadata.value_count))),
@@ -883,14 +916,16 @@ fn encode_column_stats_record(
             ),
             // V1 leaves valueType null (Java ValueMetadata.V1EmptyMetadata);
             // V2 (tv9+) carries HoodieValueTypeInfo. Ordinal derives from the
-            // stat values; all-null columns fall back to NULL (ordinal 1).
+            // stat values, or is the millisecond type they were decoded from;
+            // all-null columns fall back to NULL (ordinal 1).
             (
                 "valueType".to_string(),
                 match version {
                     StatsIndexVersion::V1 => null_union(),
                     StatsIndexVersion::V2 => {
-                        let sample = metadata.min_value.as_ref().or(metadata.max_value.as_ref());
-                        let ordinal = sample.map(ColumnStatValue::value_type_ordinal).unwrap_or(1);
+                        let ordinal = millis_ordinal.unwrap_or_else(|| {
+                            sample.map(ColumnStatValue::value_type_ordinal).unwrap_or(1)
+                        });
                         let additional_info = match sample {
                             Some(ColumnStatValue::Decimal {
                                 precision, scale, ..
@@ -1440,6 +1475,55 @@ mod tests {
                 .unwrap()
                 .expect("tombstone still decodes to a record");
             assert!(decoded.is_deleted, "{version:?}");
+        }
+    }
+
+    /// A V2 record decoded from a millisecond type is re-encoded with that
+    /// type and its millisecond values, so a decode and encode leaves its
+    /// bytes as they were.
+    #[test]
+    fn test_v2_millis_value_type_survives_reencoding() {
+        let schema = metadata_schema().unwrap();
+        for (ordinal, min, max) in [
+            (
+                13,
+                ColumnStatValue::TimeMicros(1_000),
+                ColumnStatValue::TimeMicros(86_399_999_000),
+            ),
+            (
+                15,
+                ColumnStatValue::TimestampMicros(-1_000),
+                ColumnStatValue::TimestampMicros(1_700_000_000_000_000),
+            ),
+            (
+                18,
+                ColumnStatValue::LocalTimestampMicros(0),
+                ColumnStatValue::LocalTimestampMicros(2_000),
+            ),
+        ] {
+            let meta = ColumnStatsMetadata {
+                file_name: "f.parquet".to_string(),
+                column_name: "c".to_string(),
+                min_value: Some(min),
+                max_value: Some(max),
+                value_count: 2,
+                null_count: 0,
+                total_size: 10,
+                total_uncompressed_size: 10,
+                is_deleted: false,
+                is_tight_bound: false,
+                decoded_value_type_ordinal: Some(ordinal),
+            };
+            let bytes = encode_column_stats(&meta, StatsIndexVersion::V2).unwrap();
+            let decoded = decode_column_stats_entry(&bytes, Some(schema))
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, meta, "ordinal {ordinal}");
+            assert_eq!(
+                encode_column_stats(&decoded, StatsIndexVersion::V2).unwrap(),
+                bytes,
+                "ordinal {ordinal}"
+            );
         }
     }
 }

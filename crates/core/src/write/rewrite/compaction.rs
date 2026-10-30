@@ -902,6 +902,25 @@ mod tests {
     /// table lock a write would take: stands in for a write that completes
     /// while a compaction waits for the lock.
     async fn complete_delta_commit_unlocked(table: &Table, slice: &FileSlice, rows: RecordBatch) {
+        let pending = start_delta_commit_unlocked(table, slice, rows).await;
+        finish_delta_commit_unlocked(table, pending).await;
+    }
+
+    /// A delta commit whose log file is written and whose instant is not yet
+    /// completed.
+    struct PendingDeltaCommit {
+        instant: String,
+        stat: HoodieWriteStat,
+        schema: arrow_schema::SchemaRef,
+    }
+
+    /// Mint a delta commit and write `rows` to a log file of `slice`, leaving
+    /// the instant pending.
+    async fn start_delta_commit_unlocked(
+        table: &Table,
+        slice: &FileSlice,
+        rows: RecordBatch,
+    ) -> PendingDeltaCommit {
         let storage = table.file_system_view.storage.clone();
         let instant = generate_instant_time().await;
         crate::write::fence_timeline_instant(
@@ -941,16 +960,26 @@ mod tests {
             num_writes: Some(1),
             ..Default::default()
         };
+        PendingDeltaCommit {
+            instant,
+            stat,
+            schema,
+        }
+    }
+
+    /// Complete a delta commit started by [`start_delta_commit_unlocked`].
+    async fn finish_delta_commit_unlocked(table: &Table, pending: PendingDeltaCommit) {
+        let storage = table.file_system_view.storage.clone();
         let bytes = crate::write::commit_metadata_bytes(
             table,
             "UPSERT",
-            crate::write::stats_by_partition(vec![stat]),
+            crate::write::stats_by_partition(vec![pending.stat]),
             None,
-            schema.as_ref(),
+            pending.schema.as_ref(),
         )
         .unwrap();
         let completed = crate::timeline::instant::Instant::new_completed(
-            instant,
+            pending.instant,
             Action::DeltaCommit,
             Some(generate_instant_time().await),
         )
@@ -1002,6 +1031,57 @@ mod tests {
         assert_eq!(
             data_only(&snapshot(&reader).await),
             vec![("a".into(), "sf".into(), 3, 12)]
+        );
+    }
+
+    /// Delta commits completing while a compaction is pending, as they do
+    /// beside a background compaction, attach to its new slice by completion
+    /// time: one minted before the plan (named below the compaction instant)
+    /// and one minted after. Both survive the compaction's completion.
+    #[tokio::test]
+    async fn test_writes_while_a_compaction_is_pending_survive_it() {
+        let dir = tempfile::tempdir().unwrap();
+        // The unlocked delta commit writes no metadata table entry, so file
+        // listing must come from storage.
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_table_type(TableTypeValue::MergeOnRead)
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .with_metadata_table_enabled(false)
+            .create()
+            .await
+            .unwrap();
+        table
+            .append([batch(&[("a", "sf", 1, 10), ("b", "sf", 1, 20)])])
+            .await
+            .unwrap();
+        table.upsert([batch(&[("a", "sf", 2, 11)])]).await.unwrap();
+        let slice = latest_slices(&table).await.remove(0);
+
+        let before =
+            start_delta_commit_unlocked(&table, &slice, batch(&[("a", "sf", 3, 12)])).await;
+        let (instant, slices) = request_compaction(&mut table).await.unwrap().unwrap();
+        assert!(before.instant < instant);
+        assert_eq!(slices[0].log_files.len(), 1, "a pending log is not planned");
+        finish_delta_commit_unlocked(&table, before).await;
+        let during = table.upsert([batch(&[("b", "sf", 2, 21)])]).await.unwrap();
+        assert!(during.instant > instant);
+        execute_compaction(&mut table, &instant, slices)
+            .await
+            .unwrap();
+
+        let reader = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+        let slice = latest_slices(&reader).await.remove(0);
+        assert_eq!(slice.creation_instant_time(), instant);
+        assert_eq!(slice.log_files.len(), 2);
+        assert_eq!(
+            data_only(&snapshot(&reader).await),
+            vec![
+                ("a".into(), "sf".into(), 3, 12),
+                ("b".into(), "sf".into(), 2, 21)
+            ]
         );
     }
 

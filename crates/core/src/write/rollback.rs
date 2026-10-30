@@ -41,14 +41,24 @@ use crate::write::markers::{delete_marker_dir, parse_marker_name, read_markers};
 
 const METADATA_BASE: &str = ".hoodie/metadata";
 
-/// A pending (fenced, never completed) instant on the data timeline.
+/// A pending (fenced, never completed) instant on a timeline.
 #[derive(Debug, Clone)]
-struct PendingInstant {
-    timestamp: String,
-    action: String,
+pub(crate) struct PendingInstant {
+    pub(crate) timestamp: String,
+    pub(crate) action: String,
     /// Fencing file names present on the timeline, deleted before the
     /// rollback completes.
-    fencing_files: Vec<String>,
+    pub(crate) fencing_files: Vec<String>,
+}
+
+/// A timeline directory's instants by state, from one listing.
+#[derive(Default)]
+pub(crate) struct TimelineListing {
+    /// Instants of every action with fencing files and no completed file,
+    /// in timestamp order.
+    pub(crate) pending: Vec<PendingInstant>,
+    /// `(timestamp, action)` of completed instants.
+    pub(crate) completed: Vec<(String, String)>,
 }
 
 /// A rollback whose plan was persisted but which never completed.
@@ -241,14 +251,40 @@ async fn find_pending_instants(
     Vec<PendingInstant>,
     std::collections::HashSet<String>,
 )> {
+    let listing = list_timeline(storage, timeline_dir).await?;
+    let mut pending = Vec::new();
+    let mut rollbacks = Vec::new();
+    for instant in listing.pending {
+        match instant.action.as_str() {
+            "commit" | "deltacommit" | "replacecommit" | "compaction" => pending.push(instant),
+            "rollback" => rollbacks.push(instant),
+            // Other table services (clean, clustering, indexing) belong to
+            // the engine that scheduled them.
+            _ => {}
+        }
+    }
+    let completed = listing
+        .completed
+        .into_iter()
+        .map(|(timestamp, _)| timestamp)
+        .collect();
+    Ok((pending, rollbacks, completed))
+}
+
+/// List a timeline directory's pending and completed instants. A missing
+/// directory is an empty timeline.
+pub(crate) async fn list_timeline(
+    storage: &Storage,
+    timeline_dir: &str,
+) -> Result<TimelineListing> {
     let files = match storage.list_files(Some(timeline_dir)).await {
         Ok(files) => files,
         Err(crate::storage::error::StorageError::ObjectStoreError(
             object_store::Error::NotFound { .. },
-        )) => return Ok(Default::default()),
+        )) => return Ok(TimelineListing::default()),
         Err(error) => return Err(error.into()),
     };
-    let mut completed = std::collections::HashSet::new();
+    let mut completed = Vec::new();
     let mut fenced: HashMap<String, (String, Vec<String>)> = HashMap::new();
     for file in &files {
         let name = &file.name;
@@ -269,17 +305,18 @@ async fn find_pending_instants(
                 entry.0 = action;
             }
             entry.1.push(name.clone());
-        } else {
-            completed.insert(timestamp);
+        } else if let Some((_, action)) = name.split_once('.') {
+            completed.push((timestamp, action.to_string()));
         }
     }
-    let mut pending = Vec::new();
-    let mut rollbacks = Vec::new();
-    for (timestamp, (action, fencing_files)) in fenced {
-        if completed.contains(&timestamp) {
-            continue;
-        }
-        let instant = PendingInstant {
+    let completed_timestamps: std::collections::HashSet<&str> = completed
+        .iter()
+        .map(|(timestamp, _)| timestamp.as_str())
+        .collect();
+    let mut pending: Vec<PendingInstant> = fenced
+        .into_iter()
+        .filter(|(timestamp, _)| !completed_timestamps.contains(timestamp.as_str()))
+        .map(|(timestamp, (action, fencing_files))| PendingInstant {
             timestamp,
             action: if action.is_empty() {
                 "commit".to_string()
@@ -287,18 +324,10 @@ async fn find_pending_instants(
                 action
             },
             fencing_files,
-        };
-        match instant.action.as_str() {
-            "commit" | "deltacommit" | "replacecommit" | "compaction" => pending.push(instant),
-            "rollback" => rollbacks.push(instant),
-            // Other table services (clean, clustering, indexing) belong to
-            // the engine that scheduled them.
-            _ => {}
-        }
-    }
+        })
+        .collect();
     pending.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    rollbacks.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
-    Ok((pending, rollbacks, completed))
+    Ok(TimelineListing { pending, completed })
 }
 
 /// Java `MarkerBasedRollbackStrategy` at table version 8+: one request per
