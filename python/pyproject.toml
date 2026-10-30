@@ -48,6 +48,8 @@ devel = [
     "ruff==0.17.1",
     "mypy==2.4.0",
     "pre-commit",
+    "pandas>=2.2",
+    "polars>=1.0",
 ]
 lint = [
     "ruff==0.17.1",

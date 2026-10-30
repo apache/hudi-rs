@@ -27,6 +27,7 @@ from hudi._internal import (
     HudiRecordBatchStream,
     HudiTable,
     HudiTimeline,
+    HudiWriteResult,
 )
 from hudi._internal import __version__ as __version__
 from hudi.table.builder import HudiTableBuilder
@@ -45,4 +46,5 @@ __all__ = [
     "HudiTableBuilder",
     "HudiTableConfig",
     "HudiTimeline",
+    "HudiWriteResult",
 ]

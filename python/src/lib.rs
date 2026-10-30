@@ -33,7 +33,7 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     use internal::{
         HudiFileGroupReader, HudiFileSlice, HudiInstant, HudiQueryType, HudiReadOptions,
-        HudiRecordBatchStream, HudiTable, HudiTimeline,
+        HudiRecordBatchStream, HudiTable, HudiTimeline, HudiWriteResult,
     };
     m.add_class::<HudiFileGroupReader>()?;
     m.add_class::<HudiFileSlice>()?;
@@ -43,6 +43,7 @@ fn _internal(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<HudiRecordBatchStream>()?;
     m.add_class::<HudiTable>()?;
     m.add_class::<HudiTimeline>()?;
+    m.add_class::<HudiWriteResult>()?;
 
     m.add_function(wrap_pyfunction!(internal::_config_keys, m)?)?;
 

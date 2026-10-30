@@ -322,7 +322,7 @@ std::vector<std::string> log_file_paths{};
 ArrowArrayStream* stream_ptr = reader->read_file_slice_from_paths("relative/path.parquet", log_file_paths);
 ```
 
-## Writing Tables (Rust)
+## Writing Tables
 
 hudi-rs includes a native, single-node write path that is storage-compatible
 with the Apache Hudi Spark writer: tables written here are readable — and
@@ -333,11 +333,29 @@ metadata table (file listings, column/partition stats, record-level index) on
 every commit. See [docs/writer-design.md](docs/writer-design.md) for the full
 design.
 
-> [!NOTE]
-> Write APIs are currently Rust-only; Python and C++ bindings expose the read
-> APIs shown above.
+Python exposes the same write APIs on `HudiTable`, accepting PyArrow tables,
+record batches and readers, or any object implementing the Arrow PyCapsule
+stream interface (`__arrow_c_stream__`, e.g. polars and pandas >= 2.2
+DataFrames). Each write returns a `HudiWriteResult`. The C++ binding exposes
+the read APIs only.
 
 ### Create a Table
+
+#### Python
+
+```python
+from hudi import HudiTable
+
+table = HudiTable.create(
+    "/tmp/trips_table",
+    record_key="uuid",
+    partition_by="city",
+    ordering_fields="ts",     # event-time ordering
+    table_type="cow",         # or "mor"
+)
+```
+
+#### Rust
 
 ```rust
 use hudi::table::Table;
@@ -361,6 +379,20 @@ an index lookup, splitting input into files bounded by
 path: unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
 and no metadata table, one base file per call.
 
+#### Python
+
+```python
+import pyarrow as pa
+
+# `table` is the HudiTable created above; the input is plain Arrow data.
+batch = pa.record_batch(
+    {"uuid": ["a", "b"], "city": ["san_francisco"] * 2, "ts": [1, 1], "fare": [30.0, 45.0]}
+)
+table.append(batch)
+```
+
+#### Rust
+
 ```rust
 use arrow_array::RecordBatch;
 
@@ -376,6 +408,18 @@ update their file group in place (a rewritten base file on COW, a log file on
 MOR); new keys pack into existing small files first and then form new file
 groups.
 
+#### Python
+
+```python
+result = table.upsert(batch)
+print(f"instant={result.instant_time} updates={result.num_updates} inserts={result.num_inserts}")
+
+# Partial upsert (copy-on-write only): matched rows take only these columns from the input.
+table.upsert(batch, update_columns=["fare"])
+```
+
+#### Rust
+
 ```rust
 let result = table.upsert([batch]).await?;
 println!(
@@ -385,6 +429,24 @@ println!(
 ```
 
 ### Update and Delete
+
+A write whose filter or keys match nothing succeeds without creating a commit
+and reports zero rows.
+
+#### Python
+
+```python
+# SQL-style update: each value must fit its column's type exactly.
+table.update("city = 'san_francisco'", {"fare": 99.0})
+
+# Delete by predicate (single comparison, or IN for multiple keys).
+table.delete("uuid IN ('a')")
+
+# Delete by key, optionally with the partition path.
+table.delete_keys([("b", "city=san_francisco")])
+```
+
+#### Rust
 
 ```rust
 use hudi::table::HoodieKey;
@@ -404,6 +466,18 @@ table.delete_keys([HoodieKey {
 ```
 
 ### Overwrite
+
+#### Python
+
+```python
+# INSERT_OVERWRITE_TABLE: replace all file groups.
+table.overwrite(batch)
+
+# INSERT_OVERWRITE: replace only the partitions present in the input.
+table.dynamic_partition_overwrite(batch)
+```
+
+#### Rust
 
 ```rust
 // INSERT_OVERWRITE_TABLE: replace all file groups.
