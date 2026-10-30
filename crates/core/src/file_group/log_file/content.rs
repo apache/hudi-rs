@@ -674,16 +674,13 @@ impl Decoder {
         if let Some(predicate) = self.key_predicate.as_ref() {
             let matcher = predicate.matcher();
             for entry in hfile_reader.blocks_for_predicate(predicate) {
-                for record in hfile_reader
-                    .records_in_block(&entry)
-                    .map_err(|e| CoreError::HFile(e.to_string()))?
-                {
-                    // A block is the smallest readable unit, so a selected block
-                    // holds keys nobody asked for.
-                    if record.key_as_str().is_some_and(|key| matcher.admits(key)) {
-                        records.push(record);
-                    }
-                }
+                // A block is the smallest readable unit, so a selected block
+                // holds keys nobody asked for; only the admitted ones are built.
+                records.extend(
+                    hfile_reader
+                        .records_in_block(&entry, |key| matcher.admits(key))
+                        .map_err(|e| CoreError::HFile(e.to_string()))?,
+                );
             }
             return Ok(records);
         }

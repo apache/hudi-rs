@@ -413,14 +413,39 @@ impl HFileReader {
         }
     }
 
-    /// The records of one data block, from a resident source.
+    /// The records of one data block whose key `admits`, from a resident source.
     ///
     /// The synchronous counterpart to [`Self::read_records_batched`], which needs a
     /// ranged source because it fetches. An HFile arriving as a log block's content
     /// is already in memory, so a caller that has narrowed the blocks with
     /// [`Self::blocks_for_predicate`] wants to parse just those rather than walk the
-    /// file — the saving is parsing and decompression, not I/O.
-    pub fn records_in_block(&self, entry: &BlockIndexEntry) -> Result<Vec<HFileRecord>> {
+    /// file — the saving is parsing and decompression, not I/O. Keys are compared
+    /// in place and only the admitted entries are copied out, so a lookup of a few
+    /// keys in a block of thousands costs the key comparisons rather than a record
+    /// allocation per entry.
+    pub fn records_in_block(
+        &self,
+        entry: &BlockIndexEntry,
+        admits: impl Fn(&str) -> bool,
+    ) -> Result<Vec<HFileRecord>> {
+        let data_block = self.data_block(entry)?;
+        // Records carry the file's own writer schema so a decoder can honor the
+        // shape this file was written with rather than a vendored one.
+        let schema = self.get_avro_schema_arc()?;
+        let mut records = Vec::new();
+        for entry in data_block.entries() {
+            let (key, value) = entry?;
+            if std::str::from_utf8(key).is_ok_and(&admits) {
+                records.push(
+                    HFileRecord::new(key.to_vec(), value.to_vec()).with_avro_schema(schema.clone()),
+                );
+            }
+        }
+        Ok(records)
+    }
+
+    /// The data block an index entry points at.
+    fn data_block(&self, entry: &BlockIndexEntry) -> Result<DataBlock> {
         let block = self.read_block_at(entry.offset as usize, entry.size as usize)?;
         if block.block_type() != HFileBlockType::Data {
             return Err(HFileError::UnexpectedBlockType {
@@ -428,17 +453,7 @@ impl HFileReader {
                 actual: block.block_type().to_string(),
             });
         }
-        let data_block = DataBlock::from_block(block);
-        // Records carry the file's own writer schema so a decoder can honor the
-        // shape this file was written with rather than a vendored one.
-        let schema = self.get_avro_schema_arc()?;
-        // The shared helper, not a second copy of it: two places building an
-        // `HFileRecord` from a `KeyValue` is how the predicate path and the scan path
-        // would drift on what a record key is.
-        Ok(data_block
-            .iter()
-            .map(|kv| Self::key_value_to_record(&kv, schema.clone()))
-            .collect())
+        Ok(DataBlock::from_block(block))
     }
 
     /// The data blocks a key predicate can be satisfied from.
@@ -1991,6 +2006,43 @@ mod tests {
         reader.seek_to_first().expect("Failed to seek");
         let record = reader.get_record().expect("Failed to get record").unwrap();
         assert_eq!(record.key_as_str(), Some("hudi-key-000000000"));
+    }
+
+    /// The in-place key walk sees the same entries as the copying iterator,
+    /// and an admitting predicate keeps exactly the entries it admits.
+    #[test]
+    fn test_records_in_block_matches_the_copying_iterator() {
+        let bytes = read_test_hfile("hudi_1_0_hbase_2_4_9_16KB_NONE_5000.hfile");
+        let reader = HFileReader::new(bytes).expect("Failed to create reader");
+        let entry = reader.blocks_for_keys(&["hudi-key-000000100"])[0].clone();
+        let pairs = |records: Vec<HFileRecord>| -> Vec<(Vec<u8>, Vec<u8>)> {
+            records
+                .iter()
+                .map(|r| (r.key().to_vec(), r.value().to_vec()))
+                .collect()
+        };
+        let copied: Vec<(Vec<u8>, Vec<u8>)> = reader
+            .data_block(&entry)
+            .unwrap()
+            .iter()
+            .map(|kv| (kv.key().content().to_vec(), kv.value().to_vec()))
+            .collect();
+        assert!(copied.len() > 1);
+        assert_eq!(
+            pairs(reader.records_in_block(&entry, |_| true).unwrap()),
+            copied
+        );
+
+        let wanted = |key: &str| key.ends_with("100") || key.ends_with("101");
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = copied
+            .into_iter()
+            .filter(|(k, _)| wanted(std::str::from_utf8(k).unwrap()))
+            .collect();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            pairs(reader.records_in_block(&entry, wanted).unwrap()),
+            expected
+        );
     }
 
     #[test]

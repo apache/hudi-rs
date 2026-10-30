@@ -91,15 +91,6 @@ impl Key {
         Some(Self::from_bytes(bytes))
     }
 
-    /// Returns the offset to the key content (after the length prefix).
-    ///
-    /// Private: this is an offset into *this key's* bytes, so it is only meaningful
-    /// with [`Self::bytes`]. It used to be an offset into the enclosing block, and a
-    /// caller pairing it with a block buffer would now index the wrong place.
-    fn content_offset(&self) -> usize {
-        self.offset + SIZEOF_INT16
-    }
-
     /// Returns the length of the key content.
     pub fn content_length(&self) -> usize {
         if self.bytes.len() < self.offset + SIZEOF_INT16 {
@@ -117,12 +108,7 @@ impl Key {
     /// follows it. A well-formed HFile cannot reach that: `key_length` is
     /// `2 + row + 1 + family + qualifier + 9`, always at least `2 + content`.
     pub fn content(&self) -> &[u8] {
-        let start = self.content_offset();
-        let len = self.content_length();
-        if start + len > self.bytes.len() {
-            return &[];
-        }
-        &self.bytes[start..start + len]
+        key_content(&self.bytes[self.offset..])
     }
 
     /// Returns the key content as a UTF-8 string.
@@ -139,6 +125,20 @@ impl Key {
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+}
+
+/// The content of a key: a 2-byte signed length, then that many bytes.
+///
+/// Empty when the length is missing, negative, or longer than the key, rather
+/// than reading on into the value that follows the key in a block.
+pub(crate) fn key_content(key: &[u8]) -> &[u8] {
+    let Some((length, rest)) = key.split_first_chunk::<SIZEOF_INT16>() else {
+        return &[];
+    };
+    usize::try_from(i16::from_be_bytes(*length))
+        .ok()
+        .and_then(|length| rest.get(..length))
+        .unwrap_or(&[])
 }
 
 impl PartialEq for Key {
@@ -399,6 +399,12 @@ mod tests {
         let bytes = vec![0];
         let key = Key::new(&bytes, 0, 1);
         assert_eq!(key.content_length(), 0);
+    }
+
+    #[test]
+    fn test_key_content_rejects_a_negative_length() {
+        let key = Key::from_bytes(vec![0xFF, 0xFF, b'a', b'b']);
+        assert_eq!(key.content(), b"");
     }
 
     #[test]
