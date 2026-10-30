@@ -38,7 +38,9 @@ Cross-checks hudi-rs against the Apache Hudi Spark writer/reader:
 - **I** — Spark upserts with SIMPLE, BLOOM and GLOBAL_BLOOM indexes on
   rs-written COW/MOR tables find every key rs wrote (base files, inserts,
   updates) and re-insert one rs deleted without duplicates; includes keys
-  whose UTF-8 and UTF-16 orders differ, against the bloom footer key range
+  whose UTF-8 and UTF-16 orders differ, against the bloom footer key range.
+  These tables set `hoodie.parquet.bloom.filter.enabled=true`: rs leaves the
+  footer out by default, and Java's bloom index needs it
 - **J** — Spark SQL UPDATE/DELETE/INSERT on rs-written COW/MOR tables
   registered in a non-default database, then rs writes on top
 

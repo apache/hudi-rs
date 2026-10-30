@@ -276,6 +276,15 @@ fn batch(rows: &[Row]) -> RecordBatch {
 }
 
 async fn rs_create(path: &Path, table_type: TableTypeValue, partitioned: bool) -> Table {
+    rs_create_with(path, table_type, partitioned, &[]).await
+}
+
+async fn rs_create_with(
+    path: &Path,
+    table_type: TableTypeValue,
+    partitioned: bool,
+    options: &[(&str, &str)],
+) -> Table {
     let mut builder = Table::create(path.to_str().unwrap())
         .with_table_name("parity")
         .with_table_type(table_type)
@@ -284,8 +293,15 @@ async fn rs_create(path: &Path, table_type: TableTypeValue, partitioned: bool) -
     if partitioned {
         builder = builder.with_partition_fields(["part"]);
     }
+    for (key, value) in options {
+        builder = builder.with_option(key, *value);
+    }
     builder.create().await.unwrap()
 }
+
+/// Java's bloom index reads the record-key bloom filter from each base file
+/// footer, which rs writes only when asked to.
+const BLOOM_FOOTER: (&str, &str) = ("hoodie.parquet.bloom.filter.enabled", "true");
 
 async fn rs_read(path: &Path) -> Vec<Row> {
     rs_read_with(path, ReadOptions::new()).await
@@ -1096,7 +1112,7 @@ async fn parity_i_java_index_lookups_on_rs_tables() {
         for index in ["SIMPLE", "BLOOM", "GLOBAL_BLOOM"] {
             let dir = tempdir().unwrap();
             let path = dir.path().join("t");
-            let mut table = rs_create(&path, table_type.clone(), true).await;
+            let mut table = rs_create_with(&path, table_type.clone(), true, &[BLOOM_FOOTER]).await;
             table
                 .append([batch(&[
                     row("a", Some("sf"), 1, 10),
@@ -1167,7 +1183,7 @@ async fn parity_i_java_index_lookups_on_rs_tables() {
     // packing off, a missed lookup writes a duplicate instead of merging.
     let dir = tempdir().unwrap();
     let path = dir.path().join("t");
-    let mut table = rs_create(&path, TableTypeValue::CopyOnWrite, true).await;
+    let mut table = rs_create_with(&path, TableTypeValue::CopyOnWrite, true, &[BLOOM_FOOTER]).await;
     table
         .append([batch(&[
             row("\u{FF21}", Some("sf"), 1, 10),

@@ -4326,9 +4326,10 @@ fn base_file_footers(dir: &std::path::Path) -> Vec<(HashMap<String, String>, Vec
     footers
 }
 
-/// Every base file carries the footer Java's bloom index reads: the bloom
-/// filter at Java's default sizing holding every record key, its type code,
-/// and the record key range, which an empty file leaves out.
+/// With the bloom filter enabled, every base file carries the footer Java's
+/// bloom index reads: the bloom filter at Java's default sizing holding every
+/// record key, its type code, and the record key range, which an empty file
+/// leaves out.
 #[tokio::test]
 async fn test_base_file_footer_carries_bloom_filter_and_key_range() {
     for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
@@ -4338,6 +4339,7 @@ async fn test_base_file_footer_carries_bloom_filter_and_key_range() {
             .with_table_type(table_type.clone())
             .with_partition_fields(["city"])
             .with_record_key_fields(["id"])
+            .with_option("hoodie.parquet.bloom.filter.enabled", "true")
             .create()
             .await
             .unwrap();
@@ -4397,6 +4399,28 @@ fn assert_record_key_footer(footer: &HashMap<String, String>, keys: &[String]) {
     );
     assert_eq!(footer.get("hoodie_min_record_key"), keys.iter().min());
     assert_eq!(footer.get("hoodie_max_record_key"), keys.iter().max());
+}
+
+/// By default a base file footer holds no bloom filter and no key range.
+#[tokio::test]
+async fn test_base_file_footer_omits_bloom_filter_by_default() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("trips")
+        .with_record_key_fields(["id"])
+        .create()
+        .await
+        .unwrap();
+    table.append([sample_batch()]).await.unwrap();
+    let footers = base_file_footers(dir.path());
+    assert!(!footers.is_empty());
+    for (footer, _) in &footers {
+        assert!(
+            footer.keys().all(|key| key == "ARROW:schema"),
+            "{:?}",
+            footer.keys().collect::<Vec<_>>()
+        );
+    }
 }
 
 /// A table without meta fields writes no bloom filter, as Java does.
