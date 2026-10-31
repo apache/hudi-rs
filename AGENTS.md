@@ -51,6 +51,7 @@ the `hudi-datafusion` test binaries and the Python extension fail to link, see
 make setup-venv && source .venv/bin/activate
 make develop                 # build workspace + install Python binding via maturin
 make format check test       # the pre-PR loop CI runs
+make test-demo-ci            # integration runner regression tests; no Docker required
 cargo +1.94.1 check --workspace --all-targets --all-features  # optional MSRV sanity check
 
 cargo test -p hudi-core                                        # one crate

@@ -124,7 +124,11 @@ check-python: ## Run check on Python
 	pushd $(PYTHON_DIR); mypy .; popd
 
 .PHONY: test
-test: test-rust test-python ## Run tests on Rust and Python
+test: test-demo-ci test-rust test-python ## Run integration runner, Rust and Python tests
+
+.PHONY: test-demo-ci
+test-demo-ci: ## Test integration runner exit statuses without Docker
+	python3 -m unittest discover -s demo/tests -p 'test_ci_run.py' -v
 
 .PHONY: test-rust
 test-rust: ## Run tests on Rust
