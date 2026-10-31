@@ -52,4 +52,8 @@ pub enum ConfigError {
     /// UnsupportedValue(message): the value is valid but not supported by hudi-rs.
     #[error("Config value '{0}' is not supported")]
     UnsupportedValue(String),
+
+    /// ConflictingTableProperties(details): sorted user and persisted values for each conflict.
+    #[error("Conflicting user options with hoodie.properties: {0}")]
+    ConflictingTableProperties(String),
 }

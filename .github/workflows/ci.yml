@@ -193,7 +193,7 @@ jobs:
   rust-tests-windows:
     runs-on: windows-2025
     # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
-    if: false    
+    if: false
     steps:
       - uses: actions/checkout@v7
       - name: Run unit tests on Windows with no coverage report
@@ -250,14 +250,14 @@ jobs:
           source .venv/bin/activate
           make build
           make develop
-          
+
       - name: Python unit tests
         # Only compute coverage for one matrix combination to save time
         if: ${{ !((matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13')) }}
         run: |
           source .venv/bin/activate
           pytest -v python
-          
+
       - name: Python unit tests with coverage report
         # Only compute coverage for ubuntu-24.04 with Python 3.13
         if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
@@ -265,7 +265,7 @@ jobs:
           source .venv/bin/activate
           coverage run --include 'python/hudi/*' -m pytest -v python
           coverage xml --data-file=.coverage -o ./cov-reports/cov-report-python-tests-${{ join(matrix.*, '-') }}.xml
-          
+
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         if: ${{ (matrix.os == 'ubuntu-24.04') && (matrix.python-version == '3.13') }}
@@ -273,7 +273,7 @@ jobs:
           name: cov-report-python-tests-${{ join(matrix.*, '-') }}
           path: ./cov-reports
           if-no-files-found: 'error'
-          
+
       - name: Upload wheel files
         uses: actions/upload-artifact@v7
         with:

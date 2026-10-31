@@ -147,7 +147,7 @@ pub trait ConfigParser: AsRef<str> {
 }
 
 /// All possible data types for Hudi Configuration values.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum HudiConfigValue {
     /// A boolean value.
     Boolean(bool),

@@ -20,16 +20,17 @@
 //! [`TableBuilder`] opens a [`Table`] with options.
 
 use paste::paste;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::config::error::ConfigError;
 use crate::config::properties::parse_properties;
 use crate::config::read::{HudiReadConfig, ReadConfigScope};
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
-use crate::config::{HUDI_CONF_DIR, HudiConfigs};
+use crate::config::{ConfigParser, HUDI_CONF_DIR, HudiConfigs};
 use crate::storage::Storage;
 use crate::table::Table;
 use crate::table::fs_view::FileSystemView;
@@ -45,6 +46,15 @@ use crate::util::collection::extend_if_absent;
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     option_resolver: OptionResolver,
+}
+
+/// Controls whether user-provided options are checked against persisted table properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConflictCheck {
+    /// Reject user options that conflict with values in `hoodie.properties`.
+    Enforce,
+    /// Skip conflict validation; persisted properties take precedence.
+    Skip,
 }
 
 /// Resolver for options including Hudi options, storage options, and generic options.
@@ -120,11 +130,32 @@ impl TableBuilder {
     /// # Errors
     ///
     /// Fails, among other cases, when `.hoodie/hoodie.properties` cannot be read, or the table
-    /// configs are invalid or unsupported (for example a table version other than 6, 8, or 9).
+    /// configs are invalid or unsupported (for example a table version other than 6, 8, or 9),
+    /// or when a user-provided option conflicts with a persisted table property.
+    ///
+    /// Options are resolved on a copy of this builder's state, so the builder itself is left
+    /// unchanged and may be reused; each call re-reads `hoodie.properties`.
     pub async fn build(&mut self) -> Result<Table> {
-        let option_resolver = &mut self.option_resolver;
+        let mut option_resolver = self.option_resolver.clone();
+        Self::build_with_resolver(&mut option_resolver, ConflictCheck::Enforce).await
+    }
 
-        option_resolver.resolve_options().await?;
+    /// Reopens a table from resolved options for internal background work.
+    ///
+    /// Skips checking the supplied options against `hoodie.properties`: they were resolved
+    /// when this table was opened, so a property changed since then must not fail the reopen.
+    pub(crate) async fn build_with_resolved_options(&mut self) -> Result<Table> {
+        let mut option_resolver = self.option_resolver.clone();
+        Self::build_with_resolver(&mut option_resolver, ConflictCheck::Skip).await
+    }
+
+    async fn build_with_resolver(
+        option_resolver: &mut OptionResolver,
+        conflict_check: ConflictCheck,
+    ) -> Result<Table> {
+        option_resolver
+            .resolve_options_with_conflict_check(conflict_check)
+            .await?;
 
         // A read config is dropped from the table's own configs only when it
         // selects WHICH read to perform — those are meaningful per call, and one
@@ -145,7 +176,7 @@ impl TableBuilder {
                 .filter(|(key, _)| Self::keep_at_table_level(key)),
         ));
 
-        let storage_options = Arc::from(self.option_resolver.storage_options.clone());
+        let storage_options = Arc::from(option_resolver.storage_options.clone());
 
         let timeline =
             Timeline::new_from_storage(hudi_configs.clone(), storage_options.clone()).await?;
@@ -259,6 +290,14 @@ impl OptionResolver {
     ///
     /// Note: an error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
+        self.resolve_options_with_conflict_check(ConflictCheck::Enforce)
+            .await
+    }
+
+    async fn resolve_options_with_conflict_check(
+        &mut self,
+        conflict_check: ConflictCheck,
+    ) -> Result<()> {
         self.resolve_user_provided_options();
 
         // If any user-provided options are intended for cloud storage and in uppercase,
@@ -267,7 +306,7 @@ impl OptionResolver {
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
         // We can now resolve the hudi options
-        self.resolve_hudi_options().await?;
+        self.resolve_hudi_options(conflict_check).await?;
 
         // Validate the resolved Hudi options
         let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
@@ -294,7 +333,7 @@ impl OptionResolver {
         resolve_storage_env_vars(&mut self.storage_options);
     }
 
-    async fn resolve_hudi_options(&mut self) -> Result<()> {
+    async fn resolve_hudi_options(&mut self, conflict_check: ConflictCheck) -> Result<()> {
         // create a [Storage] instance to load properties from storage layer.
         let storage = Storage::new(
             Arc::new(self.storage_options.clone()),
@@ -302,7 +341,7 @@ impl OptionResolver {
         )?;
 
         let hudi_options = &mut self.hudi_options;
-        Self::imbue_table_properties(hudi_options, storage.clone()).await?;
+        Self::imbue_table_properties(hudi_options, storage.clone(), conflict_check).await?;
 
         // TODO support imbuing Hudi options from env vars HOODIE_ENV.*
         // (see https://hudi.apache.org/docs/next/s3_hoodie)
@@ -314,17 +353,133 @@ impl OptionResolver {
     async fn imbue_table_properties(
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
+        conflict_check: ConflictCheck,
     ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
         let table_properties = parse_properties(&bytes)?;
+        Self::merge_table_properties(options, table_properties, conflict_check)
+    }
 
-        // Table properties on storage (hoodie.properties) should have the highest precedence,
-        // except for writer-changeable properties like enabling metadata table/indexes.
-        // TODO: return err when user-provided options conflict with table properties
-        for (k, v) in table_properties {
-            options.insert(k.to_string(), v.to_string());
+    fn merge_table_properties(
+        options: &mut HashMap<String, String>,
+        table_properties: HashMap<String, String>,
+        conflict_check: ConflictCheck,
+    ) -> Result<()> {
+        if conflict_check == ConflictCheck::Enforce {
+            Self::validate_no_conflicts_with_table_properties(options, &table_properties)?;
         }
 
+        // Overlay persisted values on user options; writer-managed metadata may differ.
+        options.extend(table_properties);
+
+        Ok(())
+    }
+
+    /// Persisted metadata table keys that `HudiTableConfig` does not model, such as
+    /// `hoodie.table.metadata.partitions.inflight`. Writers update them while building metadata
+    /// partitions, so a differing user value is not a conflict. The modeled writer-changeable
+    /// configs are exempted separately in [`Self::is_exempt`].
+    fn is_writer_managed_key(key: &str) -> bool {
+        key.starts_with("hoodie.table.metadata.")
+    }
+
+    /// The key and value under which `config` is persisted: the primary key if present, else
+    /// the first alias present, mirroring [`ConfigParser::resolve_raw_value`].
+    fn persisted_entry<'a, 'b>(
+        config: &'a HudiTableConfig,
+        table_properties: &'b HashMap<String, String>,
+    ) -> Option<(&'a str, &'b str)> {
+        std::iter::once(config.as_ref())
+            .chain(config.aliases().iter().map(|alias| alias.key))
+            .find_map(|key| table_properties.get(key).map(|value| (key, value.as_str())))
+    }
+
+    /// Configs whose user value may legitimately differ from the persisted one.
+    ///
+    /// - `BasePath`, `Checksum` and `CreateSchema` are supplied by the builder or derived.
+    /// - `MetadataTableEnabled` and `MetadataTablePartitions` are changed by writers.
+    /// - `DatabaseName` is exempt only while the persisted value is empty (i.e. unset).
+    fn is_exempt(config: &HudiTableConfig, table_raw: &str) -> bool {
+        match config {
+            HudiTableConfig::BasePath
+            | HudiTableConfig::Checksum
+            | HudiTableConfig::CreateSchema
+            | HudiTableConfig::MetadataTableEnabled
+            | HudiTableConfig::MetadataTablePartitions => true,
+            HudiTableConfig::DatabaseName => table_raw.trim().is_empty(),
+            _ => false,
+        }
+    }
+
+    /// Collect conflicts for persisted properties, including aliases and untyped keys.
+    fn validate_no_conflicts_with_table_properties(
+        user_options: &HashMap<String, String>,
+        table_properties: &HashMap<String, String>,
+    ) -> Result<()> {
+        use strum::IntoEnumIterator;
+        let configs: Vec<HudiTableConfig> = HudiTableConfig::iter().collect();
+        let mut conflicts = Vec::new();
+
+        // Modeled configs: compare parsed values, falling back to a trimmed,
+        // case-insensitive comparison of the raw strings when either side fails to parse.
+        for config in &configs {
+            let Some((table_key, table_raw)) = Self::persisted_entry(config, table_properties)
+            else {
+                continue;
+            };
+            if Self::is_exempt(config, table_raw) {
+                continue;
+            }
+
+            // The only error is `NotFound`: the user did not set this config.
+            let Ok(user_raw) = config.resolve_raw_value(user_options) else {
+                continue;
+            };
+            let same = match (
+                config.parse_value(user_options),
+                config.parse_value(table_properties),
+            ) {
+                (Ok(user), Ok(table)) => user == table,
+                _ => user_raw.trim().eq_ignore_ascii_case(table_raw.trim()),
+            };
+            if !same {
+                conflicts.push((
+                    table_key.to_string(),
+                    user_raw.to_string(),
+                    table_raw.to_string(),
+                ));
+            }
+        }
+
+        // Keys that `HudiTableConfig` does not model: compare the raw strings.
+        let modeled_keys: HashSet<&str> = configs
+            .iter()
+            .flat_map(|config| {
+                std::iter::once(config.as_ref()).chain(config.aliases().iter().map(|a| a.key))
+            })
+            .collect();
+        for (key, table_raw) in table_properties {
+            if modeled_keys.contains(key.as_str()) || Self::is_writer_managed_key(key) {
+                continue;
+            }
+            if let Some(user_raw) = user_options.get(key)
+                && user_raw != table_raw
+            {
+                conflicts.push((key.clone(), user_raw.clone(), table_raw.clone()));
+            }
+        }
+
+        if !conflicts.is_empty() {
+            conflicts.sort();
+            let details = conflicts
+                .into_iter()
+                .map(|(key, user, persisted)| {
+                    format!("{key}: user '{user}', persisted '{persisted}'")
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(ConfigError::ConflictingTableProperties(details).into());
+        }
         Ok(())
     }
 
@@ -356,6 +511,7 @@ impl OptionResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hudi_test::SampleTable;
     use serial_test::serial;
 
     fn create_table_builder() -> TableBuilder {
@@ -452,6 +608,309 @@ mod tests {
             resolver.storage_options["AWS_ENDPOINT"],
             "s3.us-east-1.amazonaws.com"
         );
+    }
+
+    fn map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_conflict_with_table_property_is_error() {
+        let table = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+        let user = map(&[("hoodie.table.type", "MERGE_ON_READ")]);
+
+        let err =
+            OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hoodie.table.type"), "{msg}");
+        assert!(msg.contains("MERGE_ON_READ"), "{msg}");
+        assert!(msg.contains("COPY_ON_WRITE"), "{msg}");
+    }
+
+    #[test]
+    fn test_equivalent_spellings_are_not_conflicts() {
+        let table = map(&[("hoodie.populate.meta.fields", "true")]);
+        let user = map(&[("hoodie.populate.meta.fields", "TRUE")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_unparseable_value_that_differs_is_a_conflict() {
+        // "maybe" does not parse as a boolean, so the raw-string fallback decides.
+        let table = map(&[("hoodie.populate.meta.fields", "true")]);
+        let user = map(&[("hoodie.populate.meta.fields", "maybe")]);
+
+        let msg = OptionResolver::validate_no_conflicts_with_table_properties(&user, &table)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("hoodie.populate.meta.fields"), "{msg}");
+    }
+
+    #[test]
+    fn test_string_configs_are_compared_exactly() {
+        let key = "hoodie.table.keygenerator.class";
+        let table = map(&[(key, "org.apache.hudi.keygen.SimpleKeyGenerator")]);
+
+        for variant in [
+            "org.apache.hudi.keygen.simplekeygenerator",
+            " org.apache.hudi.keygen.SimpleKeyGenerator",
+        ] {
+            let user = map(&[(key, variant)]);
+            assert!(
+                OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_err(),
+                "{variant:?} should conflict"
+            );
+        }
+    }
+
+    #[test]
+    fn test_conflict_is_detected_through_alias() {
+        let alias = HudiTableConfig::OrderingFields.aliases()[0].key;
+        let table = map(&[(alias, "ts")]);
+
+        let same = map(&[(HudiTableConfig::OrderingFields.as_ref(), "ts")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&same, &table).is_ok());
+
+        let different = map(&[(HudiTableConfig::OrderingFields.as_ref(), "other_ts")]);
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(&different, &table)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_untyped_table_property_conflict_is_detected() {
+        let table = map(&[("hoodie.record.merge.mode", "EVENT_TIME_ORDERING")]);
+        let user = map(&[("hoodie.record.merge.mode", "COMMIT_TIME_ORDERING")]);
+        let err =
+            OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hoodie.record.merge.mode"), "{msg}");
+        assert!(msg.contains("EVENT_TIME_ORDERING"), "{msg}");
+        assert!(msg.contains("COMMIT_TIME_ORDERING"), "{msg}");
+    }
+
+    #[test]
+    fn test_all_conflicts_are_reported_in_sorted_order() {
+        let table = map(&[
+            ("hoodie.table.type", "COPY_ON_WRITE"),
+            ("hoodie.record.merge.mode", "EVENT_TIME_ORDERING"),
+        ]);
+        let user = map(&[
+            ("hoodie.table.type", "MERGE_ON_READ"),
+            ("hoodie.record.merge.mode", "COMMIT_TIME_ORDERING"),
+        ]);
+        let msg = OptionResolver::validate_no_conflicts_with_table_properties(&user, &table)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.find("hoodie.record.merge.mode") < msg.find("hoodie.table.type"));
+    }
+
+    #[test]
+    fn test_keys_set_on_one_side_only_do_not_conflict() {
+        // `hoodie.table.type` is missing from the user options, and `hoodie.table.name` from
+        // the table properties.
+        let table = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+        let user = map(&[("hoodie.table.name", "t")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_table_properties_take_precedence_over_exempt_user_options() {
+        let mut options = map(&[
+            ("hoodie.table.metadata.partitions", "files,record_index"),
+            ("hoodie.table.type", "COPY_ON_WRITE"),
+        ]);
+        let table_properties = map(&[
+            ("hoodie.table.metadata.partitions", "files"),
+            ("hoodie.table.type", "COPY_ON_WRITE"),
+        ]);
+
+        OptionResolver::merge_table_properties(
+            &mut options,
+            table_properties,
+            ConflictCheck::Enforce,
+        )
+        .unwrap();
+
+        assert_eq!(options["hoodie.table.metadata.partitions"], "files");
+    }
+
+    #[test]
+    fn test_merge_leaves_options_untouched_on_conflict() {
+        let mut options = map(&[("hoodie.table.type", "MERGE_ON_READ")]);
+        let table_properties = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+
+        assert!(
+            OptionResolver::merge_table_properties(
+                &mut options,
+                table_properties,
+                ConflictCheck::Enforce
+            )
+            .is_err()
+        );
+        assert_eq!(options["hoodie.table.type"], "MERGE_ON_READ");
+    }
+
+    #[test]
+    fn test_merge_skip_lets_table_properties_win_without_error() {
+        let mut options = map(&[("hoodie.table.type", "MERGE_ON_READ")]);
+        let table_properties = map(&[("hoodie.table.type", "COPY_ON_WRITE")]);
+
+        OptionResolver::merge_table_properties(&mut options, table_properties, ConflictCheck::Skip)
+            .unwrap();
+
+        assert_eq!(options["hoodie.table.type"], "COPY_ON_WRITE");
+    }
+
+    #[test]
+    fn test_metadata_and_empty_database_name_are_exempt() {
+        let table = map(&[
+            ("hoodie.metadata.enable", "false"),
+            ("hoodie.table.metadata.partitions", "files"),
+            ("hoodie.database.name", ""),
+        ]);
+        let user = map(&[
+            ("hoodie.metadata.enable", "true"),
+            ("hoodie.table.metadata.partitions", "files,record_index"),
+            ("hoodie.database.name", "analytics"),
+        ]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_non_empty_database_name_conflict_is_detected() {
+        let table = map(&[("hoodie.database.name", "sales")]);
+        let user = map(&[("hoodie.database.name", "analytics")]);
+        let msg = OptionResolver::validate_no_conflicts_with_table_properties(&user, &table)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("hoodie.database.name"), "{msg}");
+    }
+
+    #[test]
+    fn test_unmodeled_writer_managed_keys_are_exempt() {
+        let table = map(&[("hoodie.table.metadata.partitions.inflight", "")]);
+        let user = map(&[("hoodie.table.metadata.partitions.inflight", "column_stats")]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
+    }
+
+    #[test]
+    fn test_user_alias_against_persisted_primary_key() {
+        let primary = HudiTableConfig::OrderingFields.as_ref();
+        let alias = HudiTableConfig::OrderingFields.aliases()[0].key;
+
+        let table = map(&[(primary, "ts")]);
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(
+                &map(&[(alias, "ts")]),
+                &table
+            )
+            .is_ok()
+        );
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(
+                &map(&[(alias, "other_ts")]),
+                &table
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_persisted_primary_key_takes_precedence_over_alias() {
+        let primary = HudiTableConfig::OrderingFields.as_ref();
+        let alias = HudiTableConfig::OrderingFields.aliases()[0].key;
+        let table = map(&[(primary, "ts"), (alias, "legacy_ts")]);
+
+        assert!(
+            OptionResolver::validate_no_conflicts_with_table_properties(
+                &map(&[(primary, "ts")]),
+                &table
+            )
+            .is_ok()
+        );
+
+        let msg = OptionResolver::validate_no_conflicts_with_table_properties(
+            &map(&[(primary, "other_ts")]),
+            &table,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(msg.contains(&format!("{primary}:")), "{msg}");
+        assert_eq!(msg.matches(&format!("{primary}:")).count(), 1, "{msg}");
+        assert!(!msg.contains(&format!("{alias}:")), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_build_rejects_option_conflicting_with_table_properties() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let mut builder = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option("hoodie.table.type", "MERGE_ON_READ");
+
+        let Err(err) = builder.build().await else {
+            panic!("a conflicting hoodie.table.type must be rejected");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("hoodie.table.type"), "{msg}");
+        assert!(msg.contains("MERGE_ON_READ"), "{msg}");
+        assert!(msg.contains("COPY_ON_WRITE"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_build_accepts_option_matching_table_properties() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let mut builder = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option("hoodie.table.type", "COPY_ON_WRITE");
+
+        assert!(builder.build().await.is_ok(), "first build");
+        assert!(
+            builder.build().await.is_ok(),
+            "second build on the same builder"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_with_resolved_options_skips_conflict_check() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let mut builder = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option("hoodie.table.type", "MERGE_ON_READ");
+
+        assert!(builder.build_with_resolved_options().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_build_detects_conflict_through_alias() {
+        // The fixture persists the ordering field under the legacy
+        // `hoodie.table.precombine.field` key.
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let ordering_key = HudiTableConfig::OrderingFields.as_ref();
+
+        let mut same = TableBuilder::from_base_uri(base_url.path())
+            .with_hudi_option(ordering_key, "longField");
+        assert!(same.build().await.is_ok());
+
+        let mut different =
+            TableBuilder::from_base_uri(base_url.path()).with_hudi_option(ordering_key, "intField");
+        assert!(different.build().await.is_err());
+    }
+
+    #[test]
+    fn test_builder_supplied_and_derived_configs_are_exempt() {
+        let table = map(&[
+            ("hoodie.base.path", "/persisted/path"),
+            ("hoodie.table.checksum", "123"),
+            ("hoodie.table.create.schema", "{\"type\":\"record\"}"),
+        ]);
+        let user = map(&[
+            ("hoodie.base.path", "/user/path"),
+            ("hoodie.table.checksum", "456"),
+            ("hoodie.table.create.schema", "{ \"type\": \"record\" }"),
+        ]);
+        assert!(OptionResolver::validate_no_conflicts_with_table_properties(&user, &table).is_ok());
     }
 
     #[test]
