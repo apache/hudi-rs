@@ -20,10 +20,9 @@ use crate::Result;
 use crate::config::table::TimelineTimezoneValue;
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
-use crate::storage::error::StorageError;
+use crate::storage::util::join_path_segments;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::cmp::Ordering;
-use std::path::PathBuf;
 use std::str::FromStr;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -383,15 +382,9 @@ impl Instant {
     /// Get the relative path with a specified base directory.
     /// Use `.hoodie/` for pre-v8 tables (Layout Version 1) or `.hoodie/timeline/` for v8+ tables (Layout Version 2).
     pub fn relative_path_with_base(&self, base_dir: &str) -> Result<String> {
-        let mut commit_file_path = PathBuf::from(base_dir);
-        commit_file_path.push(self.file_name());
-        commit_file_path
-            .to_str()
-            .ok_or(StorageError::InvalidPath(format!(
-                "Failed to get file path for {self:?}"
-            )))
-            .map_err(CoreError::Storage)
-            .map(|s| s.to_string())
+        // Join with explicit forward slashes: this is a relative object-store
+        // path, and PathBuf joins would introduce '\' on Windows (#445).
+        Ok(join_path_segments(base_dir, &self.file_name()))
     }
 
     pub fn is_replacecommit(&self) -> bool {

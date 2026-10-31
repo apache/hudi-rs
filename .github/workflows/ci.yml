@@ -190,8 +190,6 @@ jobs:
 
   rust-tests-windows:
     runs-on: windows-2025
-    # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
-    if: false    
     steps:
       - uses: actions/checkout@v7
       - name: Run unit tests on Windows with no coverage report

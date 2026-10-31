@@ -23,9 +23,9 @@ use crate::error::CoreError;
 use crate::file_group::base_file::BaseFile;
 use crate::file_group::log_file::LogFile;
 use crate::statistics::StatisticsContainer;
+use crate::storage::util::join_path_segments;
 use std::collections::BTreeSet;
 use std::fmt::Display;
-use std::path::PathBuf;
 
 /// Within a [crate::file_group::FileGroup],
 /// a [FileSlice] is a logical group of [BaseFile] and [LogFile]s.
@@ -131,10 +131,10 @@ impl FileSlice {
     }
 
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
-        let path = PathBuf::from(self.partition_path.as_str()).join(file_name);
-        path.to_str().map(|s| s.to_string()).ok_or_else(|| {
-            CoreError::FileGroup(format!("Failed to get relative path for file: {file_name}",))
-        })
+        // Join with explicit forward slashes: this is a relative object-store
+        // path, and PathBuf joins would introduce '\' on Windows (#445).
+        let path = join_path_segments(self.partition_path.as_str(), file_name);
+        Ok(path)
     }
 
     /// Returns the relative path of the [BaseFile] in the [FileSlice].
