@@ -159,5 +159,8 @@ mod tests {
         );
         // A hive-style two-level partition must stay forward-slashed.
         assert_eq!(join_path_segments("a=1", "b=2"), "a=1/b=2");
+        // Non-empty base with an empty segment returns the trimmed base.
+        assert_eq!(join_path_segments("dt=2024", ""), "dt=2024");
+        assert_eq!(join_path_segments("dt=2024/", ""), "dt=2024");
     }
 }
