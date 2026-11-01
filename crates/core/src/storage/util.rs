@@ -146,12 +146,18 @@ mod tests {
     #[test]
     fn join_path_segments_uses_forward_slashes() {
         assert_eq!(join_path_segments("", "dt=2024"), "dt=2024");
-        assert_eq!(join_path_segments("dt=2024", "month=01"), "dt=2024/month=01");
+        assert_eq!(
+            join_path_segments("dt=2024", "month=01"),
+            "dt=2024/month=01"
+        );
         assert_eq!(
             join_path_segments("dt=2024/month=01", "day=01"),
             "dt=2024/month=01/day=01"
         );
-        assert_eq!(join_path_segments("/dt=2024/", "/month=01/"), "dt=2024/month=01");
+        assert_eq!(
+            join_path_segments("/dt=2024/", "/month=01/"),
+            "dt=2024/month=01"
+        );
         assert_eq!(join_path_segments("", ""), "");
         assert_eq!(
             join_path_segments(".hoodie", "20240101000000000.commit"),
