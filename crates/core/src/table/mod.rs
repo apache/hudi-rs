@@ -978,7 +978,8 @@ impl Table {
     /// file written before a column was widened or added would force newer
     /// records back into that older shape — wrong values, with no error. Only a
     /// caller with no timeline at all (the cxx bridge, which is handed paths) is
-    /// left with that fallback.
+    /// left with that fallback; one handed the schema with its paths uses
+    /// [`FileGroupReader::with_data_schema`].
     pub async fn create_file_group_reader_with_options<S, K, V>(
         &self,
         read_options: Option<&ReadOptions>,
