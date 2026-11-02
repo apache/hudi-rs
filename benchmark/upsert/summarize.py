@@ -124,11 +124,13 @@ def violated(case):
 
 def case_row(name, case, scenario, scale, stat):
     s = case.get("summary", {})
-    st = s.get("stats", {})
+    ok = case.get("status") == "ok"
+    # A refused, failed or timed-out case keeps the stats of the repetitions it
+    # finished; they are not a result.
+    st = s.get("stats", {}) if ok else {}
     by_phase = s.get("peak_rss_bytes_by_phase", {})
     write_rss = [by_phase[p] for p in ("upsert", "delete") if p in by_phase]
-    files = s.get("upsert_data_files_created_per_commit")
-    ok = case.get("status") == "ok"
+    files = s.get("upsert_data_files_created_per_commit") if ok else None
     inc = timing(st.get("incremental_mean_s"), stat)
     if inc != "-" and "incremental_rows_mean" in s:
         inc += f" ({s['incremental_rows_mean']:,.0f})"
@@ -145,8 +147,8 @@ def case_row(name, case, scenario, scale, stat):
         timing(st.get("readback_s"), stat),
         inc,
         timing(st.get("time_travel_mean_s"), stat),
-        _mib(s.get("upsert_bytes_per_commit")),
-        _mib(s.get("delete_bytes_per_commit")),
+        _mib(s.get("upsert_bytes_per_commit")) if ok else "-",
+        _mib(s.get("delete_bytes_per_commit")) if ok else "-",
         "-" if files is None else f"{files:g}",
         _mib(by_phase.get("load")) if ok else "-",
         _mib(max(write_rss)) if write_rss and ok else "-",
@@ -157,11 +159,15 @@ def case_row(name, case, scenario, scale, stat):
 
 def case_notes(scenario, name, case):
     s = case.get("summary", {})
+    ok = case.get("status") == "ok"
     out = []
     noisy = [
         f"{label} {st['cv']:.0%}"
         for key, label in TIMING_COLUMNS.items()
-        if (st := s.get("stats", {}).get(key)) and st.get("cv") and st["cv"] > CV_NOTE
+        if ok
+        and (st := s.get("stats", {}).get(key))
+        and st.get("cv")
+        and st["cv"] > CV_NOTE
     ]
     if noisy:
         out.append(

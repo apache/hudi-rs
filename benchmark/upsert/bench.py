@@ -213,7 +213,7 @@ class HudiCase(Case):
             "target_file_size": "library default",
             "upsert": "HudiTable.upsert(arrow_table)",
             "delete": "HudiTable.delete_keys(keys)",
-            "read": "HudiTable.read()",
+            "read": "HudiTable.read(); every read projects the data columns (get_schema)",
             "incremental_read": (
                 "HudiTable.read(HudiReadOptions().with_query_type(Incremental)"
                 ".with_start_timestamp(<previous completion time>)"
@@ -253,6 +253,9 @@ class HudiCase(Case):
     def open(self, root, plan):
         self.plan = plan
         self.t = self._hudi().HudiTable(str(root))
+        # Reads project the data columns, as the other cases return them; the
+        # five _hoodie_* meta columns would otherwise be decoded on every read.
+        self.columns = self.t.get_schema().names
         self.last = None
 
     @staticmethod
@@ -286,6 +289,7 @@ class HudiCase(Case):
         return {"num_deleted": r.num_deletes, "instant": r.requested_time}
 
     def _read(self, opts=None):
+        opts = (opts or self._hudi().HudiReadOptions()).with_projection(self.columns)
         batches = self.t.read(opts)
         if not batches:
             return None
