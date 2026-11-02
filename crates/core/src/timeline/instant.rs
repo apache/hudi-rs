@@ -518,6 +518,10 @@ mod tests {
         );
     }
 
+    // This test fixes the timezone via the POSIX `TZ` environment variable,
+    // which the `chrono`/OS local-time path honors on Unix but not on Windows
+    // (Windows ignores `TZ` and uses the OS timezone). Exercised off-Windows.
+    #[cfg(not(windows))]
     #[test]
     #[serial(env_vars)]
     fn test_create_instant_using_local_timezone() {

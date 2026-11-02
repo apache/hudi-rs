@@ -85,7 +85,6 @@ mod tests {
     #[test]
     fn parse_valid_uri_in_various_forms() {
         let urls = vec![
-            parse_uri("/foo/").unwrap(),
             parse_uri("file:/foo/").unwrap(),
             parse_uri("file:///foo/").unwrap(),
             parse_uri("hdfs://foo/").unwrap(),
@@ -97,13 +96,22 @@ mod tests {
             parse_uri("wasbs://foo/").unwrap(),
         ];
         let schemes = vec![
-            "file", "file", "file", "hdfs", "s3", "s3", "s3a", "gs", "wasb", "wasbs",
+            "file", "file", "hdfs", "s3", "s3", "s3a", "gs", "wasb", "wasbs",
         ];
-        let paths = vec![
-            "/foo", "/foo", "/foo", "/", "", "/", "/bar", "/", "/bar", "/",
-        ];
+        let paths = vec!["/foo", "/foo", "/", "", "/", "/bar", "/", "/bar", "/"];
         assert_eq!(urls.iter().map(|u| u.scheme()).collect::<Vec<_>>(), schemes);
         assert_eq!(urls.iter().map(|u| u.path()).collect::<Vec<_>>(), paths);
+    }
+
+    // A bare POSIX root-relative path (no scheme, no drive letter) is only a
+    // valid directory path on Unix; on Windows `Url::from_directory_path`
+    // rejects it, so this case is exercised only off-Windows.
+    #[cfg(not(windows))]
+    #[test]
+    fn parse_bare_posix_root_relative_path() {
+        let url = parse_uri("/foo/").unwrap();
+        assert_eq!(url.scheme(), "file");
+        assert_eq!(url.path(), "/foo");
     }
 
     #[test]
