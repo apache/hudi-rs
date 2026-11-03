@@ -192,8 +192,10 @@ Commands:
   create-tables     Create Hudi COW tables from parquet via Spark SQL
   bench-spark       Run TPC-H queries against Hudi tables via Spark SQL
   bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
+  bench-duckdb      Run TPC-H queries against Hudi tables via DuckDB and its hudi extension
   compare           Compare persisted benchmark results with bar charts
   validate          Check Hudi query results against the same queries on parquet
+  validate-duckdb   The same check through DuckDB's read_hudi and read_parquet
   env-report        Rewrite the environment report for results already collected
 
 Options (per command):
@@ -205,7 +207,8 @@ Options (per command):
                     validate] (default: data/sf{N}-parquet)
   --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
   --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
-                    holds two sessions at once, so a lower value may be needed)
+                    holds two sessions at once, so a lower value may be needed), or
+                    DuckDB's memory_limit [*-duckdb] (default: DuckDB's own)
   --iterations N    Number of measured iterations per query [bench-*] (from config)
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
   --output-dir D    Directory to persist results as JSON [bench-*]
@@ -213,6 +216,11 @@ Options (per command):
   --runs R          Comma-separated result file stems to compare [compare], e.g.
                     datafusion_hudi_sf100,datafusion_parquet_sf100; overrides --engines
                     and is the way to compare two formats
+  --extension E     'community' or a local hudi.duckdb_extension path [*-duckdb]
+                    (default: community)
+  --label L         Suffix for the engine name, e.g. a build name [bench-duckdb]
+  --threads N       DuckDB threads [*-duckdb] (default: all cores)
+  --hudi-option O   Passed to read_hudi as hudi_option [*-duckdb]
 
 Examples:
   $0 generate --scale-factor 1
@@ -221,6 +229,10 @@ Examples:
   $0 bench-spark --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 1 --queries 1,3,6
   $0 bench-datafusion --scale-factor 100 --hudi-dir gs://bucket/sf100-hudi
+  $0 bench-duckdb --scale-factor 1 --output-dir results
+  $0 bench-duckdb --scale-factor 1 --format hudi --label dev \\
+     --extension ~/duckdb-hudi/build/release/hudi.duckdb_extension --output-dir results
+  $0 validate-duckdb --scale-factor 1
   $0 compare --scale-factor 1 --engines datafusion,spark --format hudi
 EOF
 }
@@ -406,7 +418,7 @@ cmd_bench_spark() {
   local parse_args=(parse-spark-output --input "$output_file")
   if [ -n "$output_dir" ]; then
     mkdir -p "$output_dir"
-    parse_args+=(--output-dir "$output_dir" --engine-label spark --format-label "$format" --display-name "spark+hudi" --scale-factor "$sf")
+    parse_args+=(--output-dir "$output_dir" --engine-label spark --format-label "$format" --display-name "spark+$format" --scale-factor "$sf")
     write_env_report "$output_dir/environment.txt" "$sf" "$data_dir"
   fi
   "$TPCH_BIN" "${parse_args[@]}"
@@ -519,6 +531,230 @@ cmd_bench_datafusion() {
   if [ "$use_parquet" = true ]; then
     run_datafusion_bench parquet --parquet-dir "$parquet_dir" "datafusion+parquet"
   fi
+}
+
+# The interpreter must have the duckdb package; community extensions are built
+# for current DuckDB releases only, not for older patch releases.
+require_duckdb_python() {
+  DUCKDB_PY="${DUCKDB_PYTHON:-python3}"
+  if ! "$DUCKDB_PY" -c 'import duckdb' 2>/dev/null; then
+    echo "Error: $DUCKDB_PY cannot import duckdb. Install it with 'pip install duckdb'," >&2
+    echo "or point DUCKDB_PYTHON at an interpreter that has it." >&2
+    exit 1
+  fi
+}
+
+# The DuckDB leg sets up credentials for S3 only.
+require_duckdb_storage() {
+  local dir
+  for dir in "$@"; do
+    case "$dir" in
+      s3://*|s3a://*) ;;
+      *) if is_cloud_url "$dir"; then
+           echo "Error: the DuckDB leg reads local paths and s3:// URLs only, not $dir." >&2
+           exit 1
+         fi ;;
+    esac
+  done
+}
+
+require_duckdb_extension() {
+  if [ "$1" != "community" ] && [ ! -f "$1" ]; then
+    echo "Error: extension file not found at $1." >&2
+    exit 1
+  fi
+}
+
+cmd_bench_duckdb() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local format=""
+  local queries=""
+  local iterations=""
+  local warmup=""
+  local output_dir=""
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
+  local extension="community"
+  local label=""
+  local threads=""
+  local memory_limit=""
+  local hudi_option=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --format) format="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --iterations) iterations="$2"; shift 2 ;;
+      --warmup) warmup="$2"; shift 2 ;;
+      --output-dir) output_dir="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --extension) extension="$2"; shift 2 ;;
+      --label) label="$2"; shift 2 ;;
+      --threads) threads="$2"; shift 2 ;;
+      --memory-limit) memory_limit="$2"; shift 2 ;;
+      --hudi-option) hudi_option="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
+
+  local use_hudi=false
+  local use_parquet=false
+  case "$format" in
+    hudi)    use_hudi=true ;;
+    parquet) use_parquet=true ;;
+    "")
+      if is_cloud_url "$hudi_dir" || [ -d "$hudi_dir" ]; then use_hudi=true; fi
+      if is_cloud_url "$parquet_dir" || [ -d "$parquet_dir" ]; then use_parquet=true; fi
+      ;;
+    *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
+  esac
+  if [ "$use_hudi" = false ] && [ "$use_parquet" = false ]; then
+    echo "Error: no data found for sf$sf. Run 'generate' and/or 'create-tables' first." >&2
+    exit 1
+  fi
+  if [ "$use_hudi" = true ] && ! is_cloud_url "$hudi_dir" && [ ! -d "$hudi_dir" ]; then
+    echo "Error: Hudi data not found at $hudi_dir. Run 'create-tables' first." >&2
+    exit 1
+  fi
+  if [ "$use_parquet" = true ] && ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
+    echo "Error: Parquet data not found at $parquet_dir. Run 'generate' first." >&2
+    exit 1
+  fi
+  require_duckdb_extension "$extension"
+  [ "$use_hudi" = true ] && require_duckdb_storage "$hudi_dir"
+  [ "$use_parquet" = true ] && require_duckdb_storage "$parquet_dir"
+  # The label names the result files.
+  if [ -n "$label" ] && [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "Error: --label may contain only letters, digits, '.', '_' and '-'." >&2
+    exit 1
+  fi
+
+  require_duckdb_python
+  build_tpch
+  if [ "$use_hudi" = true ]; then
+    require_hudi_tables "$hudi_dir"
+  fi
+
+  if [ -z "$warmup" ] || [ -z "$iterations" ]; then
+    local defaults
+    defaults=$("$TPCH_BIN" bench-defaults --scale-factor "$sf")
+    warmup="${warmup:-$(echo "$defaults" | awk '{print $1}')}"
+    iterations="${iterations:-$(echo "$defaults" | awk '{print $2}')}"
+  fi
+
+  # A label keeps results from different extension builds side by side, e.g.
+  # duckdb-v021_hudi_sf1 against duckdb-pushdown_hudi_sf1 via 'compare --runs'.
+  local engine="duckdb${label:+-$label}"
+
+  local common_args=(--query-dir "$SCRIPT_DIR/queries" --scale-factor "$sf" --extension "$extension")
+  [ -n "$threads" ] && common_args+=(--threads "$threads")
+  [ -n "$memory_limit" ] && common_args+=(--memory-limit "$memory_limit")
+  [ -n "$hudi_option" ] && common_args+=(--hudi-option "$hudi_option")
+
+  if [ -n "$output_dir" ]; then
+    mkdir -p "$output_dir"
+    local env_file="$output_dir/environment.txt"
+    local reported_dir="$hudi_dir"
+    [ "$use_hudi" = false ] && reported_dir="$parquet_dir"
+    # Runs of other extension builds share this report, so their version lines
+    # are carried over; this run's replaces any earlier one of the same label.
+    local other_builds=""
+    [ -f "$env_file" ] && other_builds=$(grep '^duckdb-hudi \[' "$env_file" | grep -vF "[$engine]" || true)
+    write_env_report "$env_file" "$sf" "$reported_dir"
+    [ -n "$other_builds" ] && echo "$other_builds" >> "$env_file"
+    "$DUCKDB_PY" "$SCRIPT_DIR/infra/duckdb/bench.py" "${common_args[@]}" --print-versions \
+      --engine-label "$engine" >> "$env_file"
+  fi
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local status=0
+
+  run_duckdb_bench() {
+    local fmt="$1" data_flag="$2" data_dir="$3"
+    local output_file="$tmp_dir/$fmt.jsonl"
+    local args=("${common_args[@]}" "$data_flag" "$data_dir"
+                --warmup "$warmup" --iterations "$iterations" --output "$output_file")
+    [ -n "$queries" ] && args+=(--queries "$queries")
+
+    echo "Running DuckDB benchmark ($fmt)..."
+    # A failed query still leaves the others' timings worth persisting, so the
+    # status is carried to the end rather than aborting here.
+    "$DUCKDB_PY" "$SCRIPT_DIR/infra/duckdb/bench.py" "${args[@]}" || status=$?
+
+    echo ""
+    local parse_args=(parse-spark-output --input "$output_file"
+                      --engine-label "$engine" --display-name "$engine+$fmt")
+    if [ -n "$output_dir" ]; then
+      parse_args+=(--output-dir "$output_dir" --format-label "$fmt" --scale-factor "$sf")
+    fi
+    "$TPCH_BIN" "${parse_args[@]}"
+  }
+
+  if [ "$use_hudi" = true ]; then
+    run_duckdb_bench hudi --hudi-base "$hudi_dir"
+  fi
+  if [ "$use_parquet" = true ]; then
+    run_duckdb_bench parquet --parquet-base "$parquet_dir"
+  fi
+  rm -rf "$tmp_dir"
+
+  if [ "$status" -ne 0 ]; then
+    echo "Error: some DuckDB queries failed and have no timings in the results." >&2
+    exit "$status"
+  fi
+}
+
+# The DuckDB counterpart of 'validate': the same queries through read_hudi and
+# read_parquet in one DuckDB, compared row by row.
+cmd_validate_duckdb() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
+  local queries=""
+  local extension="community"
+  local threads=""
+  local memory_limit=""
+  local hudi_option=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --extension) extension="$2"; shift 2 ;;
+      --threads) threads="$2"; shift 2 ;;
+      --memory-limit) memory_limit="$2"; shift 2 ;;
+      --hudi-option) hudi_option="$2"; shift 2 ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
+  if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
+    echo "Error: parquet data not found at $parquet_dir." >&2
+    exit 1
+  fi
+  require_duckdb_extension "$extension"
+  require_duckdb_storage "$hudi_dir" "$parquet_dir"
+
+  require_duckdb_python
+  build_tpch
+  require_hudi_tables "$hudi_dir"
+
+  local args=(--hudi-base "$hudi_dir" --parquet-base "$parquet_dir"
+              --query-dir "$SCRIPT_DIR/queries" --scale-factor "$sf"
+              --extension "$extension" --validate)
+  [ -n "$queries" ] && args+=(--queries "$queries")
+  [ -n "$threads" ] && args+=(--threads "$threads")
+  [ -n "$memory_limit" ] && args+=(--memory-limit "$memory_limit")
+  [ -n "$hudi_option" ] && args+=(--hudi-option "$hudi_option")
+  "$DUCKDB_PY" "$SCRIPT_DIR/infra/duckdb/bench.py" "${args[@]}"
 }
 
 # Check the Hudi read path against the parquet the tables were built from, so a
@@ -638,8 +874,10 @@ case "$COMMAND" in
   create-tables)    cmd_create_tables "$@" ;;
   bench-spark)      cmd_bench_spark "$@" ;;
   bench-datafusion) cmd_bench_datafusion "$@" ;;
+  bench-duckdb)     cmd_bench_duckdb "$@" ;;
   compare)          cmd_compare "$@" ;;
   validate)         cmd_validate "$@" ;;
+  validate-duckdb)  cmd_validate_duckdb "$@" ;;
   env-report)       cmd_env_report "$@" ;;
   *)
     echo "Unknown command: $COMMAND" >&2

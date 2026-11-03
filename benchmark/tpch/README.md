@@ -57,7 +57,7 @@ It reports per query and exits non-zero if any of them differ.
 
 | Variable  | Values                                            | Default      |
 |-----------|---------------------------------------------------|--------------|
-| `ENGINE`  | `datafusion`, `spark`                             | `datafusion` |
+| `ENGINE`  | `datafusion`, `spark`, `duckdb`                   | `datafusion` |
 | `SF`      | TPC-H scale factor                                | `0.001`      |
 | `QUERIES` | Comma-separated query numbers                     | all 22       |
 | `ENGINES` | Comma-separated engine names (for `tpch-compare`) |              |
@@ -116,6 +116,39 @@ Credentials come from the environment for both engines: DataFusion reads the
 instance role or service account neither engine needs any variable set. For S3
 outside `us-east-1`, set `AWS_REGION` (`object_store` defaults to `us-east-1`
 when the region is neither configured nor derivable from the URL).
+
+### DuckDB
+
+The DuckDB leg reads the Hudi tables through the
+[hudi community extension](https://github.com/alitrack/duckdb-hudi)
+(`read_hudi`) and the parquet through `read_parquet`, with the same query text
+for both. It needs a Python interpreter with the `duckdb` package; community
+extensions are built for current DuckDB releases, not for older patch releases,
+so install the latest one. The DuckDB leg reads local paths and `s3://` URLs.
+
+```bash
+pip install duckdb
+benchmark/tpch/run.sh validate-duckdb --scale-factor 1
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --output-dir benchmark/tpch/results
+```
+
+Set `DUCKDB_PYTHON` to use an interpreter other than `python3`. Each query runs
+in its own process, so one that crashes the process is reported as failed and
+the rest still run.
+
+To measure a local build of the extension against the published one, pass its
+path and a label; the label keeps the two result files apart for `compare`:
+
+```bash
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --format parquet \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --format hudi --label community \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --format hudi --label dev \
+  --extension /path/to/hudi.duckdb_extension --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh compare --scale-factor 1 \
+  --runs duckdb-community_hudi_sf1,duckdb-dev_hudi_sf1,duckdb_parquet_sf1
+```
 
 The two sections below cover running on a cloud VM, one per provider; they are
 alternatives, so follow whichever matches your setup.
