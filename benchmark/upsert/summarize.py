@@ -184,6 +184,27 @@ def case_notes(scenario, name, case):
     return out
 
 
+def headroom_note(scenario, name, case):
+    """The machine readings behind a case's timings, or None if it has none.
+    Results written before the gate measured other-process load have only load1."""
+    h = case.get("summary", {}).get("headroom")
+    if not h:
+        return None
+    mem = h.get("min_mem_available_bytes")
+    load = (
+        f"max other-process load {h['max_other_load']:.2f} cores, "
+        if "max_other_load" in h
+        else ""
+    )
+    return (
+        f"{scenario} {name} headroom over {h['readings']} readings: {load}"
+        f"max load1 {h['max_load1']:.2f}, min available memory "
+        f"{'-' if mem is None else f'{mem / 1024**3:.1f} GiB'}, min free disk "
+        f"{h['min_disk_free_bytes'] / 1024**3:.1f} GiB"
+        + (" (HEADROOM VIOLATED)" if violated(case) else "")
+    )
+
+
 def render(rows, markdown):
     if markdown:
         out = [
@@ -263,16 +284,9 @@ def main():
         for name, case in res.get("cases", {}).items():
             rows.append(case_row(name, case, scenario, scale, a.stat))
             notes += case_notes(scenario, name, case)
-            h = case.get("summary", {}).get("headroom")
-            if h:
-                mem = h.get("min_mem_available_bytes")
-                notes.append(
-                    f"{scenario} {name} headroom over {h['readings']} readings: "
-                    f"max load1 {h['max_load1']:.2f}, min available memory "
-                    f"{'-' if mem is None else f'{mem / 1024**3:.1f} GiB'}, min free disk "
-                    f"{h['min_disk_free_bytes'] / 1024**3:.1f} GiB"
-                    + (" (HEADROOM VIOLATED)" if violated(case) else "")
-                )
+            note = headroom_note(scenario, name, case)
+            if note:
+                notes.append(note)
             if case.get("error"):
                 errors.append(f"{scenario} {name} ({case['status']}): {case['error']}")
 

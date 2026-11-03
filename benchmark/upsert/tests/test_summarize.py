@@ -73,3 +73,23 @@ def test_only_a_finished_case_gets_a_variation_note(status, noted):
     c["summary"]["stats"]["upsert_mean_s"]["cv"] = 0.5
     notes = summarize.case_notes("uuid", "hudi-mor", c)
     assert any("upsert" in n for n in notes) == noted
+
+
+@pytest.mark.parametrize(
+    "extra, shown",
+    [({"max_other_load": 1.25}, "max other-process load 1.25 cores, "), ({}, "")],
+)
+def test_headroom_note_shows_other_load_when_recorded(extra, shown):
+    c = case("ok", 3)
+    c["summary"]["headroom"] = {
+        "readings": 4,
+        "max_load1": 3.5,
+        "min_mem_available_bytes": 20 * 1024**3,
+        "min_disk_free_bytes": 100 * 1024**3,
+        **extra,
+    }
+    assert summarize.headroom_note("uuid", "hudi-mor", c) == (
+        f"uuid hudi-mor headroom over 4 readings: {shown}max load1 3.50, "
+        "min available memory 20.0 GiB, min free disk 100.0 GiB"
+    )
+    assert summarize.headroom_note("uuid", "hudi-mor", case("ok", 3)) is None

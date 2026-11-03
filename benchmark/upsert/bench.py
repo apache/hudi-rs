@@ -44,6 +44,7 @@ import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 import types
@@ -405,16 +406,144 @@ def reclaim(case, root, after):
     return {"reclaimed_files": len(stale), "reclaimed_bytes": freed}
 
 
+# Window over which the gate averages the CPU other processes use.
+LOAD_WINDOW_S = 10.0
+
+
+class OtherLoad:
+    """Cores kept busy by other processes over the last LOAD_WINDOW_S seconds.
+
+    The one-minute load average lags and counts the benchmark's own work, so a
+    gate on it waits for each commit's own load to decay. This samples system
+    busy CPU time once a second and subtracts the CPU time of this process and
+    its descendants: live ones through psutil, reaped ones through
+    getrusage(RUSAGE_CHILDREN). psutil's children_* fields cannot stand in for
+    the latter; they read 0 on macOS even after the child is reaped."""
+
+    def __init__(self):
+        self.samples = []
+        self.lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def sample():
+        """(time, system busy s, own CPU s), or None when no consistent reading
+        of this process tree's CPU could be taken."""
+        own = own_cpu_s()
+        return None if own is None else (time.monotonic(), system_busy_s(), own)
+
+    def _run(self):
+        while True:
+            self._record()
+            time.sleep(1.0)
+
+    def _record(self):
+        # A sampler that died would leave its last sample as the start of every
+        # later window, averaging recent load away, so a failed sample is skipped.
+        try:
+            s = self.sample()
+        except Exception:
+            return
+        if s is None:
+            return
+        with self.lock:
+            self.samples.append(s)
+            self.samples = [x for x in self.samples if s[0] - x[0] <= 2 * LOAD_WINDOW_S]
+
+    def read(self, window):
+        """(busy cores, seconds covered) over the latest ``window`` seconds;
+        blocks until that much history exists, which only a process's first
+        reading waits for."""
+        deadline = time.monotonic() + window + 60
+        while True:
+            now = self.sample()
+            if now is not None:
+                with self.lock:
+                    old = [x for x in self.samples if now[0] - x[0] >= window]
+                if old:
+                    return busy_cores(old[-1], now), now[0] - old[-1][0]
+            elif time.monotonic() > deadline:
+                raise RuntimeError(
+                    "could not read the benchmark's own CPU time consistently; "
+                    "an exited descendant is not being reaped"
+                )
+            time.sleep(0.5)
+
+
+def system_busy_s():
+    """Busy CPU seconds across all cores, computed as psutil's cpu_percent does:
+    iowait is idle time, and guest time is already inside user time."""
+    t = psutil.cpu_times()
+    busy = sum(t) - t.idle
+    for field in ("iowait", "guest", "guest_nice"):
+        busy -= getattr(t, field, 0.0)
+    return busy
+
+
+def reaped_cpu_s():
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return r.ru_utime + r.ru_stime
+
+
+def own_cpu_s(attempts=20):
+    """CPU seconds used by this process and every descendant, live or reaped, or
+    None when no consistent reading was taken. A descendant moves from the live
+    sum to the reaped one when it is waited for. One that exits but is not yet
+    reaped, or is reaped while the tree is walked, is in neither sum and would
+    hide a whole phase's CPU, so such a walk is taken again."""
+    for _ in range(attempts):
+        reaped = reaped_cpu_s()
+        live, consistent = 0.0, True
+        for child in psutil.Process().children(recursive=True):
+            try:
+                c = child.cpu_times()
+            except psutil.NoSuchProcess:  # also a zombie, on macOS
+                consistent = False
+                break
+            except psutil.AccessDenied:
+                continue
+            live += c.user + c.system
+        if consistent and reaped_cpu_s() == reaped:
+            me = resource.getrusage(resource.RUSAGE_SELF)
+            return me.ru_utime + me.ru_stime + reaped + live
+        time.sleep(0.01)
+    return None
+
+
+def busy_cores(start, end):
+    """Cores other processes kept busy between two OtherLoad samples."""
+    (t0, busy0, own0), (t1, busy1, own1) = start, end
+    return max(0.0, ((busy1 - busy0) - (own1 - own0)) / (t1 - t0))
+
+
+_other_load = None
+
+
+def other_load(window=LOAD_WINDOW_S):
+    global _other_load
+    if _other_load is None:
+        _other_load = OtherLoad()
+    return _other_load.read(window)
+
+
 def headroom(work_dir, base_bytes, limits):
+    # Under --force a load reading only warns, so it need not wait for a full
+    # window of history.
+    load, window = other_load(1.0 if limits.force else LOAD_WINDOW_S)
     avail = psutil.virtual_memory().available
     r = {
+        "other_load": load,
+        "other_load_window_s": round(window, 1),
         "load1": os.getloadavg()[0],
         "mem_available_bytes": avail,
         "disk_free_bytes": shutil.disk_usage(work_dir).free,
     }
     v = {}
-    if r["load1"] > limits.max_load1:
-        v["load1"] = f"load1 {r['load1']:.2f} > {limits.max_load1}"
+    if r["other_load"] > limits.max_load:
+        v["load"] = (
+            f"other processes kept {r['other_load']:.2f} cores busy over the last "
+            f"{r['other_load_window_s']:.0f}s > {limits.max_load}"
+        )
     if avail < limits.min_mem_gib * 2**30:
         v["memory"] = (
             f"available memory {avail / 2**30:.1f} GiB < {limits.min_mem_gib} GiB"
@@ -431,10 +560,10 @@ def headroom(work_dir, base_bytes, limits):
 def gate(work_dir, base_bytes, limits, what):
     """Wait for the machine to be idle, then return the readings.
 
-    load1 is a one-minute moving average that the benchmark itself raises, so
-    when it is the only violation the gate polls for up to --settle-timeout,
-    letting the previous commit's own load decay instead of counting it against
-    the next; under --force, where a load violation only warns, it does not
+    Load is the CPU other processes used over the last LOAD_WINDOW_S seconds,
+    so the benchmark's own work never counts against it. When load is the only
+    violation the gate polls for up to --settle-timeout for the other processes
+    to quiet down; under --force, where a load violation only warns, it does not
     wait. Memory and disk shortfalls do not settle, so they are judged at
     once. A disk shortfall refuses even under --force: a copy-on-write commit
     can rewrite the whole table, and running out of disk mid-commit hurts more
@@ -444,7 +573,7 @@ def gate(work_dir, base_bytes, limits, what):
     while True:
         r = headroom(work_dir, base_bytes, limits)
         v = r["violations"]
-        settling = list(v) == ["load1"] and not limits.force
+        settling = list(v) == ["load"] and not limits.force
         if not settling or time.monotonic() - start >= limits.settle_timeout:
             break
         time.sleep(2)
@@ -818,6 +947,8 @@ def compare_tables(table, exp, key_cols):
 
 
 def phase_main(argv):
+    # Starts sampling now, so the gate's first window fills while inputs load.
+    other_load(0.0)
     p = argparse.ArgumentParser(prog="bench.py _phase")
     p.add_argument("--case", required=True)
     p.add_argument("--phase", required=True, choices=PHASES)
@@ -1098,6 +1229,7 @@ def summarize_case(case):
     if readings:
         s["headroom"] = {
             "readings": len(readings),
+            "max_other_load": max(r["other_load"] for r in readings),
             "max_load1": max(r["load1"] for r in readings),
             "min_mem_available_bytes": min(r["mem_available_bytes"] for r in readings),
             "min_disk_free_bytes": min(r["disk_free_bytes"] for r in readings),
@@ -1187,7 +1319,8 @@ def run_rep(name, case, r, a, plan, bd, wd, root, log_dir):
         return rep
     h = rep["headroom_before"]
     print(
-        f"{tag} headroom: load1 {h['load1']:.2f}, available memory "
+        f"{tag} headroom: other load {h['other_load']:.2f} (load1 {h['load1']:.2f}), "
+        f"available memory "
         f"{h['mem_available_bytes'] / 2**30:.1f} GiB, "
         f"free disk {h['disk_free_bytes'] / 2**30:.1f} GiB",
         flush=True,
@@ -1211,7 +1344,7 @@ def run_rep(name, case, r, a, plan, bd, wd, root, log_dir):
             "--base-dir", str(bd),
             "--workload-dir", str(wd),
             "--out", str(out),
-            "--max-load1", str(a.max_load1),
+            "--max-load", str(a.max_load),
             "--min-mem-gib", str(a.min_mem_gib),
             "--settle-timeout", str(a.settle_timeout),
             "--base-bytes", str(a.base_bytes),
@@ -1288,10 +1421,11 @@ def run_rep(name, case, r, a, plan, bd, wd, root, log_dir):
 
 def add_headroom_args(p):
     p.add_argument(
-        "--max-load1",
+        "--max-load",
         type=float,
         default=2.0,
-        help="refuse to time anything while the 1-minute load average is above this",
+        help="refuse to time anything while other processes have kept more than this "
+        f"many cores busy over the last {LOAD_WINDOW_S:.0f} seconds",
     )
     p.add_argument(
         "--min-mem-gib",
@@ -1480,7 +1614,8 @@ def run(a, sc, params, cases, work, slug, out):
             "reclaim": a.reclaim,
             "extra_cases": [Path(x).name for x in a.extra_cases],
             "headroom_limits": {
-                "max_load1": a.max_load1,
+                "max_other_load": a.max_load,
+                "other_load_window_s": 1.0 if a.force else LOAD_WINDOW_S,
                 "min_mem_available_gib": a.min_mem_gib,
                 "min_disk_free": f"{DISK_FACTOR} x base dataset ({a.base_bytes} bytes)",
                 "settle_timeout_s": a.settle_timeout,
