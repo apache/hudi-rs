@@ -124,11 +124,13 @@ def violated(case):
 
 def case_row(name, case, scenario, scale, stat):
     s = case.get("summary", {})
-    st = s.get("stats", {})
+    ok = case.get("status") == "ok"
+    # A refused, failed or timed-out case keeps the stats of the repetitions it
+    # finished; they are not a result.
+    st = s.get("stats", {}) if ok else {}
     by_phase = s.get("peak_rss_bytes_by_phase", {})
     write_rss = [by_phase[p] for p in ("upsert", "delete") if p in by_phase]
-    files = s.get("upsert_data_files_created_per_commit")
-    ok = case.get("status") == "ok"
+    files = s.get("upsert_data_files_created_per_commit") if ok else None
     inc = timing(st.get("incremental_mean_s"), stat)
     if inc != "-" and "incremental_rows_mean" in s:
         inc += f" ({s['incremental_rows_mean']:,.0f})"
@@ -145,8 +147,8 @@ def case_row(name, case, scenario, scale, stat):
         timing(st.get("readback_s"), stat),
         inc,
         timing(st.get("time_travel_mean_s"), stat),
-        _mib(s.get("upsert_bytes_per_commit")),
-        _mib(s.get("delete_bytes_per_commit")),
+        _mib(s.get("upsert_bytes_per_commit")) if ok else "-",
+        _mib(s.get("delete_bytes_per_commit")) if ok else "-",
         "-" if files is None else f"{files:g}",
         _mib(by_phase.get("load")) if ok else "-",
         _mib(max(write_rss)) if write_rss and ok else "-",
@@ -157,11 +159,15 @@ def case_row(name, case, scenario, scale, stat):
 
 def case_notes(scenario, name, case):
     s = case.get("summary", {})
+    ok = case.get("status") == "ok"
     out = []
     noisy = [
         f"{label} {st['cv']:.0%}"
         for key, label in TIMING_COLUMNS.items()
-        if (st := s.get("stats", {}).get(key)) and st.get("cv") and st["cv"] > CV_NOTE
+        if ok
+        and (st := s.get("stats", {}).get(key))
+        and st.get("cv")
+        and st["cv"] > CV_NOTE
     ]
     if noisy:
         out.append(
@@ -176,6 +182,27 @@ def case_notes(scenario, name, case):
             f"{m['step']} {m.get('field', '')} {m.get('rep1')} vs {m.get('this')})"
         )
     return out
+
+
+def headroom_note(scenario, name, case):
+    """The machine readings behind a case's timings, or None if it has none.
+    Results written before the gate measured other-process load have only load1."""
+    h = case.get("summary", {}).get("headroom")
+    if not h:
+        return None
+    mem = h.get("min_mem_available_bytes")
+    load = (
+        f"max other-process load {h['max_other_load']:.2f} cores, "
+        if "max_other_load" in h
+        else ""
+    )
+    return (
+        f"{scenario} {name} headroom over {h['readings']} readings: {load}"
+        f"max load1 {h['max_load1']:.2f}, min available memory "
+        f"{'-' if mem is None else f'{mem / 1024**3:.1f} GiB'}, min free disk "
+        f"{h['min_disk_free_bytes'] / 1024**3:.1f} GiB"
+        + (" (HEADROOM VIOLATED)" if violated(case) else "")
+    )
 
 
 def render(rows, markdown):
@@ -257,16 +284,9 @@ def main():
         for name, case in res.get("cases", {}).items():
             rows.append(case_row(name, case, scenario, scale, a.stat))
             notes += case_notes(scenario, name, case)
-            h = case.get("summary", {}).get("headroom")
-            if h:
-                mem = h.get("min_mem_available_bytes")
-                notes.append(
-                    f"{scenario} {name} headroom over {h['readings']} readings: "
-                    f"max load1 {h['max_load1']:.2f}, min available memory "
-                    f"{'-' if mem is None else f'{mem / 1024**3:.1f} GiB'}, min free disk "
-                    f"{h['min_disk_free_bytes'] / 1024**3:.1f} GiB"
-                    + (" (HEADROOM VIOLATED)" if violated(case) else "")
-                )
+            note = headroom_note(scenario, name, case)
+            if note:
+                notes.append(note)
             if case.get("error"):
                 errors.append(f"{scenario} {name} ({case['status']}): {case['error']}")
 

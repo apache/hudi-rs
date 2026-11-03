@@ -202,12 +202,19 @@ counts must match across repetitions and byte counts within 1 percent,
 otherwise `summary.writes_consistent` is false.
 
 **Headroom gate.** Before each case and each timed call, the harness refuses to
-go on if the 1-minute load average is above `--max-load1` (2.0), available
-memory is below `--min-mem-gib` (16), or free disk is below 3x the base data.
-A high load average alone is first given `--settle-timeout` seconds (180) to
-come down. `--force` turns load and memory refusals into warnings and marks
-the results, which `summarize.py` then renders only with `--allow-loaded`; a
-disk shortfall always refuses.
+go on if other processes have kept more than `--max-load` cores (2.0) busy over
+the last 10 seconds, available memory is below `--min-mem-gib` (16), or free
+disk is below 3x the base data. The load leaves out the CPU time of the
+benchmark and its phase subprocesses, so one commit's work never holds up the
+next; the 1-minute load average is recorded alongside for reference. Each
+phase subprocess's first check waits until it has 10 seconds of samples (it
+starts sampling when it starts, so most of that overlaps reading its inputs).
+Memory is read while the phase process holds its data, so `--min-mem-gib` is
+headroom beyond the benchmark's own footprint. High load alone is first given
+`--settle-timeout` seconds (180) to come down. `--force` turns load and memory
+refusals into warnings, judged over a 1-second window, and marks the results,
+which `summarize.py` then renders only with `--allow-loaded`; a disk shortfall
+always refuses.
 
 **Reclaim.** After each commit, outside the timed region, the harness deletes
 data files the latest file slices no longer reference, so a copy-on-write run
