@@ -318,8 +318,6 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
         }
 
         // Build FileGroups from parsed files
-        // Note: Currently only supports file groups with base files.
-        // TODO: Support file groups with only log files (P1 task)
         let mut file_groups = Vec::new();
         for (file_id, base_files) in file_id_to_base_files {
             let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
@@ -330,6 +328,18 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 fg.add_log_files(log_files)?;
             }
 
+            file_groups.push(fg);
+        }
+
+        // Leftover log files belong to file groups with no base file: inserts
+        // that went straight to a log file, which is what Flink ingestion, a
+        // bucket index's first write to a bucket, and any merge-on-read file
+        // group before its first compaction all produce. Dropping them loses
+        // every record in the group — the storage-listing path already builds
+        // log-only groups from its leftovers.
+        for (file_id, log_files) in file_id_to_log_files {
+            let mut fg = FileGroup::new(file_id, partition_path.clone());
+            fg.add_log_files(log_files)?;
             file_groups.push(fg);
         }
 
@@ -1138,6 +1148,52 @@ mod tests {
         }
 
         #[test]
+        fn test_log_only_file_groups_are_kept() {
+            let mut records = HashMap::new();
+            let (key, record) = create_files_record(
+                "partition1",
+                vec![
+                    // Base file + log files for file-id-0 (a normal group).
+                    ("file-id-0_0-7-24_20240418173200000.parquet", 1000, false),
+                    (".file-id-0_20240418173200000.log.1_0-8-25", 100, false),
+                    // file-id-1 wrote straight to log files with no base file:
+                    // the pre-compaction shape of a bucket-index MOR table.
+                    (".file-id-1_20240418173210000.log.1_0-9-26", 100, false),
+                    (".file-id-1_20240418173220000.log.2_0-10-27", 150, false),
+                ],
+            );
+            records.insert(key, record);
+
+            let result = file_groups_from_files_partition_records(
+                &records,
+                Some(&BaseFileFormatValue::Parquet),
+                &create_layout_v1_view(),
+                None,
+            );
+            assert!(result.is_ok());
+            let file_groups_map = result.unwrap();
+
+            assert_eq!(file_groups_map.len(), 1);
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 2, "the log-only group must be kept");
+
+            let file_ids: HashSet<_> = file_groups.iter().map(|fg| fg.file_id.as_str()).collect();
+            assert!(file_ids.contains("file-id-0"));
+            assert!(file_ids.contains("file-id-1"));
+
+            let log_only = file_groups
+                .iter()
+                .find(|fg| fg.file_id == "file-id-1")
+                .unwrap();
+            let file_slice = log_only.file_slices.values().next().unwrap();
+            assert!(
+                file_slice.base_file.is_none(),
+                "a log-only slice has no base file"
+            );
+            assert_eq!(file_slice.log_files.len(), 2);
+        }
+
+        #[test]
         fn test_multiple_partitions() {
             let mut records = HashMap::new();
 
@@ -1527,9 +1583,10 @@ mod tests {
         }
 
         #[test]
-        fn test_log_files_without_base_file_not_included() {
+        fn test_log_files_without_base_file_form_a_log_only_group() {
             let mut records = HashMap::new();
-            // Only log files, no base file
+            // Only log files, no base file — the pre-compaction shape of a
+            // bucket-index MOR table or Flink ingestion.
             let (key, record) = create_files_record(
                 "partition1",
                 vec![
@@ -1548,8 +1605,18 @@ mod tests {
             assert!(result.is_ok());
             let file_groups_map = result.unwrap();
 
-            // Log-only file groups are not yet supported (see P1 task)
-            assert!(file_groups_map.is_empty());
+            // Log-only file groups must be kept, not dropped with their records.
+            let file_groups = file_groups_map.get("partition1").unwrap();
+            assert_eq!(file_groups.len(), 1);
+            let file_group = &file_groups[0];
+            assert_eq!(file_group.file_id, "file-id-0");
+
+            let file_slice = file_group.file_slices.values().next().unwrap();
+            assert!(
+                file_slice.base_file.is_none(),
+                "a log-only slice has no base file"
+            );
+            assert_eq!(file_slice.log_files.len(), 2);
         }
 
         #[test]
