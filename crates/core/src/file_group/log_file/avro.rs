@@ -635,3 +635,111 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod variant_tests {
+    use super::AvroBlockDecoder;
+    use apache_avro::{Schema as AvroSchema, types::Value};
+    use arrow::array::{AsArray, StructArray};
+    use parquet::variant::{Variant, VariantArray, VariantArrayBuilder, VariantBuilderExt};
+
+    fn variant_bytes() -> (Vec<u8>, Vec<u8>) {
+        let mut builder = VariantArrayBuilder::new(1);
+        builder.append_value("iceberg");
+        let array = builder.build();
+        let metadata = array.metadata_column().as_binary_view().value(0).to_vec();
+        let value = array.value_column().as_binary_view().value(0).to_vec();
+        (metadata, value)
+    }
+
+    fn variant_schema(child_fields: &str) -> AvroSchema {
+        AvroSchema::parse_str(&format!(
+            r#"{{
+                "type": "record",
+                "name": "root",
+                "fields": [
+                    {{
+                        "name": "var",
+                        "type": {{
+                            "type": "record",
+                            "name": "variant_record",
+                            "logicalType": "variant",
+                            "fields": [{child_fields}]
+                        }}
+                    }}
+                ]
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    fn read_variant(schema: &AvroSchema, value: Value) -> arrow_array::RecordBatch {
+        let json = serde_json::to_string(schema).unwrap();
+        let mut decoder = AvroBlockDecoder::try_new_with_reader(&json, None, 10).unwrap();
+        let body = apache_avro::to_avro_datum(schema, value).unwrap();
+        decoder.decode(&body).unwrap();
+        let batch = decoder.flush().unwrap().unwrap();
+        let target = std::sync::Arc::new(crate::avro_to_arrow::to_arrow_schema(schema).unwrap());
+        crate::schema::batch_evolution::project_batch_to_schema(&batch, &target).unwrap()
+    }
+
+    fn variant_value(fields: Vec<(String, Value)>) -> Value {
+        Value::Record(vec![("var".to_string(), Value::Record(fields))])
+    }
+
+    #[test]
+    fn reads_hudi_variant_avro_record_as_variant_array() {
+        let schema = variant_schema(
+            r#"
+                {"name": "metadata", "type": "bytes"},
+                {"name": "value", "type": "bytes"}
+            "#,
+        );
+        let (metadata, value) = variant_bytes();
+        let value = variant_value(vec![
+            ("metadata".to_string(), Value::Bytes(metadata)),
+            ("value".to_string(), Value::Bytes(value)),
+        ]);
+
+        let batch = read_variant(&schema, value);
+        let schema = batch.schema();
+        let field = schema.field_with_name("var").unwrap();
+
+        field
+            .try_extension_type::<parquet::variant::VariantType>()
+            .unwrap();
+        let variant_array = VariantArray::try_new(batch.column_by_name("var").unwrap()).unwrap();
+        assert_eq!(variant_array.value(0), Variant::from("iceberg"));
+    }
+
+    #[test]
+    fn reads_hudi_variant_avro_record_by_child_name_not_position() {
+        let schema = variant_schema(
+            r#"
+                {"name": "value", "type": "bytes"},
+                {"name": "metadata", "type": "bytes"}
+            "#,
+        );
+        let (metadata, value) = variant_bytes();
+        let value = variant_value(vec![
+            ("value".to_string(), Value::Bytes(value)),
+            ("metadata".to_string(), Value::Bytes(metadata)),
+        ]);
+
+        let batch = read_variant(&schema, value);
+        let variant_column = batch
+            .column_by_name("var")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        assert!(variant_column.column_by_name("metadata").is_some());
+        assert_eq!(
+            VariantArray::try_new(batch.column_by_name("var").unwrap())
+                .unwrap()
+                .value(0),
+            Variant::from("iceberg")
+        );
+    }
+}
