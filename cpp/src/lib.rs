@@ -38,6 +38,7 @@ mod ffi {
     extern "Rust" {
         type HudiFileGroupReader;
         /// Opens a reader for the table at `base_uri` with `key=value` options.
+        /// An option without `=` is an error.
         ///
         /// Throws `rust::Error` on failure, including a panic inside the library.
         fn new_file_group_reader_with_options(
@@ -111,6 +112,20 @@ fn cxx_strs(values: &CxxVector<CxxString>) -> Result<Vec<&str>, String> {
     values.iter().map(cxx_str).collect()
 }
 
+/// Splits `key=value` options, erroring on a malformed one rather than
+/// dropping it: a typo that silently loses an option is hard to find from C++.
+fn key_values<'a>(
+    options: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<(&'a str, &'a str)>, String> {
+    options
+        .into_iter()
+        .map(|opt| {
+            opt.split_once('=')
+                .ok_or_else(|| format!("Option is not key=value: {opt}"))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
@@ -124,10 +139,7 @@ pub fn new_file_group_reader_with_options(
     guard("new_file_group_reader_with_options", || {
         let base_uri = cxx_str(base_uri)?;
 
-        let opt_vec: Vec<(&str, &str)> = cxx_strs(options)?
-            .into_iter()
-            .filter_map(|opt| opt.split_once('='))
-            .collect();
+        let opt_vec = key_values(cxx_strs(options)?)?;
 
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -276,6 +288,21 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(err, "op panicked: non-string panic payload");
+    }
+
+    /// Regression for the constructor, which used to drop such an option
+    /// silently. Asserted on the parser directly: `CxxVector<CxxString>`
+    /// cannot be filled from Rust, so the constructor cannot be handed one.
+    #[test]
+    fn test_key_values_option_without_equals_is_error() {
+        assert_eq!(
+            key_values(["a=1", "b"]).unwrap_err(),
+            "Option is not key=value: b"
+        );
+        assert_eq!(
+            key_values(["a=1", "b=x=y"]).unwrap(),
+            [("a", "1"), ("b", "x=y")]
+        );
     }
 
     #[test]
