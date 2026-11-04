@@ -43,6 +43,23 @@ pub fn get_scheme_authority(url: &Url) -> String {
     format!("{}://{}", url.scheme(), url.authority())
 }
 
+/// Joins a base relative path with a segment using forward slashes.
+///
+/// The result is a relative object-store path and must keep forward slashes
+/// on every platform: on Windows, `PathBuf`-based joins introduce `\`,
+/// which object-store paths and partition-value parsing cannot interpret
+/// (see <https://github.com/apache/hudi-rs/issues/445>).
+pub fn join_path_segments(base: &str, segment: &str) -> String {
+    let base = base.trim_matches('/');
+    let segment = segment.trim_matches('/');
+    match (base.is_empty(), segment.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => segment.to_string(),
+        (false, true) => base.to_string(),
+        (false, false) => format!("{base}/{segment}"),
+    }
+}
+
 /// Joins a base URL with a list of segments.
 pub fn join_url_segments(base_url: &Url, segments: &[&str]) -> Result<Url> {
     let mut url = base_url.clone();
@@ -68,7 +85,6 @@ mod tests {
     #[test]
     fn parse_valid_uri_in_various_forms() {
         let urls = vec![
-            parse_uri("/foo/").unwrap(),
             parse_uri("file:/foo/").unwrap(),
             parse_uri("file:///foo/").unwrap(),
             parse_uri("hdfs://foo/").unwrap(),
@@ -80,13 +96,22 @@ mod tests {
             parse_uri("wasbs://foo/").unwrap(),
         ];
         let schemes = vec![
-            "file", "file", "file", "hdfs", "s3", "s3", "s3a", "gs", "wasb", "wasbs",
+            "file", "file", "hdfs", "s3", "s3", "s3a", "gs", "wasb", "wasbs",
         ];
-        let paths = vec![
-            "/foo", "/foo", "/foo", "/", "", "/", "/bar", "/", "/bar", "/",
-        ];
+        let paths = vec!["/foo", "/foo", "/", "", "/", "/bar", "/", "/bar", "/"];
         assert_eq!(urls.iter().map(|u| u.scheme()).collect::<Vec<_>>(), schemes);
         assert_eq!(urls.iter().map(|u| u.path()).collect::<Vec<_>>(), paths);
+    }
+
+    // A bare POSIX root-relative path (no scheme, no drive letter) is only a
+    // valid directory path on Unix; on Windows `Url::from_directory_path`
+    // rejects it, so this case is exercised only off-Windows.
+    #[cfg(not(windows))]
+    #[test]
+    fn parse_bare_posix_root_relative_path() {
+        let url = parse_uri("/foo/").unwrap();
+        assert_eq!(url.scheme(), "file");
+        assert_eq!(url.path(), "/foo");
     }
 
     #[test]
@@ -124,5 +149,32 @@ mod tests {
         let base_url = Url::from_str("foo:text/plain,bar").unwrap();
         let result = join_url_segments(&base_url, &["foo"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn join_path_segments_uses_forward_slashes() {
+        assert_eq!(join_path_segments("", "dt=2024"), "dt=2024");
+        assert_eq!(
+            join_path_segments("dt=2024", "month=01"),
+            "dt=2024/month=01"
+        );
+        assert_eq!(
+            join_path_segments("dt=2024/month=01", "day=01"),
+            "dt=2024/month=01/day=01"
+        );
+        assert_eq!(
+            join_path_segments("/dt=2024/", "/month=01/"),
+            "dt=2024/month=01"
+        );
+        assert_eq!(join_path_segments("", ""), "");
+        assert_eq!(
+            join_path_segments(".hoodie", "20240101000000000.commit"),
+            ".hoodie/20240101000000000.commit"
+        );
+        // A hive-style two-level partition must stay forward-slashed.
+        assert_eq!(join_path_segments("a=1", "b=2"), "a=1/b=2");
+        // Non-empty base with an empty segment returns the trimmed base.
+        assert_eq!(join_path_segments("dt=2024", ""), "dt=2024");
+        assert_eq!(join_path_segments("dt=2024/", ""), "dt=2024");
     }
 }

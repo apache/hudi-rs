@@ -25,12 +25,11 @@ use crate::file_group::base_file::parquet::ParquetBaseFileReader;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::schema::{prepend_meta_fields, prepend_meta_fields_to_avro_schema_str};
 use crate::storage::Storage;
+use crate::storage::util::join_path_segments;
 use crate::table::Table;
 use apache_avro::schema::Schema as AvroSchema;
 use arrow_schema::{Schema, SchemaRef};
 use serde_json::{Map, Value};
-use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
 /// Resolves the data [`arrow_schema::Schema`] for a given Hudi table, without Hudi meta fields.
@@ -152,17 +151,10 @@ async fn resolve_schema_from_base_file(
 
     // Handle deltacommit case with baseFile
     if let Some(base_file) = &first_stat.base_file {
-        let base_file_path_buf = PathBuf::from_str(partition)
-            .map_err(|e| {
-                CoreError::CommitMetadata(format!("Failed to resolve the latest schema: {e}"))
-            })?
-            .join(base_file);
-        let path = base_file_path_buf.to_str().ok_or_else(|| {
-            CoreError::CommitMetadata(
-                "Failed to resolve the latest schema: invalid file path".to_string(),
-            )
-        })?;
-        if let Some(schema) = read_schema_by_extension(path, &storage).await? {
+        // Join with explicit forward slashes: this is a relative object-store
+        // path, and PathBuf joins would introduce '\' on Windows (#445).
+        let path = join_path_segments(partition, base_file);
+        if let Some(schema) = read_schema_by_extension(&path, &storage).await? {
             return Ok(schema);
         }
     }
