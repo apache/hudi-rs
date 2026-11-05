@@ -142,10 +142,15 @@ impl ColumnStatistics {
 
     /// Merge with another ColumnStatistics (for aggregation).
     ///
-    /// Takes min of mins, max of maxs.
+    /// Takes min of mins, max of maxs when both sides have bounds.
     /// Used when aggregating row group stats to file-level stats.
+    ///
+    /// A missing min or max is treated as unknown, not as an all-null row
+    /// group. Without a null count on [`ColumnStatistics`], keeping the
+    /// present side would let file-level pruning trust bounds that ignore
+    /// row groups with no statistics (see #852).
     pub fn merge(&mut self, other: &ColumnStatistics) {
-        // Merge min values (take the smaller one)
+        // Merge min values (take the smaller one); None if either side lacks it.
         self.min_value = match (self.min_value.take(), &other.min_value) {
             (Some(a), Some(b)) => {
                 if is_less_than(&a, b) {
@@ -154,12 +159,10 @@ impl ColumnStatistics {
                     Some(Arc::clone(b))
                 }
             }
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(Arc::clone(b)),
-            (None, None) => None,
+            _ => None,
         };
 
-        // Merge max values (take the larger one)
+        // Merge max values (take the larger one); None if either side lacks it.
         self.max_value = match (self.max_value.take(), &other.max_value) {
             (Some(a), Some(b)) => {
                 if is_greater_than(&a, b) {
@@ -168,9 +171,7 @@ impl ColumnStatistics {
                     Some(Arc::clone(b))
                 }
             }
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(Arc::clone(b)),
-            (None, None) => None,
+            _ => None,
         };
     }
 }
@@ -483,7 +484,8 @@ mod tests {
         assert_eq!(get_int32(stats1.min_value.as_ref().unwrap()), 5);
         assert_eq!(get_int32(stats1.max_value.as_ref().unwrap()), 100);
 
-        // Test 2: One side has None values - preserves the Some value
+        // Test 2: A missing bound is unknown — merged min/max become None
+        // rather than keeping the Some side (see #852).
         let mut stats3 = ColumnStatistics {
             column_name: "test".to_string(),
             data_type: DataType::Int32,
@@ -497,8 +499,8 @@ mod tests {
             max_value: Some(int32_array(100)),
         };
         stats3.merge(&stats4);
-        assert_eq!(get_int32(stats3.min_value.as_ref().unwrap()), 10);
-        assert_eq!(get_int32(stats3.max_value.as_ref().unwrap()), 100);
+        assert!(stats3.min_value.is_none());
+        assert!(stats3.max_value.is_none());
     }
 
     #[test]

@@ -904,4 +904,66 @@ mod tests {
         let stats = create_stats_with_int_range("id", 10, 100);
         assert!(!pruner.should_include(&stats));
     }
+
+    /// Regression for #852: a row group without column-chunk statistics must
+    /// invalidate file-level min/max so the file is not pruned incorrectly.
+    #[test]
+    fn row_group_without_stats_keeps_file_when_filter_outside_known_bounds() {
+        use crate::statistics::StatisticsContainer;
+        use arrow_schema::Field;
+        use parquet::basic::{Repetition, Type as PhysicalType};
+        use parquet::file::metadata::{
+            ColumnChunkMetaData, FileMetaData, ParquetMetaData, RowGroupMetaData,
+        };
+        use parquet::file::statistics::Statistics;
+        use parquet::schema::types::{SchemaDescriptor, Type};
+
+        let id = Type::primitive_type_builder("id", PhysicalType::INT64)
+            .with_repetition(Repetition::REQUIRED)
+            .build()
+            .unwrap();
+        let schema = Type::group_type_builder("schema")
+            .with_fields(vec![std::sync::Arc::new(id)])
+            .build()
+            .unwrap();
+        let descr = std::sync::Arc::new(SchemaDescriptor::new(std::sync::Arc::new(schema)));
+
+        // Row group 0: stats say id is in [50, 100].
+        let rg0 = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(10)
+            .set_column_metadata(vec![
+                ColumnChunkMetaData::builder(descr.column(0))
+                    .set_num_values(10)
+                    .set_statistics(Statistics::int64(Some(50), Some(100), None, Some(0), false))
+                    .build()
+                    .unwrap(),
+            ])
+            .build()
+            .unwrap();
+        // Row group 1: 10 non-null rows, no statistics. Its values are unknown.
+        let rg1 = RowGroupMetaData::builder(descr.clone())
+            .set_num_rows(10)
+            .set_column_metadata(vec![
+                ColumnChunkMetaData::builder(descr.column(0))
+                    .set_num_values(10)
+                    .build()
+                    .unwrap(),
+            ])
+            .build()
+            .unwrap();
+        let md = ParquetMetaData::new(
+            FileMetaData::new(1, 20, None, None, descr.clone(), None),
+            vec![rg0, rg1],
+        );
+
+        let arrow_schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+        let stats = StatisticsContainer::from_parquet_metadata(&md, &arrow_schema);
+
+        let filters = vec![Filter::try_from(("id", "=", "5")).unwrap()];
+        let pruner = FilePruner::new(&filters, &arrow_schema, &Schema::empty()).unwrap();
+        assert!(
+            pruner.should_include(&stats),
+            "file was pruned for `id = 5` although row group 1 has no stats"
+        );
+    }
 }
