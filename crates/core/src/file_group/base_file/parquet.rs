@@ -18,22 +18,20 @@
  */
 //! Parquet implementation of [`BaseFileReader`].
 
+use std::ops::Range;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::{FutureExt, TryFutureExt};
+use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
-// `ParquetObjectReader` is deprecated as of parquet 59 in favour of hand-rolling
-// an `AsyncFileReader` over `object_store`. Replacing it is its own change
-// (apache/hudi-rs#843): it has to carry the counting wrapper and the metadata
-// normalization below, so the deprecated reader is kept, allowed at each use
-// site rather than for the whole file.
-#[allow(deprecated)]
-use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber, parquet_to_arrow_schema};
-use parquet::file::metadata::ParquetMetaData;
+use parquet::file::metadata::{ParquetMetaData, ParquetMetaDataReader};
 
 use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
@@ -44,59 +42,131 @@ use crate::storage::error::{Result, StorageError};
 use crate::storage::file_metadata::FileMetadata;
 use crate::storage::util::join_url_segments;
 
-/// `AsyncFileReader` wrapper that accumulates read volume into a shared
-/// [`ReadVolume`].
-///
-/// Delegates everything and changes no behaviour. Counting happens here rather
-/// than inside the object store because the store is shared between readers and
-/// therefore cannot carry per-read counters.
-struct CountingReader<R: AsyncFileReader> {
-    inner: R,
-    volume: Arc<ReadVolume>,
+fn to_parquet_err(e: object_store::Error) -> parquet::errors::ParquetError {
+    parquet::errors::ParquetError::External(Box::new(e))
 }
 
-impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
-    fn get_bytes(
-        &mut self,
-        range: std::ops::Range<u64>,
-    ) -> BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+/// Footer fetch that does not touch [`ReadVolume`].
+///
+/// Column-chunk counters intentionally exclude the footer: they measure what a
+/// data read costs, and the previous `CountingReader` wrapper was installed only
+/// after the footer was already loaded. Keeping that boundary here means folding
+/// the reader into one type does not change what the counters mean (#843).
+struct UncountedStoreFetch<'a> {
+    store: &'a Arc<dyn ObjectStore>,
+    path: &'a ObjPath,
+}
+
+impl MetadataFetch for UncountedStoreFetch<'_> {
+    fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+        self.store
+            .get_range(self.path, range)
+            .map_err(to_parquet_err)
+            .boxed()
+    }
+}
+
+/// In-house [`AsyncFileReader`] over `object_store`, with read-volume counting
+/// and legacy-list metadata normalization folded in.
+///
+/// Replaces the deprecated `ParquetObjectReader` plus the old `CountingReader`
+/// wrapper (apache/hudi-rs#843). Range I/O goes straight to `get_range` /
+/// `get_ranges`; the footer is loaded once with the known file size, normalized,
+/// and cached for later `get_metadata` calls.
+#[derive(Clone)]
+struct CountingObjectStoreReader {
+    store: Arc<dyn ObjectStore>,
+    path: ObjPath,
+    file_size: u64,
+    volume: Arc<ReadVolume>,
+    /// Normalized footer metadata, filled on the first `get_metadata`.
+    metadata: Option<Arc<ParquetMetaData>>,
+}
+
+impl CountingObjectStoreReader {
+    fn new(
+        store: Arc<dyn ObjectStore>,
+        path: ObjPath,
+        file_size: u64,
+        volume: Arc<ReadVolume>,
+    ) -> Self {
+        Self {
+            store,
+            path,
+            file_size,
+            volume,
+            metadata: None,
+        }
+    }
+}
+
+impl AsyncFileReader for CountingObjectStoreReader {
+    fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let volume = self.volume.clone();
-        let fut = self.inner.get_bytes(range);
-        Box::pin(async move {
-            let bytes = fut.await?;
-            volume.add_bytes(bytes.len() as u64);
-            Ok(bytes)
-        })
+        self.store
+            .get_range(&self.path, range)
+            .map_ok(move |bytes| {
+                volume.add_bytes(bytes.len() as u64);
+                bytes
+            })
+            .map_err(to_parquet_err)
+            .boxed()
     }
 
     fn get_byte_ranges(
         &mut self,
-        ranges: Vec<std::ops::Range<u64>>,
-    ) -> BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>> {
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
         let volume = self.volume.clone();
-        let fut = self.inner.get_byte_ranges(ranges);
-        Box::pin(async move {
-            let chunks = fut.await?;
+        async move {
+            let chunks = self
+                .store
+                .get_ranges(&self.path, &ranges)
+                .await
+                .map_err(to_parquet_err)?;
             // One call, many ranges: count the call once and every byte it
             // returned, so `io_calls` stays a count of round trips.
             let total: u64 = chunks.iter().map(|b| b.len() as u64).sum();
             volume.add_bytes(total);
             Ok(chunks)
-        })
+        }
+        .boxed()
     }
 
     fn get_metadata<'a>(
         &'a mut self,
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        self.inner.get_metadata(options)
+        Box::pin(async move {
+            if let Some(metadata) = &self.metadata {
+                return Ok(metadata.clone());
+            }
+
+            // A parquet-avro writer with `write-old-list-structure=true` encodes
+            // an `array<map>` as a legacy 2-level list whose element is a
+            // REPEATED map group, which parquet-rs rejects when building the
+            // Arrow schema — "Map cannot be repeated". The footer parse itself
+            // does not, so the schema is rewritten here and every reader built
+            // from this metadata accepts the file. Column chunks are untouched.
+            let raw = ParquetMetaDataReader::new()
+                .with_arrow_reader_options(options)
+                .load_and_finish(
+                    UncountedStoreFetch {
+                        store: &self.store,
+                        path: &self.path,
+                    },
+                    self.file_size,
+                )
+                .await?;
+            let normalized = normalize_parquet_metadata(Arc::new(raw));
+            self.metadata = Some(normalized.clone());
+            Ok(normalized)
+        })
     }
 }
 
-/// The builder every read here is driven from: a parquet object reader with the
-/// read-volume counters wrapped around it.
-#[allow(deprecated)]
-type CountedBuilder = ParquetRecordBatchStreamBuilder<CountingReader<ParquetObjectReader>>;
+/// The builder every read here is driven from: the counting object-store reader.
+type CountedBuilder = ParquetRecordBatchStreamBuilder<CountingObjectStoreReader>;
 
 /// Parquet implementation of [`BaseFileReader`].
 ///
@@ -141,27 +211,21 @@ impl ParquetBaseFileReader {
         file_size: u64,
         row_index_column: Option<&str>,
     ) -> Result<CountedBuilder> {
-        #[allow(deprecated)]
-        let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
-            .with_file_size(file_size);
+        let mut reader = CountingObjectStoreReader::new(
+            self.storage.object_store.clone(),
+            obj_path,
+            file_size,
+            self.storage.read_volume.clone(),
+        );
 
-        // A parquet-avro writer with `write-old-list-structure=true` encodes an
-        // `array<map>` as a legacy 2-level list whose element is a REPEATED map
-        // group, which parquet-rs rejects outright when it builds the Arrow
-        // schema — "Map cannot be repeated". The footer parse itself does not,
-        // so the schema is rewritten in between and every reader built from this
-        // metadata accepts the file. The column chunks are untouched.
-        let raw = reader.get_metadata(None).await?;
-        let normalized = normalize_parquet_metadata(raw);
+        // Load and normalize the footer once; `ArrowReaderMetadata` then holds
+        // it for the stream builder so column-chunk reads do not re-parse.
+        let normalized = reader.get_metadata(None).await?;
         let arrow_metadata = ArrowReaderMetadata::try_new(
             normalized,
             Self::arrow_reader_options(row_index_column)?,
         )?;
 
-        let reader = CountingReader {
-            inner: reader,
-            volume: self.storage.read_volume.clone(),
-        };
         Ok(ParquetRecordBatchStreamBuilder::new_with_metadata(
             reader,
             arrow_metadata,
@@ -502,6 +566,32 @@ mod tests {
 
         let batch = reader.read_data("a.parquet", opts).await.unwrap();
         assert_eq!(batch.num_rows(), 0, "the predicate rejected every row");
+    }
+
+    /// Footer-only work (schema / metadata) must not move the column-chunk
+    /// counters. Those exist to describe a data read; counting the footer would
+    /// change their meaning when the deprecated reader was replaced (#843).
+    #[tokio::test]
+    async fn footer_fetch_is_not_counted_as_read_volume() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let storage = test_storage();
+        let volume = storage.read_volume();
+        let reader = ParquetBaseFileReader::new(storage);
+
+        let _ = reader.get_schema("a.parquet").await.unwrap();
+        let _ = reader.get_parquet_metadata("a.parquet").await.unwrap();
+
+        assert_eq!(
+            volume.bytes_read.load(Relaxed),
+            0,
+            "footer IO stays outside bytes_read"
+        );
+        assert_eq!(
+            volume.io_calls.load(Relaxed),
+            0,
+            "footer IO stays outside io_calls"
+        );
     }
 
     /// The volume counters describe a real read: what the file held, what was
