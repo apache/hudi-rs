@@ -556,6 +556,77 @@ mod tests {
         assert!(!includes(("date", ">", "2024-01-01"), default_category));
     }
 
+    /// A value containing a structural character is escaped by the writer precisely so the
+    /// split stays unambiguous, so each decoded value must keep its escaped `/`, `=`, space
+    /// and `%` inside the one segment.
+    #[test]
+    fn test_partition_pruner_url_encoded_value_contains_separators() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        for (encoded, decoded) in [
+            ("category=a%2Fb", "a/b"),
+            ("category=a%3Db", "a=b"),
+            ("category=a%20b", "a b"),
+            ("category=a%25b", "a%b"),
+        ] {
+            let segments = pruner.parse_segments(encoded).unwrap();
+            let expected = SchemableFilter::cast_value(&[decoded], &DataType::Utf8).unwrap();
+            assert_eq!(
+                segments["category"]
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .into_inner()
+                    .as_ref(),
+                expected.into_inner().as_ref(),
+                "decoding {encoded}"
+            );
+        }
+    }
+
+    /// Decoding happens exactly once: a literal `%2F` in the source value is written as
+    /// `%252F`, and one decode pass must yield `%2F`, not `/`.
+    #[test]
+    fn test_partition_pruner_url_decodes_exactly_once() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner.parse_segments("category=a%252Fb").unwrap();
+        let expected = SchemableFilter::cast_value(&["a%2Fb"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments["category"]
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_inner()
+                .as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
+    /// With url-encoding off, a `%` in a value is a literal `%` and must survive untouched.
+    #[test]
+    fn test_partition_pruner_no_decode_when_urlencode_disabled() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, false);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner.parse_segments("category=a%2Fb").unwrap();
+        let expected = SchemableFilter::cast_value(&["a%2Fb"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments["category"]
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_inner()
+                .as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
     #[test]
     fn test_partition_pruner_invalid_path() {
         let schema = create_test_schema();
