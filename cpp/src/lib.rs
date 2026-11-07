@@ -19,7 +19,9 @@
 mod util;
 
 use crate::util::create_raw_pointer_for_record_batches;
+use arrow_array::RecordBatch;
 use cxx::{CxxString, CxxVector};
+use hudi::config::read::HudiReadConfig;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
@@ -33,6 +35,27 @@ mod ffi {
         include!("arrow/c/abi.h");
 
         type ArrowArrayStream;
+    }
+
+    /// One column predicate, `field op value`. `op` is one of `=`, `!=`, `<`,
+    /// `<=`, `>`, `>=`, `IN`, `NOT IN`; the last two take a comma-separated
+    /// `value`.
+    struct HudiFilter {
+        field: String,
+        op: String,
+        value: String,
+    }
+
+    /// Options for one read. An empty `projection` reads every column.
+    ///
+    /// `read_optimized` reads the base file only and skips the log files;
+    /// `false` leaves the reader's own setting in place. Other read configs,
+    /// such as a time window, belong on `new_file_group_reader_with_options`:
+    /// a single slice read does not take them.
+    struct HudiReadOptions {
+        projection: Vec<String>,
+        filters: Vec<HudiFilter>,
+        read_optimized: bool,
     }
 
     extern "Rust" {
@@ -70,6 +93,25 @@ mod ffi {
         fn read_file_slice(
             self: &HudiFileGroupReader,
             file_slice: &HudiFileSlice,
+        ) -> Result<*mut ArrowArrayStream>;
+
+        /// Like `read_file_slice_from_paths`, honoring `options`.
+        ///
+        /// Throws `rust::Error` on failure, including a panic inside the library.
+        fn read_file_slice_from_paths_with_options(
+            self: &HudiFileGroupReader,
+            base_file_path: &CxxString,
+            log_file_paths: &CxxVector<CxxString>,
+            options: &HudiReadOptions,
+        ) -> Result<*mut ArrowArrayStream>;
+
+        /// Like `read_file_slice`, honoring `options`.
+        ///
+        /// Throws `rust::Error` on failure, including a panic inside the library.
+        fn read_file_slice_with_options(
+            self: &HudiFileGroupReader,
+            file_slice: &HudiFileSlice,
+            options: &HudiReadOptions,
         ) -> Result<*mut ArrowArrayStream>;
     }
 }
@@ -111,6 +153,31 @@ fn cxx_strs(values: &CxxVector<CxxString>) -> Result<Vec<&str>, String> {
     values.iter().map(cxx_str).collect()
 }
 
+impl TryFrom<&ffi::HudiReadOptions> for ReadOptions {
+    type Error = String;
+
+    fn try_from(options: &ffi::HudiReadOptions) -> Result<Self, String> {
+        let mut read_options = ReadOptions::new()
+            .with_filters(options.filters.iter().map(|f| (&f.field, &f.op, &f.value)))
+            .map_err(|e| format!("Invalid filter: {e}"))?;
+        if !options.projection.is_empty() {
+            read_options = read_options.with_projection(options.projection.clone());
+        }
+        // Only ever set to true: writing `false` would override a reader opened
+        // in read-optimized mode, and a zero-initialized C++ struct says false.
+        if options.read_optimized {
+            read_options = read_options
+                .with_hudi_option(HudiReadConfig::UseReadOptimizedMode.as_ref(), "true");
+        }
+        Ok(read_options)
+    }
+}
+
+fn to_stream(batch: RecordBatch) -> *mut ffi::ArrowArrayStream {
+    let schema = batch.schema();
+    create_raw_pointer_for_record_batches(vec![batch], schema)
+}
+
 #[derive(Debug)]
 pub struct HudiFileGroupReader {
     inner: FileGroupReader,
@@ -141,29 +208,53 @@ pub fn new_file_group_reader_with_options(
 }
 
 impl HudiFileGroupReader {
+    fn read_paths(
+        &self,
+        base_file_path: &CxxString,
+        log_file_paths: &CxxVector<CxxString>,
+        options: &ReadOptions,
+    ) -> Result<*mut ffi::ArrowArrayStream, String> {
+        let base_file_path = cxx_str(base_file_path)?;
+        let log_file_paths = cxx_strs(log_file_paths)?;
+        self.rt
+            .block_on(self.inner.read_file_slice_from_paths(
+                base_file_path,
+                log_file_paths,
+                options,
+            ))
+            .map(to_stream)
+            .map_err(|e| format!("Failed to read file batch: {e}"))
+    }
+
+    fn read_slice(
+        &self,
+        file_slice: &HudiFileSlice,
+        options: &ReadOptions,
+    ) -> Result<*mut ffi::ArrowArrayStream, String> {
+        self.rt
+            .block_on(self.inner.read_file_slice(&file_slice.inner, options))
+            .map(to_stream)
+            .map_err(|e| format!("Failed to read file slice: {e}"))
+    }
+
     pub fn read_file_slice_from_paths(
         &self,
         base_file_path: &CxxString,
         log_file_paths: &CxxVector<CxxString>,
     ) -> Result<*mut ffi::ArrowArrayStream, String> {
         guard("read_file_slice_from_paths", || {
-            let base_file_path = cxx_str(base_file_path)?;
-            let log_file_paths = cxx_strs(log_file_paths)?;
+            self.read_paths(base_file_path, log_file_paths, &ReadOptions::new())
+        })
+    }
 
-            let record_batch = self
-                .rt
-                .block_on(self.inner.read_file_slice_from_paths(
-                    base_file_path,
-                    log_file_paths,
-                    &ReadOptions::new(),
-                ))
-                .map_err(|e| format!("Failed to read file batch: {e}"))?;
-            let schema = record_batch.schema();
-
-            Ok(create_raw_pointer_for_record_batches(
-                vec![record_batch],
-                schema,
-            ))
+    pub fn read_file_slice_from_paths_with_options(
+        &self,
+        base_file_path: &CxxString,
+        log_file_paths: &CxxVector<CxxString>,
+        options: &ffi::HudiReadOptions,
+    ) -> Result<*mut ffi::ArrowArrayStream, String> {
+        guard("read_file_slice_from_paths_with_options", || {
+            self.read_paths(base_file_path, log_file_paths, &options.try_into()?)
         })
     }
 
@@ -172,19 +263,17 @@ impl HudiFileGroupReader {
         file_slice: &HudiFileSlice,
     ) -> Result<*mut ffi::ArrowArrayStream, String> {
         guard("read_file_slice", || {
-            let record_batch = self
-                .rt
-                .block_on(
-                    self.inner
-                        .read_file_slice(&file_slice.inner, &ReadOptions::new()),
-                )
-                .map_err(|e| format!("Failed to read file slice: {e}"))?;
-            let schema = record_batch.schema();
+            self.read_slice(file_slice, &ReadOptions::new())
+        })
+    }
 
-            Ok(create_raw_pointer_for_record_batches(
-                vec![record_batch],
-                schema,
-            ))
+    pub fn read_file_slice_with_options(
+        &self,
+        file_slice: &HudiFileSlice,
+        options: &ffi::HudiReadOptions,
+    ) -> Result<*mut ffi::ArrowArrayStream, String> {
+        guard("read_file_slice_with_options", || {
+            self.read_slice(file_slice, &options.try_into()?)
         })
     }
 }
@@ -225,18 +314,95 @@ pub fn new_file_slice_from_file_names(
 mod tests {
     use super::*;
     use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+    use arrow_array::{Array, Int32Array, RecordBatchReader};
     use cxx::let_cxx_string;
-    use hudi_test::SampleTable;
+    use hudi_test::{QuickstartTripsTable, SampleTable};
+    use std::path::Path;
 
     /// Takes back the stream a bridge function leaked for C++ and reads it.
-    fn rows_in(raw: *mut ffi::ArrowArrayStream) -> usize {
+    fn batch_in(raw: *mut ffi::ArrowArrayStream) -> RecordBatch {
         // SAFETY: `raw` is the one box the bridge leaks for the C++ caller,
         // reclaimed here instead.
         let stream = unsafe { Box::from_raw(raw as *mut FFI_ArrowArrayStream) };
-        ArrowArrayStreamReader::try_new(*stream)
+        let reader = ArrowArrayStreamReader::try_new(*stream).unwrap();
+        let schema = reader.schema();
+        let batches: Vec<RecordBatch> = reader.map(Result::unwrap).collect();
+        arrow::compute::concat_batches(&schema, &batches).unwrap()
+    }
+
+    fn rows_in(raw: *mut ffi::ArrowArrayStream) -> usize {
+        batch_in(raw).num_rows()
+    }
+
+    fn column_names(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
-            .map(|batch| batch.unwrap().num_rows())
-            .sum()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn read_options(
+        projection: &[&str],
+        filters: &[(&str, &str, &str)],
+        read_optimized: bool,
+    ) -> ffi::HudiReadOptions {
+        ffi::HudiReadOptions {
+            projection: projection.iter().map(|s| s.to_string()).collect(),
+            filters: filters
+                .iter()
+                .map(|(field, op, value)| ffi::HudiFilter {
+                    field: field.to_string(),
+                    op: op.to_string(),
+                    value: value.to_string(),
+                })
+                .collect(),
+            read_optimized,
+        }
+    }
+
+    fn open_reader(table_path: &str) -> Box<HudiFileGroupReader> {
+        let_cxx_string!(base_uri = table_path);
+        let options = CxxVector::<CxxString>::new();
+        new_file_group_reader_with_options(&base_uri, &options).unwrap()
+    }
+
+    /// One partition of a MOR fixture with a base file and the log file that
+    /// updates it, built without going through `CxxVector`, which cannot hold
+    /// strings pushed from Rust.
+    fn mor_slice_with_logs() -> (String, HudiFileSlice) {
+        let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+        let partition = file_names(Path::new(&table_path))
+            .into_iter()
+            .find(|name| !name.starts_with('.') && Path::new(&table_path).join(name).is_dir())
+            .expect("fixture has a partition");
+        let names = file_names(&Path::new(&table_path).join(&partition));
+        let base_file = names
+            .iter()
+            .find(|name| name.ends_with(".parquet") && !name.starts_with('.'))
+            .expect("partition has a base file");
+        let log_files: Vec<&str> = names
+            .iter()
+            .filter(|name| name.contains(".log."))
+            .map(String::as_str)
+            .collect();
+        assert!(!log_files.is_empty(), "partition has log files");
+
+        let mut file_group = FileGroup::new_with_base_file_name(base_file, &partition).unwrap();
+        file_group.add_log_files_from_names(&log_files).unwrap();
+        let inner = file_group.file_slices.values().next().unwrap().clone();
+        (table_path, HudiFileSlice { inner })
     }
 
     #[test]
@@ -303,16 +469,9 @@ mod tests {
     }
 
     fn first_base_file(table_path: &str) -> String {
-        let mut base_files: Vec<String> = std::fs::read_dir(table_path)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".parquet") && !name.starts_with('.'))
-            .collect();
-        base_files.sort();
-        base_files
+        file_names(Path::new(table_path))
             .into_iter()
-            .next()
+            .find(|name| name.ends_with(".parquet") && !name.starts_with('.'))
             .expect("fixture has a base file")
     }
 
@@ -323,9 +482,7 @@ mod tests {
         let table_path = SampleTable::V8Nonpartitioned.path_to_cow();
         let base_file_name = first_base_file(&table_path);
 
-        let_cxx_string!(base_uri = table_path.as_str());
-        let options = CxxVector::<CxxString>::new();
-        let reader = new_file_group_reader_with_options(&base_uri, &options).unwrap();
+        let reader = open_reader(&table_path);
 
         let_cxx_string!(base_file_path = base_file_name.as_str());
         let log_file_paths = CxxVector::<CxxString>::new();
@@ -347,9 +504,7 @@ mod tests {
     #[test]
     fn test_reader_usable_after_panic_inside_block_on() {
         let table_path = SampleTable::V8Nonpartitioned.path_to_cow();
-        let_cxx_string!(base_uri = table_path.as_str());
-        let options = CxxVector::<CxxString>::new();
-        let reader = new_file_group_reader_with_options(&base_uri, &options).unwrap();
+        let reader = open_reader(&table_path);
 
         let err = guard("read", || -> Result<(), String> {
             reader.rt.block_on(async { panic!("mid-read") })
@@ -368,9 +523,7 @@ mod tests {
     #[test]
     fn test_read_file_slice_from_paths_missing_base_file_is_error() {
         let table_path = SampleTable::V8Nonpartitioned.path_to_cow();
-        let_cxx_string!(base_uri = table_path.as_str());
-        let options = CxxVector::<CxxString>::new();
-        let reader = new_file_group_reader_with_options(&base_uri, &options).unwrap();
+        let reader = open_reader(&table_path);
 
         let_cxx_string!(base_file_path = "missing-file.parquet");
         let log_file_paths = CxxVector::<CxxString>::new();
@@ -381,5 +534,116 @@ mod tests {
             err.starts_with("Failed to read file batch"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_read_options_empty_means_defaults() {
+        let options = ReadOptions::try_from(&read_options(&[], &[], false)).unwrap();
+        assert_eq!(options.projection, None);
+        assert!(options.filters.is_empty());
+        assert!(options.hudi_options.is_empty());
+    }
+
+    #[test]
+    fn test_read_options_maps_every_field() {
+        let options = ReadOptions::try_from(&read_options(
+            &["id", "name"],
+            &[("id", ">", "5"), ("name", "NOT IN", "a,b")],
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            options.projection.as_deref(),
+            Some(&["id".to_string(), "name".to_string()][..])
+        );
+        assert_eq!(options.filters.len(), 2);
+        assert!(options.is_read_optimized().unwrap());
+    }
+
+    #[test]
+    fn test_read_options_bad_operator_is_error() {
+        let err =
+            ReadOptions::try_from(&read_options(&[], &[("id", "~", "5")], false)).unwrap_err();
+        assert!(err.starts_with("Invalid filter"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_read_file_slice_with_options_applies_projection_and_filter() {
+        let (table_path, slice) = mor_slice_with_logs();
+        let reader = open_reader(&table_path);
+
+        let all = batch_in(reader.read_file_slice(&slice).unwrap());
+        let ids = all.column_by_name("id").unwrap();
+        let ids = ids.as_any().downcast_ref::<Int32Array>().unwrap();
+        let max_id = ids.iter().flatten().max().unwrap();
+
+        let options = read_options(&["id", "name"], &[("id", "=", &max_id.to_string())], false);
+        let batch = batch_in(
+            reader
+                .read_file_slice_with_options(&slice, &options)
+                .unwrap(),
+        );
+        assert_eq!(column_names(&batch), ["id", "name"]);
+        assert_eq!(batch.num_rows(), 1);
+    }
+
+    /// Read-optimized mode never opens log files, so a slice whose only log
+    /// file does not exist reads fine with it and fails without it.
+    #[test]
+    fn test_read_file_slice_with_options_read_optimized_skips_logs() {
+        let table_path = SampleTable::V8Nonpartitioned.path_to_cow();
+        let base_file = first_base_file(&table_path);
+        let (file_id, rest) = base_file.split_once('_').unwrap();
+        let commit = rest
+            .rsplit('_')
+            .next()
+            .unwrap()
+            .trim_end_matches(".parquet");
+        let mut file_group = FileGroup::new_with_base_file_name(&base_file, "").unwrap();
+        file_group
+            .add_log_files_from_names([format!(".{file_id}_{commit}.log.1_0-0-0")])
+            .unwrap();
+        let slice = HudiFileSlice {
+            inner: file_group.file_slices.values().next().unwrap().clone(),
+        };
+        let reader = open_reader(&table_path);
+
+        let read_optimized = read_options(&[], &[], true);
+        let raw = reader
+            .read_file_slice_with_options(&slice, &read_optimized)
+            .unwrap();
+        assert!(rows_in(raw) > 0);
+
+        let err = reader
+            .read_file_slice_with_options(&slice, &read_options(&[], &[], false))
+            .unwrap_err();
+        assert!(
+            err.starts_with("Failed to read file slice") && err.contains(".log.1_0-0-0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// The paths entry point is the one a C++ caller uses with a split, so it
+    /// is covered with options too, not only its slice twin.
+    #[test]
+    fn test_read_file_slice_from_paths_with_options_applies_projection_and_filter() {
+        let table_path = SampleTable::V8Nonpartitioned.path_to_cow();
+        let reader = open_reader(&table_path);
+        let_cxx_string!(base_file_path = first_base_file(&table_path));
+        let log_file_paths = CxxVector::<CxxString>::new();
+
+        let all = batch_in(
+            reader
+                .read_file_slice_from_paths(&base_file_path, &log_file_paths)
+                .unwrap(),
+        );
+        let options = read_options(&["name"], &[("name", "!=", "")], false);
+        let batch = batch_in(
+            reader
+                .read_file_slice_from_paths_with_options(&base_file_path, &log_file_paths, &options)
+                .unwrap(),
+        );
+        assert_eq!(column_names(&batch), ["name"]);
+        assert_eq!(batch.num_rows(), all.num_rows());
     }
 }
