@@ -16,7 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Minimal uncompressed HFile v3 writer used by metadata table writes.
+//! HFile v3 writer used by metadata table writes.
 
 use std::collections::BTreeMap;
 
@@ -24,6 +24,7 @@ use prost::Message;
 
 use crate::hfile::block::BLOCK_HEADER_SIZE;
 use crate::hfile::block_type::HFileBlockType;
+use crate::hfile::compression::CompressionCodec;
 use crate::hfile::error::{HFileError, Result};
 use crate::hfile::proto::{BytesBytesPair, InfoProto, TrailerProto};
 use crate::hfile::trailer::TRAILER_SIZE;
@@ -40,9 +41,20 @@ impl HFileWriter {
         entries: &[(String, Vec<u8>)],
         file_info: BTreeMap<String, Vec<u8>>,
     ) -> Result<Vec<u8>> {
+        Self::write_with_compression(entries, file_info, CompressionCodec::None)
+    }
+
+    /// Write sorted key/value records using NONE or GZIP compression.
+    ///
+    /// Returns an error for codecs whose writer is not implemented.
+    pub fn write_with_compression(
+        entries: &[(String, Vec<u8>)],
+        file_info: BTreeMap<String, Vec<u8>>,
+        codec: CompressionCodec,
+    ) -> Result<Vec<u8>> {
         let mut entries: Vec<&(String, Vec<u8>)> = entries.iter().collect();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
-        let mut builder = HFileBuilder::new(usize::MAX);
+        let mut builder = HFileBuilder::new(usize::MAX).with_compression(codec)?;
         for (key, value) in entries {
             builder.append(key.as_bytes(), value)?;
         }
@@ -50,12 +62,13 @@ impl HFileWriter {
     }
 }
 
-/// Builds an uncompressed HFile v3 from cells appended in key order, cutting a
+/// Builds an HFile v3 from cells appended in key order, cutting a
 /// new data block once the current one reaches the block size.
 ///
 /// Cells are taken as key content and value slices, so a caller holding a cell
 /// read from another HFile writes it without decoding the value.
 pub struct HFileBuilder {
+    codec: CompressionCodec,
     block_size: usize,
     output: Vec<u8>,
     /// The data block being filled.
@@ -73,6 +86,7 @@ impl HFileBuilder {
     /// A builder cutting data blocks at `block_size` bytes of cell data.
     pub fn new(block_size: usize) -> Self {
         Self {
+            codec: CompressionCodec::None,
             block_size: block_size.max(1),
             output: Vec::new(),
             data: Vec::new(),
@@ -83,6 +97,22 @@ impl HFileBuilder {
             total_uncompressed_bytes: 0,
             entry_count: 0,
         }
+    }
+
+    /// Select NONE or GZIP before appending cells.
+    ///
+    /// A file has one codec in its trailer, so it cannot change after writing starts.
+    pub fn with_compression(mut self, codec: CompressionCodec) -> Result<Self> {
+        if self.entry_count != 0 {
+            return Err(HFileError::InvalidFormat(
+                "HFile compression must be selected before appending cells".to_string(),
+            ));
+        }
+        if !matches!(codec, CompressionCodec::None | CompressionCodec::Gzip) {
+            return Err(HFileError::UnsupportedCompression(codec as u32));
+        }
+        self.codec = codec;
+        Ok(self)
     }
 
     /// Append one cell. Keys must arrive in ascending byte order, which is the
@@ -131,6 +161,7 @@ impl HFileBuilder {
             HFileBlockType::Data,
             &self.data,
             self.last_data_block_offset,
+            self.codec,
         )?;
         let on_disk_size = u32::try_from(block.len())
             .map_err(|_| HFileError::InvalidFormat("HFile block is too large".to_string()))?;
@@ -149,7 +180,7 @@ impl HFileBuilder {
         // An empty file still carries a single empty data block, as readers
         // expect a data block before the load-on-open section.
         if self.index.is_empty() {
-            output = write_block(HFileBlockType::Data, &[], -1)?;
+            output = write_block(HFileBlockType::Data, &[], -1, self.codec)?;
         }
         let last_key = if self.entry_count > 0 {
             structured_key(&self.last_key_content)?
@@ -178,6 +209,7 @@ impl HFileBuilder {
             HFileBlockType::RootIndex,
             &root_index,
             self.last_data_block_offset.max(0),
+            self.codec,
         )?);
 
         let meta_index_offset = output.len() as u64;
@@ -185,6 +217,7 @@ impl HFileBuilder {
             HFileBlockType::RootIndex,
             &[],
             root_index_offset as i64,
+            self.codec,
         )?);
 
         file_info.insert("hfile.LASTKEY".to_string(), last_key);
@@ -211,6 +244,7 @@ impl HFileBuilder {
             HFileBlockType::FileInfo,
             &info_bytes,
             meta_index_offset as i64,
+            self.codec,
         )?);
 
         let trailer = TrailerProto {
@@ -228,7 +262,7 @@ impl HFileBuilder {
             comparator_class_name: Some(
                 "org.apache.hudi.io.storage.HoodieHBaseKVComparator".to_string(),
             ),
-            compression_codec: Some(2),
+            compression_codec: Some(self.codec as u32),
             encryption_key: None,
         };
         let encoded_trailer = trailer.encode_to_vec();
@@ -273,9 +307,15 @@ fn push_structured_key(out: &mut Vec<u8>, content: &[u8]) -> crate::hfile::error
     Ok(())
 }
 
-fn write_block(block_type: HFileBlockType, data: &[u8], previous_offset: i64) -> Result<Vec<u8>> {
-    let checksum_bytes = (BLOCK_HEADER_SIZE + data.len()).div_ceil(BYTES_PER_CHECKSUM) * 4;
-    let on_disk_size = data
+fn write_block(
+    block_type: HFileBlockType,
+    data: &[u8],
+    previous_offset: i64,
+    codec: CompressionCodec,
+) -> Result<Vec<u8>> {
+    let compressed = codec.compress(data)?;
+    let checksum_bytes = (BLOCK_HEADER_SIZE + compressed.len()).div_ceil(BYTES_PER_CHECKSUM) * 4;
+    let on_disk_size = compressed
         .len()
         .checked_add(checksum_bytes)
         .ok_or_else(|| HFileError::InvalidFormat("HFile block size overflow".to_string()))?;
@@ -295,11 +335,11 @@ fn write_block(block_type: HFileBlockType, data: &[u8], previous_offset: i64) ->
     block.push(CHECKSUM_TYPE_CRC32);
     block.extend_from_slice(&(BYTES_PER_CHECKSUM as i32).to_be_bytes());
     block.extend_from_slice(
-        &i32::try_from(BLOCK_HEADER_SIZE + data.len())
+        &i32::try_from(BLOCK_HEADER_SIZE + compressed.len())
             .map_err(|_| HFileError::InvalidFormat("HFile block is too large".to_string()))?
             .to_be_bytes(),
     );
-    block.extend_from_slice(data);
+    block.extend_from_slice(&compressed);
     block.resize(BLOCK_HEADER_SIZE + on_disk_size, 0);
     Ok(block)
 }
@@ -388,5 +428,107 @@ mod tests {
                 .comparator_class_name,
             "org.apache.hudi.io.storage.HoodieHBaseKVComparator"
         );
+    }
+
+    #[test]
+    fn test_gzip_multiblock_scan_and_lookup() {
+        for count in [0, 1, 257] {
+            for block_size in [1, 64, 16384] {
+                let mut builder = HFileBuilder::new(block_size)
+                    .with_compression(CompressionCodec::Gzip)
+                    .unwrap();
+                let entries: Vec<_> = (0..count)
+                    .map(|n| (format!("key{n:05}"), vec![(n % 251) as u8; 500]))
+                    .collect();
+                for (key, value) in &entries {
+                    builder.append(key.as_bytes(), value).unwrap();
+                }
+                let bytes = builder
+                    .finish(BTreeMap::from([(
+                        "custom".to_string(),
+                        b"file-info".to_vec(),
+                    )]))
+                    .unwrap();
+                let trailer = crate::hfile::trailer::HFileTrailer::read(&bytes).unwrap();
+                assert_eq!(trailer.compression_codec, CompressionCodec::Gzip);
+                assert_eq!(trailer.entry_count, count as u64);
+                let mut reader = HFileReader::new(bytes).unwrap();
+                assert_eq!(
+                    reader.get_file_info("custom"),
+                    Some(b"file-info".as_slice())
+                );
+                let records = reader.collect_records().unwrap();
+                assert_eq!(records.len(), entries.len());
+                for (record, (key, value)) in records.iter().zip(&entries) {
+                    assert_eq!(record.key_as_str(), Some(key.as_str()));
+                    assert_eq!(record.value(), value);
+                }
+                let keys: Vec<_> = entries.iter().map(|(key, _)| key.as_str()).collect();
+                let located = reader.lookup_records(&keys).unwrap();
+                for ((_, record), (_, value)) in located.iter().zip(&entries) {
+                    assert_eq!(record.as_ref().unwrap().value(), value);
+                }
+                assert!(reader.lookup_records(&["missing"]).unwrap()[0].1.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn test_gzip_block_sizes_and_corruption() {
+        use crate::hfile::block::HFileBlock;
+        // Incompressible input exercises compressed sizes larger than the input
+        // and both sides of checksum chunk boundaries.
+        let mut seed = 42u64;
+        for size in [0, 1, 16300, 16350, 16384, 32768, 100000] {
+            let input: Vec<u8> = (0..size)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    seed as u8
+                })
+                .collect();
+            let mut bytes =
+                write_block(HFileBlockType::Data, &input, -1, CompressionCodec::Gzip).unwrap();
+            let block = HFileBlock::parse(&bytes, CompressionCodec::Gzip).unwrap();
+            assert_eq!(block.data, input);
+            assert_eq!(block.header.on_disk_size_with_header(), bytes.len());
+            assert_eq!(block.header.uncompressed_size_without_header, size);
+            let end = block.header.on_disk_data_size_with_header;
+            assert_eq!(bytes.len() - end, end.div_ceil(BYTES_PER_CHECKSUM) * 4);
+            bytes[end - 8] ^= 1; // Damage the gzip CRC, keeping HFile framing valid.
+            assert!(HFileBlock::parse(&bytes, CompressionCodec::Gzip).is_err());
+        }
+    }
+
+    #[test]
+    fn test_compression_selection_preserves_default_and_rejects_invalid_changes() {
+        let entries = vec![("a".to_string(), vec![b'x'; 10000])];
+        let default = HFileWriter::write(&entries, BTreeMap::new()).unwrap();
+        let none =
+            HFileWriter::write_with_compression(&entries, BTreeMap::new(), CompressionCodec::None)
+                .unwrap();
+        assert_eq!(default, none);
+        let gzip =
+            HFileWriter::write_with_compression(&entries, BTreeMap::new(), CompressionCodec::Gzip)
+                .unwrap();
+        assert!(gzip.len() < none.len());
+        for codec in [
+            CompressionCodec::Lzo,
+            CompressionCodec::Snappy,
+            CompressionCodec::Lz4,
+            CompressionCodec::Bzip2,
+            CompressionCodec::Zstd,
+        ] {
+            assert!(matches!(
+                HFileWriter::write_with_compression(&[], BTreeMap::new(), codec),
+                Err(HFileError::UnsupportedCompression(_))
+            ));
+        }
+        for block_size in [1, 10000] {
+            let mut builder = HFileBuilder::new(block_size);
+            builder.append(b"key", b"value").unwrap();
+            assert!(builder.with_compression(CompressionCodec::Gzip).is_err());
+        }
     }
 }

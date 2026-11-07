@@ -828,6 +828,29 @@ def test_compact_folds_logs_and_keeps_rows(tmp_path):
     assert table.await_compaction() is None
 
 
+def test_gzip_metadata_survives_reopen_and_compaction(tmp_path):
+    path = str(tmp_path / "trips")
+    table = HudiTable.create(
+        path,
+        record_key="id",
+        partition_by="city",
+        ordering_fields="ts",
+        table_type="mor",
+        hudi_options={
+            "hoodie.hfile.compression.algorithm": "GZ",
+            "hoodie.metadata.compact.max.delta.commits": "2",
+        },
+    )
+    table.append(trips(("t1", "sf", 1, 30.0), ("t2", "nyc", 1, 10.0)))
+    table = HudiTable(path)
+    table.upsert(trips(("t1", "sf", 2, 31.0)))
+    table.compact()
+    assert snapshot(HudiTable(path)) == {
+        "t1": ("sf", 2, 31.0),
+        "t2": ("nyc", 1, 10.0),
+    }
+
+
 def test_compaction_in_the_background(tmp_path):
     table = HudiTable.create(
         str(tmp_path / "trips"),

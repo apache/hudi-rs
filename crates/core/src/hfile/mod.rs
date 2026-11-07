@@ -52,6 +52,7 @@ mod writer;
 
 pub use block::BlockIndexEntry;
 pub use block_type::HFileBlockType;
+pub use compression::CompressionCodec;
 pub use error::{HFileError, Result};
 pub use key::{Key, KeyValue, Utf8Key};
 pub use reader::{HFileReader, HFileRecordIterator, SeekResult};

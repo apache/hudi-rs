@@ -35,7 +35,7 @@ use apache_avro::Schema as AvroSchema;
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
-use crate::hfile::{HFileBuilder, HFileReader, HFileRecord};
+use crate::hfile::{CompressionCodec, HFileBuilder, HFileReader, HFileRecord};
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::compaction::{CompactionOperation, CompactionPlan};
 use crate::metadata::payload_merger::MetadataPayloadMerger;
@@ -360,6 +360,7 @@ async fn write_compacted_slices(
     instant: &str,
 ) -> Result<Vec<HoodieWriteStat>> {
     let storage = table.file_system_view.storage.clone();
+    let codec = crate::write::metadata::hfile_compression(&table.hudi_configs)?;
     let tasks = slices
         .iter()
         .map(|slice| {
@@ -380,7 +381,7 @@ async fn write_compacted_slices(
                     let num_log_files = log_paths.len() as i64;
                     let groups = scanner.scan_hfile_records(log_paths, &range).await?;
                     let (bytes, num_records) = tokio::task::spawn_blocking(move || {
-                        compact_slice(kind, base, groups, version)
+                        compact_slice(kind, base, groups, version, codec)
                     })
                     .await
                     .map_err(|e| {
@@ -602,6 +603,7 @@ fn compact_slice(
     base: Option<Vec<u8>>,
     groups: Vec<HFileRecordGroup>,
     version: StatsIndexVersion,
+    codec: CompressionCodec,
 ) -> Result<(Vec<u8>, u64)> {
     let hfile_error = |e: crate::hfile::HFileError| CoreError::HFile(e.to_string());
     let output = metadata_schema()?;
@@ -677,7 +679,7 @@ fn compact_slice(
     touched.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut touched = touched.into_iter().peekable();
 
-    let mut out = CompactedFile::new();
+    let mut out = CompactedFile::new(codec)?;
     if let Some(reader) = base.as_mut() {
         for kv in reader.iter().map_err(hfile_error)? {
             let kv = kv.map_err(hfile_error)?;
@@ -707,12 +709,14 @@ struct CompactedFile {
 }
 
 impl CompactedFile {
-    fn new() -> Self {
-        Self {
-            builder: HFileBuilder::new(HFILE_BLOCK_SIZE),
+    fn new(codec: CompressionCodec) -> Result<Self> {
+        Ok(Self {
+            builder: HFileBuilder::new(HFILE_BLOCK_SIZE)
+                .with_compression(codec)
+                .map_err(|e| CoreError::HFile(e.to_string()))?,
             min_key: None,
             max_key: Vec::new(),
-        }
+        })
     }
 
     fn push(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -823,6 +827,7 @@ mod tests {
             Some(base),
             groups,
             StatsIndexVersion::V2,
+            CompressionCodec::None,
         )
         .unwrap();
         assert_eq!(count, 3);
@@ -856,6 +861,7 @@ mod tests {
             Some(base),
             vec![group(&[("j", b"w")])],
             StatsIndexVersion::V2,
+            CompressionCodec::None,
         )
         .unwrap_err();
         assert!(matches!(error, CoreError::Unsupported(_)), "{error}");
@@ -868,6 +874,7 @@ mod tests {
             Some(hfile(&[("k", b"v")])),
             vec![foreign],
             StatsIndexVersion::V2,
+            CompressionCodec::None,
         )
         .unwrap_err();
         assert!(matches!(error, CoreError::Unsupported(_)), "{error}");
@@ -917,6 +924,7 @@ mod tests {
             None,
             vec![group(&[("k", b"v")])],
             StatsIndexVersion::V2,
+            CompressionCodec::None,
         )
         .unwrap();
         assert_eq!(
@@ -928,6 +936,7 @@ mod tests {
             Some(hfile(&[("k", b"v")])),
             vec![group(&[("k", b"")])],
             StatsIndexVersion::V2,
+            CompressionCodec::None,
         )
         .unwrap();
         assert_eq!((cells(bytes), count), (Vec::new(), 0));
@@ -964,8 +973,14 @@ mod tests {
                 ("__all_partitions__", &all_partitions),
             ]),
         ];
-        let (bytes, _) =
-            compact_slice(MergeKind::Files, Some(base), groups, StatsIndexVersion::V2).unwrap();
+        let (bytes, _) = compact_slice(
+            MergeKind::Files,
+            Some(base),
+            groups,
+            StatsIndexVersion::V2,
+            CompressionCodec::None,
+        )
+        .unwrap();
         let schema = metadata_schema().unwrap();
         let decoded: HashMap<String, Vec<(String, i64, bool)>> = cells(bytes)
             .into_iter()
@@ -1304,10 +1319,15 @@ mod tests {
         let path = dir.path();
         let mut table = indexed_table(path, TableTypeValue::MergeOnRead, "1000").await;
         write_history(&mut table).await;
-        let mut handle =
-            Table::new_with_options(path.to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
-                .await
-                .unwrap();
+        let mut handle = Table::new_with_options(
+            path.to_str().unwrap(),
+            [
+                (MAX_DELTA_COMMITS, "1"),
+                ("hoodie.hfile.compression.algorithm", "GZ"),
+            ],
+        )
+        .await
+        .unwrap();
         let storage = handle.file_system_view.storage.clone();
 
         let pending = crate::write::append::generate_instant_time().await;
@@ -1360,5 +1380,214 @@ mod tests {
         );
         assert!(instant > crashed);
         assert_eq!(metadata_views(path).await, before);
+    }
+
+    async fn assert_metadata_codec(table: &Table, gzip: bool, logs: bool, instant: Option<&str>) {
+        let storage = table.file_system_view.storage.as_ref();
+        let mut total = 0;
+        for partition in table.get_metadata_table_partitions() {
+            let slices = crate::write::metadata::mdt_partition_latest_slices(storage, &partition)
+                .await
+                .unwrap();
+            let mut checked = 0;
+            for (_, base, log_paths) in slices {
+                let paths = if logs {
+                    log_paths
+                } else {
+                    base.into_iter().collect()
+                };
+                for path in paths {
+                    if instant.is_some_and(|instant| !path.ends_with(&format!("_{instant}.hfile")))
+                    {
+                        continue;
+                    }
+                    let bytes = storage.get_file_data(&path).await.unwrap();
+                    // The fixture's values contain no block magic. Delete-only
+                    // logs have no HFile payload and are deliberately skipped.
+                    for offset in bytes
+                        .windows(8)
+                        .enumerate()
+                        .filter_map(|(offset, magic)| (magic == b"DATABLK*").then_some(offset))
+                    {
+                        assert_eq!(
+                            &bytes[offset + 33..offset + 35] == b"\x1f\x8b",
+                            gzip,
+                            "{path}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            if instant.is_none() {
+                assert!(checked > 0, "no HFile checked in {partition}, logs={logs}");
+            }
+            total += checked;
+        }
+        // Compaction leaves groups without new logs on their existing bases.
+        assert!(total > 0, "no metadata HFiles checked");
+    }
+
+    #[tokio::test]
+    async fn test_metadata_compression_inherits_persisted_option() {
+        const CODEC: &str = "hoodie.hfile.compression.algorithm";
+        for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let mut table = Table::create(path.to_str().unwrap())
+                .with_table_name("compressed")
+                .with_table_type(table_type.clone())
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_ordering_fields(["ts"])
+                .with_partition_stats_enabled(true)
+                .with_option(CODEC, "gz")
+                .create()
+                .await
+                .unwrap();
+            assert_metadata_codec(&table, true, false, None).await;
+            write_history(&mut table).await;
+            assert_metadata_codec(&table, true, true, None).await;
+            let before = metadata_views(path).await;
+            let rows = data_rows(path).await;
+            let mut handle = Table::new_with_options(
+                path.to_str().unwrap(),
+                [(MAX_DELTA_COMMITS, "1"), (CODEC, "NONE")],
+            )
+            .await
+            .unwrap();
+            // hoodie.properties has precedence over runtime options.
+            assert_eq!(handle.hudi_configs.get_raw(CODEC), Some("gz"));
+            let instant = compact_metadata_table_if_needed(&mut handle)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_metadata_codec(&handle, true, false, Some(&instant)).await;
+            assert_eq!(metadata_views(path).await, before);
+            assert_eq!(data_rows(path).await, rows);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_metadata_compression_survives_runtime_codec_changes() {
+        const CODEC: &str = "hoodie.hfile.compression.algorithm";
+        for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let mut table = indexed_table(path, table_type, "1000").await;
+            write_history(&mut table).await;
+            for (round, codec) in ["NONE", "GZ", "NONE"].into_iter().enumerate() {
+                let rows = data_rows(path).await;
+                let before = metadata_views(path).await;
+                let mut handle = Table::new_with_options(
+                    path.to_str().unwrap(),
+                    [(MAX_DELTA_COMMITS, "1"), (CODEC, codec)],
+                )
+                .await
+                .unwrap();
+                let instant = compact_metadata_table_if_needed(&mut handle)
+                    .await
+                    .unwrap()
+                    .expect("metadata compaction must run");
+                assert_metadata_codec(&handle, codec == "GZ", false, Some(&instant)).await;
+                assert_eq!(metadata_views(path).await, before);
+                assert_eq!(data_rows(path).await, rows);
+                // Add logs with the opposite codec to the current base, then
+                // compact again.
+                let mut writer = Table::new_with_options(
+                    path.to_str().unwrap(),
+                    [(CODEC, if codec == "GZ" { "NONE" } else { "GZ" })],
+                )
+                .await
+                .unwrap();
+                let ts = 4 + round as i64;
+                let value = 20 + round as i64;
+                writer
+                    .upsert([batch(&[("a", "sf", ts, value)])])
+                    .await
+                    .unwrap();
+                let mut expected = rows;
+                expected.retain(|row| row.0 != "a");
+                expected.push(("a".to_string(), "sf".to_string(), ts, value));
+                expected.sort();
+                assert_eq!(data_rows(path).await, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_metadata_compression_fails_before_mutation() {
+        const CODEC: &str = "hoodie.hfile.compression.algorithm";
+        let dir = tempfile::tempdir().unwrap();
+        for invalid in ["", "zstd", "gziip"] {
+            let result = Table::create(dir.path().to_str().unwrap())
+                .with_table_name("invalid")
+                .with_record_key_fields(["id"])
+                .with_option(CODEC, invalid)
+                .create()
+                .await;
+            assert!(result.unwrap_err().to_string().contains(CODEC));
+            assert!(!dir.path().join(".hoodie/hoodie.properties").exists());
+        }
+        let mut table = indexed_table(dir.path(), TableTypeValue::MergeOnRead, "1000").await;
+        assert_metadata_codec(&table, false, false, None).await;
+        write_history(&mut table).await;
+        let before = data_rows(dir.path()).await;
+        let timeline = metadata_timeline_files(dir.path());
+        let mut invalid = Table::new_with_options(dir.path().to_str().unwrap(), [(CODEC, "ZSTD")])
+            .await
+            .unwrap();
+        assert!(
+            invalid
+                .upsert([batch(&[("x", "sf", 99, 99)])])
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(CODEC)
+        );
+        assert_eq!(metadata_timeline_files(dir.path()), timeline);
+        assert_eq!(data_rows(dir.path()).await, before);
+    }
+
+    #[tokio::test]
+    async fn test_gzip_metadata_compaction_recovers_failed_base_put() {
+        use crate::storage::fault::{FaultyPutStore, PutFault};
+        for fault in [PutFault::NotLanded, PutFault::LandedThenError] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let mut table = indexed_table(path, TableTypeValue::MergeOnRead, "1000").await;
+            write_history(&mut table).await;
+            let before = metadata_views(path).await;
+            let rows = data_rows(path).await;
+            let mut handle = Table::new_with_options(
+                path.to_str().unwrap(),
+                [
+                    (MAX_DELTA_COMMITS, "1"),
+                    ("hoodie.hfile.compression.algorithm", "GZ"),
+                ],
+            )
+            .await
+            .unwrap();
+            let storage = handle.file_system_view.storage.clone();
+            let faulty =
+                FaultyPutStore::new_for_any_put(storage.object_store.clone(), fault, |path| {
+                    path.as_ref().ends_with(".hfile")
+                });
+            handle.file_system_view.storage = Storage::new_with_object_store(
+                storage.base_url.as_ref().clone(),
+                faulty.clone(),
+                storage.hudi_configs.clone(),
+            );
+            assert!(compact_metadata_table_if_needed(&mut handle).await.is_err());
+            assert!(!faulty.is_armed());
+            assert_eq!(metadata_views(path).await, before);
+            assert_eq!(data_rows(path).await, rows);
+            let instant = compact_metadata_table_if_needed(&mut handle)
+                .await
+                .unwrap()
+                .expect("retry must compact metadata");
+            assert_metadata_codec(&handle, true, false, Some(&instant)).await;
+            assert_eq!(metadata_views(path).await, before);
+            assert_eq!(data_rows(path).await, rows);
+        }
     }
 }
