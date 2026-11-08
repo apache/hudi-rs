@@ -100,7 +100,11 @@ impl FileGroupReader {
     ///
     /// This API does **not** use [`OptionResolver`] that loads table properties
     /// from storage to resolve options — callers supply final configs.
+    ///
+    /// The reader's storage is derived from `shared` when given, reusing its
+    /// object store if the options match.
     pub(crate) fn new_with_overrides(
+        shared: Option<&Storage>,
         hudi_configs: Arc<HudiConfigs>,
         extra_hudi_opts: HashMap<String, String>,
         storage_opts: HashMap<String, String>,
@@ -108,7 +112,11 @@ impl FileGroupReader {
         let mut final_opts = hudi_configs.as_options();
         final_opts.extend(extra_hudi_opts);
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
-        let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
+        let storage_opts = Arc::new(storage_opts);
+        let storage = match shared {
+            Some(shared) => shared.derive(storage_opts, hudi_configs.clone())?,
+            None => Storage::new(storage_opts, hudi_configs.clone())?,
+        };
         let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
@@ -174,10 +182,10 @@ impl FileGroupReader {
         V: Into<String>,
     {
         let mut resolver = OptionResolver::new_with_options(base_uri, options);
-        resolver.resolve_options().await?;
+        let storage = resolver.resolve_options_with_storage(None).await?;
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
         Self::reject_scan_budget(&hudi_configs)?;
-        let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+        let storage = storage.derive(Arc::new(resolver.storage_options), hudi_configs.clone())?;
         let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
@@ -1590,6 +1598,24 @@ mod tests {
         Ok(())
     }
 
+    /// A reader opened from a base URI reads the table properties and the slice
+    /// through one object store. The counter is thread-local, which holds on the
+    /// current-thread runtime `#[tokio::test]` uses.
+    #[tokio::test]
+    async fn new_with_options_builds_one_object_store() -> Result<()> {
+        let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
+        let before = crate::storage::object_stores_built();
+
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+        let batch = reader
+            .read_file_slice_from_paths(&base_file_name, Vec::<&str>::new(), &ReadOptions::new())
+            .await?;
+        assert!(batch.num_rows() > 0);
+
+        assert_eq!(crate::storage::object_stores_built() - before, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_read_file_slice_from_paths_eager_with_real_base_file() -> Result<()> {
         // Real-fixture eager read covers: option resolution, base-file-only branch,
@@ -1693,8 +1719,12 @@ mod tests {
                 BaseFileFormatValue::HFile.as_ref(),
             ),
         ]));
-        let reader =
-            FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())?;
+        let reader = FileGroupReader::new_with_overrides(
+            None,
+            hudi_configs,
+            HashMap::new(),
+            HashMap::new(),
+        )?;
 
         let result = reader
             .read_file_slice_from_paths(
@@ -1753,7 +1783,7 @@ mod tests {
     /// Helper to create a FileGroupReader without using block_on (safe for async tests).
     fn create_test_reader(base_uri: &str) -> Result<FileGroupReader> {
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
-        FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())
+        FileGroupReader::new_with_overrides(None, hudi_configs, HashMap::new(), HashMap::new())
     }
 
     /// Returns a (base_uri, base_file_name) tuple for the V8Nonpartitioned
@@ -2108,8 +2138,12 @@ mod tests {
             HudiTableConfig::BasePath,
             get_metadata_table_base_uri().as_str(),
         )]));
-        let metadata_table_reader =
-            FileGroupReader::new_with_overrides(metadata_configs, HashMap::new(), HashMap::new())?;
+        let metadata_table_reader = FileGroupReader::new_with_overrides(
+            None,
+            metadata_configs,
+            HashMap::new(),
+            HashMap::new(),
+        )?;
         assert!(metadata_table_reader.is_metadata_table());
 
         Ok(())
@@ -2509,7 +2543,8 @@ mod file_group_reader_version_tests {
             HudiTableConfig::BasePath.as_ref(),
             super::tests::get_metadata_table_base_uri(),
         )]));
-        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let reader =
+            FileGroupReader::new_with_overrides(None, configs, HashMap::new(), HashMap::new())?;
         let err = reader.version_two_unsupported_reason(false).unwrap_err();
         assert!(
             matches!(err, CoreError::Unsupported(ref m) if m.contains("metadata table")),
@@ -2934,7 +2969,8 @@ mod file_group_reader_version_tests {
                 "true".to_string(),
             ),
         ]));
-        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let reader =
+            FileGroupReader::new_with_overrides(None, configs, HashMap::new(), HashMap::new())?;
 
         assert!(
             reader
@@ -2967,7 +3003,8 @@ mod file_group_reader_version_tests {
                 "2".to_string(),
             ),
         ]));
-        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let reader =
+            FileGroupReader::new_with_overrides(None, configs, HashMap::new(), HashMap::new())?;
         assert!(reader.is_metadata_table());
         assert_eq!(
             reader.file_group_reader_version()?,

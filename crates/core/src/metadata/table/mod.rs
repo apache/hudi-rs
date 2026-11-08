@@ -43,7 +43,6 @@ pub(crate) mod v2_reader;
 pub(crate) mod test_support;
 
 use crate::config::HudiConfigs;
-use crate::storage::Storage;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -61,6 +60,7 @@ use crate::metadata::rollback::{RestoreMetadata, RollbackMetadata, RollbackPlan}
 use crate::storage::util::join_url_segments;
 use crate::table::ReadOptions;
 use crate::table::Table;
+use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::instant::{Action, Instant, State};
@@ -158,11 +158,11 @@ impl Table {
         }
 
         let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
-        Table::new_with_options(
-            mdt_url.as_str(),
-            [(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)],
-        )
-        .await
+        TableBuilder::from_base_uri(mdt_url.as_str())
+            .with_options([(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)])
+            .with_shared_storage(self.storage.clone())
+            .build()
+            .await
     }
 
     /// Fetch records from the `files` partition of metadata table
@@ -473,7 +473,9 @@ impl Table {
                 .into_iter()
                 .chain(opts.hudi_options.clone()),
         ));
-        let storage = Storage::new(Arc::new(self.storage_options()), configs.clone())?;
+        let storage = self
+            .storage
+            .derive(Arc::new(self.storage_options()), configs.clone())?;
 
         // About 2.1x the cost of the reader it replaces on this table's own `files`
         // partition, measured by `v2_reader::tests::reader_cost_on_a_metadata_slice`,
@@ -744,6 +746,7 @@ fn concat_metadata_batches(batches: Vec<RecordBatch>) -> Result<RecordBatch> {
 mod tests {
     use super::*;
     use crate::config::table::HudiTableConfig::TableVersion;
+    use crate::storage::Storage;
     use crate::table::partition::PartitionPruner;
     use hudi_test::{QuickstartTripsTable, SampleTable};
     use records::{FilesPartitionRecord, MetadataRecordType};
