@@ -68,4 +68,10 @@ pub trait CompletionTimeView {
     /// layout v2 the completion map is built from the *active* timeline, so the
     /// same test discarded files from commits that had merely been archived.
     fn is_committed(&self, request_timestamp: &str) -> bool;
+
+    /// Whether `request_timestamp` is a compaction that is scheduled and has
+    /// not completed. The default reports none.
+    fn is_pending_compaction(&self, _request_timestamp: &str) -> bool {
+        false
+    }
 }

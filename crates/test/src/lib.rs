@@ -395,6 +395,20 @@ pub enum QuickstartTripsTable {
     /// built, with no per-block gate involved.
     #[strum(serialize = "table_uncommitted_log_v9")]
     MorUncommittedLogV9,
+    /// Table version 6 MOR non-partitioned, metadata table on, with delta
+    /// commits written while a compaction is scheduled and not executed.
+    ///
+    /// Provenance: `table_pending_compaction_v6.sql` beside this zip
+    /// (Spark 3.5.5 / Hudi 1.1.1).
+    /// Schema: ts LONG, uuid STRING, rider STRING, fare DOUBLE (non-partitioned).
+    ///   `20261107230645098` deltacommit, INSERT a, b, c, d: base .parquet
+    ///   `20261107230652758` deltacommit, UPDATE a: log on the base instant
+    ///   `20261107230653491` compaction, requested only
+    ///   `20261107230654610` deltacommit, UPDATE b: log on the compaction instant
+    ///   `20261107230656022` deltacommit, UPDATE c: log on the compaction instant
+    /// gold_data = Spark `SELECT *` snapshot: every update applied, 4 rows.
+    #[strum(serialize = "table_pending_compaction_v6")]
+    MorPendingCompactionV6,
 
     // -------------------------------------------------------------------------
     // Delete-block orderingVal wrapper-type fixtures (Task 7).

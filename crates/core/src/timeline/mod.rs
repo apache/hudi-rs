@@ -83,11 +83,19 @@ pub struct Timeline {
     /// instant can still carry blocks appended by a later instant that never
     /// completed, and only the instant's state can tell.
     pub(crate) pending_instants: HashSet<String>,
+    /// Request timestamps of compactions that are scheduled and have not
+    /// completed (requested or inflight).
+    ///
+    /// Kept apart from [`Self::pending_instants`] and the archival boundary
+    /// because those feed the log-block gate, which Java's
+    /// `BaseHoodieLogRecordReader` builds from `getCommitsTimeline()`, and a
+    /// pending compaction is not on that timeline.
+    pub(crate) pending_compactions: HashSet<String>,
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
 
-/// The actions a read loads from the timeline.
+/// The actions a read takes its commits from.
 ///
 /// Narrowing this is no longer only a listing decision: `Timeline::completion_gate_inputs`
 /// derives the log scan's committed set from these, so an action that completes outside this
@@ -96,8 +104,29 @@ pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
 /// action that writes such blocks (compaction completes as `commit`, clustering as
 /// `replacecommit`, log compaction as `deltacommit`), which is also the set Java's gate is
 /// built from via `getCommitsTimeline()`.
+///
+/// The listing of the active timeline also loads [`Action::Compaction`] for
+/// the pending compactions, which `Timeline::set_active_instants` keeps out of
+/// the gate's inputs.
 pub const DEFAULT_LOADING_ACTIONS: &[Action] =
     &[Action::Commit, Action::DeltaCommit, Action::ReplaceCommit];
+
+/// Selects the active timeline in every state: the instants of
+/// [`DEFAULT_LOADING_ACTIONS`] plus the pending compactions.
+fn active_instants_selector(hudi_configs: Arc<HudiConfigs>) -> Result<TimelineSelector> {
+    let actions: Vec<Action> = DEFAULT_LOADING_ACTIONS
+        .iter()
+        .cloned()
+        .chain([Action::Compaction])
+        .collect();
+    TimelineSelector::actions_in_range(
+        &actions,
+        &[State::Requested, State::Inflight, State::Completed],
+        hudi_configs,
+        None,
+        None,
+    )
+}
 
 impl Timeline {
     pub(crate) fn new(
@@ -114,6 +143,7 @@ impl Timeline {
             completed_commits: Vec::new(),
             earliest_active_instant: None,
             pending_instants: HashSet::new(),
+            pending_compactions: HashSet::new(),
         }
     }
 
@@ -127,13 +157,7 @@ impl Timeline {
         // completed commits and the archival boundary. See
         // `Timeline::earliest_active_instant` for why the boundary needs the
         // pending ones.
-        let selector = TimelineSelector::actions_in_range(
-            DEFAULT_LOADING_ACTIONS,
-            &[State::Requested, State::Inflight, State::Completed],
-            timeline.hudi_configs.clone(),
-            None,
-            None,
-        )?;
+        let selector = active_instants_selector(timeline.hudi_configs.clone())?;
         let all_active = timeline.load_instants(&selector, false).await?;
         timeline.set_active_instants(all_active);
         Ok(timeline)
@@ -142,6 +166,9 @@ impl Timeline {
     /// Set the completed commits, the pending instants and the archival
     /// boundary from one listing of the active timeline in every state.
     fn set_active_instants(&mut self, all_active: Vec<Instant>) {
+        let (compactions, all_active): (Vec<Instant>, Vec<Instant>) = all_active
+            .into_iter()
+            .partition(|instant| instant.action == Action::Compaction);
         self.earliest_active_instant = all_active
             .iter()
             .map(|instant| instant.timestamp.clone())
@@ -159,6 +186,13 @@ impl Timeline {
             .map(|instant| instant.timestamp.clone())
             .collect();
         self.pending_instants = pending
+            .into_iter()
+            .map(|instant| instant.timestamp)
+            .filter(|timestamp| !completed_times.contains(timestamp))
+            .collect();
+        // A completed compaction is listed as a `commit` and also keeps its
+        // `compaction` requested and inflight files.
+        self.pending_compactions = compactions
             .into_iter()
             .map(|instant| instant.timestamp)
             .filter(|timestamp| !completed_times.contains(timestamp))
@@ -208,13 +242,7 @@ impl Timeline {
         // kept the old one would leave newly-archived instants neither in the
         // completed set nor below the boundary — read as uncommitted, silently
         // hiding their file groups from this handle's later reads and writes.
-        let selector = TimelineSelector::actions_in_range(
-            DEFAULT_LOADING_ACTIONS,
-            &[State::Requested, State::Inflight, State::Completed],
-            self.hudi_configs.clone(),
-            None,
-            None,
-        )?;
+        let selector = active_instants_selector(self.hudi_configs.clone())?;
         let all_active = self.load_instants(&selector, false).await?;
         self.set_active_instants(all_active);
         Ok(())
@@ -417,7 +445,8 @@ impl Timeline {
             excludes,
             &self.hudi_configs,
             self.earliest_active_instant.clone(),
-        ))
+        )
+        .with_pending_compactions(self.pending_compactions.clone()))
     }
 
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
@@ -1036,5 +1065,51 @@ mod tests {
             both.is_empty(),
             "an instant cannot be both completed and pending, got {both:?}"
         );
+    }
+
+    /// Pending compactions are tracked on their own, and stay out of the
+    /// pending instants and the archival boundary the log-block gate reads.
+    #[tokio::test]
+    async fn test_pending_compactions_are_kept_apart_from_the_gate_inputs() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_mor_parquet();
+        let mut timeline = create_test_timeline(base_url).await;
+        let instant = |timestamp: &str, action: Action, state: State| Instant {
+            timestamp: timestamp.to_string(),
+            completion_timestamp: None,
+            action,
+            state,
+            epoch_millis: 0,
+        };
+        timeline.set_active_instants(vec![
+            instant("20240101000000000", Action::Compaction, State::Requested),
+            instant("20240102000000000", Action::DeltaCommit, State::Requested),
+            instant("20240102000000000", Action::DeltaCommit, State::Completed),
+            // An executing compaction is still pending.
+            instant("20240104000000000", Action::Compaction, State::Requested),
+            instant("20240104000000000", Action::Compaction, State::Inflight),
+            // A completed compaction keeps its requested and inflight files.
+            instant("20240103000000000", Action::Compaction, State::Requested),
+            instant("20240103000000000", Action::Compaction, State::Inflight),
+            instant("20240103000000000", Action::Commit, State::Completed),
+        ]);
+
+        assert_eq!(
+            timeline.pending_compactions,
+            HashSet::from([
+                "20240101000000000".to_string(),
+                "20240104000000000".to_string()
+            ])
+        );
+        assert!(timeline.pending_instants.is_empty());
+        assert_eq!(
+            timeline.earliest_active_instant.as_deref(),
+            Some("20240102000000000")
+        );
+        let completed: Vec<&str> = timeline
+            .completed_commits
+            .iter()
+            .map(|i| i.timestamp.as_str())
+            .collect();
+        assert_eq!(completed, vec!["20240102000000000", "20240103000000000"]);
     }
 }
