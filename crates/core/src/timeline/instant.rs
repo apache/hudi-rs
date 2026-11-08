@@ -26,6 +26,17 @@ use std::cmp::Ordering;
 use std::path::PathBuf;
 use std::str::FromStr;
 
+/// Java `HoodieTimeline.INIT_INSTANT_TS`.
+pub(crate) const INIT_INSTANT_TS: &str = "00000000000000";
+
+/// Java `HoodieTimeline.METADATA_BOOTSTRAP_INSTANT_TS`, the instant of a
+/// METADATA_ONLY bootstrap's skeleton base files.
+pub(crate) const METADATA_BOOTSTRAP_INSTANT_TS: &str = "00000000000001";
+
+/// Java `HoodieTimeline.FULL_BOOTSTRAP_INSTANT_TS`, the instant of a
+/// FULL_RECORD bootstrap's base files.
+pub(crate) const FULL_BOOTSTRAP_INSTANT_TS: &str = "00000000000002";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Action {
     Commit,
@@ -249,8 +260,11 @@ impl Instant {
     /// has to map them somewhere; epoch 0/1/2 ms places them before every real
     /// instant and in the same order as the 17-character forms the metadata
     /// table writes for the same purpose.
-    const BOOTSTRAP_INSTANT_TIMES: [&'static str; 3] =
-        ["00000000000000", "00000000000001", "00000000000002"];
+    const BOOTSTRAP_INSTANT_TIMES: [&'static str; 3] = [
+        INIT_INSTANT_TS,
+        METADATA_BOOTSTRAP_INSTANT_TS,
+        FULL_BOOTSTRAP_INSTANT_TS,
+    ];
 
     fn validate_timestamp(timestamp: &str) -> Result<()> {
         if !matches!(timestamp.len(), 14 | 17) {

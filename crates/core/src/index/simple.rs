@@ -50,7 +50,7 @@ impl HoodieIndex for SimpleIndex {
         if requested.is_empty() {
             return Ok(locations);
         }
-        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        let slices = table.plan_file_slices(&ReadOptions::new()).await?;
         if slices.is_empty() {
             return Ok(locations);
         }

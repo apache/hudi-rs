@@ -235,7 +235,7 @@ pub(crate) async fn latest_slices_by_partition(
     table: &Table,
 ) -> Result<HashMap<String, Vec<FileSlice>>> {
     let slices = table
-        .get_file_slices(&crate::table::ReadOptions::new())
+        .plan_file_slices(&crate::table::ReadOptions::new())
         .await?;
     let mut by_partition: HashMap<String, Vec<FileSlice>> = HashMap::new();
     for slice in slices {

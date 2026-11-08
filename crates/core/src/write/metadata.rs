@@ -996,7 +996,7 @@ async fn compute_partition_stats_records(
 
     // Files still live in the latest pre-commit file slices of touched partitions.
     let mut survivors: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for slice in table.get_file_slices(&ReadOptions::new()).await? {
+    for slice in table.plan_file_slices(&ReadOptions::new()).await? {
         let partition = slice.partition_path.clone();
         if !touched.contains(&partition) {
             continue;
