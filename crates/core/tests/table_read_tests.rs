@@ -449,6 +449,96 @@ mod v6_tables {
         }
     }
 
+    /// Delta commits written while a compaction is pending land in log files
+    /// named on the compaction's instant, which has not completed. Hudi reads
+    /// them as part of the file slice before the compaction.
+    mod pending_compaction_queries {
+        use super::*;
+        use std::path::PathBuf;
+
+        const UPDATE_A: &str = "20261107230652758";
+        const UPDATE_B: &str = "20261107230654610";
+
+        async fn fares(
+            table_path: &str,
+            reader_version: &str,
+            options: ReadOptions,
+        ) -> Result<Vec<(String, f64)>> {
+            let table = Table::new(table_path).await?;
+            let records = table
+                .read(&options.with_hudi_option(
+                    HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                    reader_version,
+                ))
+                .await?;
+            let records = concat_batches(&records[0].schema(), &records)?;
+            let mut rows: Vec<(String, f64)> = QuickstartTripsTable::uuid_rider_and_fare(&records)
+                .into_iter()
+                .map(|(uuid, _, fare)| (uuid, fare))
+                .collect();
+            rows.sort_by(|l, r| l.0.cmp(&r.0));
+            Ok(rows)
+        }
+
+        fn rows(expected: &[(&str, f64)]) -> Vec<(String, f64)> {
+            expected.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        }
+
+        #[tokio::test]
+        async fn test_reads_delta_commits_written_against_a_pending_compaction() -> Result<()> {
+            let path = QuickstartTripsTable::MorPendingCompactionV6.path_to_mor_avro();
+            let cases = [
+                (
+                    ReadOptions::new(),
+                    rows(&[("a", 11.0), ("b", 22.0), ("c", 33.0), ("d", 40.0)]),
+                ),
+                (
+                    ReadOptions::new().with_as_of_timestamp(UPDATE_B),
+                    rows(&[("a", 11.0), ("b", 22.0), ("c", 30.0), ("d", 40.0)]),
+                ),
+                (
+                    ReadOptions::new().with_as_of_timestamp(UPDATE_A),
+                    rows(&[("a", 11.0), ("b", 20.0), ("c", 30.0), ("d", 40.0)]),
+                ),
+                (
+                    ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
+                        .with_start_timestamp(UPDATE_A),
+                    rows(&[("b", 22.0), ("c", 33.0)]),
+                ),
+            ];
+            for reader_version in ["1", "2"] {
+                for (options, expected) in &cases {
+                    assert_eq!(
+                        fares(&path, reader_version, options.clone()).await?,
+                        *expected,
+                        "reader version {reader_version} {options:?}"
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        /// A delta commit against the pending compaction that never completed
+        /// stays excluded: `b`'s update is dropped, `c`'s still applies. Only
+        /// reader version 2 checks each log block's instant.
+        #[tokio::test]
+        async fn test_excludes_a_failed_write_against_a_pending_compaction() -> Result<()> {
+            let zip = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+                "../test/data/quickstart_trips_table/mor/avro/table_pending_compaction_v6.zip",
+            );
+            let table_dir = hudi_test::extract_test_table_fresh(&zip)
+                .join(QuickstartTripsTable::MorPendingCompactionV6.as_ref());
+            std::fs::remove_file(table_dir.join(format!(".hoodie/{UPDATE_B}.deltacommit")))
+                .unwrap();
+            assert_eq!(
+                fares(table_dir.to_str().unwrap(), "2", ReadOptions::new()).await?,
+                rows(&[("a", 11.0), ("b", 20.0), ("c", 33.0), ("d", 40.0)])
+            );
+            Ok(())
+        }
+    }
+
     mod incremental_queries {
         use super::*;
 

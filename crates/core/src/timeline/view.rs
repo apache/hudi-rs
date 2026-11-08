@@ -73,6 +73,10 @@ pub struct TimelineView {
     /// archived — hence completed — commit. See
     /// [`Timeline::earliest_active_instant`](crate::timeline::Timeline).
     earliest_active_instant: Option<String>,
+
+    /// Request timestamps of compactions that are scheduled and have not
+    /// completed.
+    pending_compactions: HashSet<String>,
 }
 
 impl TimelineView {
@@ -147,7 +151,14 @@ impl TimelineView {
             request_to_completion,
             completed_requests,
             earliest_active_instant,
+            pending_compactions: HashSet::new(),
         }
+    }
+
+    /// Set the compactions that are scheduled and have not completed.
+    pub(crate) fn with_pending_compactions(mut self, pending_compactions: HashSet<String>) -> Self {
+        self.pending_compactions = pending_compactions;
+        self
     }
 
     /// Get the "as of" timestamp for this view.
@@ -180,6 +191,10 @@ impl CompletionTimeView for TimelineView {
             Some(boundary) => request_timestamp < boundary.as_str(),
             None => false,
         }
+    }
+
+    fn is_pending_compaction(&self, request_timestamp: &str) -> bool {
+        self.pending_compactions.contains(request_timestamp)
     }
 }
 

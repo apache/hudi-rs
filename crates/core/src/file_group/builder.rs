@@ -268,8 +268,7 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
                 })?;
 
                 log_file.set_completion_time(completion_time_view);
-                // Skip the file if the commit that wrote it never completed.
-                if !completion_time_view.is_committed(&log_file.timestamp) {
+                if !log_file.is_readable(completion_time_view) {
                     continue;
                 }
                 if file_size > 0 {

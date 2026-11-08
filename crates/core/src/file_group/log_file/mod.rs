@@ -167,6 +167,22 @@ impl LogFile {
             .get_completion_time(&self.timestamp)
             .map(|s| s.to_string());
     }
+
+    /// Whether the instant in this log file's name lets it be read.
+    ///
+    /// Below table version 8 that instant is the base instant of the file
+    /// slice the file appends to, and a scheduled compaction opens a new
+    /// slice, so writes made while it is pending name the compaction. Hudi
+    /// admits those (its file-system view is built over
+    /// `filterCompletedAndCompactionInstants()`) and merges them into the slice
+    /// before the compaction (`fetchMergedFileSlice`), which is where
+    /// [`FileGroup::add_log_file`] places them. A failed write among them is
+    /// excluded per block by the log scan of file group reader version 2.
+    ///
+    /// [`FileGroup::add_log_file`]: crate::file_group::FileGroup::add_log_file
+    pub(crate) fn is_readable<V: CompletionTimeView>(&self, view: &V) -> bool {
+        view.is_committed(&self.timestamp) || view.is_pending_compaction(&self.timestamp)
+    }
 }
 
 impl FromStr for LogFile {

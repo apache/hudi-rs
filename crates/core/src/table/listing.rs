@@ -123,9 +123,9 @@ impl FileLister {
                 match LogFile::try_from(file_metadata) {
                     Ok(mut log_file) => {
                         // Look up completion timestamp, and skip the file outright
-                        // if the commit that wrote it never completed.
+                        // if its instant does not let it be read.
                         log_file.set_completion_time(completion_time_view);
-                        if !completion_time_view.is_committed(&log_file.timestamp) {
+                        if !log_file.is_readable(completion_time_view) {
                             continue;
                         }
 
