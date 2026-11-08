@@ -290,9 +290,10 @@ mod tests {
         assert_eq!(err, "op panicked: non-string panic payload");
     }
 
-    /// Regression for the constructor, which used to drop such an option
-    /// silently. Asserted on the parser directly: `CxxVector<CxxString>`
-    /// cannot be filled from Rust, so the constructor cannot be handed one.
+    /// An option without `=` is an error, and only the first `=` splits, so a
+    /// value may contain one. Asserted on the parser directly:
+    /// `CxxVector<CxxString>` cannot be filled from Rust, so the constructor
+    /// cannot be handed one.
     #[test]
     fn test_key_values_option_without_equals_is_error() {
         assert_eq!(
