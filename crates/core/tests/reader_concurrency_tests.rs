@@ -16,7 +16,8 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! Reader-vs-writer concurrency repros.
+//! Reader concurrency repros: a reader racing a writer, or other reads on the
+//! same handle.
 //!
 //! The `#[ignore]`d ones are probes: they print what the reader does without
 //! asserting anything, which would pass whatever happened, so they do not belong
@@ -343,5 +344,66 @@ async fn probe_commit_times_in_window_slice() {
             b.num_rows(),
             times
         );
+    }
+}
+
+/// Concurrent reads on one handle plan independently: a read whose filter
+/// prunes most file groups by column stats must not shrink what an unfiltered
+/// read on the same handle (or a clone of it) returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_reads_on_one_handle_plan_independently() {
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    const ROWS: i64 = 400;
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().to_str().unwrap();
+    let mut writer = Table::create(base)
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["p"])
+        .create()
+        .await
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("p", DataType::Utf8, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from_iter_values(0..ROWS)),
+            Arc::new(StringArray::from_iter_values(
+                (0..ROWS).map(|i| format!("p{:02}", i % 40)),
+            )),
+        ],
+    )
+    .unwrap();
+    writer.append([batch]).await.unwrap();
+
+    let table = Table::new(base).await.unwrap();
+    let all = ReadOptions::new()
+        .with_filters([("id", ">=", "0")])
+        .unwrap();
+    let one = ReadOptions::new().with_filters([("id", "=", "7")]).unwrap();
+    assert_eq!(rows(&table.read(&all).await.unwrap()), ROWS as usize);
+    assert_eq!(rows(&table.read(&one).await.unwrap()), 1);
+
+    for _ in 0..30 {
+        let full = {
+            let (table, all) = (table.clone(), all.clone());
+            tokio::spawn(async move { rows(&table.read(&all).await.unwrap()) })
+        };
+        let filtered: Vec<_> = (0..3)
+            .map(|_| {
+                let (table, one) = (table.clone(), one.clone());
+                tokio::spawn(async move { rows(&table.read(&one).await.unwrap()) })
+            })
+            .collect();
+        assert_eq!(full.await.unwrap(), ROWS as usize);
+        for f in filtered {
+            assert_eq!(f.await.unwrap(), 1);
+        }
     }
 }
