@@ -76,6 +76,7 @@ elif [ "$app_path" = "hudi-file-group-api/cpp" ]; then
     mkdir build && cd build && \
     cmake .. && \
     make && \
+    ctest --output-on-failure && \
     ./file_group_api_cpp
     "
 else
@@ -83,5 +84,8 @@ else
   exit 1
 fi
 
-# Always tear down the compose stack to release file locks and avoid cache save issues
+integration_status=$?
+
+# Cleanup must not replace the exit status of the demo or CTest.
 docker compose down -v || echo 'Warning: Failed to tear down compose stack' >&2
+exit "$integration_status"

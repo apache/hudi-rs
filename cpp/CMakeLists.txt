@@ -23,12 +23,50 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find the cargo metadata to locate the project paths
 execute_process(
-    COMMAND cargo metadata --format-version=1
+    COMMAND cargo metadata --format-version=1 --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml"
     OUTPUT_VARIABLE CARGO_METADATA
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
+    COMMAND_ERROR_IS_FATAL ANY
 )
 string(JSON CARGO_WORKSPACE_ROOT GET ${CARGO_METADATA} "workspace_root")
 string(JSON TARGET_DIRECTORY GET ${CARGO_METADATA} "target_directory")
+
+# Resolve this crate's cxx dependency: another workspace member may use a different version.
+string(JSON HUDI_CPP_PACKAGE_ID GET "${CARGO_METADATA}" resolve root)
+string(JSON CARGO_NODES GET "${CARGO_METADATA}" resolve nodes)
+string(JSON NODE_COUNT LENGTH "${CARGO_NODES}")
+math(EXPR NODE_LAST "${NODE_COUNT} - 1")
+foreach(NODE_INDEX RANGE ${NODE_LAST})
+    string(JSON NODE_ID GET "${CARGO_NODES}" ${NODE_INDEX} id)
+    if(NODE_ID STREQUAL HUDI_CPP_PACKAGE_ID)
+        string(JSON CPP_DEPS GET "${CARGO_NODES}" ${NODE_INDEX} deps)
+        string(JSON DEP_COUNT LENGTH "${CPP_DEPS}")
+        math(EXPR DEP_LAST "${DEP_COUNT} - 1")
+        foreach(DEP_INDEX RANGE ${DEP_LAST})
+            string(JSON DEP_NAME GET "${CPP_DEPS}" ${DEP_INDEX} name)
+            if(DEP_NAME STREQUAL "cxx")
+                string(JSON CXX_PACKAGE_ID GET "${CPP_DEPS}" ${DEP_INDEX} pkg)
+                break()
+            endif()
+        endforeach()
+        break()
+    endif()
+endforeach()
+
+string(JSON PACKAGE_COUNT LENGTH "${CARGO_METADATA}" packages)
+math(EXPR PACKAGE_LAST "${PACKAGE_COUNT} - 1")
+foreach(PACKAGE_INDEX RANGE ${PACKAGE_LAST})
+    string(JSON PACKAGE_ID GET "${CARGO_METADATA}" packages ${PACKAGE_INDEX} id)
+    if(PACKAGE_ID STREQUAL CXX_PACKAGE_ID)
+        string(JSON CXX_MANIFEST_PATH GET "${CARGO_METADATA}" packages ${PACKAGE_INDEX} manifest_path)
+        get_filename_component(CXX_CRATE_DIR "${CXX_MANIFEST_PATH}" DIRECTORY)
+        set(CXX_RUNTIME_SOURCE "${CXX_CRATE_DIR}/src/cxx.cc")
+        break()
+    endif()
+endforeach()
+if(NOT CXX_RUNTIME_SOURCE OR NOT EXISTS "${CXX_RUNTIME_SOURCE}")
+    message(FATAL_ERROR "Could not locate the hudi-cpp cxx dependency's C++ runtime source")
+endif()
 
 # Set the default build type if not specified
 if(NOT CMAKE_BUILD_TYPE)
@@ -83,6 +121,7 @@ target_include_directories(hudi INTERFACE
 # Store the library path as a property for consumers
 set_target_properties(hudi PROPERTIES
     INTERFACE_HUDI_LIBRARY_PATH ${RUST_LIB_PATH}
+    INTERFACE_HUDI_CXX_RUNTIME_SOURCE "${CXX_RUNTIME_SOURCE}"
 )
 
 # Make sure the Rust library is built before anyone uses this target

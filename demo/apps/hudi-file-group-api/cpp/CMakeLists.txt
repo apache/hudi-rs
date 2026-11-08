@@ -21,6 +21,8 @@ project(hudi_cpp_example)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+
 add_subdirectory(../../../../cpp hudi-cpp)
 
 add_executable(file_group_api_cpp
@@ -32,23 +34,25 @@ get_target_property(HUDI_LIB_PATH hudi INTERFACE_HUDI_LIBRARY_PATH)
 get_filename_component(TARGET_DIR ${HUDI_LIB_PATH} DIRECTORY)
 get_filename_component(TARGET_DIR ${TARGET_DIR} DIRECTORY)  # Go up one level to get target directory
 set(CXX_BRIDGE_DIR "${TARGET_DIR}/cxxbridge")
+get_target_property(CXX_RUNTIME_SOURCE hudi INTERFACE_HUDI_CXX_RUNTIME_SOURCE)
 
-target_sources(file_group_api_cpp PRIVATE
+set_source_files_properties(${CXX_BRIDGE_DIR}/hudi/src/lib.rs.cc PROPERTIES GENERATED TRUE)
+
+# The Rust cdylib exports the C bridge but can hide C++ symbols such as rust::Error.
+add_library(hudi_cpp_example_bridge STATIC
   ${CXX_BRIDGE_DIR}/hudi/src/lib.rs.cc
+  "${CXX_RUNTIME_SOURCE}"
 )
-
-# Make sure the executable depends on the rust build completing
-add_dependencies(file_group_api_cpp rust_build)
-
-# Link against the hudi library target
-target_link_libraries(file_group_api_cpp
+target_link_libraries(hudi_cpp_example_bridge PUBLIC
   Hudi::Hudi
+  "${HUDI_LIB_PATH}"
 )
+target_link_libraries(file_group_api_cpp PRIVATE hudi_cpp_example_bridge)
 
-# Get the actual library path and link it directly
-get_target_property(HUDI_LIB_PATH hudi INTERFACE_HUDI_LIBRARY_PATH)
-if(HUDI_LIB_PATH)
-    target_link_libraries(file_group_api_cpp ${HUDI_LIB_PATH})
+if(BUILD_TESTING)
+    add_executable(file_group_api_cpp_link_test link_test.cpp)
+    target_link_libraries(file_group_api_cpp_link_test PRIVATE hudi_cpp_example_bridge)
+    add_test(NAME file_group_api_cpp_link_test COMMAND file_group_api_cpp_link_test)
 endif()
 
 # Output configuration

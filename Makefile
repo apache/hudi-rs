@@ -22,6 +22,7 @@ SHELL := /bin/bash
 VENV := .venv
 PYTHON_DIR = python
 UPSERT_BENCH_DIR := benchmark/upsert
+DEMO_TESTS_DIR := demo/tests
 MATURIN_VERSION := $(shell grep 'requires =' $(PYTHON_DIR)/pyproject.toml | cut -d= -f2- | tr -d '[ "]')
 PACKAGE_VERSION := $(shell grep version Cargo.toml | head -n 1 | awk '{print $$3}' | tr -d '"' )
 
@@ -102,7 +103,7 @@ format-rust: ## Format Rust code
 .PHONY: format-python
 format-python: ## Format Python code
 	$(info --- Format Python code ---)
-	ruff format $(PYTHON_DIR) $(UPSERT_BENCH_DIR)
+	ruff format $(PYTHON_DIR) $(UPSERT_BENCH_DIR) $(DEMO_TESTS_DIR)
 
 .PHONY: check
 check: check-rust check-python ## Run check on Rust and Python
@@ -117,14 +118,18 @@ check-rust: ## Run check on Rust
 .PHONY: check-python
 check-python: ## Run check on Python
 	$(info --- Check Python format ---)
-	ruff format --check --diff $(PYTHON_DIR) $(UPSERT_BENCH_DIR)
+	ruff format --check --diff $(PYTHON_DIR) $(UPSERT_BENCH_DIR) $(DEMO_TESTS_DIR)
 	$(info --- Check Python linting ---)
-	ruff check $(PYTHON_DIR) $(UPSERT_BENCH_DIR)
+	ruff check $(PYTHON_DIR) $(UPSERT_BENCH_DIR) $(DEMO_TESTS_DIR)
 	$(info --- Check Python typing ---)
 	pushd $(PYTHON_DIR); mypy .; popd
 
 .PHONY: test
-test: test-rust test-python ## Run tests on Rust and Python
+test: test-demo-ci test-rust test-python ## Run integration runner, Rust and Python tests
+
+.PHONY: test-demo-ci
+test-demo-ci: ## Test integration runner exit statuses without Docker
+	python3 -m unittest discover -s demo/tests -p 'test_ci_run.py' -v
 
 .PHONY: test-rust
 test-rust: ## Run tests on Rust

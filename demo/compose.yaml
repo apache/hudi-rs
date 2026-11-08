@@ -57,6 +57,9 @@ services:
   runner:
     build:
       context: ./infra/runner
+      args:
+        RUNNER_UID: "${HOST_UID:-1000}"
+        RUNNER_GID: "${HOST_GID:-1000}"
     container_name: runner
     user: "${HOST_UID}:${HOST_GID}"
     volumes:

@@ -21,9 +21,18 @@
 
 This directory contains demo applications showcasing Hudi-rs APIs across different programming languages. The demos run on Docker Compose and also serve as integration tests in the CI pipeline (see [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
 
+Run `make test-demo-ci` from the repository root to check the integration runner's
+exit-status handling without Docker. These tests verify that cleanup runs after
+the demo and preserves its result, including a nonzero CTest exit status. Cleanup
+failures remain warnings and do not replace the demo's exit status.
+
 ## Infrastructure
 
 The demo infrastructure is defined in [`compose.yaml`](compose.yaml).
+
+The runner includes libclang and keeps uv and Python outside `/root`. Compose
+passes the host UID/GID to make `/opt/.venv` writable. Image builds check these
+dependencies and permissions as the runtime user.
 
 Test data copied from the [`crates/test`](../crates/test/data) are placed in Minio, providing COW and MOR tables at:
 - `s3://hudi-demo/cow/`
@@ -42,3 +51,8 @@ Test data copied from the [`crates/test`](../crates/test/data) are placed in Min
 
 ### [`hudi-file-group-api/cpp`](apps/hudi-file-group-api/cpp)
 **C++**: File group reading using C++ bindings and Arrow C ABI.
+
+The C++ example also registers a CTest that constructs a file slice and catches a
+`rust::Error` from an invalid file name. It checks the generated bridge and cxx
+runtime link together without requiring MinIO or cloud credentials. After building
+the example, run `ctest --test-dir <example-build-directory> --output-on-failure`.
