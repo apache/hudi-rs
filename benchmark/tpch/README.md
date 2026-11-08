@@ -51,7 +51,13 @@ that the Hudi read path returns what the parquet it was built from returns:
 benchmark/tpch/run.sh validate --scale-factor 1
 ```
 
-It reports per query and exits non-zero if any of them differ.
+It reports per query and exits non-zero if any of them differ. To see where a
+query's time goes on Hudi versus parquet, print both plans; `--analyze` also
+runs the queries and adds per-operator metrics:
+
+```bash
+benchmark/tpch/run.sh explain --scale-factor 1 --queries 15 --analyze
+```
 
 ### Options
 
