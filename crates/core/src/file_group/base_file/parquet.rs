@@ -49,9 +49,7 @@ fn to_parquet_err(e: object_store::Error) -> parquet::errors::ParquetError {
 /// Footer fetch that does not touch [`ReadVolume`].
 ///
 /// Column-chunk counters intentionally exclude the footer: they measure what a
-/// data read costs, and the previous `CountingReader` wrapper was installed only
-/// after the footer was already loaded. Keeping that boundary here means folding
-/// the reader into one type does not change what the counters mean (#843).
+/// data read costs, and footer bytes are not part of that cost.
 struct UncountedStoreFetch<'a> {
     store: &'a Arc<dyn ObjectStore>,
     path: &'a ObjPath,
@@ -66,21 +64,16 @@ impl MetadataFetch for UncountedStoreFetch<'_> {
     }
 }
 
-/// In-house [`AsyncFileReader`] over `object_store`, with read-volume counting
-/// and legacy-list metadata normalization folded in.
+/// [`AsyncFileReader`] over `object_store`, with read-volume counting and
+/// legacy-list metadata normalization folded in.
 ///
-/// Replaces the deprecated `ParquetObjectReader` plus the old `CountingReader`
-/// wrapper (apache/hudi-rs#843). Range I/O goes straight to `get_range` /
-/// `get_ranges`; the footer is loaded once with the known file size, normalized,
-/// and cached for later `get_metadata` calls.
-#[derive(Clone)]
+/// Range I/O goes straight to `get_range` / `get_ranges`; the footer is loaded
+/// with the known file size and normalized.
 struct CountingObjectStoreReader {
     store: Arc<dyn ObjectStore>,
     path: ObjPath,
     file_size: u64,
     volume: Arc<ReadVolume>,
-    /// Normalized footer metadata, filled on the first `get_metadata`.
-    metadata: Option<Arc<ParquetMetaData>>,
 }
 
 impl CountingObjectStoreReader {
@@ -95,7 +88,6 @@ impl CountingObjectStoreReader {
             path,
             file_size,
             volume,
-            metadata: None,
         }
     }
 }
@@ -138,10 +130,6 @@ impl AsyncFileReader for CountingObjectStoreReader {
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         Box::pin(async move {
-            if let Some(metadata) = &self.metadata {
-                return Ok(metadata.clone());
-            }
-
             // A parquet-avro writer with `write-old-list-structure=true` encodes
             // an `array<map>` as a legacy 2-level list whose element is a
             // REPEATED map group, which parquet-rs rejects when building the
@@ -158,9 +146,7 @@ impl AsyncFileReader for CountingObjectStoreReader {
                     self.file_size,
                 )
                 .await?;
-            let normalized = normalize_parquet_metadata(Arc::new(raw));
-            self.metadata = Some(normalized.clone());
-            Ok(normalized)
+            Ok(normalize_parquet_metadata(Arc::new(raw)))
         })
     }
 }
@@ -569,8 +555,7 @@ mod tests {
     }
 
     /// Footer-only work (schema / metadata) must not move the column-chunk
-    /// counters. Those exist to describe a data read; counting the footer would
-    /// change their meaning when the deprecated reader was replaced (#843).
+    /// counters, which describe what a data read costs.
     #[tokio::test]
     async fn footer_fetch_is_not_counted_as_read_volume() {
         use std::sync::atomic::Ordering::Relaxed;
