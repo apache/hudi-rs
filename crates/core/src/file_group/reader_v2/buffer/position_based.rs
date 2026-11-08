@@ -617,7 +617,7 @@ mod tests {
     use crate::file_group::reader_v2::buffer::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME;
     use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
     use crate::file_group::record_batches::RecordBatches;
-    use arrow_array::{Int32Array, Int64Array, StringArray};
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, StringArray, StructArray};
     use arrow_schema::{DataType, Field, Schema};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -726,6 +726,16 @@ mod tests {
             ],
         )
         .unwrap();
+        data_block_from_batch(batch, positions, base_instant_of_positions, instant_time)
+    }
+
+    /// A data LogBlock of `batch`, with the position headers.
+    fn data_block_from_batch(
+        batch: RecordBatch,
+        positions: &[u64],
+        base_instant_of_positions: &str,
+        instant_time: &str,
+    ) -> LogBlock {
         let mut header = HashMap::new();
         header.insert(BlockMetadataKey::InstantTime, instant_time.to_string());
         header.insert(
@@ -855,6 +865,92 @@ mod tests {
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
+    }
+
+    /// Event-time position merge by a nested ordering field: a log row replaces
+    /// its base row only when its `meta.ts` is not lower.
+    #[test]
+    fn position_merge_orders_by_nested_ordering_field() {
+        let ts = Arc::new(Field::new("ts", DataType::Int64, true));
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("_hoodie_record_key", DataType::Utf8, false),
+            Field::new("meta", DataType::Struct(vec![ts.clone()].into()), true),
+        ]));
+        let columns = |keys: &[&str], ts_values: &[i64]| -> Vec<ArrayRef> {
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())),
+                Arc::new(StructArray::from(vec![(
+                    ts.clone(),
+                    Arc::new(Int64Array::from(ts_values.to_vec())) as ArrayRef,
+                )])),
+            ]
+        };
+        let merge_mode = "EVENT_TIME_ORDERING";
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            crate::config::table::HudiTableConfig::OrderingFields
+                .as_ref()
+                .to_string(),
+            "meta.ts".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        let mut handler = FileGroupReaderSchemaHandler::new()
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema.clone());
+        handler
+            .prepare_required_schema(
+                true,
+                &[ctx.record_key_field().to_string()],
+                &ctx.record_context.ordering_field_names.clone(),
+                &ctx.table_config,
+                false,
+                merge_mode,
+            )
+            .unwrap();
+        ctx.schema_handler = handler;
+        let mut buffer = PositionBasedFileGroupRecordBuffer::new(
+            Arc::new(ctx),
+            merge_mode.to_string(),
+            false,
+            BASE_INSTANT.to_string(),
+        )
+        .unwrap();
+
+        let log =
+            RecordBatch::try_new(table_schema.clone(), columns(&["a", "b"], &[1, 9])).unwrap();
+        let mut block = data_block_from_batch(log, &[0, 1], BASE_INSTANT, "20240101000001000");
+        buffer.process_data_block(&mut block).unwrap();
+        let mut base_fields: Vec<Field> = table_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        base_fields.push(Field::new(
+            ROW_INDEX_TEMPORARY_COLUMN_NAME,
+            DataType::Int64,
+            false,
+        ));
+        let mut base_columns = columns(&["a", "b"], &[5, 5]);
+        base_columns.push(Arc::new(Int64Array::from(vec![0, 1])));
+        buffer.set_base_file_iterator(vec![
+            RecordBatch::try_new(Arc::new(Schema::new(base_fields)), base_columns).unwrap(),
+        ]);
+
+        let (out, _) = Box::new(buffer).merge_and_collect_with_stats().unwrap();
+        let ts_out = crate::util::arrow::nested_column(&out, "meta.ts")
+            .unwrap()
+            .unwrap();
+        let ts_out = ts_out.as_any().downcast_ref::<Int64Array>().unwrap();
+        let keys = out
+            .column(out.schema().index_of("_hoodie_record_key").unwrap())
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut rows: Vec<(String, i64)> = (0..out.num_rows())
+            .map(|i| (keys.value(i).to_string(), ts_out.value(i)))
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![("a".to_string(), 5), ("b".to_string(), 9)]);
     }
 
     #[test]

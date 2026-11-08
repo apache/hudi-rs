@@ -219,13 +219,19 @@ pub(super) fn event_time_ordering_fields(
 
 /// The ordering fields an upsert compares. A partial update that does not set
 /// every ordering field merges by commit time, since the merged row takes its
-/// ordering value from the stored row, not the update.
+/// ordering value from the stored row, not the update. Updating a struct column
+/// sets every field nested in it.
 pub(super) fn upsert_ordering_fields(
     hudi_configs: &crate::config::HudiConfigs,
     update_columns: Option<&[String]>,
 ) -> Result<Vec<String>> {
     let fields = event_time_ordering_fields(hudi_configs)?;
-    if update_columns.is_some_and(|columns| fields.iter().any(|field| !columns.contains(field))) {
+    let sets = |columns: &[String], field: &str| {
+        columns
+            .iter()
+            .any(|column| column == field || field.split('.').next() == Some(column.as_str()))
+    };
+    if update_columns.is_some_and(|columns| fields.iter().any(|field| !sets(columns, field))) {
         return Ok(Vec::new());
     }
     Ok(fields)

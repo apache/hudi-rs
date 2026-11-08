@@ -23,6 +23,7 @@ This is a crate meant for facilitating testing in `hudi-rs` - it provides utilit
 
 The `data/` directory contains fully prepared sample Hudi tables categorized by table version and configuration options:
 each zipped file contains the Hudi table and the corresponding `.sql` contains the SQL used to generate the table.
+A fixture that needs the DataFrame writer ships a `.scala` or `.py` generator instead.
 
 Beside the table directory, a zip may also carry what Hudi's own reader returns for it, so this crate can be
 diffed against the reference implementation rather than against its own expectations:

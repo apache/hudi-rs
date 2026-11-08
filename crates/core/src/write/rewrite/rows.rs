@@ -349,9 +349,13 @@ pub(super) fn deduplicate_last_by_key(
 ) -> Result<RecordBatch> {
     // One comparator per ordering field, hoisted out of the duplicate loop;
     // fields compare lexicographically (first field breaks ties via the next).
-    let comparators = ordering_fields
+    let columns = ordering_fields
         .iter()
-        .filter_map(|name| batch.column_by_name(name))
+        .map(|name| nested_column(batch, name))
+        .collect::<Result<Vec<_>>>()?;
+    let comparators = columns
+        .iter()
+        .flatten()
         .map(|column| {
             arrow_ord::ord::make_comparator(
                 column.as_ref(),

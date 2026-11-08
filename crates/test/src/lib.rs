@@ -605,6 +605,7 @@ pub enum SampleTable {
     V8Nonpartitioned,
     V8SimplekeygenHivestyleNoMetafields,
     V8SimplekeygenNonhivestyle,
+    V9NestedOrderingField,
     V9NonpartitionedRollback,
     V9TimebasedkeygenEpochmillis,
     V9TimebasedkeygenNonhivestyle,
@@ -684,7 +685,9 @@ impl SampleTable {
 
             Self::V6NonpartitionedRollback => MOR_PARQUET,
 
-            Self::V9NonpartitionedRollback | Self::V9LanceNonhivestyle => MOR_AVRO,
+            Self::V9NestedOrderingField
+            | Self::V9NonpartitionedRollback
+            | Self::V9LanceNonhivestyle => MOR_AVRO,
 
             Self::V9TimebasedkeygenNonhivestyle
             | Self::V9TxnsComplexMeta

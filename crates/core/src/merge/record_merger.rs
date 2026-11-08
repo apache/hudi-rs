@@ -29,7 +29,7 @@ use crate::merge::ordering::{MaxOrderingInfo, process_batch_for_max_orderings};
 use crate::metadata::meta_field::MetaField;
 use crate::record::{
     create_commit_time_ordering_converter, create_event_time_ordering_converter,
-    create_record_key_converter, extract_commit_time_ordering_values,
+    create_record_key_converter, event_time_ordering_column, extract_commit_time_ordering_values,
     extract_event_time_ordering_values, extract_record_keys,
 };
 use crate::util::arrow::ColumnAsArray;
@@ -105,7 +105,7 @@ impl RecordMerger {
                     .map(|s| s.as_str())
                     .unwrap_or(commit_time_field.as_str());
                 let key_array = data_batch.get_array(MetaField::RecordKey.as_ref())?;
-                let ordering_array = data_batch.get_array(ordering_field)?;
+                let ordering_array = event_time_ordering_column(&data_batch, ordering_field)?;
                 let commit_seqno_array = data_batch.get_array(MetaField::CommitSeqno.as_ref())?;
                 let desc_indices =
                     lexsort_to_indices(&[key_array, ordering_array, commit_seqno_array], true);

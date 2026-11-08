@@ -821,8 +821,8 @@ pub(super) async fn moved_keys_rejected_by_event_time(
         let old_keys = keys(&old, MetaField::RecordKey.as_ref())?;
         let wanted: HashSet<&String> = moved_keys.iter().collect();
         let (Some(old_ordering), Some(new_ordering)) = (
-            old.column_by_name(ordering_field),
-            incoming.column_by_name(ordering_field),
+            nested_column(&old, ordering_field)?,
+            nested_column(incoming, ordering_field)?,
         ) else {
             continue;
         };

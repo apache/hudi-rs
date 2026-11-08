@@ -37,6 +37,7 @@ use crate::file_group::reader_v2::buffered_record::{BufferedRecord, OrderingValu
 use crate::file_group::reader_v2::delete_context::DeleteContext;
 use crate::keygen::record_key::{construct_record_key, render_key_field};
 use crate::metadata::meta_field::MetaField;
+use crate::util::arrow::nested_column;
 use arrow_array::{Array, ListArray, RecordBatch, StringArray, StructArray, UnionArray};
 use arrow_schema::{DataType, SchemaRef};
 use std::collections::HashMap;
@@ -525,7 +526,9 @@ impl RecordContext {
     /// Mirrors Java's `RecordContext.getOrderingValue(T, Schema, List<String>)`,
     /// applied to each row in the batch.
     ///
-    /// Uses `self.ordering_field_names` to locate the ordering column.
+    /// Uses `self.ordering_field_names` to locate the ordering column, by
+    /// top-level name or by dotted path to a nested field (`meta.ts`), as
+    /// [`nested_column`] resolves it.
     /// Supports Int32, Int64, Float32, Float64, and Utf8 column types.
     /// Returns None if no ordering fields specified or column not found.
     pub fn get_ordering_values(
@@ -535,12 +538,10 @@ impl RecordContext {
         match self.ordering_field_names.as_slice() {
             // No precombine/ordering field configured → no ordering values.
             [] => Ok(None),
-            [field_name] => match batch.schema().index_of(field_name) {
-                Ok(col_idx) => Ok(Self::column_to_ordering_values(
-                    batch.column(col_idx).as_ref(),
-                )),
+            [field_name] => match nested_column(batch, field_name)? {
+                Some(column) => Ok(Self::column_to_ordering_values(column.as_ref())),
                 // Ordering field not present in this batch's schema → no ordering value.
-                Err(_) => Ok(None),
+                None => Ok(None),
             },
             // Multi-field (composite) ordering, e.g. MySql Debezium's
             // `(_event_bin_file, _event_pos)`. Build one `OrderingValue::Composite`
@@ -557,16 +558,14 @@ impl RecordContext {
                 let mut per_field: Vec<Vec<Option<OrderingValue>>> =
                     Vec::with_capacity(fields.len());
                 for field_name in fields {
-                    match batch.schema().index_of(field_name) {
-                        Ok(col_idx) => {
-                            match Self::column_to_ordering_values(batch.column(col_idx).as_ref()) {
-                                Some(vals) => per_field.push(vals),
-                                // Unsupported field type → no composite ordering.
-                                None => return Ok(None),
-                            }
-                        }
+                    match nested_column(batch, field_name)? {
+                        Some(column) => match Self::column_to_ordering_values(column.as_ref()) {
+                            Some(vals) => per_field.push(vals),
+                            // Unsupported field type → no composite ordering.
+                            None => return Ok(None),
+                        },
                         // A composite ordering field absent from this batch → none.
-                        Err(_) => return Ok(None),
+                        None => return Ok(None),
                     }
                 }
                 let num_rows = batch.num_rows();
@@ -603,8 +602,8 @@ impl RecordContext {
     /// exactly, because the single-column case and the eager path both resolve the
     /// column through [`OrderingAccessor::from_column`]: integers/dates/timestamps/
     /// boolean → `Long`, `Float64`/`Float32` → `Double`, `Utf8`/`LargeUtf8` →
-    /// `String`; null or unsupported type → `None`; multi-column → eager
-    /// `Composite` via [`Self::get_ordering_values`].
+    /// `String`; null or unsupported type → `None`; multi-column or nested field
+    /// → eager values via [`Self::get_ordering_values`].
     pub fn ordering_accessor<'b>(&self, batch: &'b RecordBatch) -> Result<OrderingAccessor<'b>> {
         match self.ordering_field_names.as_slice() {
             [] => Ok(OrderingAccessor::None),
@@ -618,16 +617,25 @@ impl RecordContext {
                 Ok(col_idx) => Ok(OrderingAccessor::from_column(
                     batch.column(col_idx).as_ref(),
                 )),
-                Err(_) => Ok(OrderingAccessor::None),
+                // A nested field (`meta.ts`): its column is derived from the
+                // parent struct, so it cannot be borrowed and takes the eager path.
+                Err(_) => self.precomputed_ordering_accessor(batch),
             },
             // Multi-field (composite) ordering: build the per-row composite
             // values eagerly via the shared path, then index into them. Returns
             // `OrderingAccessor::None` when no composite applies (field absent /
             // unsupported element type / no rows), matching `get_ordering_values`.
-            _ => match self.get_ordering_values(batch)? {
-                Some(vals) => Ok(OrderingAccessor::Precomputed(vals)),
-                None => Ok(OrderingAccessor::None),
-            },
+            _ => self.precomputed_ordering_accessor(batch),
+        }
+    }
+
+    fn precomputed_ordering_accessor<'b>(
+        &self,
+        batch: &'b RecordBatch,
+    ) -> Result<OrderingAccessor<'b>> {
+        match self.get_ordering_values(batch)? {
+            Some(vals) => Ok(OrderingAccessor::Precomputed(vals)),
+            None => Ok(OrderingAccessor::None),
         }
     }
 
@@ -2626,5 +2634,66 @@ mod tests {
         .unwrap();
 
         assert!(ctx.get_ordering_values(&batch).unwrap().is_none());
+    }
+
+    /// A dotted ordering field resolves through its parent struct on both the
+    /// eager (log) and lazy (base) paths. A null parent reads as a null value
+    /// even where the child slot holds one; a path that resolves to nothing
+    /// gives no ordering value.
+    #[test]
+    fn test_ordering_values_resolve_nested_field() {
+        let ts = Arc::new(Field::new("ts", DataType::Int64, true));
+        let meta = StructArray::try_new(
+            vec![ts].into(),
+            vec![Arc::new(Int64Array::from(vec![Some(5), Some(7), None])) as ArrayRef],
+            Some(arrow_buffer::NullBuffer::from(vec![true, false, true])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("meta", meta.data_type().clone(), true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b", "c"])) as ArrayRef,
+                Arc::new(meta),
+            ],
+        )
+        .unwrap();
+        let ctx_for = |ordering: &str| {
+            let table_config = HashMap::from([(
+                HudiTableConfig::OrderingFields.as_ref().to_string(),
+                ordering.to_string(),
+            )]);
+            RecordContext::new(&table_config, String::new())
+        };
+
+        let ctx = ctx_for("meta.ts");
+        let expected = vec![
+            Some(OrderingValue::Long(5)),
+            Some(OrderingValue::Default),
+            Some(OrderingValue::Default),
+        ];
+        assert_eq!(
+            ctx.get_ordering_values(&batch).unwrap(),
+            Some(expected.clone())
+        );
+        let accessor = ctx.ordering_accessor(&batch).unwrap();
+        let lazy: Vec<_> = (0..batch.num_rows())
+            .map(|i| accessor.value_at(i))
+            .collect();
+        assert_eq!(lazy, expected);
+
+        for unresolved in ["meta.absent", "meta.ts.deeper", "absent.ts", "id.ts"] {
+            let ctx = ctx_for(unresolved);
+            assert!(
+                ctx.get_ordering_values(&batch).unwrap().is_none(),
+                "{unresolved}"
+            );
+            assert!(
+                ctx.ordering_accessor(&batch).unwrap().value_at(0).is_none(),
+                "{unresolved}"
+            );
+        }
     }
 }
