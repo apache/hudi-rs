@@ -17,12 +17,15 @@
  * under the License.
  */
 
+//! [`TableBuilder`] opens a [`Table`] with options.
+
 use paste::paste;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Result;
+use crate::config::properties::parse_properties;
 use crate::config::read::{HudiReadConfig, ReadConfigScope};
 use crate::config::table::HudiTableConfig;
 use crate::config::util::{parse_data_for_options, split_hudi_options_from_others};
@@ -34,7 +37,11 @@ use crate::table::validation::validate_configs;
 use crate::timeline::Timeline;
 use crate::util::collection::extend_if_absent;
 
-/// Builder for creating a [Table] instance.
+/// Builder that opens an existing [`Table`] with options.
+///
+/// `with_hudi_option(s)` set Hudi configs, `with_storage_option(s)` set storage options, and
+/// `with_option(s)` take either, routing keys that start with `hoodie.` to Hudi configs.
+/// [`OptionResolver::resolve_options`] describes how these combine with the table's own configs.
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     option_resolver: OptionResolver,
@@ -43,9 +50,13 @@ pub struct TableBuilder {
 /// Resolver for options including Hudi options, storage options, and generic options.
 #[derive(Debug, Clone)]
 pub struct OptionResolver {
+    /// The table's base URI.
     pub base_uri: String,
+    /// Hudi configs (`hoodie.*`).
     pub hudi_options: HashMap<String, String>,
+    /// Storage options, such as cloud credentials.
     pub storage_options: HashMap<String, String>,
+    /// Options not yet split into Hudi configs and storage options.
     pub options: HashMap<String, String>,
 }
 
@@ -101,6 +112,15 @@ impl TableBuilder {
         TableBuilder { option_resolver }
     }
 
+    /// Resolves the options, validates the table configs, and loads the timeline.
+    ///
+    /// Read configs that select which read to perform (query type and timestamps) are dropped
+    /// with a warning; pass them in [`ReadOptions`](crate::table::ReadOptions) instead.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, when `.hoodie/hoodie.properties` cannot be read, or the table
+    /// configs are invalid or unsupported (for example a table version other than 6, 8, or 9).
     pub async fn build(&mut self) -> Result<Table> {
         let option_resolver = &mut self.option_resolver;
 
@@ -169,6 +189,32 @@ impl TableBuilder {
     }
 }
 
+/// Add storage options from env vars for keys starting with `HOODIE_ENV_` or cloud storage
+/// prefixes, without overriding options already present.
+///
+/// For example: `HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key` will be converted to `fs.s3a.access.key`.
+///
+/// Also supports standard cloud storage env vars like `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.
+///
+/// [note] All keys will be converted to lowercase.
+pub(crate) fn resolve_storage_env_vars(storage_options: &mut HashMap<String, String>) {
+    for (env_key, env_value) in std::env::vars() {
+        let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
+            Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
+        } else if Storage::CLOUD_STORAGE_PREFIXES
+            .iter()
+            .any(|prefix| env_key.starts_with(prefix))
+        {
+            Some(env_key.to_ascii_lowercase())
+        } else {
+            None
+        };
+        if let Some(key) = lower_option_key {
+            storage_options.entry(key).or_insert(env_value);
+        }
+    }
+}
+
 impl OptionResolver {
     /// Create a new [OptionResolver] with the given base URI.
     pub fn new(base_uri: &str) -> Self {
@@ -211,7 +257,7 @@ impl OptionResolver {
     ///    - Cloud storage options specified via env vars
     /// 4. Global Hudi configs
     ///
-    /// [note] Error may occur when 1 and 2 have conflicts.
+    /// Note: an error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
         self.resolve_user_provided_options();
 
@@ -244,29 +290,8 @@ impl OptionResolver {
         extend_if_absent(&mut self.storage_options, &generic_other_opts)
     }
 
-    /// Resolve env vars for keys starting with `HOODIE_ENV_` or cloud storage options.
-    ///
-    /// For example: `HOODIE_ENV_fs_DOT_s3a_DOT_access_DOT_key` will be converted to `fs.s3a.access.key`.
-    ///
-    /// Also supports standard cloud storage env vars like `AWS_ACCESS_KEY_ID`, `GOOGLE_APPLICATION_CREDENTIALS`, `AZURE_STORAGE_ACCOUNT_KEY`, etc.
-    ///
-    /// [note] All keys will be converted to lowercase.
     fn resolve_env_vars(&mut self) {
-        for (env_key, env_value) in std::env::vars() {
-            let lower_option_key = if let Some(stripped) = env_key.strip_prefix("HOODIE_ENV_") {
-                Some(stripped.replace("_DOT_", ".").to_ascii_lowercase())
-            } else if Storage::CLOUD_STORAGE_PREFIXES
-                .iter()
-                .any(|prefix| env_key.starts_with(prefix))
-            {
-                Some(env_key.to_ascii_lowercase())
-            } else {
-                None
-            };
-            if let Some(key) = lower_option_key {
-                self.storage_options.entry(key).or_insert(env_value);
-            }
-        }
+        resolve_storage_env_vars(&mut self.storage_options);
     }
 
     async fn resolve_hudi_options(&mut self) -> Result<()> {
@@ -291,7 +316,7 @@ impl OptionResolver {
         storage: Arc<Storage>,
     ) -> Result<()> {
         let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
-        let table_properties = parse_data_for_options(&bytes, "=")?;
+        let table_properties = parse_properties(&bytes)?;
 
         // Table properties on storage (hoodie.properties) should have the highest precedence,
         // except for writer-changeable properties like enabling metadata table/indexes.

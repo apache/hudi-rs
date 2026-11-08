@@ -18,14 +18,27 @@
  */
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::file_group::base_file::reader::KeyPredicate;
+use crate::file_group::log_file::BlockMetadataKey;
 use crate::file_group::log_file::log_block::{BlockType, LogBlock, LogBlockContent};
 use crate::file_group::log_file::reader::LogFileReader;
 use crate::file_group::record_batches::RecordBatches;
 use crate::hfile::HFileRecord;
 use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
-use std::collections::HashSet;
+use apache_avro::Schema as AvroSchema;
+use arrow_array::Array;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Metadata-table records of one log block.
+#[derive(Debug)]
+pub struct HFileRecordGroup {
+    /// The block's writer schema, from its `SCHEMA` header; `None` for
+    /// delete-block tombstones and blocks without one.
+    pub schema: Option<Arc<AvroSchema>>,
+    pub records: Vec<HFileRecord>,
+}
 
 /// Result of scanning log files.
 ///
@@ -127,6 +140,8 @@ impl CollectedBlocks {
 pub struct LogFileScanner {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
+    /// Keys to narrow HFile log blocks to; see [`LogFileReader::with_key_predicate`].
+    key_predicate: Option<KeyPredicate>,
 }
 
 impl LogFileScanner {
@@ -134,7 +149,14 @@ impl LogFileScanner {
         Self {
             hudi_configs,
             storage,
+            key_predicate: None,
         }
+    }
+
+    /// Narrow HFile log blocks to `key_predicate` on every file this scanner reads.
+    pub(crate) fn with_key_predicate(mut self, key_predicate: Option<KeyPredicate>) -> Self {
+        self.key_predicate = key_predicate;
+        self
     }
 
     /// Read all blocks from multiple log files and collect rollback targets.
@@ -148,7 +170,9 @@ impl LogFileScanner {
 
         for path in relative_paths {
             let mut reader =
-                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path).await?;
+                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path)
+                    .await?
+                    .with_key_predicate(self.key_predicate.clone());
             let blocks = reader.read_all_blocks(instant_range).await?;
 
             // Collect rollback targets from command blocks
@@ -247,28 +271,96 @@ impl LogFileScanner {
     }
 
     /// Collect HFile records from blocks.
-    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<ScanResult> {
-        // Pre-count records for capacity
-        let mut total_records = 0;
-        for blocks in &collected.all_blocks {
-            for block in blocks {
-                if block.block_type == BlockType::HfileData
-                    && let Some(records) = block.content.as_hfile_records()
-                {
-                    total_records += records.len();
-                }
-            }
-        }
-
-        // Collect valid HFile records
-        let mut records = Vec::with_capacity(total_records);
+    ///
+    /// Delete blocks may appear alongside HFile data (MDT RLI tombstones). Apply them
+    /// as empty-value records so callers treat the key as deleted.
+    fn collect_hfile_records(&self, collected: CollectedBlocks) -> Result<Vec<HFileRecordGroup>> {
+        let mut schemas: HashMap<String, Arc<AvroSchema>> = HashMap::new();
+        // HFile records keep their block's schema; delete-block keys become
+        // tombstones, which need none.
+        let mut groups = Vec::new();
         for block in collected.iter_valid_blocks() {
-            if let LogBlockContent::HFileRecords(hfile_records) = block.content {
-                records.extend(hfile_records);
+            match block.content {
+                LogBlockContent::HFileRecords(hfile_records) => {
+                    let schema = match block.header.get(&BlockMetadataKey::Schema) {
+                        Some(json) => Some(match schemas.get(json) {
+                            Some(schema) => schema.clone(),
+                            None => {
+                                let schema =
+                                    Arc::new(AvroSchema::parse_str(json).map_err(|e| {
+                                        crate::error::CoreError::LogBlockError(format!(
+                                            "invalid HFile log block schema: {e}"
+                                        ))
+                                    })?);
+                                schemas.insert(json.clone(), schema.clone());
+                                schema
+                            }
+                        }),
+                        None => None,
+                    };
+                    groups.push(HFileRecordGroup {
+                        schema,
+                        records: hfile_records,
+                    });
+                }
+                LogBlockContent::Records(batches) => {
+                    if block.block_type == BlockType::Delete {
+                        let mut records = Vec::new();
+                        for (batch, _) in &batches.delete_batches {
+                            if let Some(keys) = batch
+                                .column_by_name("recordKey")
+                                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>())
+                            {
+                                for i in 0..keys.len() {
+                                    if !keys.is_null(i) {
+                                        records.push(crate::hfile::HFileRecord::from_str_key(
+                                            keys.value(i),
+                                            Vec::new(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        groups.push(HFileRecordGroup {
+                            schema: None,
+                            records,
+                        });
+                    }
+                }
+                _ => {}
             }
         }
 
-        Ok(ScanResult::HFileRecords(records))
+        Ok(groups)
+    }
+
+    /// Scan metadata-table log files, whose data blocks are HFile blocks.
+    ///
+    /// Records come grouped in block order with the writer schema of the block
+    /// they were read from (its `SCHEMA` header), since blocks written by
+    /// another writer may use a different schema than the base file.
+    ///
+    /// Delete blocks become tombstones even when no HFile block is in range: after an
+    /// MDT compaction, a write that only deletes leaves delete-only logs, which the
+    /// content detection of [`Self::scan`] would classify as Arrow records.
+    pub async fn scan_hfile_records(
+        &self,
+        relative_paths: Vec<String>,
+        instant_range: &InstantRange,
+    ) -> Result<Vec<HFileRecordGroup>> {
+        let collected = self.collect_blocks(relative_paths, instant_range).await?;
+        if collected.all_blocks.iter().flatten().any(|block| {
+            matches!(
+                block.block_type,
+                BlockType::AvroData | BlockType::ParquetData | BlockType::CdcData
+            )
+        }) {
+            return Err(crate::error::CoreError::LogBlockError(
+                "metadata table log files must not contain Avro, Parquet, or CDC data blocks"
+                    .into(),
+            ));
+        }
+        self.collect_hfile_records(collected)
     }
 
     /// Scan log files and return the appropriate content type.
@@ -294,7 +386,9 @@ impl LogFileScanner {
 
         match content_type {
             ContentType::Records => self.collect_record_batches(collected),
-            ContentType::HFile => self.collect_hfile_records(collected),
+            ContentType::HFile => self.collect_hfile_records(collected).map(|groups| {
+                ScanResult::HFileRecords(groups.into_iter().flat_map(|g| g.records).collect())
+            }),
             ContentType::Empty => Ok(ScanResult::Empty),
         }
     }
@@ -445,6 +539,67 @@ mod tests {
     const CHENNAI_UUID: &str = "6e1d5cc4-c487-487d-abbe-fe9b30b1c0cc";
     const SAN_FRANCISCO_UUID: &str = "036ded81-9ed4-479f-bcea-7145dfa0079b";
     const SAO_PAULO_UUID: &str = "8aa68f7e-afd6-4c94-b86c-8a886552e08d";
+
+    /// The key predicate narrows HFile data blocks but must leave delete
+    /// blocks whole: a tombstone for a requested key may sit in a block that
+    /// also names keys nobody asked for, and dropping it would bring the
+    /// deleted key back.
+    #[tokio::test]
+    async fn test_scan_hfile_records_key_predicate_keeps_delete_blocks_whole() -> crate::Result<()>
+    {
+        use crate::file_group::base_file::reader::KeyPredicate;
+        use crate::file_group::log_file::writer::write_log_block;
+        use crate::file_group::log_file::{BlockMetadataKey, BlockType};
+        use std::collections::{BTreeMap, HashMap};
+
+        let dir = tempfile::tempdir()?;
+        let instant = "20260101000000000";
+        let entries: Vec<(String, Vec<u8>)> = ["a", "b", "c"]
+            .iter()
+            .map(|k| (k.to_string(), k.as_bytes().to_vec()))
+            .collect();
+        let hfile = crate::hfile::HFileWriter::write(&entries, BTreeMap::new())
+            .map_err(|e| crate::error::CoreError::HFile(e.to_string()))?;
+        let header = HashMap::from([(BlockMetadataKey::InstantTime, instant.to_string())]);
+        let mut bytes = write_log_block(BlockType::HfileData, header, &hfile);
+        bytes.extend(crate::write::build_delete_log_block(
+            instant,
+            &[
+                ("b".to_string(), String::new()),
+                ("d".to_string(), String::new()),
+            ],
+            0,
+        )?);
+        let log = ".f-0_20260101000000000.log.1_0-0-0";
+        std::fs::write(dir.path().join(log), bytes)?;
+
+        let storage = Storage::new_with_base_url(parse_uri(dir.path().to_str().unwrap())?)?;
+        let scanner = LogFileScanner::new(Arc::new(HudiConfigs::empty()), storage)
+            .with_key_predicate(Some(KeyPredicate::Keys(vec!["b".to_string()])));
+        let records = scanner
+            .scan_hfile_records(
+                vec![log.to_string()],
+                &InstantRange::up_to("99991231235959999", "utc"),
+            )
+            .await?;
+        let mut keys: Vec<(String, bool)> = records
+            .iter()
+            .flat_map(|group| &group.records)
+            .map(|r| (r.key_as_str().unwrap().to_string(), r.value().is_empty()))
+            .collect();
+        keys.sort();
+        // `b` from the data block, then the tombstones for `b` and `d`; `a`
+        // and `c` were narrowed away.
+        assert_eq!(
+            keys,
+            vec![
+                ("b".to_string(), false),
+                ("b".to_string(), true),
+                ("d".to_string(), true)
+            ]
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn test_scan_metadata_table_log_files() -> crate::Result<()> {

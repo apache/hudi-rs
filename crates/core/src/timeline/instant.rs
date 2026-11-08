@@ -44,6 +44,13 @@ pub enum Action {
     Rollback,
     /// A restore, which is made up of several rollbacks.
     Restore,
+    /// A compaction of merge-on-read file groups. Pending states carry this
+    /// action; the completed instant is a [`Action::Commit`], as Java writes
+    /// it, so it is absent from [`DEFAULT_LOADING_ACTIONS`] like the others
+    /// that never complete under their own name.
+    ///
+    /// [`DEFAULT_LOADING_ACTIONS`]: crate::timeline::DEFAULT_LOADING_ACTIONS
+    Compaction,
 }
 
 impl FromStr for Action {
@@ -56,6 +63,7 @@ impl FromStr for Action {
             "replacecommit" => Ok(Action::ReplaceCommit),
             "rollback" => Ok(Action::Rollback),
             "restore" => Ok(Action::Restore),
+            "compaction" => Ok(Action::Compaction),
             _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
@@ -69,6 +77,7 @@ impl AsRef<str> for Action {
             Action::ReplaceCommit => "replacecommit",
             Action::Rollback => "rollback",
             Action::Restore => "restore",
+            Action::Compaction => "compaction",
         }
     }
 }
@@ -156,6 +165,31 @@ impl FromStr for Instant {
 }
 
 impl Instant {
+    /// Construct a completed instant for writers.
+    ///
+    /// `timestamp` is the requested time (`yyyyMMddHHmmssSSS` or 17-digit epoch millis).
+    /// When `completion_timestamp` is set, the v8+ `{requested}_{completion}.{action}`
+    /// file name form is used.
+    pub fn new_completed(
+        timestamp: impl Into<String>,
+        action: Action,
+        completion_timestamp: Option<String>,
+    ) -> Result<Self> {
+        let timestamp = timestamp.into();
+        Self::validate_timestamp(&timestamp)?;
+        if let Some(ref completion) = completion_timestamp {
+            Self::validate_timestamp(completion)?;
+        }
+        let dt = Self::parse_datetime(&timestamp, "UTC")?;
+        Ok(Self {
+            timestamp,
+            completion_timestamp,
+            action,
+            state: State::Completed,
+            epoch_millis: dt.timestamp_millis(),
+        })
+    }
+
     pub fn try_from_file_name_and_timezone(file_name: &str, timezone: &str) -> Result<Self> {
         let (timestamp_part, action_suffix) = file_name
             .split_once('.')
@@ -233,7 +267,7 @@ impl Instant {
     /// 1. Date format: `yyyyMMddHHmmss` (14 chars) or `yyyyMMddHHmmssSSS` (17 chars)
     /// 2. Epoch milliseconds: 17-digit number representing milliseconds since Unix epoch
     ///    (used by metadata table for timestamps like `00000000000000000`), or one
-    ///    of the [`Self::BOOTSTRAP_INSTANT_TIMES`] sentinels.
+    ///    of the `Self::BOOTSTRAP_INSTANT_TIMES` sentinels.
     ///
     /// The function tries date format first, then falls back to epoch milliseconds
     /// if the date parsing fails (e.g., invalid month/day like `00`).
@@ -729,6 +763,7 @@ mod tests {
             Action::ReplaceCommit,
             Action::Rollback,
             Action::Restore,
+            Action::Compaction,
         ] {
             let suffix = action.as_ref();
             assert_eq!(

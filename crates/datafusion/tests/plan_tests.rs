@@ -42,10 +42,20 @@ use hudi_test::{SampleTable, assert_arrow_field_names_eq};
 // ============================================================================
 
 async fn create_test_session() -> SessionContext {
-    let config = SessionConfig::new().set(
-        "datafusion.sql_parser.enable_ident_normalization",
-        &ScalarValue::from(false),
-    );
+    let config = SessionConfig::new()
+        .set(
+            "datafusion.sql_parser.enable_ident_normalization",
+            &ScalarValue::from(false),
+        )
+        // The plan assertions below check how the provider buckets file slices
+        // under `hoodie.read.input.partitions`. DataFusion may then split those
+        // groups further for parallelism once they pass
+        // `repartition_file_min_size` (1 MiB since DataFusion 55), which the
+        // fixtures do, so that pass is turned off to keep the groups visible.
+        .set(
+            "datafusion.optimizer.repartition_file_scans",
+            &ScalarValue::from(false),
+        );
     let table_factory: Arc<dyn TableProviderFactory> = Arc::new(HudiTableFactory::default());
 
     let session_state = SessionStateBuilder::new()
@@ -826,5 +836,26 @@ mod lance_tests {
 
         assert_eq!(txn_ids, ["TXN-001", "TXN-003", "TXN-013", "TXN-014"]);
         assert_eq!(txn_types, ["reversal", "transfer", "debit", "debit"]);
+    }
+}
+
+mod factory_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_create_external_table_rejects_multiple_locations() {
+        let ctx = create_test_session().await;
+        let path = SampleTable::V6Nonpartitioned.path_to_cow();
+        let sql = format!(
+            "CREATE EXTERNAL TABLE two_locations STORED AS HUDI LOCATION ('{path}', '{path}')"
+        );
+        let err = ctx
+            .sql(&sql)
+            .await
+            .expect_err("two locations must be rejected");
+        assert!(
+            err.to_string().contains("exactly one location, got 2"),
+            "unexpected error: {err}"
+        );
     }
 }
