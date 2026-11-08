@@ -16,12 +16,16 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+//! The error type of config parsing and validation.
+
 use std::num::ParseIntError;
 use std::str::ParseBoolError;
 use thiserror::Error;
 
+/// Result type of config parsing, failing with [`ConfigError`] by default.
 pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
 
+/// Errors from parsing or validating a config.
 #[derive(Error, Debug)]
 pub enum ConfigError {
     /// ParseBool(key, value, source)
@@ -36,12 +40,16 @@ pub enum ConfigError {
     #[error("Failed to parse line: {0}'")]
     ParseLine(String),
 
+    /// InvalidValue(value or message): the value is not one the config accepts. The payload is
+    /// the rejected value or a message describing it.
     #[error("Config value '{0}' is not valid")]
     InvalidValue(String),
 
+    /// NotFound(key): the config is not set.
     #[error("Config '{0}' not found")]
     NotFound(String),
 
+    /// UnsupportedValue(message): the value is valid but not supported by hudi-rs.
     #[error("Config value '{0}' is not supported")]
     UnsupportedValue(String),
 }

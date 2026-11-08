@@ -88,6 +88,13 @@ lazy_static! {
 }
 
 impl MetaField {
+    /// Whether `name` is a writer-managed meta field (Java
+    /// `HoodieSchemaUtils.isMetadataField`). Other `_hoodie_` names, such as the
+    /// `_hoodie_is_deleted` delete marker, are data columns.
+    pub fn is_meta_field(name: &str) -> bool {
+        Self::from_str(name).is_ok()
+    }
+
     #[inline]
     pub fn field_index(&self) -> usize {
         self.clone() as usize

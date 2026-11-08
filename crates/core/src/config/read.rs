@@ -113,7 +113,12 @@ pub enum HudiReadConfig {
 
     /// Number of input partitions to read the data in parallel.
     ///
-    /// For processing 100 files, [InputPartitions] being 5 will produce 5 partitions, with each partition having 20 files.
+    /// For processing 100 files, [Self::InputPartitions] being 5 will produce 5 partitions, with each partition having 20 files.
+    ///
+    /// On the parquet-source path (copy-on-write, or read-optimized merge-on-read)
+    /// DataFusion may split these buckets further once one exceeds
+    /// `datafusion.optimizer.repartition_file_min_size`, unless
+    /// `datafusion.optimizer.repartition_file_scans` is off.
     InputPartitions,
 
     /// When set to true, only base files will be read for optimized reads.
@@ -135,7 +140,9 @@ pub enum HudiReadConfig {
     /// This controls the batch size when using streaming APIs.
     StreamBatchSize,
 
-    /// Maximum number of file-slice streams to poll concurrently within one scan partition.
+    /// Maximum number of file slices to read concurrently within one scan partition.
+    /// Defaults to 4 per DataFusion partition; a `Table` read, which is one
+    /// partition covering the whole scan, defaults to the available cores.
     FileSliceReadConcurrency,
 
     /// Total memory, in bytes, a whole scan may use for concurrent file-slice

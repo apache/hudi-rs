@@ -21,7 +21,7 @@
 use crate::hfile::block_type::{HFileBlockType, MAGIC_LENGTH};
 use crate::hfile::compression::CompressionCodec;
 use crate::hfile::error::{HFileError, Result};
-use crate::hfile::key::{KEY_VALUE_HEADER_SIZE, Key, KeyValue};
+use crate::hfile::key::{KEY_VALUE_HEADER_SIZE, Key, KeyValue, key_content};
 
 /// Size constants for block header
 const SIZEOF_INT32: usize = 4;
@@ -41,9 +41,6 @@ const HEADER_SIZE_NO_CHECKSUM: usize = MAGIC_LENGTH + 2 * SIZEOF_INT32 + SIZEOF_
 /// - 4 bytes: bytes per checksum
 /// - 4 bytes: on-disk data size with header
 pub const BLOCK_HEADER_SIZE: usize = HEADER_SIZE_NO_CHECKSUM + SIZEOF_BYTE + 2 * SIZEOF_INT32;
-
-/// Checksum size (each checksum is 4 bytes)
-const CHECKSUM_SIZE: usize = SIZEOF_INT32;
 
 /// Parsed block header information.
 #[derive(Debug, Clone)]
@@ -100,13 +97,6 @@ impl BlockHeader {
         })
     }
 
-    /// Calculate the number of checksum bytes.
-    pub fn checksum_bytes_count(&self) -> usize {
-        let on_disk_with_header = BLOCK_HEADER_SIZE + self.on_disk_size_without_header;
-        let num_chunks = on_disk_with_header.div_ceil(self.bytes_per_checksum);
-        num_chunks * CHECKSUM_SIZE
-    }
-
     /// Returns the total on-disk size including header.
     pub fn on_disk_size_with_header(&self) -> usize {
         BLOCK_HEADER_SIZE + self.on_disk_size_without_header
@@ -128,8 +118,7 @@ impl HFileBlock {
 
         // Extract the compressed data (between header and checksum)
         let data_start = BLOCK_HEADER_SIZE;
-        let data_end =
-            data_start + header.on_disk_size_without_header - header.checksum_bytes_count();
+        let data_end = header.on_disk_data_size_with_header;
 
         // For uncompressed blocks, on_disk_size == uncompressed_size
         // For compressed blocks, we need to decompress
@@ -222,6 +211,19 @@ impl DataBlock {
         offset < self.content_end
     }
 
+    /// The record key content and value of every entry, as slices of the
+    /// block.
+    ///
+    /// [`Self::iter`] copies each entry out of the block; a caller that only
+    /// wants to find a few keys among thousands of entries can look at the
+    /// keys in place and copy the entries it keeps.
+    pub fn entries(&self) -> DataBlockEntries<'_> {
+        DataBlockEntries {
+            block: self,
+            offset: 0,
+        }
+    }
+
     /// Iterate over all key-value pairs in the block.
     #[allow(dead_code)]
     pub fn iter(&self) -> DataBlockIterator<'_> {
@@ -260,6 +262,52 @@ impl<'a> Iterator for DataBlockIterator<'a> {
         let kv = self.block.read_key_value(self.offset);
         self.offset += kv.record_size();
         Some(kv)
+    }
+}
+
+/// Borrowing walk over a data block's entries: see [`DataBlock::entries`].
+pub struct DataBlockEntries<'a> {
+    block: &'a DataBlock,
+    offset: usize,
+}
+
+impl<'a> Iterator for DataBlockEntries<'a> {
+    /// `(key content, value)`, the bytes `KeyValue::key().content()` and
+    /// `KeyValue::value()` return for the entry, or an error for an entry
+    /// that does not fit the block. The error ends the walk: a lookup that
+    /// quietly stopped at a corrupt entry would report its keys as absent.
+    type Item = Result<(&'a [u8], &'a [u8])>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let data = &self.block.data[..self.block.content_end];
+        let offset = self.offset;
+        if offset + KEY_VALUE_HEADER_SIZE > data.len() {
+            return None;
+        }
+        let truncated = || {
+            HFileError::InvalidFormat(format!(
+                "HFile data block entry at offset {offset} runs past the block"
+            ))
+        };
+        let key_length = i32::from_be_bytes(data[offset..offset + 4].try_into().ok()?);
+        let value_length = i32::from_be_bytes(data[offset + 4..offset + 8].try_into().ok()?);
+        let (Ok(key_length), Ok(value_length)) =
+            (usize::try_from(key_length), usize::try_from(value_length))
+        else {
+            self.offset = data.len();
+            return Some(Err(truncated()));
+        };
+        let key_start = offset + KEY_VALUE_HEADER_SIZE;
+        let value_start = key_start.saturating_add(key_length);
+        let end = value_start.saturating_add(value_length);
+        // One MVCC timestamp byte follows the value (`KeyValue::record_size`).
+        if end.saturating_add(1) > data.len() {
+            self.offset = data.len();
+            return Some(Err(truncated()));
+        }
+        self.offset = end + 1;
+        let content = key_content(&data[key_start..value_start]);
+        Some(Ok((content, &data[value_start..end])))
     }
 }
 
@@ -312,6 +360,59 @@ pub fn var_long_size_on_disk(bytes: &[u8], offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    /// One entry as the writer lays it out: lengths, structured key, value,
+    /// MVCC byte.
+    fn entry(content: &[u8], value: &[u8]) -> Vec<u8> {
+        let mut key = (content.len() as u16).to_be_bytes().to_vec();
+        key.extend_from_slice(content);
+        key.push(0);
+        key.extend_from_slice(&i64::MAX.to_be_bytes());
+        key.push(4);
+        let mut out = (key.len() as i32).to_be_bytes().to_vec();
+        out.extend_from_slice(&(value.len() as i32).to_be_bytes());
+        out.extend_from_slice(&key);
+        out.extend_from_slice(value);
+        out.push(0);
+        out
+    }
+
+    fn data_block(bytes: Vec<u8>) -> super::DataBlock {
+        let content_end = bytes.len();
+        super::DataBlock {
+            data: bytes,
+            content_end,
+        }
+    }
+
+    /// The borrowing walk sees what the copying iterator sees, and a
+    /// truncated entry is an error rather than a silent end.
+    #[test]
+    fn entries_match_key_values_and_reject_a_truncated_entry() {
+        let mut bytes = entry(b"k1", b"v1");
+        bytes.extend(entry(b"k2", b"value two"));
+        let block = data_block(bytes.clone());
+        let walked: Vec<(Vec<u8>, Vec<u8>)> = block
+            .entries()
+            .map(|e| e.map(|(k, v)| (k.to_vec(), v.to_vec())).unwrap())
+            .collect();
+        let copied: Vec<(Vec<u8>, Vec<u8>)> = block
+            .iter()
+            .map(|kv| (kv.key().content().to_vec(), kv.value().to_vec()))
+            .collect();
+        assert_eq!(walked, copied);
+        assert_eq!(walked[1], (b"k2".to_vec(), b"value two".to_vec()));
+
+        // Drop the tail of the second entry.
+        let truncated = data_block(bytes[..bytes.len() - 4].to_vec());
+        let results: Vec<_> = truncated.entries().collect();
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(matches!(
+            results[1],
+            Err(super::HFileError::InvalidFormat(_))
+        ));
+    }
+
     use super::*;
 
     #[test]
@@ -336,6 +437,48 @@ mod tests {
         let header = BlockHeader::parse(&bytes).unwrap();
         assert_eq!(header.on_disk_size_with_header(), BLOCK_HEADER_SIZE + 100);
         assert_eq!(header.block_type, HFileBlockType::Data);
+    }
+
+    #[test]
+    fn test_parse_gz_block_at_checksum_chunk_boundary() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let bytes_per_checksum = 16384usize;
+        let checksum_size = SIZEOF_INT32;
+        let (input, compressed) = (16000..16384)
+            .find_map(|len| {
+                let input = vec![b'x'; len];
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+                encoder.write_all(&input).unwrap();
+                let compressed = encoder.finish().unwrap();
+                let data_size = BLOCK_HEADER_SIZE + compressed.len();
+                (data_size == bytes_per_checksum - 1).then_some((input, compressed))
+            })
+            .expect("a stored GZIP block one byte below the checksum boundary");
+        let data_size = BLOCK_HEADER_SIZE + compressed.len();
+        let num_chunks = data_size.div_ceil(bytes_per_checksum);
+        let checksum_bytes = num_chunks * checksum_size;
+        assert!(num_chunks < (data_size + checksum_bytes).div_ceil(bytes_per_checksum));
+        eprintln!(
+            "synthetic GZIP boundary: N={data_size}, C={}, chunks={num_chunks}, checksum_bytes={checksum_bytes}",
+            compressed.len()
+        );
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DATABLK*");
+        bytes.extend_from_slice(&((compressed.len() + checksum_bytes) as i32).to_be_bytes());
+        bytes.extend_from_slice(&(input.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&(-1i64).to_be_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&(bytes_per_checksum as i32).to_be_bytes());
+        bytes.extend_from_slice(&(data_size as i32).to_be_bytes());
+        assert_eq!(bytes.len(), BLOCK_HEADER_SIZE);
+        bytes.extend_from_slice(&compressed);
+        bytes.resize(bytes.len() + checksum_bytes, 0);
+
+        let block = HFileBlock::parse(&bytes, CompressionCodec::Gzip).unwrap();
+        assert_eq!(block.data, input);
     }
 
     #[test]

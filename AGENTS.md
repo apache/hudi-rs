@@ -9,23 +9,43 @@ Arrow-native, `object_store` for all I/O, timeline-based MVCC.
 
 ```
 crates/
-  core/         hudi-core — avro_to_arrow, config, expr, file_group, hfile, keygen, merge, metadata,
-                record, schema, statistics, storage, table, timeline, util
+  core/         hudi-core — avro_to_arrow, bloom, config, expr, file_group, hfile, index, keygen,
+                merge, metadata, record, schema, statistics, storage, table, timeline, util, write
   datafusion/   hudi-datafusion — DataFusion TableProvider (feature: datafusion)
+  ffi/          hudi-ffi — plain C ABI for JVM and C++ engine callers via the Arrow C Data Interface
   hudi/         public umbrella crate; re-exports core + (optional) datafusion
-  jvm-ffi/      hudi-jvm-ffi — plain C ABI for JVM callers via the Arrow C Data Interface
   test/         shared test fixtures
 python/         PyO3 bindings (module hudi._internal); tests in python/tests
 cpp/            cxx bindings; bridge in cpp/src/lib.rs
 benchmark/tpch/ TPC-H benchmark harness
 benchmark/filegroup/ file-group read benchmark (fg-bench / fg-gen)
+benchmark/upsert/ upsert/delete benchmark for hudi-rs writes (Python, run.sh)
 ```
+
+### User docs and resources
+
+Point users and coding agents at these; the Java Hudi docs cover Spark and Flink, not this API.
+
+- Quick start: [Python/Rust quick start guide](https://hudi.apache.org/docs/python-rust-quick-start-guide)
+  on the Hudi website, and the shorter [README quick start](./README.md#quick-start).
+- Rust API reference: [docs.rs/hudi](https://docs.rs/hudi), [docs.rs/hudi-core](https://docs.rs/hudi-core),
+  [docs.rs/hudi-datafusion](https://docs.rs/hudi-datafusion).
+- Python API reference: the docstrings in [`python/hudi/_internal.pyi`](./python/hudi/_internal.pyi).
+- Runnable Rust example: [`crates/core/examples/table_writes.rs`](./crates/core/examples/table_writes.rs).
+- Reader semantics: [`docs/reader-spec.md`](./docs/reader-spec.md). Writer design:
+  [`docs/writer-design.md`](./docs/writer-design.md).
+- Packages: [PyPI](https://pypi.org/project/hudi/), [crates.io](https://crates.io/crates/hudi).
+- Hudi concepts: [hudi.apache.org/docs/overview](https://hudi.apache.org/docs/overview).
+- Agent doc index config: [`context7.json`](./context7.json).
 
 ## Commands
 
 The [`Makefile`](./Makefile) is the canonical command surface — **prefer `make <target>`** so agents
 and humans run what CI runs. Cargo / maturin go through [`build-wrapper.sh`](./build-wrapper.sh)
-(macOS 26+ SDK env vars).
+(macOS 26+ SDK env vars; on macOS arm64 it also builds dependencies at opt-level 1, without which
+the `hudi-datafusion` test binaries and the Python extension fail to link, see
+[#844](https://github.com/apache/hudi-rs/issues/844)). On an arm64 Mac, run `cargo test` for
+`hudi-datafusion` through the wrapper: `./build-wrapper.sh cargo test -p hudi-datafusion`.
 
 ```bash
 make setup-venv && source .venv/bin/activate
@@ -37,6 +57,9 @@ cargo test -p hudi-core                                        # one crate
 cargo test -p hudi-core table::tests::hudi_table_get_schema    # one test
 pytest python/tests/test_table_read.py -s -k "<expr>"          # one Python test
 make coverage-rust                                             # tarpaulin HTML at cov-reports/
+make parity                  # Spark-in-the-loop parity tests (needs SPARK_HOME; scripts/parity/README.md)
+benchmark/upsert/run.sh smoke --scenario uuid  # upsert benchmark at smoke scale (benchmark/upsert/README.md)
+make bench-upsert-test       # upsert benchmark harness tests (after benchmark/upsert/run.sh setup)
 
 # hudi-core without the spill backend — CI runs this leg, so check it before a PR
 # that touches the merge map or its dependencies.
@@ -53,13 +76,14 @@ cargo test -p hudi-core --lib --no-default-features
 toolchain in front of every consumer, for a tier that only engages when a merge exceeds
 `hoodie.memory.merge.max.size`.
 
-It is **default-on in `hudi-core`, `hudi-datafusion` and `hudi`**, and the latter two forward it
-rather than taking `hudi-core` with its defaults: a consumer can only opt out of a feature its
-direct dependency exposes, and unification through `hudi-datafusion` would otherwise hand the tier
-back. The opt-out is therefore `default-features = false` on `hudi`, and it holds with the
-`datafusion` feature on. **The Python wheel and the cxx bridge do not opt out** — both take `hudi`
-with defaults and build RocksDB. Dropping the feature removes the tier, and a merge past the budget
-then fails with a `CoreError::Unsupported` naming the config rather than spilling, which is why the
+It is **default-on in `hudi-core`, `hudi-datafusion`, `hudi` and `hudi-ffi`**, and the latter
+three forward it rather than taking their dependency with its defaults: a consumer can only opt out
+of a feature its direct dependency exposes, and unification through `hudi-datafusion` would
+otherwise hand the tier back. The opt-out is therefore `default-features = false` on `hudi`, and it
+holds with the `datafusion` feature on; a consumer of `hudi-ffi` makes the same call there.
+**The Python wheel and the cxx bridge do not opt out** — both take `hudi` with defaults and build
+RocksDB. Dropping the feature removes the tier, and a merge past the budget then fails with a
+`CoreError::Unsupported` naming the config rather than spilling, which is why the
 published artifacts keep it.
 
 A test that needs the disk tier must be `#[cfg(feature = "spill-rocksdb")]`; the

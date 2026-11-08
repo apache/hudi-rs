@@ -70,7 +70,15 @@ echo "<<< OK"
 echo ">>> Verifying signature..."
 curl -s "https://dist.apache.org/repos/dist/$repo/hudi/KEYS" >"$work_dir/KEYS"
 gpg -q --import "$work_dir/KEYS"
-gpg --verify "$pub_key" "$src"
+# gpg exits 0 for a good signature made by an expired or revoked key, reporting
+# EXPKEYSIG/REVKEYSIG instead of GOODSIG. ASF requires GOODSIG, so match on the
+# status output rather than the exit code.
+# human-readable output goes to stderr and stays visible; status goes to the file
+gpg --verify --status-fd 1 "$pub_key" "$src" >"$work_dir/gpg_status"
+if ! grep -q '^\[GNUPG:\] GOODSIG ' "$work_dir/gpg_status"; then
+  echo "ERROR: signature is not a GOODSIG (expired or revoked signing key)."
+  exit 1
+fi
 echo "<<< OK"
 
 echo "Un-tarring the source release artifact"
@@ -100,7 +108,7 @@ fi
 echo "<<< OK"
 
 echo ">>> Verifying licenses..."
-docker run -it --rm -v $(pwd):/github/workspace apache/skywalking-eyes header check
+docker run -i --rm -v $(pwd):/github/workspace apache/skywalking-eyes header check
 echo "<<< OK"
 
 echo ">>> Verifying no binary files..."
