@@ -23,8 +23,8 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, RecordBatch, StringArray};
-use arrow_schema::{Field, Schema, SchemaRef};
+use arrow_array::{ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::SessionContext;
 use hudi_core::config::internal::HudiInternalConfig;
 use hudi_core::config::read::HudiReadConfig::{InputPartitions, UseReadOptimizedMode};
@@ -33,7 +33,7 @@ use hudi_core::table::{ReadOptions, Table};
 use hudi_datafusion::HudiDataSource;
 use hudi_test::QuickstartTripsTable;
 use hudi_test::SampleTable;
-use hudi_test::util::explain_physical_plan;
+use hudi_test::util::{explain_physical_plan, get_str_column};
 use hudi_test::v9_verification::{
     verify_partitioned_records, verify_v9_txns_table, verify_v9_txns_table_snapshot,
 };
@@ -510,4 +510,51 @@ async fn test_hudi_scan_exec_strips_filters_on_dropped_partition_columns() {
         err_message.contains("byteField"),
         "dropped partition projection error should name byteField, got: {err_message}"
     );
+}
+
+/// Partition pruning keeps the default partition for `city = ''`, and that
+/// partition also holds the rows whose `city` is NULL, so the equality must
+/// still be evaluated per row.
+#[tokio::test]
+async fn test_cow_partition_equality_filter_excludes_null_rows_in_default_partition() {
+    let dir = tempfile::tempdir().unwrap();
+    let base_uri = dir.path().to_str().unwrap();
+    let mut table = Table::create(base_uri)
+        .with_table_name("t")
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .create()
+        .await
+        .unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, true),
+        Field::new("value", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            Arc::new(StringArray::from(vec![Some(""), None, Some("sf")])),
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+        ],
+    )
+    .unwrap();
+    table.append([batch]).await.unwrap();
+
+    let ctx = SessionContext::new();
+    let hudi = HudiDataSource::new(base_uri).await.unwrap();
+    ctx.register_table("t", Arc::new(hudi)).unwrap();
+    let batches = ctx
+        .sql("SELECT id FROM t WHERE city = ''")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = batches
+        .iter()
+        .flat_map(|batch| get_str_column(batch, "id"))
+        .collect();
+    assert_eq!(ids, ["a"]);
 }

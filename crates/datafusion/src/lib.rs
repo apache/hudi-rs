@@ -48,13 +48,11 @@ use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::object_store::ObjectStoreUrl;
 use datafusion::datasource::physical_plan::FileGroup;
 use datafusion::datasource::physical_plan::FileScanConfigBuilder;
-use datafusion::datasource::physical_plan::parquet::can_expr_be_pushed_down_with_schemas;
 use datafusion::datasource::physical_plan::parquet::source::ParquetSource;
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::error::Result;
 use datafusion::logical_expr::Operator;
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion_common::DFSchema;
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_common::stats::Precision;
@@ -107,6 +105,11 @@ fn filter_field_matches_partition_column(filter_field: &str, partition_column: &
 ///
 /// The provider reads the table as of its creation, including its schema and statistics; create
 /// a new provider to see later commits.
+///
+/// Copy-on-write and read-optimized scans of parquet base files go through DataFusion's parquet
+/// source, so the session's `datafusion.execution.parquet.*` options apply as they do to a plain
+/// parquet table. In particular, filters are evaluated during decoding (late materialization)
+/// only when `datafusion.execution.parquet.pushdown_filters` is set.
 ///
 /// # Examples
 ///
@@ -626,7 +629,7 @@ impl HudiDataSource {
 
     fn filter_pushdown_support(
         table_schema: &Schema,
-        partition_cols: &[String],
+        exact_partition_cols: &[String],
         expr: &Expr,
     ) -> TableProviderFilterPushDown {
         let conjuncts = split_conjunction(expr);
@@ -640,7 +643,7 @@ impl HudiDataSource {
 
         let all_conjuncts_are_exact_partition_eq = conjuncts.iter().all(|conjunct| {
             Self::can_push_down_expr(table_schema, conjunct)
-                && Self::is_exact_partition_equality_filter(conjunct, partition_cols)
+                && Self::is_exact_partition_equality_filter(conjunct, exact_partition_cols)
         });
 
         if all_conjuncts_are_exact_partition_eq {
@@ -700,7 +703,6 @@ impl HudiDataSource {
         &self,
         state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
         limit: Option<usize>,
         flat_slices: Vec<FileSlice>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
@@ -752,31 +754,11 @@ impl HudiDataSource {
         // Row-filter pushdown, filter reordering, and page-index use follow
         // the session's parquet options, the same knobs a plain parquet
         // registration of these files obeys.
-        let mut parquet_source =
+        // Filters reach the source through DataFusion's filter-pushdown rule;
+        // installing them here as well would AND a second copy of each
+        // conjunct into the scan predicate.
+        let parquet_source =
             ParquetSource::new(table_schema.clone()).with_table_parquet_options(parquet_opts);
-        // Conjuncts DataFusion's filter-pushdown rule can absorb reach the
-        // scan through that rule exactly once (for stats pruning, and as a row
-        // filter when the session enables pushdown); installing them here too
-        // ANDs a duplicate copy into the merged predicate. Only conjuncts the
-        // rule rejects (e.g. struct-field filters) are installed, which keeps
-        // their footer-stats pruning.
-        if !filters.is_empty() {
-            let df_schema = DFSchema::try_from(table_schema.clone())?;
-            let mut residual_conjuncts: Vec<Expr> = Vec::new();
-            for conjunct in filters.iter().flat_map(|expr| split_conjunction(expr)) {
-                let physical = state.create_physical_expr(conjunct.clone(), &df_schema)?;
-                if !can_expr_be_pushed_down_with_schemas(&physical, table_schema.as_ref()) {
-                    residual_conjuncts.push(conjunct.clone());
-                }
-            }
-            if let Some(expr) = residual_conjuncts
-                .into_iter()
-                .reduce(|acc, new| acc.and(new))
-            {
-                let predicate = state.create_physical_expr(expr, &df_schema)?;
-                parquet_source = parquet_source.with_predicate(predicate)
-            }
-        }
 
         let file_groups: Vec<FileGroup> = parquet_file_groups
             .into_iter()
@@ -976,7 +958,7 @@ impl TableProvider for HudiDataSource {
                     &partition_read_options,
                     &partition_flat_slices,
                 )? {
-                    self.scan_parquet(state, projection, filters, limit, partition_flat_slices)
+                    self.scan_parquet(state, projection, limit, partition_flat_slices)
                         .await
                 } else {
                     let flat_slices = if all_filters_are_partition_filters {
@@ -1002,22 +984,34 @@ impl TableProvider for HudiDataSource {
         }
     }
 
-    /// Reports partition equality predicates as `Exact`; all other pushed
-    /// filters are `Inexact` so DataFusion retains a residual `FilterExec`.
+    /// Reports pushed filters as `Inexact` so DataFusion retains a residual
+    /// `FilterExec`: partition pruning keeps any partition it cannot rule out,
+    /// such as the default partition that holds both NULL and `''`. A table
+    /// that drops partition columns from its data files has nothing to filter
+    /// those columns on per row, so its partition equality stays `Exact`.
     /// `scan()` splits conjunctions before converting them to Hudi filters, so
     /// pushable atoms inside mixed `AND` predicates still help pruning.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let partition_cols = self.get_partition_columns();
+        let drops_partition_columns: bool = self
+            .table
+            .hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        let exact_partition_cols = if drops_partition_columns {
+            self.get_partition_columns()
+        } else {
+            Vec::new()
+        };
 
         filters
             .iter()
             .map(|expr| {
                 Ok(Self::filter_pushdown_support(
                     self.schema.as_ref(),
-                    &partition_cols,
+                    &exact_partition_cols,
                     expr,
                 ))
             })
@@ -1253,7 +1247,7 @@ mod tests {
         let ctx = SessionContext::new();
         let state = ctx.state();
         let err = hudi
-            .scan_parquet(&state, None, &[], None, slices)
+            .scan_parquet(&state, None, None, slices)
             .await
             .expect_err("a sizeless base file must not reach DataFusion as zero bytes");
         assert!(err.to_string().contains("has no known size"), "{err}");
@@ -1689,14 +1683,22 @@ mod tests {
                 .to_string()
         }
 
+        fn scan_predicate(plan: &str) -> Option<&str> {
+            plan.split(", predicate=")
+                .nth(1)?
+                .split(", pruning_predicate=")
+                .next()
+        }
+
         let default_plan = filtered_cow_plan(None).await;
         assert!(
             default_plan.contains("FilterExec"),
             "with default session config the filter must stay above the scan: {default_plan}"
         );
-        assert!(
-            !default_plan.contains("id@5 > 1 AND id@5 > 1"),
-            "the scan predicate must carry the conjunct once: {default_plan}"
+        assert_eq!(
+            scan_predicate(&default_plan),
+            Some("id@5 > 1"),
+            "the scan predicate must carry the conjunct once for stats pruning: {default_plan}"
         );
 
         let pushdown_plan = filtered_cow_plan(Some(true)).await;
@@ -1704,12 +1706,9 @@ mod tests {
             !pushdown_plan.contains("FilterExec"),
             "with pushdown_filters=true the filter must move into the scan: {pushdown_plan}"
         );
-        assert!(
-            pushdown_plan.contains("id@5 > 1"),
-            "the scan predicate must carry the pushed filter: {pushdown_plan}"
-        );
-        assert!(
-            !pushdown_plan.contains("id@5 > 1 AND id@5 > 1"),
+        assert_eq!(
+            scan_predicate(&pushdown_plan),
+            Some("id@5 > 1"),
             "the scan predicate must carry the conjunct once: {pushdown_plan}"
         );
     }

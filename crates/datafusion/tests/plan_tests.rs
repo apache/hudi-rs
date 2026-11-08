@@ -161,10 +161,13 @@ async fn verify_plan(
     // The struct field access and the base columns are pushed into the Parquet
     // source's projection rather than planned as a standalone scan; the
     // optimizer computes the struct access under an extracted name inside the
-    // scan and an outer projection restores the user-facing alias.
+    // scan and an outer projection restores the user-facing alias. Reading the
+    // scan's own column list is what makes this catch a scan that stopped
+    // projecting.
+    let projection = scan_projection(&plan);
     assert!(
-        plan.contains("get_field(structField@") && plan.contains("id, name, isActive"),
-        "Plan should project the struct field inside the scan: {plan}"
+        projection.contains("get_field(structField@") && projection.contains("id, name, isActive"),
+        "Scan should project the base columns and the struct field: {plan}"
     );
     assert!(
         plan.contains(&format!("as {table_name}.structField[field2]")),
@@ -184,20 +187,35 @@ async fn verify_plan(
     );
 }
 
+/// The columns the scan produces, which it renders as `projection=[...]`.
+fn scan_projection(plan: &str) -> &str {
+    scan_attribute(plan, "projection=[", "], file_type=")
+}
+
 /// The predicate the scan evaluates per row, which it renders as `, predicate=`.
 ///
 /// The scan also renders a `, pruning_predicate=` derived from that one, and a
 /// bare substring search cannot tell the two apart. Only the former says what
 /// actually reached the source.
 fn scan_predicate(plan: &str) -> &str {
-    let predicate = plan
-        .split(", predicate=")
+    scan_attribute(plan, ", predicate=", ", pruning_predicate=")
+}
+
+/// The text between the scan's `start` marker and the `end` marker that follows it, or the
+/// rest of the plan when `end` is absent.
+///
+/// The search starts at the `DataSourceExec` node because operators above it, such as a
+/// `FilterExec`, can render the same markers.
+fn scan_attribute<'a>(plan: &'a str, start: &str, end: &str) -> &'a str {
+    let scan = plan
+        .split("DataSourceExec:")
         .nth(1)
-        .expect("plan should carry a scan predicate");
-    predicate
-        .split(", pruning_predicate=")
-        .next()
-        .unwrap_or(predicate)
+        .expect("plan should carry a DataSourceExec");
+    let rest = scan
+        .split(start)
+        .nth(1)
+        .unwrap_or_else(|| panic!("plan should carry `{start}`"));
+    rest.split(end).next().unwrap_or(rest)
 }
 
 async fn verify_data(ctx: &SessionContext, sql: &str, table_name: &str) {
@@ -602,10 +620,6 @@ mod dispatch_tests {
         assert!(
             filtered_plan.contains("file_slices=1"),
             "Partition filter should reduce the scan to 1 file slice. Plan: {filtered_plan}"
-        );
-        assert!(
-            !filtered_plan.contains("FilterExec"),
-            "Exact partition filter should not leave a residual FilterExec. Plan: {filtered_plan}"
         );
     }
 
