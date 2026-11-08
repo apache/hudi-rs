@@ -25,6 +25,10 @@ pub(crate) mod selector;
 pub(crate) mod util;
 pub mod view;
 
+// `LogFileScanner::scan` takes an `InstantRange`; export it so external callers
+// can actually invoke that public API.
+pub use selector::InstantRange;
+
 use crate::Result;
 use crate::config::HudiConfigs;
 use crate::error::CoreError;
@@ -85,7 +89,7 @@ pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
 
 /// The actions a read loads from the timeline.
 ///
-/// Narrowing this is no longer only a listing decision: [`Timeline::completion_gate_inputs`]
+/// Narrowing this is no longer only a listing decision: `Timeline::completion_gate_inputs`
 /// derives the log scan's committed set from these, so an action that completes outside this
 /// list and wrote data or delete log blocks would have its rows dropped from a merge-on-read
 /// read — silently, since the gate excludes rather than errors. The three here cover every
@@ -131,7 +135,14 @@ impl Timeline {
             None,
         )?;
         let all_active = timeline.load_instants(&selector, false).await?;
-        timeline.earliest_active_instant = all_active
+        timeline.set_active_instants(all_active);
+        Ok(timeline)
+    }
+
+    /// Set the completed commits, the pending instants and the archival
+    /// boundary from one listing of the active timeline in every state.
+    fn set_active_instants(&mut self, all_active: Vec<Instant>) {
+        self.earliest_active_instant = all_active
             .iter()
             .map(|instant| instant.timestamp.clone())
             .min();
@@ -147,13 +158,12 @@ impl Timeline {
             .iter()
             .map(|instant| instant.timestamp.clone())
             .collect();
-        timeline.pending_instants = pending
+        self.pending_instants = pending
             .into_iter()
             .map(|instant| instant.timestamp)
             .filter(|timestamp| !completed_times.contains(timestamp))
             .collect();
-        timeline.completed_commits = completed;
-        Ok(timeline)
+        self.completed_commits = completed;
     }
 
     /// The inputs the log-block scan needs to tell a committed instant from one
@@ -187,6 +197,27 @@ impl Timeline {
     /// needs Java's whole-timeline view.
     pub(crate) async fn all_pending_instant_times(&self) -> Result<HashSet<String>> {
         self.active_loader.list_pending_instant_times().await
+    }
+
+    /// Reload completed commits from storage after a write.
+    pub(crate) async fn reload_completed_commits(&mut self) -> Result<()> {
+        // Same listing as `new_from_storage`: every state, so the archival
+        // boundary and the pending instants are refreshed together with the
+        // completed commits.
+        // Archival (running inside writes) raises the boundary; a reload that
+        // kept the old one would leave newly-archived instants neither in the
+        // completed set nor below the boundary — read as uncommitted, silently
+        // hiding their file groups from this handle's later reads and writes.
+        let selector = TimelineSelector::actions_in_range(
+            DEFAULT_LOADING_ACTIONS,
+            &[State::Requested, State::Inflight, State::Completed],
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        let all_active = self.load_instants(&selector, false).await?;
+        self.set_active_instants(all_active);
+        Ok(())
     }
 
     /// Load instants from the timeline based on the selector criteria.
@@ -392,8 +423,8 @@ impl Timeline {
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].
     ///
     /// ### Note
-    /// This API behaves differently from [crate::table::Table::get_avro_schema],
-    /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
+    /// This API behaves differently from [crate::table::Table::get_schema_in_avro_str],
+    /// which additionally looks for [HudiTableConfig::CreateSchema](crate::config::table::HudiTableConfig::CreateSchema) in the table config.
     pub async fn get_latest_avro_schema(&self) -> Result<String> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
         resolve_avro_schema_from_commit_metadata(&commit_metadata)
@@ -403,7 +434,7 @@ impl Timeline {
     ///
     /// ### Note
     /// This API behaves differently from [crate::table::Table::get_schema],
-    /// which additionally looks for [HudiTableConfig::CreateSchema] in the table config.
+    /// which additionally looks for [HudiTableConfig::CreateSchema](crate::config::table::HudiTableConfig::CreateSchema) in the table config.
     pub async fn get_latest_schema(&self) -> Result<Schema> {
         let commit_metadata = self.get_latest_commit_metadata().await?;
         resolve_data_schema_from_commit_metadata(&commit_metadata, self.storage.clone()).await
@@ -596,12 +627,11 @@ mod tests {
         )
         .unwrap();
 
-        let table_properties = crate::config::util::parse_data_for_options(
+        let table_properties = crate::config::properties::parse_properties(
             &storage
                 .get_file_data(".hoodie/hoodie.properties")
                 .await
                 .unwrap(),
-            "=",
         )
         .unwrap();
         options_map.extend(table_properties);
@@ -634,12 +664,11 @@ mod tests {
         .unwrap();
 
         let hudi_configs = HudiConfigs::new([(HudiTableConfig::BasePath, base_url.to_string())]);
-        let table_properties = crate::config::util::parse_data_for_options(
+        let table_properties = crate::config::properties::parse_properties(
             &storage
                 .get_file_data(".hoodie/hoodie.properties")
                 .await
                 .unwrap(),
-            "=",
         )
         .unwrap();
         let mut hudi_configs_map = hudi_configs.as_options();

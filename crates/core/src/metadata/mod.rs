@@ -17,8 +17,10 @@
  * under the License.
  */
 pub mod commit;
+pub mod compaction;
 pub mod merger;
 pub mod meta_field;
+pub mod payload_merger;
 pub mod replace_commit;
 pub mod rollback;
 pub mod table;

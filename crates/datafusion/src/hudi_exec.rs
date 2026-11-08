@@ -36,7 +36,9 @@ use datafusion::physical_plan::{
 };
 use datafusion_common::DataFusionError::Execution;
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{ColumnStatistics, DataFusionError, Result, Statistics};
+use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{self, BoxStream, TryStreamExt};
 use futures::{Stream, StreamExt};
 
@@ -267,6 +269,13 @@ impl ExecutionPlan for HudiScanExec {
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 
     fn with_new_children(

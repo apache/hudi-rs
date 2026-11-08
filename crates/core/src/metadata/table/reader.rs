@@ -28,10 +28,9 @@ use crate::Result;
 use crate::config::HudiConfigs;
 use crate::config::read::HudiReadConfig;
 use crate::config::table::HudiTableConfig;
-use crate::error::CoreError;
 use crate::error::CoreError::ReadFileSliceError;
 use crate::file_group::file_slice::FileSlice;
-use crate::file_group::log_file::scanner::{LogFileScanner, ScanResult};
+use crate::file_group::log_file::scanner::LogFileScanner;
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::metadata::merger::FilesPartitionMerger;
 use crate::metadata::table_record::FilesPartitionRecord;
@@ -118,27 +117,16 @@ impl MetadataTableFileGroupReader {
                 .collect()
         };
 
-        let log_records = if log_file_paths.is_empty() {
-            vec![]
-        } else {
-            let instant_range = self.create_instant_range_for_log_file_scan()?;
-            let scan_result = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
-                .scan(log_file_paths, &instant_range)
-                .await?;
-
-            match scan_result {
-                ScanResult::HFileRecords(records) => records,
-                ScanResult::Empty => vec![],
-                ScanResult::RecordBatches(_) => {
-                    return Err(CoreError::LogBlockError(
-                        "Unexpected RecordBatches in metadata table log file".to_string(),
-                    ));
-                }
-            }
-        };
-
         let merger = FilesPartitionMerger::new(schema);
-        merger.merge_for_keys(&base_records, &log_records, &hfile_keys)
+        let mut merged = merger.merge_for_keys(&base_records, &[], &hfile_keys)?;
+        if !log_file_paths.is_empty() {
+            let instant_range = self.create_instant_range_for_log_file_scan()?;
+            let groups = LogFileScanner::new(self.hudi_configs.clone(), self.storage.clone())
+                .scan_hfile_records(log_file_paths, &instant_range)
+                .await?;
+            merger.merge_log_groups(&mut merged, &groups, &hfile_keys)?;
+        }
+        Ok(merged)
     }
 
     /// The window bounding which log instants this read admits.

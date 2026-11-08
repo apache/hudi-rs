@@ -21,6 +21,120 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-11-03
+
+### 🚀 Features
+
+- Upgrade to arrow 59, DataFusion 55 and pyo3 0.29 with Lance kept on by default (#698) by @wirybeaver
+- *(core)* Read any metadata table partition as Arrow (#819) by @alitrack
+- *(core)* Add support for in and not in file pruning (#800) by @oglego
+- *(core)* Add append_only writes for append-only tables (#588) by @morningstarxcdcode
+- *(core)* Native table write support with spark storage parity (#666) by @vinothchandar
+- *(core)* Return the commit completion time from writes (#877) by @yihua
+- *(core)* Write composite and non-string record keys (#871) by @yihua
+- *(python)* Add write APIs to the Python binding (#878) by @yihua
+- *(core)* Read only the file groups the record index names for key filters (#907) by @yihua
+- *(python)* Expose commit completion time on write results (#887) by @yihua
+- *(benchmark)* Add a reproducible upsert and delete benchmark for hudi-rs writes (#880) by @yihua
+- *(core)* Add merge-on-read and metadata table compaction (#931) by @yihua
+
+### 🐛 Bug Fixes
+
+- *(reader)* Read Avro enum columns and V2 Avro data log blocks (#803) by @yihua
+- *(cpp)* Catch panics at the FFI boundary so they surface as errors (#766) by @codope
+- *(python)* Run the DataFusion FFI provider on the binding's tokio runtime (#829) by @yihua
+- *(reader)* Map Avro local-timestamp logical types instead of panicking (#813) by @yihua
+- *(hfile)* Count checksum chunks over header + data (#836) by @linliu-code
+- *(reader)* Apply the logical timestamp repair to parquet log block records (#815) by @yihua
+- *(core)* Resolve storage options from the environment on table create (#875) by @yihua
+- *(core)* Accept list and fixed-size list columns on upsert and update (#868) by @yihua
+- *(core)* Follow-up fixes for native table writes and Java interop (#851) by @linliu-code
+- *(python)* Register HudiCoreError so callers can catch it (#915) by @yihua
+
+### 🚜 Refactor
+
+- *(ffi)* Rename hudi-jvm-ffi to hudi-ffi (#847) by @yihua
+- Name the table create toggles *_enabled in rust and python (#927) by @yihua
+- *(core)* Return one WriteResult from every table write (#945) by @yihua
+- *(python)* Name the result instant requested_time and document the remaining stub items (#939) by @yihua
+
+### 📚 Documentation
+
+- *(core)* Correct stale HFile reasoning in metadata-table reader routing (#723) by @yihua
+- *(release)* Correct the announce email list to users@hudi.apache.org (#769) by @yihua
+- *(python)* Add doctests to builder and config APIs, enable --doctest-modules (#623) by @GayathriSrividya
+- Add a python write quick start to the readme (#888) by @yihua
+- *(rust)* Document the user-facing API and build docs.rs with datafusion (#938) by @yihua
+- Add a feature overview, rust quick start, and doc links to the readme (#940) by @yihua
+- Add a context7.json for coding-agent doc indexes (#941) by @yihua
+
+### ⚡ Performance
+
+- *(core)* Encode record index entries directly as Avro binary (#873) by @yihua
+- *(core)* Sort hfile entries by reference instead of cloning them (#894) by @yihua
+- *(core)* Read only the requested keys' record index shards and blocks (#869) by @yihua
+- *(core)* Write hfile structured keys straight into the block buffer (#912) by @yihua
+- *(core)* Merge only matched keys in event-time copy-on-write upserts (#882) by @yihua
+- *(core)* Evaluate string IN filters with a hash set (#901) by @yihua
+- *(core)* Compute the record index instant once per commit (#892) by @yihua
+- *(core)* Encode record index shards in parallel (#898) by @yihua
+- *(core)* Push read filters into the parquet reader (#911) by @yihua
+- *(core)* Decode table read file slices on runtime worker threads (#890) by @yihua
+- *(core)* Slice contiguous append chunks instead of copying them (#903) by @yihua
+- *(core)* Match record index keys in place before building records (#906) by @yihua
+- *(core)* Build commit sequence numbers without a per-row allocation (#896) by @yihua
+- *(core)* Merge copy-on-write file groups in parallel (#884) by @yihua
+- *(core)* Write the base file bloom filter only when asked (#933) by @yihua
+
+### 🛠️ Build
+
+- *(deps)* Bump actions/setup-python from 6 to 7 (#731) by @dependabot[bot]
+- *(deps)* Update base64 requirement from 0.22 to 0.23 (#744) by @dependabot[bot]
+- *(deps)* Update serial_test requirement from 3 to 4 (#745) by @dependabot[bot]
+- *(deps)* Bump actions/checkout from 6 to 7 (#733) by @dependabot[bot]
+- *(deps)* Bump actions/setup-node from 6 to 7 (#728) by @dependabot[bot]
+- *(deps)* Bump apache/skywalking-eyes from 0.8.0 to 0.9.0 (#726) by @dependabot[bot]
+- *(deps)* Update comfy-table requirement from 7 to 8 (#742) by @dependabot[bot]
+- *(deps-dev)* Bump coverage from 7.16.0 to 7.16.2 in /python (#817) by @dependabot[bot]
+- *(deps-dev)* Bump mypy from 2.3.1 to 2.4.0 in /python (#818) by @dependabot[bot]
+- *(deps)* Bump actions/setup-python from 6 to 7 (#770) by @dependabot[bot]
+- *(deps)* Bump rocksdb to 0.24 for ubuntu-26.04 runners (#837) by @yihua
+- *(deps-dev)* Bump ruff from 0.15.18 to 0.17.1 in /python (#841) by @dependabot[bot]
+- *(deps)* Bump docker/setup-buildx-action from 4.3.0 to 4.4.1 (#806) by @dependabot[bot]
+- *(deps)* Bump swatinem/rust-cache from 2.9.2 to 2.9.3 (#842) by @dependabot[bot]
+- *(deps)* Bump astral-sh/setup-uv from 10.0.1 to 10.3.0 (#821) by @dependabot[bot]
+- *(deps)* Upgrade lance to 13 (#845) by @yihua
+- *(deps)* Zip 8 → 9.0.3 (#850) by @yihua
+- *(ffi)* Forward the spill-rocksdb feature through hudi-ffi (#849) by @yihua
+- Drop dependency debug info from dev builds (#928) by @yihua
+
+### ⚙️ Miscellaneous Tasks
+
+- Update changelog for 0.5.0 (#768) by @yihua
+- Take the MinIO client from its container image (#799) by @vinothchandar
+- Require an approving review before merging to main (#801) by @yihua
+- Pull MinIO images from Chainguard (#811) by @voonhous
+- Pin ubuntu-latest runners to ubuntu-24.04 (#838) by @yihua
+- Bump Node to 24.22.1 for PR title lint (#839) by @vinayus
+
+## New Contributors
+
+* @vinothchandar made their first contribution in #799
+
+* @morningstarxcdcode made their first contribution in #588
+
+* @GayathriSrividya made their first contribution in #623
+
+* @oglego made their first contribution in #800
+
+* @alitrack made their first contribution in #819
+
+* @vinayus made their first contribution in #839
+
+* @wirybeaver made their first contribution in #698
+
+* @voonhous made their first contribution in #811
+
 ## [0.5.0] - 2026-09-10
 
 ### 🚀 Features
