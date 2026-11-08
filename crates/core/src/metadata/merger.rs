@@ -22,9 +22,10 @@
 //! and log files for the metadata table's files partition.
 
 use crate::Result;
+use crate::file_group::log_file::scanner::HFileRecordGroup;
 use crate::hfile::HFileRecord;
 use crate::metadata::table_record::{
-    FilesPartitionRecord, HoodieMetadataFileInfo, decode_files_partition_record_with_schema,
+    FilesPartitionRecord, decode_files_partition_record_with_schema,
 };
 use apache_avro::Schema as AvroSchema;
 use std::collections::HashMap;
@@ -53,6 +54,7 @@ use std::collections::HashMap;
 /// ```
 pub struct FilesPartitionMerger {
     schema: AvroSchema,
+    payload_merger: crate::metadata::payload_merger::MetadataPayloadMerger,
 }
 
 impl FilesPartitionMerger {
@@ -60,7 +62,19 @@ impl FilesPartitionMerger {
     ///
     /// The schema should be obtained from an HFile's file info ("schema" key).
     pub fn new(schema: AvroSchema) -> Self {
-        Self { schema }
+        Self::with_payload_merger(schema, Default::default())
+    }
+
+    /// Create a merger with an explicitly resolved payload merger (from the
+    /// MDT's declared merge strategy).
+    pub fn with_payload_merger(
+        schema: AvroSchema,
+        payload_merger: crate::metadata::payload_merger::MetadataPayloadMerger,
+    ) -> Self {
+        Self {
+            schema,
+            payload_merger,
+        }
     }
 
     /// Merge base HFile records with log file records.
@@ -162,53 +176,51 @@ impl FilesPartitionMerger {
         Ok(merged)
     }
 
+    /// Merge log blocks into `merged` in log order, decoding each block with
+    /// its own writer schema (this merger's schema when it has none). A block
+    /// holds a key at most once. An empty `keys` merges every record.
+    pub fn merge_log_groups(
+        &self,
+        merged: &mut HashMap<String, FilesPartitionRecord>,
+        groups: &[HFileRecordGroup],
+        keys: &[&str],
+    ) -> Result<()> {
+        let key_set: std::collections::HashSet<&str> = keys.iter().copied().collect();
+        for group in groups {
+            let schema = group.schema.as_deref().unwrap_or(&self.schema);
+            for record in &group.records {
+                if !key_set.is_empty()
+                    && !record.key_as_str().is_some_and(|key| key_set.contains(key))
+                {
+                    continue;
+                }
+                let decoded = decode_files_partition_record_with_schema(record, schema)?;
+                match merged.get_mut(&decoded.key) {
+                    Some(existing) => self.merge_files_partition_records(existing, &decoded),
+                    None => {
+                        merged.insert(decoded.key.clone(), decoded);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Decode an HFile record using the schema.
     fn decode_record(&self, record: &HFileRecord) -> Result<FilesPartitionRecord> {
         decode_files_partition_record_with_schema(record, &self.schema)
     }
 
-    /// Merge a newer record into an existing record.
-    ///
-    /// This implements Hudi's metadata table merge semantics:
-    /// - For each entry in newer.files:
-    ///   - If isDeleted=true and old entry exists (not deleted): remove from result
-    ///   - If isDeleted=true and old entry is also deleted: keep tombstone
-    ///   - If isDeleted=false and old entry exists: keep max(size), mark not deleted
-    ///   - If entry doesn't exist in old: add it (file or tombstone)
+    /// Merge a newer record into an existing record
+    /// (Java `HoodieMetadataPayload` files semantics — see
+    /// [`crate::metadata::payload_merger::MetadataPayloadMerger::merge_file_infos`]).
     fn merge_files_partition_records(
         &self,
         existing: &mut FilesPartitionRecord,
         newer: &FilesPartitionRecord,
     ) {
-        for (name, new_info) in &newer.files {
-            match existing.files.get(name) {
-                Some(old_info) => {
-                    if new_info.is_deleted {
-                        if old_info.is_deleted {
-                            // Both are tombstones: keep the newer one
-                            existing.files.insert(name.clone(), new_info.clone());
-                        } else {
-                            // Deletion cancels existing entry: remove from result
-                            existing.files.remove(name);
-                        }
-                    } else {
-                        // Non-deletion: keep max size, mark as not deleted
-                        existing.files.insert(
-                            name.clone(),
-                            HoodieMetadataFileInfo::new(
-                                name.clone(),
-                                old_info.size.max(new_info.size),
-                                false,
-                            ),
-                        );
-                    }
-                }
-                None => {
-                    // New entry (could be file or tombstone)
-                    existing.files.insert(name.clone(), new_info.clone());
-                }
-            }
-        }
+        self.payload_merger
+            .merge_file_infos(&mut existing.files, &newer.files);
     }
 }
 
@@ -216,7 +228,9 @@ impl FilesPartitionMerger {
 mod tests {
     use super::*;
     use crate::hfile::HFileReader;
-    use crate::metadata::table_record::{FilesPartitionRecord, MetadataRecordType};
+    use crate::metadata::table_record::{
+        FilesPartitionRecord, HoodieMetadataFileInfo, MetadataRecordType,
+    };
     use hudi_test::QuickstartTripsTable;
     use std::path::PathBuf;
 

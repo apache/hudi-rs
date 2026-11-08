@@ -269,7 +269,7 @@ Release Manager
 [6] https://github.com/apache/hudi-rs/actions/runs/xxx
 [7] https://pypi.org/project/hudi/x.y.zrcN/
 [8] https://crates.io/crates/hudi/x.y.z-rc.N
-[9] https://github.com/apache/hudi-rs?tab=readme-ov-file#usage-examples
+[9] https://github.com/apache/hudi-rs?tab=readme-ov-file#reading-tables
 ```
 
 ## After VOTE passes
@@ -372,7 +372,7 @@ Go to `https://github.com/apache/hudi-rs/releases/new` and draft a new release.
 > [!NOTE]
 > Update the template below in a text editor before pasting it to an email client to avoid hyperlink editing issue.
 
-Send to `dev@hudi.apache.org` and `user@hudi.apache.org`.
+Send to `dev@hudi.apache.org` and `users@hudi.apache.org`.
 
 ```text
 subject: [ANNOUNCE] Hudi-rs 0.5.0 released

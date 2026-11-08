@@ -70,7 +70,7 @@ impl InstantRange {
 
     /// A range that admits exactly the instants in `instants`, and nothing else.
     ///
-    /// See [`Self::explicit_instants`] for why a window cannot stand in for this.
+    /// See `Self::explicit_instants` for why a window cannot stand in for this.
     pub fn exact_match<I, S>(instants: I, timezone: &str) -> Self
     where
         I: IntoIterator<Item = S>,

@@ -36,11 +36,16 @@ use std::cmp::Ordering;
 /// the value is the raw bytes (typically Avro-serialized payload).
 ///
 /// # Example
-/// ```ignore
-/// let record = HFileRecord::new("my-key".into(), value_bytes);
-/// println!("Key: {}", record.key_as_str());
-/// // Decode value on demand
-/// let payload = decode_avro(&record.value);
+/// ```
+/// use hudi_core::hfile::HFileRecord;
+///
+/// let record = HFileRecord {
+///     key: b"my-key".to_vec(),
+///     value: vec![1, 2],
+/// };
+/// let HFileRecord { key, value } = record.clone();
+/// assert_eq!(key, b"my-key");
+/// assert_eq!(record, HFileRecord::from_str_key("my-key", value));
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HFileRecord {

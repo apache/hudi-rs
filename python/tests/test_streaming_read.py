@@ -21,6 +21,7 @@ import pyarrow as pa
 import pytest
 
 from hudi import (
+    HudiCoreError,
     HudiFileGroupReader,
     HudiQueryType,
     HudiReadOptions,
@@ -66,7 +67,7 @@ def test_read_options_typed_accessors_round_trip():
 def test_read_options_query_type_bad_value_raises():
     """A bogus value left in hudi_options under the query-type key surfaces as an error."""
     bogus = HudiReadOptions(hudi_options={"hoodie.read.query.type": "bogus"})
-    with pytest.raises(Exception):
+    with pytest.raises(HudiCoreError):
         bogus.query_type()
 
 
@@ -77,20 +78,20 @@ def test_read_options_batch_size_bad_value_raises():
     bogus = HudiReadOptions(
         hudi_options={"hoodie.read.stream.batch_size": "not_a_number"}
     )
-    with pytest.raises(Exception):
+    with pytest.raises(HudiCoreError):
         bogus.batch_size()
 
-    with pytest.raises(Exception, match="must be > 0"):
+    with pytest.raises(HudiCoreError, match="must be > 0"):
         HudiReadOptions().with_batch_size(0)
 
 
 def test_read_options_with_filters_validates_at_build_time():
     """`with_filters` parses + cardinality-validates upfront, so a bad operator or
     empty IN value list raises here rather than at read time."""
-    with pytest.raises(Exception):
+    with pytest.raises(HudiCoreError):
         HudiReadOptions().with_filters([("col", "BAD_OP", "x")])
 
-    with pytest.raises(Exception, match="at least one value"):
+    with pytest.raises(HudiCoreError, match="at least one value"):
         HudiReadOptions().with_filters([("col", "IN", "")])
 
 
