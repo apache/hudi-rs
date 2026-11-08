@@ -79,6 +79,7 @@ Which knobs each API consumes:
 Notes:
 
 - `read_stream` errors with `Unsupported` for `query_type = Incremental` — incremental streaming is not yet implemented.
+- An incremental query errors with `Unsupported` on a table with `hoodie.populate.meta.fields=false`, as in Spark, since `_hoodie_commit_time` is the only record of which rows a commit changed.
 - The `hudi_options` bag is a per-read override layer — set arbitrary `hoodie.read.*` configs (e.g. `hoodie.read.use.read_optimized.mode = true`) for this single read. Each read config declares a scope. A `ReadOnly` one — `hoodie.read.query.type` and the as-of/start/end timestamps — selects *which* read to perform, so it flows exclusively through `ReadOptions` and is dropped when set on the table. A `TableOrRead` one describes *how* to read, so it may be set on the table and overridden here. The full list is in the [README](../README.md#read-configs).
 - Per-slice reads are exposed only by `FileGroupReader`. The `Table` type owns logical reads (snapshot, incremental); per-slice reads are physical and belong at the file-group layer. To read one slice with table-level configs, build a `FileGroupReader` via `Table::create_file_group_reader_with_options` and call its per-slice methods. The method resolves timestamps automatically (e.g. `AsOfTimestamp` → `EndTimestamp`), so callers can pass the same `ReadOptions` used for `get_file_slices`.
 - For parallel reads, call `get_file_slices(...)` and bucket the result with `hudi::util::collection::split_into_chunks` or your engine's preferred partitioning policy.

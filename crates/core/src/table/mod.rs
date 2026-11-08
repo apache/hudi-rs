@@ -1074,6 +1074,20 @@ impl Table {
                 }
             }
             QueryType::Incremental => {
+                // `_hoodie_commit_time` is the only record of which rows of a
+                // rewritten file a commit changed. Java's `IncrementalRelationV1/V2`
+                // and the MOR relations refuse it for the same reason.
+                let populates_meta_fields = self
+                    .hudi_configs
+                    .try_get(HudiTableConfig::PopulatesMetaFields)?
+                    .is_none_or(bool::from);
+                if !populates_meta_fields {
+                    return Err(CoreError::Unsupported(
+                        "Incremental queries are not supported when meta fields are disabled \
+                         (hoodie.populate.meta.fields=false)"
+                            .to_string(),
+                    ));
+                }
                 let Some((start, end)) = self.resolve_incremental_range(&options)? else {
                     return Ok(options);
                 };
