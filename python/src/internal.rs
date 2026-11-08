@@ -30,7 +30,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::collections::HashMap;
 use std::convert::From;
-use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Runtime;
@@ -47,7 +46,7 @@ use hudi::error::Result as HudiResult;
 use hudi::file_group::FileGroup;
 use hudi::file_group::file_slice::FileSlice;
 use hudi::file_group::reader::FileGroupReader;
-use hudi::storage::error::StorageError;
+use hudi::storage::util::join_path_segments;
 use hudi::table::CompactionResult;
 use hudi::table::builder::TableBuilder;
 use hudi::table::{QueryType, ReadOptions, Table};
@@ -526,19 +525,8 @@ pub struct HudiFileSlice {
 #[cfg(not(tarpaulin_include))]
 #[pymethods]
 impl HudiFileSlice {
-    fn base_file_relative_path(&self) -> PyResult<String> {
-        let path = PathBuf::from(&self.partition_path)
-            .join(&self.base_file_name)
-            .to_str()
-            .map(String::from)
-            .ok_or_else(|| {
-                StorageError::InvalidPath(format!(
-                    "Failed to get base file relative path for file slice: {self:?}"
-                ))
-            })
-            .map_err(CoreError::from)
-            .map_err(PythonError::from)?;
-        Ok(path)
+    fn base_file_relative_path(&self) -> String {
+        join_path_segments(&self.partition_path, &self.base_file_name)
     }
     /// Total on-disk size (base + log files) in bytes.
     /// Use for I/O cost estimation and split sizing.
@@ -579,23 +567,11 @@ impl HudiFileSlice {
         Ok(Some(dict.into()))
     }
 
-    fn log_files_relative_paths(&self) -> PyResult<Vec<String>> {
-        let mut paths = Vec::<String>::new();
-        for name in self.log_file_names.iter() {
-            let p = PathBuf::from(&self.partition_path)
-                .join(name)
-                .to_str()
-                .map(String::from)
-                .ok_or_else(|| {
-                    StorageError::InvalidPath(format!(
-                        "Failed to get log file relative path for file slice: {self:?}"
-                    ))
-                })
-                .map_err(CoreError::from)
-                .map_err(PythonError::from)?;
-            paths.push(p)
-        }
-        Ok(paths)
+    fn log_files_relative_paths(&self) -> Vec<String> {
+        self.log_file_names
+            .iter()
+            .map(|name| join_path_segments(&self.partition_path, name))
+            .collect()
     }
 }
 
@@ -2094,5 +2070,45 @@ mod tests {
         assert_eq!(pascal_to_screaming_snake("TableName"), "TABLE_NAME");
         assert_eq!(pascal_to_screaming_snake("URLEncoded"), "URL_ENCODED");
         assert_eq!(pascal_to_screaming_snake("A"), "A");
+    }
+
+    #[cfg(not(tarpaulin_include))]
+    fn file_slice(partition_path: &str) -> super::HudiFileSlice {
+        super::HudiFileSlice {
+            file_id: "fg-0".to_string(),
+            partition_path: partition_path.to_string(),
+            creation_instant_time: "20240101000000000".to_string(),
+            base_file_name: "fg-0_0-1-1_20240101000000000.parquet".to_string(),
+            base_file_size: 0,
+            base_file_byte_size: 0,
+            log_file_names: vec![".fg-0_20240101000000000.log.1_0-1-1".to_string()],
+            log_file_sizes: vec![0],
+            num_records: 0,
+            column_stats: None,
+        }
+    }
+
+    #[cfg(not(tarpaulin_include))]
+    #[test]
+    fn file_slice_relative_paths_use_forward_slashes() {
+        let slice = file_slice("a=1/b=2");
+        assert_eq!(
+            slice.base_file_relative_path(),
+            "a=1/b=2/fg-0_0-1-1_20240101000000000.parquet"
+        );
+        assert_eq!(
+            slice.log_files_relative_paths(),
+            vec!["a=1/b=2/.fg-0_20240101000000000.log.1_0-1-1"]
+        );
+
+        let slice = file_slice("");
+        assert_eq!(
+            slice.base_file_relative_path(),
+            "fg-0_0-1-1_20240101000000000.parquet"
+        );
+        assert_eq!(
+            slice.log_files_relative_paths(),
+            vec![".fg-0_20240101000000000.log.1_0-1-1"]
+        );
     }
 }

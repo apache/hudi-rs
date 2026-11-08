@@ -190,7 +190,8 @@ jobs:
 
   rust-tests-windows:
     runs-on: windows-2025
-    # disable until https://github.com/apache/hudi-rs/issues/445 is resolved
+    # disabled: the workspace does not build and pass on Windows yet (local drive-letter
+    # table paths, Unix-only fg-bench rusage, TZ-based tests)
     if: false    
     steps:
       - uses: actions/checkout@v7

@@ -32,6 +32,7 @@ use crate::keygen::record_key::{configured_record_key_fields, encode_record_keys
 use crate::keygen::{
     DEFAULT_PARTITION_PATH, declares_complex_key_generator, encodes_single_key_field_name,
 };
+use crate::storage::util::join_path_segments;
 
 /// Build per-row [`HoodieKey`]s from a write batch.
 ///
@@ -247,11 +248,7 @@ fn array_value_as_string(array: &dyn Array, row: usize) -> Result<String> {
 
 /// Join a partition path and file name into a table-relative path.
 pub fn relative_data_path(partition_path: &str, file_name: &str) -> String {
-    if partition_path.is_empty() {
-        file_name.to_string()
-    } else {
-        format!("{partition_path}/{file_name}")
-    }
+    join_path_segments(partition_path, file_name)
 }
 
 #[cfg(test)]
