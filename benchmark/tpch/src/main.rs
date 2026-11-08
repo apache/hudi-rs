@@ -42,7 +42,6 @@ use datafusion::prelude::SessionConfig;
 use hudi::HudiDataSource;
 use hudi::config::ReadOptions;
 use hudi::config::read::HudiReadConfig;
-use hudi::config::table::HudiTableConfig;
 use hudi::table::Table as HudiTable;
 use serde::{Deserialize, Serialize};
 
@@ -113,10 +112,10 @@ enum Commands {
         #[arg(long)]
         hudi_base: String,
 
-        /// Also require this table type; `mor` requires a log file in every
+        /// Require this table type; `mor` also requires a log file in every
         /// file group and prints the file layout per table
-        #[arg(long, value_enum)]
-        table_type: Option<TableType>,
+        #[arg(long, value_enum, default_value_t = TableType::Cow)]
+        table_type: TableType,
     },
     /// Render benchmark SQL (table registrations + query iterations)
     RenderBenchSql {
@@ -418,23 +417,7 @@ async fn main() -> Result<()> {
         Commands::CheckTables {
             hudi_base,
             table_type,
-        } => {
-            // With a type to check, the layout check opens each table itself
-            // and names the one that fails, so the presence check would only
-            // open them all a second time.
-            if let Some(expected) = table_type {
-                return check_table_layout(&hudi_base, expected).await;
-            }
-            let missing = missing_hudi_tables(&hudi_base).await?;
-            if missing.is_empty() {
-                Ok(())
-            } else {
-                Err(datafusion::error::DataFusionError::Plan(format!(
-                    "Hudi tables not found at {hudi_base}: {}",
-                    missing.join(", ")
-                )))
-            }
-        }
+        } => check_table_layout(&hudi_base, table_type).await,
         Commands::RenderBenchSql {
             scale_factor,
             hudi_base,
@@ -576,24 +559,6 @@ fn load_query(query_num: usize, scale_factor: f64) -> std::result::Result<String
     Ok(sql.replace("${Q11_FRACTION}", &q11_fraction))
 }
 
-/// Names of the TPC-H tables that cannot be opened under `base_dir`.
-///
-/// Opens each through the same `HudiDataSource` the benchmark uses, so a table
-/// that passes here is one the benchmark can actually read, not merely a
-/// directory that exists.
-async fn missing_hudi_tables(base_dir: &str) -> Result<Vec<String>> {
-    let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
-
-    let mut missing = Vec::new();
-    for table_name in TPCH_TABLES {
-        let table_uri = hudi_table_uri(&resolved, table_name)?;
-        if HudiDataSource::new(&table_uri).await.is_err() {
-            missing.push((*table_name).to_string());
-        }
-    }
-    Ok(missing)
-}
-
 /// Build the URI for one Hudi table under a local path or cloud URL.
 fn hudi_table_uri(resolved_base: &str, table_name: &str) -> Result<String> {
     if is_cloud_url(resolved_base) {
@@ -638,50 +603,12 @@ async fn register_hudi_tables(
 ) -> Result<()> {
     let resolved = resolve_path(base_dir).map_err(datafusion::error::DataFusionError::Plan)?;
 
-    let pins_version_one = hudi_options
-        .iter()
-        .any(|(k, v)| k == HudiReadConfig::FileGroupReaderVersion.as_ref() && v.trim() == "1");
-
     for table_name in TPCH_TABLES {
         let table_uri = hudi_table_uri(&resolved, table_name)?;
-        if pins_version_one {
-            refuse_append_only_baseline(&table_uri, table_name).await?;
-        }
         let hudi = HudiDataSource::new_with_options(&table_uri, hudi_options.to_vec()).await?;
         ctx.register_table(*table_name, Arc::new(hudi))?;
     }
     Ok(())
-}
-
-/// Refuse a reader version 1 baseline on a merge-on-read table it would not merge.
-///
-/// Version 1 has no commit-time merge: a table without an ordering field is
-/// read append-only, base rows and log rows both returned. A benchmark of that
-/// would be labelled a merge baseline while merging nothing, and `validate`
-/// would only catch it after the fact through duplicate rows. Version 2 infers
-/// commit-time ordering for the same table, so this applies to the pin alone.
-async fn refuse_append_only_baseline(table_uri: &str, table_name: &str) -> Result<()> {
-    let table = HudiTable::new(table_uri).await.map_err(core_error)?;
-    if !table.is_mor() {
-        return Ok(());
-    }
-    let options = table.hudi_options();
-    // The deprecated alias too: a table written before the rename carries only that.
-    let has_ordering_field = [
-        HudiTableConfig::OrderingFields.as_ref(),
-        "hoodie.table.precombine.field",
-    ]
-    .iter()
-    .any(|key| options.get(*key).is_some_and(|v| !v.trim().is_empty()));
-    if has_ordering_field {
-        return Ok(());
-    }
-    Err(datafusion::error::DataFusionError::Plan(format!(
-        "{table_name} is merge-on-read with no ordering field, which file group reader \
-         version 1 reads append-only rather than merging by commit time; a version 1 \
-         baseline on it would measure no merge. Give the table a pre_combine_field in \
-         tables.yaml and rebuild it, or drop --reader-version."
-    )))
 }
 
 /// Bytes as a short human-readable size.
@@ -1706,4 +1633,26 @@ fn batches_to_csv_rows(batches: &[RecordBatch]) -> std::result::Result<Vec<Strin
     }
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_records_in_commit_sums_across_partitions() {
+        let metadata = r#"{
+            "partitionToWriteStats": {
+                "p1": [{"numUpdateWrites": 3}, {"numUpdateWrites": 4}],
+                "p2": [{"numUpdateWrites": 5}, {"numWrites": 9}]
+            }
+        }"#;
+        assert_eq!(update_records_in_commit(metadata), Ok(12));
+    }
+
+    #[test]
+    fn update_records_in_commit_rejects_metadata_without_write_stats() {
+        assert!(update_records_in_commit(r#"{"operationType": "UPSERT"}"#).is_err());
+        assert!(update_records_in_commit("not json").is_err());
+    }
 }

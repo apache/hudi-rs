@@ -87,12 +87,10 @@ and fails if any file group is missing its log file.
 Merge-on-read tables live in `data/sf{N}-hudi-mor` by default and persist
 results under the `hudi-mor` format label, so both types can be built from one
 parquet set and compared. `--reader-version 1` pins hudi-rs's previous file
-group reader for a baseline; its results get a `-r1` suffix. That reader has no
-commit-time merge and reads a merge-on-read table without an ordering field
-append-only, so the harness refuses the pin on the default merge-on-read tables
-rather than chart a baseline that merged nothing; to compare the two readers on
-merge-on-read, give every table a `pre_combine_field` in `tables.yaml` and
-rebuild. To see which reader served each file slice, run with
+group reader for a baseline; its results get a `-r1` suffix. Both readers merge
+the default merge-on-read tables, by commit time where a table has no ordering
+field, and `validate --reader-version 1` checks that for version 1 the same way.
+To see which reader served each file slice, run with
 `RUST_LOG=hudi_core::file_group::reader=debug` and count the lines naming
 "file group reader version 2".
 

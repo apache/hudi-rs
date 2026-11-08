@@ -210,13 +210,10 @@ require_usable_data_dir() {
 # Fail with the missing table names rather than letting the engine report a
 # missing path once the run is already under way.
 require_hudi_tables() {
-  local hudi_dir="$1" table_type="${2:-}"
-  if ! "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" \
-       ${table_type:+--table-type "$table_type"} >/dev/null; then
+  local hudi_dir="$1" table_type="$2"
+  if ! "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" --table-type "$table_type" >/dev/null; then
     echo "Error: run 'create-tables' first, or point --hudi-dir at existing tables." >&2
-    if [ -n "$table_type" ]; then
-      echo "Tables of the other type are refused; --table-type picks which one runs." >&2
-    fi
+    echo "Tables of the other type are refused; --table-type picks which one runs." >&2
     exit 1
   fi
 }
@@ -333,13 +330,21 @@ cmd_create_tables() {
   build_tpch
 
   # Rebuilding is the expensive step at scale, so existing tables are reused
-  # unless --recreate says otherwise. The type is checked too, so a directory
-  # of the other type is rebuilt rather than silently benchmarked as this one.
-  if [ "$recreate" -eq 0 ] && \
-     "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" --table-type "$table_type" >/dev/null 2>&1; then
-    echo "Reusing existing Hudi $table_type tables at: $hudi_dir"
-    echo "Pass --recreate to rebuild them."
-    return 0
+  # unless --recreate says otherwise. Tables of the other type are refused
+  # rather than rebuilt, so a forgotten --table-type never deletes them.
+  if [ "$recreate" -eq 0 ]; then
+    if "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" --table-type "$table_type" >/dev/null 2>&1; then
+      echo "Reusing existing Hudi $table_type tables at: $hudi_dir"
+      echo "Pass --recreate to rebuild them."
+      return 0
+    fi
+    local other_type="mor"
+    [ "$table_type" = "mor" ] && other_type="cow"
+    if "$TPCH_BIN" check-tables --hudi-base "$hudi_dir" --table-type "$other_type" >/dev/null 2>&1; then
+      echo "Error: the Hudi tables at $hudi_dir are $other_type." >&2
+      echo "Pass --table-type $other_type to reuse them, or --recreate to rebuild them as $table_type." >&2
+      exit 1
+    fi
   fi
 
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
@@ -360,13 +365,13 @@ cmd_create_tables() {
     mkdir -p "$hudi_dir"
   fi
 
-  local sql_file
+  local sql_file derby_home
   sql_file="$(mktemp)"
+  derby_home="$(mktemp -d)"
   "$TPCH_BIN" render-ctas --scale-factor "$sf" --table-type "$table_type" \
     --parquet-base "$parquet_dir" --hudi-base "$hudi_dir" > "$sql_file"
-  # The update commit runs in the same session as the bulk insert: the tables
-  # are already registered there, and a second session would have to re-register
-  # them against a catalog that may still name another run's location.
+  # The update commit runs in the same session as the bulk insert, where the
+  # tables are already registered.
   if [ "$table_type" = "mor" ]; then
     "$TPCH_BIN" render-updates --scale-factor "$sf" \
       ${update_fraction:+--update-fraction "$update_fraction"} >> "$sql_file"
@@ -379,12 +384,16 @@ cmd_create_tables() {
   else
     echo "Creating Hudi COW tables from parquet (sf$sf)..."
   fi
+  # The session catalog is a Derby metastore under derby.system.home, which
+  # defaults to the caller's cwd; a per-run home keeps metastore_db/ and
+  # derby.log out of it.
   "$SPARK_HOME/bin/spark-sql" \
     --packages "$HUDI_SPARK_BUNDLE" \
+    --driver-java-options "-Dderby.system.home=$derby_home" \
     "${SPARK_ARGS[@]}" \
     -f "$sql_file"
 
-  rm -f "$sql_file"
+  rm -rf "$sql_file" "$derby_home"
   echo "Hudi $table_type tables created at: $hudi_dir"
 
   # For mor, this also prints the file layout and fails if any file group is
