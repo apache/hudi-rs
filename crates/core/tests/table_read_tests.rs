@@ -3527,10 +3527,19 @@ mod hive_style_keygen_partition_pruning {
 
     /// Day-granularity hive-style table written by Hudi 0.15.0. Its paths are
     /// `ts_str=2024-03-01`, so the reader must build the same shape to prune at all.
+    ///
+    /// The 0.15 writer does not persist `hoodie.keygen.timebased.timestamp.type`
+    /// (it is set at write time only), so the table is opened with it supplied as
+    /// a read option — without it the keygen cannot be built and the transform
+    /// never engages.
     #[tokio::test]
     async fn day_granularity_selects_only_the_requested_days() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleDay.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
         assert_eq!(
@@ -3564,12 +3573,17 @@ mod hive_style_keygen_partition_pruning {
         Ok(())
     }
 
-    /// A predicate no partition can satisfy must select nothing at all. Before the reader
-    /// built hive paths correctly this returned every file instead.
+    /// A predicate no partition can satisfy must select nothing at all. With the
+    /// transform engaged this is a genuine partition-path mismatch: the literal
+    /// names 1900-01-01, no partition carries that path, and none is read.
     #[tokio::test]
     async fn impossible_predicate_selects_no_files() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleDay.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let opts =
             ReadOptions::new().with_filters([("ts_str", "=", "1900-01-01T00:00:00.000Z")])?;
@@ -3590,7 +3604,11 @@ mod hive_style_keygen_partition_pruning {
     #[tokio::test]
     async fn hour_granularity_keeps_one_hive_prefix_over_nested_directories() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleHour.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
         assert_eq!(
@@ -3617,12 +3635,52 @@ mod hive_style_keygen_partition_pruning {
         Ok(())
     }
 
+    /// A 1.x-written table persists `timestamp.type` in `hoodie.properties`, so the
+    /// keygen transform engages from table config alone. Its `input.dateformat` is
+    /// stored through `Properties.store` as `yyyy-MM-dd'T'HH\:mm\:ss.SSSZ`; read
+    /// back without unescaping, any filter on the timestamp source column would
+    /// fail with `TimestampParsingError` instead of pruning.
+    #[tokio::test]
+    async fn v9_table_prunes_through_its_persisted_keygen_config() -> Result<()> {
+        let base_url = SampleTable::V9TimebasedkeygenNonhivestyle.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+
+        let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        assert_eq!(
+            partitions_of(&all),
+            vec![
+                "2024/01/15/10",
+                "2024/01/15/11",
+                "2024/01/16/09",
+                "2024/01/17/14",
+                "2024/01/18/16",
+            ]
+        );
+
+        let opts = ReadOptions::new().with_filters([
+            ("ts_str", ">=", "2024-01-16T00:00:00.000Z"),
+            ("ts_str", "<", "2024-01-18T00:00:00.000Z"),
+        ])?;
+        // The widened bounds retain the boundary hours; file-level column
+        // statistics on the source column drop their files, whose rows all fall
+        // outside the predicate.
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["2024/01/16/09", "2024/01/17/14"]
+        );
+        Ok(())
+    }
+
     /// Rows returned must agree with the partitions selected, so pruning cannot be hiding a
     /// row that the predicate should have kept.
     #[tokio::test]
     async fn pruned_read_returns_exactly_the_matching_rows() -> Result<()> {
         let base_url = SampleTable::V6TimebasedkeygenHivestyleDay.url_to_cow();
-        let hudi_table = Table::new(base_url.path()).await?;
+        let hudi_table = Table::new_with_options(
+            base_url.path(),
+            [("hoodie.keygen.timebased.timestamp.type", "DATE_STRING")],
+        )
+        .await?;
 
         let opts = ReadOptions::new().with_filters([
             ("ts_str", ">=", "2024-03-01T00:00:00.000Z"),
