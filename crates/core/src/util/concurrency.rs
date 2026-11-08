@@ -19,7 +19,40 @@
 //! flight at once.
 
 use crate::Result;
+use crate::error::CoreError;
 use std::future::Future;
+
+/// Run `fut` as a task on the current multi-thread runtime, so it can make
+/// progress on another worker thread than the one awaiting it. Without one (no
+/// runtime, or a current-thread runtime with no other thread to use) `fut` is
+/// awaited in place.
+///
+/// Dropping the returned future aborts the task, so a caller that gives up on a
+/// read (an error elsewhere, a dropped stream) does not leave it running. A
+/// panic in a spawned task comes back as an error rather than unwinding the
+/// caller.
+pub(crate) async fn spawn_aborting<R, Fut>(fut: Fut) -> Result<R>
+where
+    R: Send + 'static,
+    Fut: Future<Output = Result<R>> + Send + 'static,
+{
+    struct AbortOnDrop<R>(tokio::task::JoinHandle<R>);
+    impl<R> Drop for AbortOnDrop<R> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let handle = match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => h,
+        _ => return fut.await,
+    };
+    let mut task = AbortOnDrop(handle.spawn(fut));
+    (&mut task.0).await.unwrap_or_else(|e| {
+        Err(CoreError::ReadFileSliceError(format!(
+            "read task failed: {e}"
+        )))
+    })
+}
 
 /// Apply `op` to every item, at most `concurrency` at a time, keeping input
 /// order in the output.
@@ -62,7 +95,43 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Dropping the wrapper stops the task instead of leaving it running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_aborting_aborts_the_task_on_drop() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let read = spawn_aborting(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        // Start the task, then give up on it.
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(10), read).await;
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the dropped task kept running"
+        );
+    }
+
+    /// Outside any runtime the future is awaited in place instead of panicking
+    /// on a missing reactor.
+    #[test]
+    fn spawn_aborting_runs_in_place_without_a_runtime() {
+        let got = futures::executor::block_on(spawn_aborting(async { Ok(7) })).unwrap();
+        assert_eq!(got, 7);
+    }
+
+    /// A panic in the task comes back as an error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_aborting_reports_a_panic_as_an_error() {
+        let result: Result<()> = spawn_aborting(async { panic!("boom") }).await;
+        let err = result.expect_err("a panicking task must fail the read");
+        assert!(err.to_string().contains("read task failed"), "{err}");
+    }
 
     /// Output order follows input order, not completion order.
     #[tokio::test]

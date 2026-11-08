@@ -4,16 +4,17 @@
 
 - **No `.unwrap()` / `.expect()` / `panic!()`** in non-test code (Critical). `unreachable!()`
   only with a comment justifying the invariant.
-- **Errors carry context** — typed `thiserror` variants or `anyhow::Context`; messages name the
-  offending value. Avoid bare `.map_err(Into::into)`.
+- **Errors carry context** — typed `thiserror` variants (`CoreError` in `hudi-core`) whose
+  messages name the offending value. Avoid bare `.map_err(Into::into)`.
 
 ```rust
 // GOOD — with context
-let file = File::open(&path)
-    .with_context(|| format!("Failed to open table metadata at {}", path.display()))?;
+let version: isize = value
+    .parse()
+    .map_err(|e| CoreError::InvalidValue(format!("table version '{value}' is not a number: {e}")))?;
 
 // BAD — no context
-let file = File::open(&path).map_err(|e| HudiError::Io(e))?;
+let version: isize = value.parse().map_err(|e| CoreError::InvalidValue(e.to_string()))?;
 ```
 
 ## Async

@@ -18,7 +18,7 @@
 services:
   # storage layer containing test data
   minio:
-    image: quay.io/minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
     container_name: minio
     ports:
       - 9000:9000
@@ -34,9 +34,10 @@ services:
       retries: 3
 
   # minio client to prepare test data
+  # latest-dev, not latest: the plain image has no shell or unzip, and
+  # prepare_data.sh needs both.
   mc:
-    build:
-      context: ./infra/mc
+    image: cgr.dev/chainguard/minio-client:latest-dev
     container_name: mc
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
@@ -47,7 +48,7 @@ services:
     volumes:
       - ../crates/test/data:/opt/data:ro
       - ./infra/mc/prepare_data.sh:/opt/prepare_data.sh
-    command:
+    entrypoint:
       - /bin/sh
       - -c
       - /opt/prepare_data.sh

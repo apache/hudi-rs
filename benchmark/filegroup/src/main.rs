@@ -69,7 +69,7 @@ struct Args {
     columns: Option<Vec<String>>,
 
     /// Streaming chunk size (`hoodie.read.stream.batch_size`). When
-    /// omitted the reader uses its built-in default (DEFAULT_BATCH_SIZE = 4096).
+    /// omitted the reader uses its built-in default (1024 rows).
     /// Set this to measure the effect of chunk granularity on wall time. (The
     /// peak-RSS effect shows only on the streaming `open()` path; this bench
     /// drives `read()`, which retains the full output, so `max_rss` is

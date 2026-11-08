@@ -275,10 +275,6 @@ impl ReadOptions {
         }
     }
 
-    /// The target batch size (rows per batch) for streaming reads, if set.
-    /// Errors if the stored string is not a valid `usize` or if the value is `0`
-    /// (a zero-row batch yields no batches at the parquet stream reader and is
-    /// almost certainly a caller mistake).
     /// Fill in defaults from the given configs for keys not already set.
     ///
     /// Values already present in this `ReadOptions` take precedence.
@@ -296,6 +292,10 @@ impl ReadOptions {
         Ok(resolved)
     }
 
+    /// The target batch size (rows per batch) for streaming reads, if set.
+    /// Errors if the stored string is not a valid `usize` or if the value is `0`
+    /// (a zero-row batch yields no batches at the parquet stream reader and is
+    /// almost certainly a caller mistake).
     pub fn batch_size(&self) -> crate::Result<Option<usize>> {
         let key = HudiReadConfig::StreamBatchSize.as_ref();
         match self.hudi_options.get(key) {
