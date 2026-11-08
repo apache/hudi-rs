@@ -151,8 +151,6 @@ async fn resolve_schema_from_base_file(
 
     // Handle deltacommit case with baseFile
     if let Some(base_file) = &first_stat.base_file {
-        // Join with explicit forward slashes: this is a relative object-store
-        // path, and PathBuf joins would introduce '\' on Windows (#445).
         let path = join_path_segments(partition, base_file);
         if let Some(schema) = read_schema_by_extension(&path, &storage).await? {
             return Ok(schema);

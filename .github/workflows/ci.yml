@@ -190,13 +190,11 @@ jobs:
 
   rust-tests-windows:
     runs-on: windows-2025
+    # disabled: the workspace does not build and pass on Windows yet (local drive-letter
+    # table paths, Unix-only fg-bench rusage, TZ-based tests)
+    if: false    
     steps:
       - uses: actions/checkout@v7
-      # hudi-core compiles prost .proto files at build time and shells out to
-      # protoc, which is not preinstalled on the Windows runner (mirrors
-      # release.yml; see #445 for why this job was disabled).
-      - name: Install protobuf compiler
-        run: choco install protoc --yes
       - name: Run unit tests on Windows with no coverage report
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
 

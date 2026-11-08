@@ -382,8 +382,6 @@ impl Instant {
     /// Get the relative path with a specified base directory.
     /// Use `.hoodie/` for pre-v8 tables (Layout Version 1) or `.hoodie/timeline/` for v8+ tables (Layout Version 2).
     pub fn relative_path_with_base(&self, base_dir: &str) -> Result<String> {
-        // Join with explicit forward slashes: this is a relative object-store
-        // path, and PathBuf joins would introduce '\' on Windows (#445).
         Ok(join_path_segments(base_dir, &self.file_name()))
     }
 

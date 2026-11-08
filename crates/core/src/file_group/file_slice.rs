@@ -131,10 +131,7 @@ impl FileSlice {
     }
 
     fn relative_path_for_file(&self, file_name: &str) -> Result<String> {
-        // Join with explicit forward slashes: this is a relative object-store
-        // path, and PathBuf joins would introduce '\' on Windows (#445).
-        let path = join_path_segments(self.partition_path.as_str(), file_name);
-        Ok(path)
+        Ok(join_path_segments(self.partition_path.as_str(), file_name))
     }
 
     /// Returns the relative path of the [BaseFile] in the [FileSlice].

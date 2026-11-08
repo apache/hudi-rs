@@ -47,8 +47,7 @@ pub fn get_scheme_authority(url: &Url) -> String {
 ///
 /// The result is a relative object-store path and must keep forward slashes
 /// on every platform: on Windows, `PathBuf`-based joins introduce `\`,
-/// which object-store paths and partition-value parsing cannot interpret
-/// (see <https://github.com/apache/hudi-rs/issues/445>).
+/// which object-store paths and partition-value parsing cannot interpret.
 pub fn join_path_segments(base: &str, segment: &str) -> String {
     let base = base.trim_matches('/');
     let segment = segment.trim_matches('/');
