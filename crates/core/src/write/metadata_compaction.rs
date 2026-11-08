@@ -35,7 +35,7 @@ use apache_avro::Schema as AvroSchema;
 use crate::Result;
 use crate::error::CoreError;
 use crate::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
-use crate::hfile::{HFileBuilder, HFileReader, HFileRecord};
+use crate::hfile::{CompressionCodec, HFileBuilder, HFileReader, HFileRecord};
 use crate::metadata::commit::{HoodieCommitMetadata, HoodieWriteStat};
 use crate::metadata::compaction::{CompactionOperation, CompactionPlan};
 use crate::metadata::payload_merger::MetadataPayloadMerger;
@@ -134,7 +134,10 @@ fn file_name(path: &str) -> &str {
 /// does not skip: it schedules the compaction 1 ms below the earliest pending
 /// data instant whose metadata delta commit completed, and its planner leaves
 /// out log files that completed after that time.
-pub(crate) async fn compact_metadata_table_if_needed(table: &mut Table) -> Result<Option<String>> {
+pub(crate) async fn compact_metadata_table_if_needed(
+    table: &mut Table,
+    codec: CompressionCodec,
+) -> Result<Option<String>> {
     if !table.is_metadata_table_enabled() {
         return Ok(None);
     }
@@ -204,7 +207,7 @@ pub(crate) async fn compact_metadata_table_if_needed(table: &mut Table) -> Resul
         Vec::new(),
     )
     .await?;
-    match write_compacted_slices(table, &slices, &range, version, &instant).await {
+    match write_compacted_slices(table, &slices, &range, version, &instant, codec).await {
         Ok(stats) => {
             complete_metadata_compaction(storage.as_ref(), &instant, stats).await?;
             Ok(Some(instant))
@@ -358,6 +361,7 @@ async fn write_compacted_slices(
     range: &InstantRange,
     version: StatsIndexVersion,
     instant: &str,
+    codec: CompressionCodec,
 ) -> Result<Vec<HoodieWriteStat>> {
     let storage = table.file_system_view.storage.clone();
     let tasks = slices
@@ -380,7 +384,7 @@ async fn write_compacted_slices(
                     let num_log_files = log_paths.len() as i64;
                     let groups = scanner.scan_hfile_records(log_paths, &range).await?;
                     let (bytes, num_records) = tokio::task::spawn_blocking(move || {
-                        compact_slice(kind, base, groups, version)
+                        compact_slice(kind, base, groups, version, codec)
                     })
                     .await
                     .map_err(|e| {
@@ -602,6 +606,7 @@ fn compact_slice(
     base: Option<Vec<u8>>,
     groups: Vec<HFileRecordGroup>,
     version: StatsIndexVersion,
+    codec: CompressionCodec,
 ) -> Result<(Vec<u8>, u64)> {
     let hfile_error = |e: crate::hfile::HFileError| CoreError::HFile(e.to_string());
     let output = metadata_schema()?;
@@ -677,7 +682,7 @@ fn compact_slice(
     touched.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut touched = touched.into_iter().peekable();
 
-    let mut out = CompactedFile::new()?;
+    let mut out = CompactedFile::new(codec)?;
     if let Some(reader) = base.as_mut() {
         for kv in reader.iter().map_err(hfile_error)? {
             let kv = kv.map_err(hfile_error)?;
@@ -707,10 +712,10 @@ struct CompactedFile {
 }
 
 impl CompactedFile {
-    fn new() -> Result<Self> {
+    fn new(codec: CompressionCodec) -> Result<Self> {
         Ok(Self {
             builder: HFileBuilder::new(HFILE_BLOCK_SIZE)
-                .with_compression(crate::write::metadata::METADATA_HFILE_CODEC)
+                .with_compression(codec)
                 .map_err(|e| CoreError::HFile(e.to_string()))?,
             min_key: None,
             max_key: Vec::new(),
@@ -769,6 +774,7 @@ mod tests {
     use crate::metadata::table::encode::encode_all_partitions;
     use crate::metadata::table::records::{decode_avro_value, extract_filesystem_metadata};
     use crate::table::ReadOptions;
+    use crate::write::metadata::{DEFAULT_METADATA_HFILE_CODEC, HFILE_COMPRESSION_ALGORITHM};
     use arrow::array::{Array, ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::path::Path;
@@ -825,6 +831,7 @@ mod tests {
             Some(base),
             groups,
             StatsIndexVersion::V2,
+            DEFAULT_METADATA_HFILE_CODEC,
         )
         .unwrap();
         assert_eq!(count, 3);
@@ -858,6 +865,7 @@ mod tests {
             Some(base),
             vec![group(&[("j", b"w")])],
             StatsIndexVersion::V2,
+            DEFAULT_METADATA_HFILE_CODEC,
         )
         .unwrap_err();
         assert!(matches!(error, CoreError::Unsupported(_)), "{error}");
@@ -870,6 +878,7 @@ mod tests {
             Some(hfile(&[("k", b"v")])),
             vec![foreign],
             StatsIndexVersion::V2,
+            DEFAULT_METADATA_HFILE_CODEC,
         )
         .unwrap_err();
         assert!(matches!(error, CoreError::Unsupported(_)), "{error}");
@@ -919,6 +928,7 @@ mod tests {
             None,
             vec![group(&[("k", b"v")])],
             StatsIndexVersion::V2,
+            DEFAULT_METADATA_HFILE_CODEC,
         )
         .unwrap();
         assert_eq!(
@@ -930,6 +940,7 @@ mod tests {
             Some(hfile(&[("k", b"v")])),
             vec![group(&[("k", b"")])],
             StatsIndexVersion::V2,
+            DEFAULT_METADATA_HFILE_CODEC,
         )
         .unwrap();
         assert_eq!((cells(bytes), count), (Vec::new(), 0));
@@ -966,8 +977,14 @@ mod tests {
                 ("__all_partitions__", &all_partitions),
             ]),
         ];
-        let (bytes, _) =
-            compact_slice(MergeKind::Files, Some(base), groups, StatsIndexVersion::V2).unwrap();
+        let (bytes, _) = compact_slice(
+            MergeKind::Files,
+            Some(base),
+            groups,
+            StatsIndexVersion::V2,
+            DEFAULT_METADATA_HFILE_CODEC,
+        )
+        .unwrap();
         let schema = metadata_schema().unwrap();
         let decoded: HashMap<String, Vec<(String, i64, bool)>> = cells(bytes)
             .into_iter()
@@ -1192,10 +1209,11 @@ mod tests {
                 Table::new_with_options(path.to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
                     .await
                     .unwrap();
-            let instant = compact_metadata_table_if_needed(&mut handle)
-                .await
-                .unwrap()
-                .expect("delta commits are above the threshold");
+            let instant =
+                compact_metadata_table_if_needed(&mut handle, DEFAULT_METADATA_HFILE_CODEC)
+                    .await
+                    .unwrap()
+                    .expect("delta commits are above the threshold");
             let timeline = metadata_timeline_files(path);
             assert!(timeline.contains(&format!("{instant}.compaction.requested")));
             assert!(
@@ -1324,7 +1342,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            compact_metadata_table_if_needed(&mut handle).await.unwrap(),
+            compact_metadata_table_if_needed(&mut handle, DEFAULT_METADATA_HFILE_CODEC)
+                .await
+                .unwrap(),
             None
         );
         for state in ["deltacommit.inflight", "deltacommit.requested"] {
@@ -1350,7 +1370,7 @@ mod tests {
         ));
         std::fs::write(&orphan, b"half a base file").unwrap();
         let before = metadata_views(path).await;
-        let instant = compact_metadata_table_if_needed(&mut handle)
+        let instant = compact_metadata_table_if_needed(&mut handle, DEFAULT_METADATA_HFILE_CODEC)
             .await
             .unwrap()
             .expect("the crashed compaction no longer blocks");
@@ -1409,107 +1429,8 @@ mod tests {
         assert!(total > 0, "no metadata HFiles checked");
     }
 
-    /// Re-encode every metadata HFile in the latest slices, base files and
-    /// HFile log blocks alike, uncompressed.
-    async fn rewrite_metadata_uncompressed(table: &Table) {
-        use crate::file_group::log_file::BlockType;
-        use crate::file_group::log_file::reader::LogFileReader;
-        use crate::file_group::log_file::writer::LogFileWriter;
-        let storage = table.file_system_view.storage.clone();
-        let uncompressed = |bytes: &[u8]| {
-            let mut reader = HFileReader::new(bytes.to_vec()).unwrap();
-            let schema = reader.get_file_info("schema").unwrap().to_vec();
-            let entries: Vec<(String, Vec<u8>)> = reader
-                .collect_records()
-                .unwrap()
-                .iter()
-                .map(|r| (r.key_as_str().unwrap().to_string(), r.value().to_vec()))
-                .collect();
-            let info = BTreeMap::from([("schema".to_string(), schema)]);
-            crate::hfile::HFileWriter::write(&entries, info).unwrap()
-        };
-        for partition in table.get_metadata_table_partitions() {
-            let slices = crate::write::metadata::mdt_partition_latest_slices(&storage, &partition)
-                .await
-                .unwrap();
-            for (_, base, log_paths) in slices {
-                if let Some(path) = base {
-                    let bytes = storage.get_file_data(&path).await.unwrap();
-                    storage.put_file(&path, uncompressed(&bytes)).await.unwrap();
-                }
-                for path in log_paths {
-                    let bytes = storage.get_file_data(&path).await.unwrap();
-                    let mut reader =
-                        LogFileReader::new(table.hudi_configs.clone(), storage.clone(), &path)
-                            .await
-                            .unwrap();
-                    let mut rewritten = Vec::new();
-                    for block in reader
-                        .read_all_blocks_metadata_only_unbounded()
-                        .await
-                        .unwrap()
-                    {
-                        let location = block.deferred_content.unwrap().location;
-                        // The content range starts at its 8-byte length field.
-                        let start = location.content_position as usize + 8;
-                        let end = (location.content_position + location.content_length) as usize;
-                        let content = if block.block_type == BlockType::HfileData {
-                            uncompressed(&bytes[start..end])
-                        } else {
-                            bytes[start..end].to_vec()
-                        };
-                        rewritten.extend(LogFileWriter::write_log_block(
-                            block.block_type,
-                            block.header,
-                            &content,
-                        ));
-                    }
-                    storage.put_file(&path, rewritten).await.unwrap();
-                }
-            }
-        }
-    }
-
-    /// Every metadata HFile is written GZ, and a metadata table whose HFiles
-    /// are uncompressed compacts into GZ bases with every view intact.
-    #[tokio::test]
-    async fn test_gzip_metadata_compaction_over_uncompressed_files() {
-        for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path();
-            let mut table = indexed_table(path, table_type, "1000").await;
-            assert_metadata_codec(&table, true, false, None).await;
-            write_history(&mut table).await;
-            assert_metadata_codec(&table, true, true, None).await;
-            let before = metadata_views(path).await;
-            let rows = data_rows(path).await;
-
-            rewrite_metadata_uncompressed(&table).await;
-            assert_metadata_codec(&table, false, false, None).await;
-            assert_metadata_codec(&table, false, true, None).await;
-            assert_eq!(metadata_views(path).await, before);
-
-            let mut handle =
-                Table::new_with_options(path.to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
-                    .await
-                    .unwrap();
-            let instant = compact_metadata_table_if_needed(&mut handle)
-                .await
-                .unwrap()
-                .expect("metadata compaction must run");
-            assert_metadata_codec(&handle, true, false, Some(&instant)).await;
-            assert_eq!(metadata_views(path).await, before);
-            assert_eq!(data_rows(path).await, rows);
-
-            handle.upsert([batch(&[("a", "sf", 4, 13)])]).await.unwrap();
-            let mut expected = rows;
-            expected.retain(|row| row.0 != "a");
-            expected.push(("a".to_string(), "sf".to_string(), 4, 13));
-            expected.sort();
-            assert_eq!(data_rows(path).await, expected);
-        }
-    }
-
+    /// The default writes GZ bootstrap bases and log blocks, and a compaction
+    /// whose base file put fails rolls back and then compacts into GZ bases.
     #[tokio::test]
     async fn test_gzip_metadata_compaction_recovers_failed_base_put() {
         use crate::storage::fault::{FaultyPutStore, PutFault};
@@ -1517,7 +1438,9 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path();
             let mut table = indexed_table(path, TableTypeValue::MergeOnRead, "1000").await;
+            assert_metadata_codec(&table, true, false, None).await;
             write_history(&mut table).await;
+            assert_metadata_codec(&table, true, true, None).await;
             let before = metadata_views(path).await;
             let rows = data_rows(path).await;
             let mut handle =
@@ -1534,17 +1457,184 @@ mod tests {
                 faulty.clone(),
                 storage.hudi_configs.clone(),
             );
-            assert!(compact_metadata_table_if_needed(&mut handle).await.is_err());
+            assert!(
+                compact_metadata_table_if_needed(&mut handle, DEFAULT_METADATA_HFILE_CODEC)
+                    .await
+                    .is_err()
+            );
             assert!(!faulty.is_armed());
             assert_eq!(metadata_views(path).await, before);
             assert_eq!(data_rows(path).await, rows);
-            let instant = compact_metadata_table_if_needed(&mut handle)
-                .await
-                .unwrap()
-                .expect("retry must compact metadata");
+            let instant =
+                compact_metadata_table_if_needed(&mut handle, DEFAULT_METADATA_HFILE_CODEC)
+                    .await
+                    .unwrap()
+                    .expect("retry must compact metadata");
             assert_metadata_codec(&handle, true, false, Some(&instant)).await;
             assert_eq!(metadata_views(path).await, before);
             assert_eq!(data_rows(path).await, rows);
+        }
+    }
+
+    /// Requested time of the latest completed metadata table compaction.
+    fn latest_metadata_compaction(path: &Path) -> String {
+        let name = metadata_timeline_files(path)
+            .into_iter()
+            .rfind(|name| name.ends_with(".commit"))
+            .expect("a completed metadata compaction");
+        name[..name.find('_').unwrap()].to_string()
+    }
+
+    /// With the option at NONE, create, writes and inline compaction write
+    /// uncompressed metadata HFiles and the option stays out of
+    /// hoodie.properties. A later handle without it writes onto those slices,
+    /// which read back and compact into GZ bases.
+    #[tokio::test]
+    async fn test_metadata_hfile_compression_none_then_default() {
+        for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path();
+            let uri = path.to_str().unwrap();
+            let mut table = Table::create(uri)
+                .with_table_name("t")
+                .with_table_type(table_type)
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_ordering_fields(["ts"])
+                .with_record_index_enabled(true)
+                .with_column_stats_enabled(true)
+                .with_partition_stats_enabled(true)
+                .with_option(HFILE_COMPRESSION_ALGORITHM, "none")
+                .create()
+                .await
+                .unwrap();
+            let properties =
+                std::fs::read_to_string(path.join(".hoodie/hoodie.properties")).unwrap();
+            assert!(!properties.contains(HFILE_COMPRESSION_ALGORITHM));
+            assert_metadata_codec(&table, false, false, None).await;
+            write_history(&mut table).await;
+            assert_metadata_codec(&table, false, true, None).await;
+
+            let mut handle = Table::new_with_options(
+                uri,
+                [
+                    (MAX_DELTA_COMMITS, "1"),
+                    (HFILE_COMPRESSION_ALGORITHM, "None"),
+                ],
+            )
+            .await
+            .unwrap();
+            handle.upsert([batch(&[("a", "sf", 4, 13)])]).await.unwrap();
+            let none_compaction = latest_metadata_compaction(path);
+            assert_metadata_codec(&handle, false, false, Some(&none_compaction)).await;
+            let mut rows = data_rows(path).await;
+            assert!(rows.contains(&("a".to_string(), "sf".to_string(), 4, 13)));
+
+            let mut handle = Table::new(uri).await.unwrap();
+            handle.upsert([batch(&[("f", "ny", 5, 60)])]).await.unwrap();
+            rows.push(("f".to_string(), "ny".to_string(), 5, 60));
+            rows.sort();
+            assert_eq!(data_rows(path).await, rows);
+            let before = metadata_views(path).await;
+            let mut handle = Table::new_with_options(uri, [(MAX_DELTA_COMMITS, "1")])
+                .await
+                .unwrap();
+            let instant =
+                compact_metadata_table_if_needed(&mut handle, DEFAULT_METADATA_HFILE_CODEC)
+                    .await
+                    .unwrap()
+                    .expect("metadata compaction must run");
+            assert_metadata_codec(&handle, true, false, Some(&instant)).await;
+            assert_eq!(metadata_views(path).await, before);
+            assert_eq!(data_rows(path).await, rows);
+        }
+    }
+
+    /// Without a metadata table no HFile is written, so, as in Java, any
+    /// value is accepted.
+    #[tokio::test]
+    async fn test_unsupported_hfile_compression_accepted_without_metadata_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let mut table = Table::create(uri)
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .with_partition_fields(["city"])
+            .with_ordering_fields(["ts"])
+            .with_metadata_table_enabled(false)
+            .with_option(HFILE_COMPRESSION_ALGORITHM, "snappy")
+            .create()
+            .await
+            .unwrap();
+        table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
+        let mut handle = Table::new_with_options(uri, [(HFILE_COMPRESSION_ALGORITHM, "zstd")])
+            .await
+            .unwrap();
+        handle.upsert([batch(&[("a", "sf", 2, 11)])]).await.unwrap();
+        assert_eq!(
+            data_rows(dir.path()).await,
+            vec![("a".to_string(), "sf".to_string(), 2, 11)]
+        );
+    }
+
+    /// A codec Hudi's HFile readers cannot decode fails create and writes
+    /// before anything is stored.
+    #[tokio::test]
+    async fn test_unsupported_metadata_hfile_compression_fails_before_mutation() {
+        fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+            let mut files = Vec::new();
+            let mut dirs = vec![dir.to_path_buf()];
+            while let Some(dir) = dirs.pop() {
+                for entry in std::fs::read_dir(dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        dirs.push(path);
+                    } else {
+                        files.push(path);
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t");
+        let uri = path.to_str().unwrap();
+        let mut table = indexed_table(&path, TableTypeValue::MergeOnRead, "1").await;
+        table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
+        let before = files_under(&path);
+        for value in ["SNAPPY", "zstd", "Lz4", "BZIP2", "lzo", "brotli"] {
+            let mut handle = Table::new_with_options(
+                uri,
+                [
+                    (MAX_DELTA_COMMITS, "1"),
+                    (HFILE_COMPRESSION_ALGORITHM, value),
+                ],
+            )
+            .await
+            .unwrap();
+            let error = handle
+                .upsert([batch(&[("a", "sf", 2, 11)])])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(&format!("{HFILE_COMPRESSION_ALGORITHM}={value}"))
+                    && error.contains("only NONE and GZ"),
+                "{error}"
+            );
+            assert_eq!(files_under(&path), before, "{value}");
+
+            let other = dir.path().join(value);
+            let error = Table::create(other.to_str().unwrap())
+                .with_table_name("t")
+                .with_record_key_fields(["id"])
+                .with_option(HFILE_COMPRESSION_ALGORITHM, value)
+                .create()
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("only NONE and GZ"), "{error}");
+            assert!(!other.exists(), "{value}");
         }
     }
 }

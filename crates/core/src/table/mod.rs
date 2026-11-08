@@ -203,6 +203,7 @@ impl Table {
         crate::write::ensure_writable_table_version(self)?;
         crate::write::ensure_complex_keygen_validated(&self.hudi_configs)?;
         crate::write::archival::validated_keep_range(&self.hudi_configs)?;
+        crate::write::metadata::metadata_hfile_codec_for(self)?;
         crate::write::metadata::ensure_supported_metadata_layout(self).await?;
         // Instants must be minted in the table's declared timeline timezone
         // (Spark writers default to LOCAL); set before any instant is minted.

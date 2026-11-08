@@ -501,6 +501,22 @@ mod tests {
         }
     }
 
+    /// Checksums cover the header and data only, so a block whose header and
+    /// data fill one checksum chunk exactly takes a single checksum.
+    #[test]
+    fn test_block_ending_on_checksum_chunk_boundary() {
+        use crate::hfile::block::HFileBlock;
+        let input = vec![7u8; BYTES_PER_CHECKSUM - BLOCK_HEADER_SIZE];
+        let bytes = write_block(HFileBlockType::Data, &input, -1, CompressionCodec::None).unwrap();
+        assert_eq!(bytes.len(), BYTES_PER_CHECKSUM + 4);
+        let block = HFileBlock::parse(&bytes, CompressionCodec::None).unwrap();
+        assert_eq!(
+            block.header.on_disk_data_size_with_header,
+            BYTES_PER_CHECKSUM
+        );
+        assert_eq!(block.data, input);
+    }
+
     #[test]
     fn test_compression_selection_preserves_default_and_rejects_invalid_changes() {
         let entries = vec![("a".to_string(), vec![b'x'; 10000])];

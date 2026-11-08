@@ -614,7 +614,9 @@ class HudiTable:
             partition_stats_enabled (Optional[bool]): Partition stats index in the metadata table.
             hive_style_partitioning (Optional[bool]): Use ``field=value`` partition paths.
             hudi_options (Optional[Dict[str, str]]): Extra ``hoodie.*`` table configs, written into
-                ``hoodie.properties``. Read options belong on the reader, not here.
+                ``hoodie.properties``. Read options belong on the reader, not here. The write
+                option ``hoodie.hfile.compression.algorithm`` is not stored; it applies to the
+                metadata table's initial files and to writes through the returned table.
             storage_options (Optional[Dict[str, str]]): Storage options such as cloud credentials.
 
         Returns:

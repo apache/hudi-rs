@@ -57,17 +57,57 @@ pub(crate) const DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS: usize = 2;
 /// Java `hoodie.metadata.index.partition.stats.file.group.count` default.
 pub(crate) const DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS: usize = 1;
 
-/// Codec of every metadata-table HFile. Java's metadata write config does not
-/// inherit the data table's `hoodie.hfile.compression.algorithm`, so Java
-/// metadata HFiles always take the HFile default, GZ.
-pub(crate) const METADATA_HFILE_CODEC: CompressionCodec = CompressionCodec::Gzip;
+/// Write option for the block compression of every metadata-table HFile: base
+/// files, HFile log blocks and compacted bases, under Java's HFile compression
+/// key, parsed as Java parses it: an absent or empty value means `GZ`, and a
+/// name matches Java's codec names (`gz`, `none`, ...) ignoring case. Only `gz`
+/// and `none` are accepted, because this crate's HFile reader and released
+/// Java readers decode only those; a table without a metadata table writes no
+/// HFile and does not check the value.
+///
+/// It is read per write and never stored in `hoodie.properties`: readers take
+/// the codec from each file's trailer, so files of different codecs coexist.
+pub(crate) const HFILE_COMPRESSION_ALGORITHM: &str = "hoodie.hfile.compression.algorithm";
+
+/// Codec of metadata-table HFiles when [`HFILE_COMPRESSION_ALGORITHM`] is unset.
+pub(crate) const DEFAULT_METADATA_HFILE_CODEC: CompressionCodec = CompressionCodec::Gzip;
+
+/// Resolve the metadata-table HFile codec from the configured
+/// [`HFILE_COMPRESSION_ALGORITHM`].
+pub(crate) fn metadata_hfile_codec(value: Option<&str>) -> Result<CompressionCodec> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_METADATA_HFILE_CODEC);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "gz" => Ok(CompressionCodec::Gzip),
+        "none" => Ok(CompressionCodec::None),
+        _ => Err(crate::error::CoreError::Write(format!(
+            "{HFILE_COMPRESSION_ALGORITHM}={value} is not supported: only NONE and GZ are \
+             supported for metadata table HFiles for now"
+        ))),
+    }
+}
+
+/// The metadata-table HFile codec a write to `table` uses, or the default when
+/// the table has no metadata table, which writes no HFile and so does not
+/// check the value.
+pub(crate) fn metadata_hfile_codec_for(table: &Table) -> Result<CompressionCodec> {
+    if !table.is_metadata_table_enabled() {
+        return Ok(DEFAULT_METADATA_HFILE_CODEC);
+    }
+    metadata_hfile_codec(table.hudi_configs.get_raw(HFILE_COMPRESSION_ALGORITHM))
+}
 
 /// Encode one metadata-table HFile, with the writer schema as file info.
-fn encode_metadata_hfile(entries: &[(String, Vec<u8>)], schema_json: &str) -> Result<Vec<u8>> {
+fn encode_metadata_hfile(
+    entries: &[(String, Vec<u8>)],
+    schema_json: &str,
+    codec: CompressionCodec,
+) -> Result<Vec<u8>> {
     HFileWriter::write_with_compression(
         entries,
         BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
-        METADATA_HFILE_CODEC,
+        codec,
     )
     .map_err(|error| crate::error::CoreError::HFile(error.to_string()))
 }
@@ -75,9 +115,10 @@ fn encode_metadata_hfile(entries: &[(String, Vec<u8>)], schema_json: &str) -> Re
 async fn write_metadata_hfile(
     entries: Vec<(String, Vec<u8>)>,
     schema_json: &str,
+    codec: CompressionCodec,
 ) -> Result<Vec<u8>> {
     let schema_json = schema_json.to_string();
-    tokio::task::spawn_blocking(move || encode_metadata_hfile(&entries, &schema_json))
+    tokio::task::spawn_blocking(move || encode_metadata_hfile(&entries, &schema_json, codec))
         .await
         .map_err(|e| crate::error::CoreError::Write(format!("metadata HFile task failed: {e}")))?
 }
@@ -141,6 +182,7 @@ pub async fn bootstrap_metadata_table(
     record_index_enabled: bool,
     column_stats_enabled: bool,
     partition_stats_enabled: bool,
+    codec: CompressionCodec,
 ) -> Result<()> {
     let mdt_name = format!("{table_name}_metadata");
     let checksum = crate::write::create::table_checksum("", &mdt_name);
@@ -191,6 +233,7 @@ pub async fn bootstrap_metadata_table(
             all_partitions,
         )],
         files_metadata_avro_schema_json()?,
+        codec,
     )?;
     let files_base_size = hfile.len() as i64;
     crate::write::ensure_partition_metadata(
@@ -233,6 +276,7 @@ pub async fn bootstrap_metadata_table(
             DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS,
             &column_stats_file_id,
             hoodie_metadata_schema_json()?,
+            codec,
         )
         .await?;
         next_offset += 1;
@@ -245,6 +289,7 @@ pub async fn bootstrap_metadata_table(
             DEFAULT_RLI_NUM_FILE_GROUPS,
             &record_index_file_id,
             record_index_metadata_avro_schema_json()?,
+            codec,
         )
         .await?;
         next_offset += 1;
@@ -257,6 +302,7 @@ pub async fn bootstrap_metadata_table(
             DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS,
             &partition_stats_file_id,
             hoodie_metadata_schema_json()?,
+            codec,
         )
         .await?;
     }
@@ -270,6 +316,7 @@ async fn bootstrap_empty_hfile_partition(
     num_file_groups: usize,
     file_id_fn: &(dyn Fn(usize) -> String + Sync),
     schema_json: &str,
+    codec: CompressionCodec,
 ) -> Result<()> {
     crate::write::ensure_partition_metadata(
         storage,
@@ -281,7 +328,7 @@ async fn bootstrap_empty_hfile_partition(
     for shard in 0..num_file_groups {
         let file_id = file_id_fn(shard);
         let base_name = format!("{file_id}_0-0-0_{instant}.hfile");
-        let empty = encode_metadata_hfile(&[], schema_json)?;
+        let empty = encode_metadata_hfile(&[], schema_json, codec)?;
         let size = empty.len() as i64;
         storage
             .put_file(
@@ -317,6 +364,7 @@ pub async fn update_files_partition_entries(
     data_storage: &Storage,
     instant: &str,
     files: &[(String, String, i64, bool)],
+    codec: CompressionCodec,
 ) -> Result<Vec<HoodieWriteStat>> {
     let mut by_partition: BTreeMap<String, Vec<FilesMetadataEntry>> = BTreeMap::new();
     for (partition, file_name, size, is_deleted) in files {
@@ -359,7 +407,7 @@ pub async fn update_files_partition_entries(
     }
     let schema_json = files_metadata_avro_schema_json()?.to_string();
     let num_writes = entries.len() as i64;
-    let hfile = write_metadata_hfile(entries, &schema_json).await?;
+    let hfile = write_metadata_hfile(entries, &schema_json, codec).await?;
     // Java HFile data blocks embed SCHEMA (ordinal 2) alongside INSTANT_TIME.
     let block = LogFileWriter::write_log_block(
         BlockType::HfileData,
@@ -401,6 +449,7 @@ pub async fn update_record_index(
     instant: &str,
     entries: Vec<RecordIndexEntry>,
     max_parallelism: usize,
+    codec: CompressionCodec,
 ) -> Result<Vec<HoodieWriteStat>> {
     if entries.is_empty() {
         return Ok(Vec::new());
@@ -458,7 +507,7 @@ pub async fn update_record_index(
                 let mut num_writes = 0i64;
                 if !puts.is_empty() {
                     num_writes += puts.len() as i64;
-                    let hfile = encode_metadata_hfile(&puts, &schema_json)?;
+                    let hfile = encode_metadata_hfile(&puts, &schema_json, codec)?;
                     log_bytes.extend(LogFileWriter::write_log_block(
                         BlockType::HfileData,
                         HashMap::from([
@@ -861,6 +910,7 @@ pub async fn update_column_stats_partitions(
     updates: &[StatsFileUpdate],
     schema: &Schema,
     replaced_files: &[String],
+    codec: CompressionCodec,
 ) -> Result<HashMap<String, Vec<HoodieWriteStat>>> {
     let mut out: HashMap<String, Vec<HoodieWriteStat>> = HashMap::new();
     if updates.is_empty() {
@@ -929,6 +979,7 @@ pub async fn update_column_stats_partitions(
             &column_records,
             true,
             stats_version,
+            codec,
         )
         .await?;
         out.insert(
@@ -959,6 +1010,7 @@ pub async fn update_column_stats_partitions(
                 &partition_records,
                 false,
                 stats_version,
+                codec,
             )
             .await?;
             out.insert(
@@ -1360,6 +1412,7 @@ async fn write_stats_log_blocks(
     records: &[(String, ColumnStatsMetadata)],
     is_column_stats: bool,
     version: StatsIndexVersion,
+    codec: CompressionCodec,
 ) -> Result<Vec<HoodieWriteStat>> {
     let num_groups =
         detect_num_file_groups(data_storage, partition_name, file_id_prefix, default_groups)
@@ -1382,7 +1435,7 @@ async fn write_stats_log_blocks(
     for (shard, entries) in by_shard {
         let file_id = file_id_fn(shard);
         let num_writes = entries.len() as i64;
-        let hfile = write_metadata_hfile(entries, &schema_json).await?;
+        let hfile = write_metadata_hfile(entries, &schema_json, codec).await?;
         let block = LogFileWriter::write_log_block(
             BlockType::HfileData,
             HashMap::from([
@@ -1511,6 +1564,32 @@ pub fn epoch_millis_to_instant_in(millis: i64, timezone: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_metadata_hfile_codec_accepts_none_and_gz_only() {
+        assert_eq!(metadata_hfile_codec(None).unwrap(), CompressionCodec::Gzip);
+        for value in ["", "GZ", "gz", "Gz"] {
+            assert_eq!(
+                metadata_hfile_codec(Some(value)).unwrap(),
+                CompressionCodec::Gzip
+            );
+        }
+        for value in ["NONE", "none", "None"] {
+            assert_eq!(
+                metadata_hfile_codec(Some(value)).unwrap(),
+                CompressionCodec::None
+            );
+        }
+        for value in [
+            "SNAPPY", "zstd", "LZ4", "bz2", "LZO", "gzip", " gz", "deflate",
+        ] {
+            let error = metadata_hfile_codec(Some(value)).unwrap_err().to_string();
+            assert!(
+                error.contains(HFILE_COMPRESSION_ALGORITHM) && error.contains("only NONE and GZ"),
+                "{error}"
+            );
+        }
+    }
 
     /// Record index instants encode and decode in the same zone.
     #[test]
