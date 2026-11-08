@@ -555,7 +555,8 @@ async fn ids_read_with(base_uri: &str, options: ReadOptions) -> Result<Vec<i32>>
 }
 
 #[tokio::test]
-async fn append_only_version_6_commits_support_time_travel_and_incremental_reads() -> Result<()> {
+async fn append_only_version_6_commits_support_time_travel_and_refuse_incremental_reads()
+-> Result<()> {
     let temp_dir = tempdir()?;
     write_table_properties(temp_dir.path())?;
     let uri = temp_dir.path().to_str().expect("valid temp path");
@@ -585,27 +586,19 @@ async fn append_only_version_6_commits_support_time_travel_and_incremental_reads
         vec![1, 2, 3, 4, 5]
     );
 
-    let incremental = |start: &str| {
+    // Meta fields are off, so no `_hoodie_commit_time` says which rows a commit
+    // wrote; an incremental read is refused rather than answered from whole files.
+    let err = ids_read_with(
+        uri,
         ReadOptions::new()
             .with_query_type(QueryType::Incremental)
-            .with_start_timestamp(start)
-    };
-    assert_eq!(
-        ids_read_with(
-            uri,
-            incremental(first.requested_time.as_deref().unwrap())
-                .with_end_timestamp(second.requested_time.as_deref().unwrap())
-        )
-        .await?,
-        vec![3]
-    );
-    assert_eq!(
-        ids_read_with(uri, incremental(first.requested_time.as_deref().unwrap())).await?,
-        vec![3, 4, 5]
-    );
-    assert_eq!(
-        ids_read_with(uri, incremental(third.requested_time.as_deref().unwrap())).await?,
-        Vec::<i32>::new()
+            .with_start_timestamp(first.requested_time.as_deref().unwrap()),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, CoreError::Unsupported(msg) if msg.contains("hoodie.populate.meta.fields")),
+        "{err:?}"
     );
 
     Ok(())

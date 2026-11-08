@@ -28,6 +28,7 @@ use futures::stream::BoxStream;
 use hudi_core::config::read::HudiReadConfig;
 use hudi_core::error::{CoreError, Result};
 use hudi_core::table::{QueryType, ReadOptions, Table};
+use hudi_core::timeline::EARLIEST_START_TIMESTAMP;
 use hudi_test::{QuickstartTripsTable, SampleTable, TableFormat};
 
 async fn collect_stream_batches(
@@ -38,6 +39,62 @@ async fn collect_stream_batches(
         batches.push(result?);
     }
     Ok(batches)
+}
+
+/// Without `_hoodie_commit_time` nothing tells which rows of a rewritten file a
+/// commit changed, so every incremental entry point refuses a table that does not
+/// populate meta fields, while a snapshot read of it stays supported.
+async fn assert_incremental_refused_without_meta_fields(table: SampleTable) -> Result<()> {
+    fn assert_refused(result: Result<()>, entry_point: &str, url: &url::Url) {
+        match result {
+            Err(CoreError::Unsupported(msg)) => assert!(
+                msg.contains("hoodie.populate.meta.fields"),
+                "{entry_point} on {url}: the error must name the config: {msg}"
+            ),
+            Err(e) => panic!("{entry_point} on {url}: expected Unsupported, got {e:?}"),
+            Ok(()) => panic!("{entry_point} on {url}: an incremental query must be refused"),
+        }
+    }
+    for base_url in table.urls() {
+        let hudi_table = Table::new(base_url.path()).await?;
+        let options = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(EARLIEST_START_TIMESTAMP);
+
+        assert_refused(
+            hudi_table.read(&options).await.map(|_| ()),
+            "read",
+            &base_url,
+        );
+        assert_refused(
+            hudi_table.read_stream(&options).await.map(|_| ()),
+            "read_stream",
+            &base_url,
+        );
+        assert_refused(
+            hudi_table.get_file_slices(&options).await.map(|_| ()),
+            "get_file_slices",
+            &base_url,
+        );
+        assert_refused(
+            hudi_table
+                .create_file_group_reader_with_options(
+                    Some(&options),
+                    std::iter::empty::<(&str, &str)>(),
+                )
+                .await
+                .map(|_| ()),
+            "create_file_group_reader_with_options",
+            &base_url,
+        );
+
+        let snapshot = hudi_table.read(&ReadOptions::new()).await?;
+        assert!(
+            snapshot.iter().map(|b| b.num_rows()).sum::<usize>() > 0,
+            "a snapshot read of {base_url} must still return rows"
+        );
+    }
+    Ok(())
 }
 
 fn sample_rows(records: &[RecordBatch]) -> Result<Vec<(i32, String, bool)>> {
@@ -453,6 +510,14 @@ mod v6_tables {
         use super::*;
 
         #[tokio::test]
+        async fn test_refused_without_meta_fields() -> Result<()> {
+            assert_incremental_refused_without_meta_fields(
+                SampleTable::V6SimplekeygenHivestyleNoMetafields,
+            )
+            .await
+        }
+
+        #[tokio::test]
         async fn test_empty_table() -> Result<()> {
             for base_url in SampleTable::V6Empty.urls() {
                 let hudi_table = Table::new(base_url.path()).await?;
@@ -808,6 +873,18 @@ mod v8_tables {
                 .unwrap();
             assert_eq!(riders.value(0), target_rider);
             Ok(())
+        }
+    }
+
+    mod incremental_queries {
+        use super::*;
+
+        #[tokio::test]
+        async fn test_refused_without_meta_fields() -> Result<()> {
+            assert_incremental_refused_without_meta_fields(
+                SampleTable::V8SimplekeygenHivestyleNoMetafields,
+            )
+            .await
         }
     }
 
