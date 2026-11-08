@@ -201,7 +201,7 @@ impl FileGroup {
     ///   based on log timestamp.
     ///
     /// A log file with no base file to attach to starts (or extends) a log-only
-    /// file slice keyed by the log's own instant — see [`FileSlice::new_log_only`].
+    /// file slice keyed by the log's own instant (see [`FileSlice::new_log_only`]).
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
         // Validate file_id matches
         if log_file.file_id != self.file_id {

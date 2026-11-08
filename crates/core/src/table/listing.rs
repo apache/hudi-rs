@@ -23,6 +23,7 @@ use crate::config::table::BaseFileFormatValue;
 use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::BaseFile;
+use crate::file_group::builder::assemble_file_groups;
 use crate::file_group::log_file::LogFile;
 use crate::metadata::LAKE_FORMAT_METADATA_DIRS;
 use crate::statistics::estimator::FileStatsEstimator;
@@ -147,29 +148,7 @@ impl FileLister {
             }
         }
 
-        let mut file_groups: Vec<FileGroup> = Vec::new();
-        for (file_id, base_files) in file_id_to_base_files.into_iter() {
-            let mut file_group = FileGroup::new(file_id.to_owned(), partition_path.to_string());
-
-            file_group.add_base_files(base_files)?;
-
-            let log_files = file_id_to_log_files.remove(&file_id).unwrap_or_default();
-            file_group.add_log_files(log_files)?;
-
-            file_groups.push(file_group);
-        }
-
-        // Whatever log files are left belong to file groups with no base file:
-        // inserts that went straight to a log file, which is what Flink
-        // ingestion, a bucket index's first write to a bucket, and any
-        // merge-on-read file group before its first compaction all produce.
-        // Dropping them loses every record in the group.
-        for (file_id, log_files) in file_id_to_log_files.into_iter() {
-            let mut file_group = FileGroup::new(file_id, partition_path.to_string());
-            file_group.add_log_files(log_files)?;
-            file_groups.push(file_group);
-        }
-        Ok(file_groups)
+        assemble_file_groups(partition_path, file_id_to_base_files, file_id_to_log_files)
     }
 
     async fn list_relevant_partition_paths(&self) -> Result<Vec<String>> {

@@ -799,6 +799,8 @@ impl Table {
         }
 
         if base_file_only {
+            // A log-only slice has no base file to read.
+            file_slices.retain(|fs| fs.base_file.is_some());
             for fs in &mut file_slices {
                 fs.log_files.clear();
             }

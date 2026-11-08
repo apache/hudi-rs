@@ -57,6 +57,33 @@ impl FileGroupMerger for HashSet<FileGroup> {
     }
 }
 
+/// Assembles the [FileGroup]s of one partition from its base and log files keyed by file id.
+///
+/// Log files with no base file in the same file id form a log-only file group: inserts that
+/// went straight to a log file, which is what Flink ingestion, a bucket index's first write to
+/// a bucket, and any merge-on-read file group before its first compaction all produce.
+/// Dropping them loses every record in the group.
+pub(crate) fn assemble_file_groups(
+    partition_path: &str,
+    file_id_to_base_files: HashMap<String, Vec<BaseFile>>,
+    mut file_id_to_log_files: HashMap<String, Vec<LogFile>>,
+) -> Result<Vec<FileGroup>> {
+    let mut file_groups = Vec::new();
+    for (file_id, base_files) in file_id_to_base_files {
+        let log_files = file_id_to_log_files.remove(&file_id).unwrap_or_default();
+        let mut file_group = FileGroup::new(file_id, partition_path.to_string());
+        file_group.add_base_files(base_files)?;
+        file_group.add_log_files(log_files)?;
+        file_groups.push(file_group);
+    }
+    for (file_id, log_files) in file_id_to_log_files {
+        let mut file_group = FileGroup::new(file_id, partition_path.to_string());
+        file_group.add_log_files(log_files)?;
+        file_groups.push(file_group);
+    }
+    Ok(file_groups)
+}
+
 /// # Arguments
 ///
 /// * `commit_metadata` - The commit metadata JSON map
@@ -317,32 +344,8 @@ pub(crate) fn file_groups_from_files_partition_records<V: CompletionTimeView>(
             // Skip files with unrecognized extensions
         }
 
-        // Build FileGroups from parsed files
-        let mut file_groups = Vec::new();
-        for (file_id, base_files) in file_id_to_base_files {
-            let mut fg = FileGroup::new(file_id.clone(), partition_path.clone());
-            fg.add_base_files(base_files)?;
-
-            // Add corresponding log files if any
-            if let Some(log_files) = file_id_to_log_files.remove(&file_id) {
-                fg.add_log_files(log_files)?;
-            }
-
-            file_groups.push(fg);
-        }
-
-        // Leftover log files belong to file groups with no base file: inserts
-        // that went straight to a log file, which is what Flink ingestion, a
-        // bucket index's first write to a bucket, and any merge-on-read file
-        // group before its first compaction all produce. Dropping them loses
-        // every record in the group — the storage-listing path already builds
-        // log-only groups from its leftovers.
-        for (file_id, log_files) in file_id_to_log_files {
-            let mut fg = FileGroup::new(file_id, partition_path.clone());
-            fg.add_log_files(log_files)?;
-            file_groups.push(fg);
-        }
-
+        let file_groups =
+            assemble_file_groups(partition_path, file_id_to_base_files, file_id_to_log_files)?;
         if !file_groups.is_empty() {
             file_groups_map.insert(partition_path.clone(), file_groups);
         }
@@ -1585,7 +1588,7 @@ mod tests {
         #[test]
         fn test_log_files_without_base_file_form_a_log_only_group() {
             let mut records = HashMap::new();
-            // Only log files, no base file — the pre-compaction shape of a
+            // Only log files, no base file: the pre-compaction shape of a
             // bucket-index MOR table or Flink ingestion.
             let (key, record) = create_files_record(
                 "partition1",
