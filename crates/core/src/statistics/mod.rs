@@ -142,15 +142,11 @@ impl ColumnStatistics {
 
     /// Merge with another ColumnStatistics (for aggregation).
     ///
-    /// Takes min of mins, max of maxs when both sides have bounds.
-    /// Used when aggregating row group stats to file-level stats.
-    ///
-    /// A missing min or max is treated as unknown, not as an all-null row
-    /// group. Without a null count on [`ColumnStatistics`], keeping the
-    /// present side would let file-level pruning trust bounds that ignore
-    /// row groups with no statistics (see #852).
+    /// Takes min of mins, max of maxs. Used when aggregating row group stats to
+    /// file-level stats. A missing bound means the values on that side are unknown,
+    /// so the merged bound is missing as well: a bound built from the other side alone
+    /// would not bound the values the unknown side holds.
     pub fn merge(&mut self, other: &ColumnStatistics) {
-        // Merge min values (take the smaller one); None if either side lacks it.
         self.min_value = match (self.min_value.take(), &other.min_value) {
             (Some(a), Some(b)) => {
                 if is_less_than(&a, b) {
@@ -162,7 +158,6 @@ impl ColumnStatistics {
             _ => None,
         };
 
-        // Merge max values (take the larger one); None if either side lacks it.
         self.max_value = match (self.max_value.take(), &other.max_value) {
             (Some(a), Some(b)) => {
                 if is_greater_than(&a, b) {
@@ -217,12 +212,14 @@ impl StatisticsContainer {
         // Get total rows directly from file metadata
         container.num_rows = Some(metadata.file_metadata().num_rows());
 
-        // Iterate through row groups and aggregate stats
+        // A row group holding only nulls has no min/max to contribute and cannot
+        // widen the file-level bounds, so it is left out of the aggregation; a row
+        // group whose bounds are unknown clears them through `merge`.
         for row_group in metadata.row_groups() {
-            let rg_stats = Self::from_row_group(row_group, schema);
-
-            // Merge row group stats into file-level stats
-            for (col_name, col_stats) in rg_stats.columns {
+            for (col_name, col_stats, all_null) in row_group_column_stats(row_group, schema) {
+                if all_null {
+                    continue;
+                }
                 container
                     .columns
                     .entry(col_name)
@@ -249,48 +246,48 @@ impl StatisticsContainer {
     pub fn from_row_group(row_group: &RowGroupMetaData, schema: &Schema) -> Self {
         let mut container = Self::new(StatsGranularity::RowGroup);
         container.num_rows = Some(row_group.num_rows());
-
-        // Build a map of column name to Arrow data type
-        let column_types: HashMap<&str, &DataType> = schema
-            .fields()
-            .iter()
-            .map(|f| (f.name().as_str(), f.data_type()))
-            .collect();
-
-        // Extract stats for each column in the row group
-        for col_chunk in row_group.columns() {
-            let col_path = col_chunk.column_descr().path();
-
-            // Skip nested columns (multi-part paths like "struct.field")
-            if col_path.parts().len() > 1 {
-                continue;
-            }
-
-            let Some(col_name) = col_path.parts().first().map(|s| s.as_str()) else {
-                continue;
-            };
-
-            // Skip if we don't have type info for this column
-            let Some(&data_type) = column_types.get(col_name) else {
-                continue;
-            };
-
-            // Extract statistics if available
-            if let Some(stats) = col_chunk.statistics() {
-                let col_stats =
-                    ColumnStatistics::from_parquet_statistics(col_name, data_type, stats);
-                container.columns.insert(col_name.to_string(), col_stats);
-            } else {
-                // No stats available, create empty entry
-                container.columns.insert(
-                    col_name.to_string(),
-                    ColumnStatistics::new(col_name.to_string(), data_type.clone()),
-                );
-            }
+        for (col_name, col_stats, _) in row_group_column_stats(row_group, schema) {
+            container.columns.insert(col_name, col_stats);
         }
-
         container
     }
+}
+
+/// Statistics of every top-level column chunk in `row_group` that `schema` knows,
+/// with whether the chunk is known to hold only nulls.
+fn row_group_column_stats<'a>(
+    row_group: &'a RowGroupMetaData,
+    schema: &'a Schema,
+) -> impl Iterator<Item = (String, ColumnStatistics, bool)> + 'a {
+    let column_types: HashMap<&str, &DataType> = schema
+        .fields()
+        .iter()
+        .map(|f| (f.name().as_str(), f.data_type()))
+        .collect();
+
+    row_group.columns().iter().filter_map(move |col_chunk| {
+        let col_path = col_chunk.column_descr().path();
+        // Nested columns (multi-part paths like "struct.field") are not tracked.
+        if col_path.parts().len() > 1 {
+            return None;
+        }
+        let col_name = col_path.parts().first().map(|s| s.as_str())?;
+        let data_type = *column_types.get(col_name)?;
+
+        let (col_stats, all_null) = match col_chunk.statistics() {
+            Some(stats) => (
+                ColumnStatistics::from_parquet_statistics(col_name, data_type, stats),
+                stats
+                    .null_count_opt()
+                    .is_some_and(|nulls| Some(nulls) == u64::try_from(col_chunk.num_values()).ok()),
+            ),
+            None => (
+                ColumnStatistics::new(col_name.to_string(), data_type.clone()),
+                false,
+            ),
+        };
+        Some((col_name.to_string(), col_stats, all_null))
+    })
 }
 
 /// Convert Parquet statistics to Arrow single-element arrays.
@@ -410,8 +407,15 @@ fn bytes_to_array(data: &[u8], data_type: &DataType) -> ArrayRef {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use arrow_array::Int64Array;
+    use arrow_schema::Field;
+    use parquet::basic::{Repetition, Type as PhysicalType};
+    use parquet::file::metadata::{
+        ColumnChunkMetaData, FileMetaData, ParquetMetaData, RowGroupMetaData,
+    };
+    use parquet::schema::types::{SchemaDescriptor, Type};
 
     #[test]
     fn test_stats_granularity_from_str() {
@@ -484,8 +488,7 @@ mod tests {
         assert_eq!(get_int32(stats1.min_value.as_ref().unwrap()), 5);
         assert_eq!(get_int32(stats1.max_value.as_ref().unwrap()), 100);
 
-        // Test 2: A missing bound is unknown — merged min/max become None
-        // rather than keeping the Some side (see #852).
+        // Test 2: a missing bound on either side is unknown and clears the merged bound
         let mut stats3 = ColumnStatistics {
             column_name: "test".to_string(),
             data_type: DataType::Int32,
@@ -501,6 +504,100 @@ mod tests {
         stats3.merge(&stats4);
         assert!(stats3.min_value.is_none());
         assert!(stats3.max_value.is_none());
+    }
+
+    /// Arrow schema of the file built by [`id_file_metadata`].
+    pub(crate) fn id_schema() -> Schema {
+        Schema::new(vec![Field::new("id", DataType::Int64, true)])
+    }
+
+    /// Footer of a file with one optional Int64 column `id` and one 10-row row group
+    /// per entry of `row_group_stats`; `None` writes the chunk without statistics.
+    pub(crate) fn id_file_metadata(
+        row_group_stats: Vec<Option<ParquetStatistics>>,
+    ) -> ParquetMetaData {
+        let id = Type::primitive_type_builder("id", PhysicalType::INT64)
+            .with_repetition(Repetition::OPTIONAL)
+            .build()
+            .unwrap();
+        let schema = Type::group_type_builder("schema")
+            .with_fields(vec![Arc::new(id)])
+            .build()
+            .unwrap();
+        let descr = Arc::new(SchemaDescriptor::new(Arc::new(schema)));
+
+        let row_groups: Vec<RowGroupMetaData> = row_group_stats
+            .into_iter()
+            .map(|stats| {
+                let mut chunk = ColumnChunkMetaData::builder(descr.column(0)).set_num_values(10);
+                if let Some(stats) = stats {
+                    chunk = chunk.set_statistics(stats);
+                }
+                RowGroupMetaData::builder(descr.clone())
+                    .set_num_rows(10)
+                    .set_column_metadata(vec![chunk.build().unwrap()])
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let num_rows = 10 * row_groups.len() as i64;
+        ParquetMetaData::new(
+            FileMetaData::new(1, num_rows, None, None, descr, None),
+            row_groups,
+        )
+    }
+
+    fn file_stats(row_group_stats: Vec<Option<ParquetStatistics>>) -> ColumnStatistics {
+        StatisticsContainer::from_parquet_metadata(&id_file_metadata(row_group_stats), &id_schema())
+            .columns
+            .remove("id")
+            .unwrap()
+    }
+
+    fn get_int64(arr: &ArrayRef) -> i64 {
+        arr.as_any().downcast_ref::<Int64Array>().unwrap().value(0)
+    }
+
+    fn bounded_50_100() -> Option<ParquetStatistics> {
+        Some(ParquetStatistics::int64(
+            Some(50),
+            Some(100),
+            None,
+            Some(0),
+            false,
+        ))
+    }
+
+    #[test]
+    fn test_from_parquet_metadata_row_group_without_stats_clears_file_bounds() {
+        let no_min_max = Some(ParquetStatistics::int64(None, None, None, Some(3), false));
+
+        let stats = file_stats(vec![bounded_50_100(), None]);
+        assert!(stats.min_value.is_none());
+        assert!(stats.max_value.is_none());
+
+        let stats = file_stats(vec![no_min_max, bounded_50_100()]);
+        assert!(stats.min_value.is_none());
+        assert!(stats.max_value.is_none());
+
+        let no_null_count = Some(ParquetStatistics::int64(None, None, None, None, false));
+        let stats = file_stats(vec![bounded_50_100(), no_null_count]);
+        assert!(stats.min_value.is_none());
+        assert!(stats.max_value.is_none());
+    }
+
+    #[test]
+    fn test_from_parquet_metadata_all_null_row_group_keeps_file_bounds() {
+        let all_null = Some(ParquetStatistics::int64(None, None, None, Some(10), false));
+
+        let stats = file_stats(vec![all_null.clone(), bounded_50_100()]);
+        assert_eq!(get_int64(stats.min_value.as_ref().unwrap()), 50);
+        assert_eq!(get_int64(stats.max_value.as_ref().unwrap()), 100);
+
+        // Only nulls in the file: nothing is known about non-null values.
+        let stats = file_stats(vec![all_null]);
+        assert!(stats.min_value.is_none());
+        assert!(stats.max_value.is_none());
     }
 
     #[test]
