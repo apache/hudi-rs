@@ -26,7 +26,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.6.0-dev"
+version = "0.7.0-dev"
 edition = "2024"
 license = "Apache-2.0"
 rust-version = "1.94.1"
@@ -83,6 +83,9 @@ paste = { version = "1" }
 strum = { version = "0.28", features = ["derive"] }
 strum_macros = { version = "0.28" }
 url = { version = "2" }
+uuid = { version = "1" }
+md-5 = { version = "0.10" }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 # runtime / async
 async-recursion = { version = "1" }
@@ -112,4 +115,11 @@ flate2 = { version = "1" }
 # testing
 serial_test = { version = "4" }
 tempfile = { version = "3" }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+# Dependency debug info (DataFusion, Arrow, Parquet, and RocksDB's C++ objects) is about a
+# third of a debug `target/` and is rarely stepped through. Workspace crates keep full debug
+# info, so debuggers and backtraces still resolve hudi-rs code. To step into a dependency,
+# build with `--config 'profile.dev.package."*".debug=true'`.
+[profile.dev.package."*"]
+debug = false

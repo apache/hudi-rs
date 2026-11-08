@@ -16,77 +16,17 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-//! This module is responsible for Hudi table APIs.
+//! The [`Table`] API for reading and writing a Hudi table.
 //!
-//! It provides a quick entry point for reading Hudi table metadata and data,
-//! facilitating adaptation and compatibility across various engines.
+//! Open an existing table with [`Table::new`] or [`builder::TableBuilder`], or create one with
+//! [`Table::create`]. Reads take [`ReadOptions`]; [`Table::read`] and [`Table::read_stream`] return
+//! records, while [`Table::get_file_slices`] and [`Table::create_file_group_reader_with_options`]
+//! let a query engine plan and distribute the scan itself. A write ([`Table::append`],
+//! [`Table::upsert`], [`Table::delete`], [`Table::update`], [`Table::overwrite`]) that changes
+//! data creates one commit and refreshes the handle so later reads see it. On a merge-on-read
+//! table, [`Table::compact`] folds log files into new base files.
 //!
-//! **Example**
-//! 1. create hudi table
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::Table;
-//!
-//! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//! }
-//! ```
-//! 2. get hudi table schema(arrow_schema::Schema)
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::Table;
-//!
-//! pub async fn test() {
-//!     use arrow_schema::Schema;
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let schema = hudi_table.get_schema().await.unwrap();
-//! }
-//! ```
-//! 3. read hudi table
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::{ReadOptions, Table};
-//!
-//! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let record_read = hudi_table.read(&ReadOptions::new()).await.unwrap();
-//! }
-//! ```
-//! 4. get file slice
-//!    Users can obtain metadata to customize reading methods, read in batches, perform parallel reads, and more.
-//! ```rust
-//! use url::Url;
-//! use hudi_core::table::{ReadOptions, Table};
-//! use hudi_core::storage::util::parse_uri;
-//! use hudi_core::storage::util::join_url_segments;
-//!
-//! pub async fn test() {
-//!     let base_uri = Url::from_file_path("/tmp/hudi_data").unwrap();
-//!     let hudi_table = Table::new(base_uri.path()).await.unwrap();
-//!     let flat_slices = hudi_table
-//!             .get_file_slices(&ReadOptions::new())
-//!             .await.unwrap();
-//!     let file_slices = hudi_core::util::collection::split_into_chunks(flat_slices, 2);
-//!     // define every parquet task reader how many slice
-//!     let mut parquet_file_groups: Vec<Vec<String>> = Vec::new();
-//!         for file_slice_vec in file_slices {
-//!             let file_group_vec = file_slice_vec
-//!                 .iter()
-//!                 .filter_map(|f| {
-//!                     // None when the slice's records live entirely in log
-//!                     // files, so there is no base file to read.
-//!                     let relative_path = f.base_file_relative_path().unwrap()?;
-//!                     let url = join_url_segments(&base_uri, &[relative_path.as_str()]).unwrap();
-//!                     Some(url.path().to_string())
-//!                 })
-//!                 .collect();
-//!             parquet_file_groups.push(file_group_vec)
-//!         }
-//! }
-//! ```
+//! See the crate-level docs for examples.
 
 pub mod builder;
 pub mod file_pruner;
@@ -96,8 +36,12 @@ pub mod partition;
 pub(crate) mod validation;
 
 pub use crate::config::read_options::{QueryType, ReadOptions};
+pub use crate::index::{HoodieKey, SimpleIndex};
+pub use crate::write::TableCreateBuilder;
+pub use crate::write::{CompactionResult, UpsertOptions, WriteResult};
 
 use crate::Result;
+use crate::config::ConfigParser;
 use crate::config::HudiConfigs;
 use crate::config::internal::HudiInternalConfig;
 use crate::config::read::HudiReadConfig;
@@ -109,6 +53,7 @@ use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::keygen::is_timestamp_based_keygen;
+use crate::keygen::record_key::configured_record_key_fields;
 use crate::metadata::METADATA_TABLE_PARTITION_FIELD;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::meta_field::MetaField;
@@ -123,22 +68,31 @@ use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
-use arrow_schema::{Field, Schema};
+use arrow_schema::{DataType, Field, Schema};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
 use url::Url;
 
-/// The main struct that provides table APIs for interacting with a Hudi table.
+/// A handle to a Hudi table, with the read and write APIs.
+///
+/// Clones share configs and caches. Write methods take `&mut self` and refresh
+/// that handle's timeline; reopen or rebuild other handles to see the new commit.
 #[derive(Debug)]
 pub struct Table {
+    /// Resolved Hudi configs: user options, `hoodie.properties`, and `hudi-defaults.conf`.
     pub hudi_configs: Arc<HudiConfigs>,
+    /// Options for the storage backend, such as cloud credentials.
     pub storage_options: Arc<HashMap<String, String>>,
+    /// The table's timeline of commits.
     pub timeline: Timeline,
+    /// Listing of the table's file groups and file slices.
     pub file_system_view: FileSystemView,
     /// Cached metadata table instance, lazily initialized on first use.
-    /// Only populated when metadata table is enabled (v8+ with files partition).
-    /// Shared across clones via `Arc` so all scan() calls reuse the same instance.
+    /// Shared across clones via `Arc`; [`Table::clear_read_caches`] gives this
+    /// handle a fresh cell, so a handle that writes reopens the metadata table
+    /// and sees its own delta commits while clones keep the one that matches
+    /// their timeline.
     cached_metadata_table: Arc<OnceCell<Table>>,
     /// Cached file stats estimator. Materialized on first successful call to
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
@@ -204,7 +158,7 @@ impl Table {
     /// Get or initialize the cached metadata table instance.
     ///
     /// Returns `Ok(&Table)` if metadata table is successfully created or was already cached.
-    /// The instance is created once and reused across all subsequent calls.
+    /// The instance is created once and reused until [`Self::clear_read_caches`].
     pub(crate) async fn get_or_init_metadata_table(&self) -> Result<&Table> {
         self.cached_metadata_table
             .get_or_try_init(|| async {
@@ -212,6 +166,50 @@ impl Table {
                 self.new_metadata_table().await
             })
             .await
+    }
+
+    /// Drop the listing cache, the metadata-table handle and the file-stats
+    /// sample, after the timeline has been reloaded around a write.
+    pub(crate) fn clear_read_caches(&mut self) {
+        self.file_system_view.clear_cache();
+        self.cached_metadata_table = Arc::new(OnceCell::new());
+        self.cached_estimator = Arc::new(OnceCell::new());
+    }
+
+    /// Reload the active timeline and drop listing caches before a write plans.
+    pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
+        self.validate_for_write().await?;
+        // Eager rollback of crashed writes (Java rollbackFailedWrites) before
+        // any new instant is minted.
+        crate::write::rollback::rollback_failed_writes(self).await?;
+        self.timeline.reload_completed_commits().await?;
+        self.clear_read_caches();
+        Ok(())
+    }
+
+    /// [`Self::reload_timeline_for_write`] for a compaction, which rolls back
+    /// only a compaction a crash left pending. A compaction may run alongside
+    /// a write of this process, whose pending instant is live rather than
+    /// crashed; the write's own eager rollback skips compactions the same way.
+    pub(crate) async fn reload_timeline_for_compaction(&mut self) -> Result<()> {
+        self.validate_for_write().await?;
+        crate::write::rollback::rollback_pending_compactions(self).await?;
+        self.timeline.reload_completed_commits().await?;
+        self.clear_read_caches();
+        Ok(())
+    }
+
+    async fn validate_for_write(&mut self) -> Result<()> {
+        crate::write::ensure_writable_table_version(self)?;
+        crate::write::ensure_complex_keygen_validated(&self.hudi_configs)?;
+        crate::write::archival::validated_keep_range(&self.hudi_configs)?;
+        crate::write::metadata::ensure_supported_metadata_layout(self).await?;
+        // Instants must be minted in the table's declared timeline timezone
+        // (Spark writers default to LOCAL); set before any instant is minted.
+        crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
+            &self.hudi_configs,
+        ));
+        Ok(())
     }
 
     /// Get or initialize the cached `FileStatsEstimator` for this **data table**.
@@ -303,12 +301,19 @@ impl Table {
         None
     }
 
-    /// Create hudi table by base_uri
+    /// Opens the table at `base_uri`, a local path or an object store URI (`s3://`, `az://`,
+    /// `gs://`, `file://`).
+    ///
+    /// Equivalent to `TableBuilder::from_base_uri(base_uri).build()`; see
+    /// [`builder::TableBuilder`] for how options are resolved.
     pub async fn new(base_uri: &str) -> Result<Self> {
         TableBuilder::from_base_uri(base_uri).build().await
     }
 
-    /// Create hudi table with options
+    /// Opens the table at `base_uri` with extra options.
+    ///
+    /// Keys starting with `hoodie.` are Hudi configs; all others are storage options, such as
+    /// `aws_region`.
     pub async fn new_with_options<I, K, V>(base_uri: &str, options: I) -> Result<Self>
     where
         I: IntoIterator<Item = (K, V)>,
@@ -321,14 +326,163 @@ impl Table {
             .await
     }
 
+    /// Start creating a new Hudi table at `base_uri` (does not open until [`TableCreateBuilder::create`]).
+    ///
+    /// # Example
+    /// ```
+    /// # #[tokio::main]
+    /// # async fn main() -> hudi_core::error::Result<()> {
+    /// # let dir = tempfile::tempdir()?;
+    /// # let base_uri = dir.path().to_str().unwrap();
+    /// use hudi_core::table::Table;
+    /// let table = Table::create(base_uri)
+    ///     .with_table_name("trips")
+    ///     .with_record_key_fields(["id"])
+    ///     .create()
+    ///     .await?;
+    /// assert_eq!(table.table_name(), "trips");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create(base_uri: impl Into<String>) -> TableCreateBuilder {
+        TableCreateBuilder::new(base_uri)
+    }
+
+    /// Upsert complete records by their configured record key.
+    ///
+    /// If a key occurs more than once in an input batch, the row with the
+    /// highest ordering (precombine) value is retained when ordering fields
+    /// are configured; otherwise the final occurrence is retained.
+    pub async fn upsert(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        self.upsert_with(batches, UpsertOptions::default()).await
+    }
+
+    /// Upsert records, optionally updating only selected columns on matched rows.
+    pub async fn upsert_with(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+        options: UpsertOptions,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::upsert_batches(self, &batches, options).await
+    }
+
+    /// Replaces all data in the table with `batches` (`INSERT_OVERWRITE_TABLE`), as one
+    /// replacecommit.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, when `batches` is empty or does not match the table schema.
+    pub async fn overwrite(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::overwrite_batches(self, &batches).await
+    }
+
+    /// Replaces only the partitions present in `batches` (`INSERT_OVERWRITE`), leaving the others
+    /// untouched, as one replacecommit.
+    ///
+    /// # Errors
+    ///
+    /// Fails, among other cases, with [`CoreError::Unsupported`] on an unpartitioned table, and
+    /// when `batches` is empty or does not match the table schema.
+    pub async fn dynamic_partition_overwrite(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::dynamic_partition_overwrite_batches(self, &batches).await
+    }
+
+    /// Delete rows matching a single binary filter such as `id = 'a'` or `value = 2`.
+    ///
+    /// Equality / `IN` predicates on the configured record key field or
+    /// `_hoodie_record_key` are routed through [`Self::delete_keys`] (RLI when enabled).
+    /// Other predicates scan the snapshot and rewrite (COW) or write delete logs (MOR).
+    /// A filter that matches no rows succeeds without creating a commit and reports zero deletes.
+    pub async fn delete(&mut self, filter: &str) -> Result<WriteResult> {
+        let filter = parse_write_filter(filter)?;
+        ensure_record_key_list_parsable(&self.hudi_configs, &filter)?;
+        crate::write::delete_filter(self, filter).await
+    }
+
+    /// Delete records identified by record key.
+    ///
+    /// Uses the table index (RLI when enabled, otherwise SimpleIndex) to locate
+    /// affected file groups. The input must contain at least one key. Unknown keys
+    /// succeed without creating a commit and report zero deletes.
+    pub async fn delete_keys(
+        &mut self,
+        keys: impl IntoIterator<Item = crate::index::HoodieKey>,
+    ) -> Result<WriteResult> {
+        let keys: Vec<crate::index::HoodieKey> = keys.into_iter().collect();
+        crate::write::delete_keys(self, &keys).await
+    }
+
+    /// Compact a merge-on-read table (experimental): every file group whose
+    /// latest file slice carries log files gets a new base file holding its
+    /// merged rows, under one compaction instant that completes as a `commit`.
+    ///
+    /// Rows keep their `_hoodie_commit_time`, so incremental reads see no new
+    /// rows from a compaction. Returns a result whose `requested_time` is
+    /// `None` when no file group had log files, in which case nothing is
+    /// written.
+    ///
+    /// Compaction also runs on its own after a delta commit when
+    /// `hoodie.compact.inline` is `true` and the completed delta commits since
+    /// the latest compaction reach `hoodie.compact.inline.max.delta.commits`
+    /// (default 5).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] on a copy-on-write table, which has no log files to
+    /// compact.
+    pub async fn compact(&mut self) -> Result<CompactionResult> {
+        crate::write::compact_table(self).await
+    }
+
+    /// Wait for a background compaction started by a write of this process
+    /// under `hoodie.datasource.compaction.async.enable`, and return its
+    /// outcome; `None` when none was started since the last call. Dropping
+    /// the process before this returns leaves the compaction pending for the
+    /// next one to roll back.
+    pub async fn await_compaction(&mut self) -> Result<Option<CompactionResult>> {
+        let result = crate::write::await_async_compaction(self).await?;
+        if result.is_some() {
+            self.timeline.reload_completed_commits().await?;
+            self.clear_read_caches();
+        }
+        Ok(result)
+    }
+
+    /// UPDATE: set columns from a single-row batch on rows matching `filter`.
+    ///
+    /// `updates` must contain exactly one row. Every non-meta data column present in
+    /// `updates` is written onto matching target rows; other columns are preserved.
+    /// Predicates may target any column. Zero matches succeed without a commit.
+    pub async fn update(&mut self, filter: &str, updates: RecordBatch) -> Result<WriteResult> {
+        let filter = parse_write_filter(filter)?;
+        ensure_record_key_list_parsable(&self.hudi_configs, &filter)?;
+        crate::write::update_filter(self, filter, updates).await
+    }
+
+    /// A copy of the resolved Hudi configs as key-value pairs.
     pub fn hudi_options(&self) -> HashMap<String, String> {
         self.hudi_configs.as_options()
     }
 
+    /// A copy of the storage options as key-value pairs.
     pub fn storage_options(&self) -> HashMap<String, String> {
         self.storage_options.as_ref().clone()
     }
 
+    /// Registers the table's object stores with a DataFusion runtime, so DataFusion can read the
+    /// table's files.
     #[cfg(feature = "datafusion")]
     pub fn register_storage(
         &self,
@@ -342,6 +496,12 @@ impl Table {
             .register_object_store(runtime_env.clone());
     }
 
+    /// The table's base path as a URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hoodie.base.path` is missing or not a valid URI, which a table opened through
+    /// [`builder::TableBuilder`] always has.
     pub fn base_url(&self) -> Url {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::BasePath);
         self.hudi_configs
@@ -351,6 +511,12 @@ impl Table {
             .expect(&err_msg)
     }
 
+    /// The table name (`hoodie.table.name`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the config is missing, which table opening rejects unless config validation is
+    /// skipped.
     pub fn table_name(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableName);
         self.hudi_configs
@@ -359,6 +525,12 @@ impl Table {
             .into()
     }
 
+    /// The table type: `COPY_ON_WRITE` or `MERGE_ON_READ`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the config is missing or not a valid table type, which table opening rejects
+    /// unless config validation is skipped.
     pub fn table_type(&self) -> String {
         let err_msg = format!("{:?} is missing or invalid.", HudiTableConfig::TableType);
         self.hudi_configs
@@ -367,6 +539,11 @@ impl Table {
             .into()
     }
 
+    /// Whether this is a merge-on-read table.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same condition as [`Self::table_type`].
     pub fn is_mor(&self) -> bool {
         self.table_type() == TableTypeValue::MergeOnRead.as_ref()
     }
@@ -375,6 +552,9 @@ impl Table {
         Ok(!self.is_mor() || options.is_read_optimized()?)
     }
 
+    /// The timezone of the timeline's instant times (`hoodie.table.timeline.timezone`): `utc` or
+    /// `local`, and `utc` when the config is unset. [`Table::create`] records `local` unless that
+    /// config is passed with [`TableCreateBuilder::with_option`].
     pub fn timezone(&self) -> String {
         self.hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -594,12 +774,140 @@ impl Table {
             )
             .await?;
 
+        // The index describes merged rows, which a read-optimized read of a
+        // merge-on-read table does not see.
+        let read_optimized = base_file_only && self.is_mor();
+        if !read_optimized
+            && let Some(located) = self
+                .file_groups_for_record_keys(filters, timestamp, &table_schema)
+                .await
+        {
+            let planned: HashSet<(&str, &str)> = file_slices
+                .iter()
+                .map(|fs| (fs.partition_path.as_str(), fs.file_id()))
+                .collect();
+            // A file group the index names that this plan lacks (another
+            // filter pruned it, or the index disagrees with the snapshot)
+            // leaves the plan as it is.
+            if located.iter().all(|(partition, file_id)| {
+                planned.contains(&(partition.as_str(), file_id.as_str()))
+            }) {
+                file_slices.retain(|fs| {
+                    located.contains(&(fs.partition_path.clone(), fs.file_id().to_string()))
+                });
+            }
+        }
+
         if base_file_only {
             for fs in &mut file_slices {
                 fs.log_files.clear();
             }
         }
         Ok(file_slices)
+    }
+
+    /// The file groups the record-level index names for the record keys
+    /// `filters` ask for, or `None` when the index cannot answer.
+    ///
+    /// Only an equality or `IN` filter on the table's single string record key
+    /// field (or on `_hoodie_record_key`) is a key lookup, and only for a read
+    /// of the latest commit on table version 8 or later, whose metadata table
+    /// this reader can list. Anything the lookup cannot handle, including an
+    /// error, leaves the full scan in place; the row-level mask still applies
+    /// the filter to whatever is read.
+    async fn file_groups_for_record_keys(
+        &self,
+        filters: &[Filter],
+        timestamp: &str,
+        table_schema: &Schema,
+    ) -> Option<HashSet<(String, String)>> {
+        use crate::expr::ExprOperator;
+        use crate::index::is_record_index_enabled;
+        use crate::keygen::{KeyGeneratorKind, key_generator_kind};
+
+        let metadata_off = self
+            .hudi_configs
+            .get_raw(HudiTableConfig::MetadataTableEnabled.as_ref())
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("false"));
+        if filters.is_empty()
+            || metadata_off
+            || !self.is_metadata_table_enabled()
+            || !is_record_index_enabled(self)
+            || self.timeline.get_latest_commit_timestamp_as_option() != Some(timestamp)
+        {
+            return None;
+        }
+        let version: isize = self
+            .hudi_configs
+            .try_get(HudiTableConfig::TableVersion)
+            .ok()
+            .flatten()
+            .map(Into::into)?;
+        if version < 8 {
+            return None;
+        }
+        let key_fields: Vec<String> = self
+            .hudi_configs
+            .try_get(HudiTableConfig::RecordKeyFields)
+            .ok()
+            .flatten()
+            .map(Into::into)?;
+        let [key_field] = key_fields.as_slice() else {
+            return None;
+        };
+        // The index stores the key as a string; only a string column's filter
+        // value is that same text.
+        let key_is_string = matches!(
+            table_schema.field_with_name(key_field).ok()?.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        );
+        // A complex key generator stores a single-field key as `field:value`
+        // from table version 9; below it the stored form depends on the writer
+        // release, so the index cannot be asked.
+        let prefixed = match key_generator_kind(&self.hudi_configs).ok()? {
+            KeyGeneratorKind::Simple | KeyGeneratorKind::NonPartitioned => false,
+            KeyGeneratorKind::Complex | KeyGeneratorKind::SparkSql if version >= 9 => true,
+            _ => return None,
+        };
+        let mut keys: Option<HashSet<String>> = None;
+        for filter in filters {
+            if !matches!(filter.operator, ExprOperator::Eq | ExprOperator::In) {
+                continue;
+            }
+            let values: HashSet<String> = if filter.field == *key_field {
+                if !key_is_string {
+                    return None;
+                }
+                filter
+                    .values
+                    .iter()
+                    .map(|v| {
+                        if prefixed {
+                            format!("{key_field}:{v}")
+                        } else {
+                            v.clone()
+                        }
+                    })
+                    .collect()
+            } else if filter.field == MetaField::RecordKey.as_ref() {
+                filter.values.iter().cloned().collect()
+            } else {
+                continue;
+            };
+            keys = Some(match keys {
+                Some(prior) => prior.intersection(&values).cloned().collect(),
+                None => values,
+            });
+        }
+        let keys = keys?;
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        match crate::index::locate_file_groups(self, &keys, timestamp).await {
+            Ok(located) => located,
+            Err(e) => {
+                log::warn!("record index lookup failed, reading every file slice: {e}");
+                None
+            }
+        }
     }
 
     async fn get_file_slices_between_inner(
@@ -878,8 +1186,12 @@ impl Table {
     /// batches at once — and under file group reader version 2 each of those also
     /// carries its own merge map and, on spill, its own RocksDB instance.
     ///
-    /// The same derivation the DataFusion plan uses, so the two paths cannot
-    /// bound a scan differently. This is the **only** way to obtain a
+    /// The same budget derivation the DataFusion plan uses, so the two paths
+    /// cannot budget a scan differently. Only the default ceiling differs: a
+    /// `Table` read is the whole scan, with no caller dividing it into
+    /// partitions, so it defaults to the available cores, while the DataFusion
+    /// plan applies the config's own default per partition, where the partitions
+    /// already spread the scan across cores. This is the **only** way to obtain a
     /// concurrency for a read: the raw `hoodie.read.file.slice.read.concurrency`
     /// lookup lives inside it rather than in a method of its own, so a read
     /// cannot reach the ceiling while bypassing the budget. A test can miss that
@@ -892,7 +1204,9 @@ impl Table {
     /// tested elsewhere in isolation, which says nothing about whether anything
     /// calls it.
     fn bounded_read_concurrency(&self, file_slices: &[FileSlice]) -> usize {
+        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
         self.bounded_read_concurrency_from_log_bytes(
+            cores,
             file_slices.iter().map(FileSlice::log_size_bytes),
         )
     }
@@ -903,8 +1217,18 @@ impl Table {
     /// holds `&FileSlice` rather than owning them. The budget must see that
     /// subset, not the whole partition: routing a single key to one shard should
     /// admit on that shard's cost.
+    ///
+    /// Keeps the config's own default ceiling: these reads are polled on the
+    /// caller's task, so a wider fan-out would open more readers without
+    /// adding cores.
     pub(crate) fn bounded_read_concurrency_for(&self, file_slices: &[&FileSlice]) -> usize {
-        self.bounded_read_concurrency_from_log_bytes(file_slices.iter().map(|s| s.log_size_bytes()))
+        let config_default = HudiReadConfig::FileSliceReadConcurrency
+            .default_value()
+            .map_or(1, usize::from);
+        self.bounded_read_concurrency_from_log_bytes(
+            config_default,
+            file_slices.iter().map(|s| s.log_size_bytes()),
+        )
     }
 
     /// The one place the ceiling and the budget meet.
@@ -914,13 +1238,14 @@ impl Table {
     /// to own or copy one.
     fn bounded_read_concurrency_from_log_bytes(
         &self,
+        default_ceiling: usize,
         slice_log_bytes: impl Iterator<Item = Option<u64>>,
     ) -> usize {
-        let slice_log_bytes: Vec<Option<u64>> = slice_log_bytes.collect();
-        let ceiling: usize = self
+        let ceiling = self
             .hudi_configs
-            .get_or_default(HudiReadConfig::FileSliceReadConcurrency)
-            .into();
+            .get(HudiReadConfig::FileSliceReadConcurrency)
+            .map_or(default_ceiling, usize::from);
+        let slice_log_bytes: Vec<Option<u64>> = slice_log_bytes.collect();
         crate::file_group::admission::slices_in_flight(
             self.scan_max_memory_size(),
             1,
@@ -932,22 +1257,37 @@ impl Table {
     /// Read `file_slices` with at most [`Self::bounded_read_concurrency`] in
     /// flight, or fewer when a scan memory budget admits fewer, in slice order.
     ///
+    /// Each slice is read on its own runtime task: decoding is CPU-bound, and
+    /// futures polled together on the caller's task share a single thread.
     /// Order is preserved (`buffered`, not `buffer_unordered`) because a caller
     /// that concatenates these batches should not see its row order shift with
-    /// scheduling. Any single failure aborts the whole read, as `try_join_all`
-    /// did — a partially-read table is not a useful answer.
+    /// scheduling. Any single failure aborts the whole read: a partially-read
+    /// table is not a useful answer.
     async fn read_file_slices_bounded(
         &self,
         fg_reader: &FileGroupReader,
         file_slices: &[FileSlice],
         fg_options: &ReadOptions,
     ) -> Result<Vec<RecordBatch>> {
-        crate::util::concurrency::bounded_in_order(
-            file_slices,
-            self.bounded_read_concurrency(file_slices),
-            |file_slice| fg_reader.read_file_slice(file_slice, fg_options),
-        )
-        .await
+        use futures::{StreamExt, TryStreamExt};
+        let concurrency = self.bounded_read_concurrency(file_slices).max(1);
+        // Collected rather than mapped lazily: a stream over a borrowing
+        // iterator cannot be proven `Send`, and callers spawn this read.
+        let reads: Vec<_> = file_slices
+            .iter()
+            .map(|file_slice| {
+                let file_slice = file_slice.clone();
+                let fg_reader = fg_reader.clone();
+                let fg_options = fg_options.clone();
+                crate::util::concurrency::spawn_aborting(async move {
+                    fg_reader.read_file_slice(&file_slice, &fg_options).await
+                })
+            })
+            .collect();
+        futures::stream::iter(reads)
+            .buffered(concurrency)
+            .try_collect()
+            .await
     }
 
     /// Warn when an incremental window reaches below the active timeline.
@@ -1235,6 +1575,26 @@ impl Table {
         Ok(Box::pin(combined_stream))
     }
 
+    /// Append record batches as one new INSERT commit, like Hudi's bulk insert:
+    /// new file groups without an index lookup. All batches must share one
+    /// schema matching the table's.
+    ///
+    /// Tables at version 8 and 9 take the native write path, for COW and MOR,
+    /// partitioned or not. Older tables take a narrow path that only supports
+    /// unpartitioned append-only tables with `hoodie.populate.meta.fields=false`
+    /// and no metadata table, and writes one base file; see
+    /// `write::append::append_version_6` for what that path leaves out.
+    ///
+    /// After a successful write the in-memory timeline and file-system view
+    /// cache are refreshed so subsequent reads see the new data.
+    pub async fn append(
+        &mut self,
+        batches: impl IntoIterator<Item = RecordBatch>,
+    ) -> Result<WriteResult> {
+        let batches: Vec<RecordBatch> = batches.into_iter().collect();
+        crate::write::append_batches(self, &batches).await
+    }
+
     /// Compute estimated table-level statistics for scan planning.
     ///
     /// Returns `(estimated_num_rows, estimated_total_byte_size)` derived from
@@ -1296,6 +1656,73 @@ impl Table {
     }
 }
 
+fn parse_write_filter(filter: &str) -> Result<Filter> {
+    // `NOT IN` must be tried before `IN`, which it contains as a substring.
+    const OPERATORS: [&str; 8] = ["!=", ">=", "<=", "=", ">", "<", " NOT IN ", " IN "];
+    let filter = filter.trim();
+    for operator in OPERATORS {
+        if let Some((field, value)) = filter.split_once(operator) {
+            let field = field.trim();
+            let raw = value.trim();
+            if field.is_empty() || raw.is_empty() {
+                break;
+            }
+            let operator = operator.trim();
+            if matches!(operator, "IN" | "NOT IN") {
+                // Accept both `IN ('a', 'b')` and `IN a,b`.
+                let inner = raw
+                    .strip_prefix('(')
+                    .and_then(|v| v.strip_suffix(')'))
+                    .unwrap_or(raw);
+                let values: Vec<String> = inner
+                    .split(',')
+                    .map(|v| v.trim().trim_matches('\'').trim_matches('"').to_string())
+                    .filter(|v| !v.is_empty())
+                    .collect();
+                if values.is_empty() {
+                    break;
+                }
+                use std::str::FromStr;
+                let operator = crate::expr::ExprOperator::from_str(operator)?;
+                return Filter::new(field.to_string(), operator, values);
+            }
+            let value = raw.trim_matches('\'').trim_matches('"');
+            // Leftover quotes mean the input was more than one comparison
+            // (e.g. `id = 'a' OR id = 'b'`); erroring beats silently matching
+            // nothing.
+            if value.contains('\'') || value.contains('"') {
+                return Err(CoreError::Write(format!(
+                    "write filter must be a single comparison (AND/OR are not supported; \
+                     use `IN` for multiple keys), got '{filter}'"
+                )));
+            }
+            return Filter::try_from((field, operator, value));
+        }
+    }
+    Err(CoreError::Write(format!(
+        "write filter must be a single comparison such as `id = 'a'`, got '{filter}'"
+    )))
+}
+
+/// [`parse_write_filter`] splits an `IN` list on every `,`, and every
+/// composite record key contains one, so the list would name key fragments.
+fn ensure_record_key_list_parsable(hudi_configs: &HudiConfigs, filter: &Filter) -> Result<()> {
+    if filter.field == MetaField::RecordKey.as_ref()
+        && matches!(
+            filter.operator,
+            crate::expr::ExprOperator::In | crate::expr::ExprOperator::NotIn
+        )
+        && configured_record_key_fields(hudi_configs)?.len() > 1
+    {
+        return Err(CoreError::Unsupported(format!(
+            "an IN list on {} cannot hold composite record keys, which contain ','; \
+             use one `=` predicate per key or a predicate on a non-key column",
+            filter.field
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1348,6 +1775,39 @@ mod tests {
             "a window inside the active timeline must not warn"
         );
         Ok(())
+    }
+
+    mod test_parse_write_filter {
+        use super::super::parse_write_filter;
+        use crate::expr::ExprOperator;
+
+        #[test]
+        fn test_parse_write_filter_in_with_parens_strips_quotes() {
+            let filter = parse_write_filter("id IN ('a', 'b')").unwrap();
+            assert_eq!(filter.operator, ExprOperator::In);
+            assert_eq!(filter.values, vec!["a".to_string(), "b".to_string()]);
+        }
+
+        #[test]
+        fn test_parse_write_filter_not_in_parses_as_not_in() {
+            let filter = parse_write_filter("id NOT IN ('a')").unwrap();
+            assert_eq!(filter.operator, ExprOperator::NotIn);
+            assert_eq!(filter.field, "id");
+            assert_eq!(filter.values, vec!["a".to_string()]);
+        }
+
+        #[test]
+        fn test_parse_write_filter_or_clause_errors_instead_of_silent_no_match() {
+            let err = parse_write_filter("id = 'a' OR id = 'b'").unwrap_err();
+            assert!(err.to_string().contains("single comparison"), "{err}");
+        }
+
+        #[test]
+        fn test_parse_write_filter_simple_equality() {
+            let filter = parse_write_filter("id = 'a'").unwrap();
+            assert_eq!(filter.operator, ExprOperator::Eq);
+            assert_eq!(filter.values, vec!["a".to_string()]);
+        }
     }
     use crate::config::HUDI_CONF_DIR;
     use crate::config::internal::HudiInternalConfig;
@@ -1424,7 +1884,8 @@ mod tests {
     }
 
     /// A scan memory budget lowers the core fan-out's concurrency; without one
-    /// the configured ceiling stands.
+    /// the ceiling stands: the configured value when set, the core count
+    /// otherwise.
     ///
     /// Pins the wiring rather than the arithmetic — `slices_in_flight` has its
     /// own tests, and passing those tells you nothing about whether this path
@@ -1454,10 +1915,33 @@ mod tests {
 
         let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
         let unbounded = Table::new(base_url.path()).await.unwrap();
+        let cores = std::thread::available_parallelism().unwrap().get();
         assert_eq!(
             unbounded.bounded_read_concurrency(&slices),
+            cores,
+            "with no budget and no configured ceiling, the core count stands"
+        );
+        let slice_refs: Vec<&FileSlice> = slices.iter().collect();
+        assert_eq!(
+            unbounded.bounded_read_concurrency_for(&slice_refs),
             4,
+            "the metadata read keeps the config's own default"
+        );
+        let configured = Table::new_with_options(
+            base_url.path(),
+            [(HudiReadConfig::FileSliceReadConcurrency.as_ref(), "3")],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            configured.bounded_read_concurrency(&slices),
+            3,
             "with no budget the configured ceiling stands"
+        );
+        assert_eq!(
+            configured.bounded_read_concurrency_for(&slice_refs),
+            3,
+            "a configured ceiling applies to the metadata read too"
         );
 
         // Each slice estimates at 33 MiB + 4 x 8 MiB = 65 MiB, so 128 MiB admits one.
@@ -1470,7 +1954,7 @@ mod tests {
         assert_eq!(
             bounded.bounded_read_concurrency(&slices),
             1,
-            "a 128 MiB budget must admit one 65 MiB slice, not the ceiling of 4"
+            "a 128 MiB budget must admit one 65 MiB slice, not the ceiling"
         );
     }
 
@@ -2540,6 +3024,40 @@ mod tests {
         let initialized = table.get_or_init_estimator(&latest_ts).await.unwrap();
         let cached = table.get_or_init_estimator(early_ts).await.unwrap();
         assert!(std::ptr::eq(initialized, cached));
+    }
+
+    /// A write on the handle drops the footer sample taken before it.
+    #[tokio::test]
+    async fn test_write_drops_cached_estimator() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let batch = |id: &str| {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("id", DataType::Utf8, false),
+                    Field::new("value", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec![id])),
+                    Arc::new(Int64Array::from(vec![1])),
+                ],
+            )
+            .unwrap()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut table = Table::create(dir.path().to_str().unwrap())
+            .with_table_name("t")
+            .with_record_key_fields(["id"])
+            .create()
+            .await
+            .unwrap();
+        table.append([batch("a")]).await.unwrap();
+        let latest_ts = table.timeline.get_latest_commit_timestamp().unwrap();
+        assert!(table.get_or_init_estimator(&latest_ts).await.is_some());
+
+        table.append([batch("b")]).await.unwrap();
+        assert!(table.cached_estimator.get().is_none());
     }
 
     /// Regression test: the slice fan-out honours

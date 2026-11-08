@@ -28,8 +28,8 @@ homepage.workspace = true
 repository.workspace = true
 
 [dependencies]
-hudi-core = { version = "0.6.0-dev", path = "../core", default-features = false }
-hudi-datafusion = { version = "0.6.0-dev", path = "../datafusion", optional = true, default-features = false }
+hudi-core = { version = "0.7.0-dev", path = "../core", default-features = false }
+hudi-datafusion = { version = "0.7.0-dev", path = "../datafusion", optional = true, default-features = false }
 
 [features]
 default = ["spill-rocksdb"]
@@ -48,4 +48,10 @@ datafusion = [
 ]
 
 [dev-dependencies]
-tokio = { workspace = true }
+arrow = { workspace = true }
+datafusion = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[package.metadata.docs.rs]
+features = ["datafusion"]

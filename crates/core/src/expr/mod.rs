@@ -17,6 +17,11 @@
  * under the License.
  */
 
+//! Column filter expressions for reads and writes.
+//!
+//! A [`filter::Filter`] compares one column against string values with an [`ExprOperator`].
+//! Values are cast to the column's Arrow type when the filter is evaluated.
+
 pub mod filter;
 
 use crate::error::CoreError;
@@ -26,16 +31,24 @@ use std::cmp::PartialEq;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 use std::str::FromStr;
 
-/// An operator that represents a comparison operation used in a partition filter expression.
+/// A comparison operator in a [`filter::Filter`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExprOperator {
+    /// `=`
     Eq,
+    /// `!=`
     Ne,
+    /// `<`
     Lt,
+    /// `<=`
     Lte,
+    /// `>`
     Gt,
+    /// `>=`
     Gte,
+    /// `IN`: equal to any of the values.
     In,
+    /// `NOT IN`: equal to none of the values.
     NotIn,
 }
 
@@ -56,6 +69,7 @@ impl Display for ExprOperator {
 }
 
 impl ExprOperator {
+    /// The token for each operator, as accepted by [`FromStr`] (case-insensitive).
     pub const TOKEN_OP_PAIRS: [(&'static str, ExprOperator); 8] = [
         ("=", ExprOperator::Eq),
         ("!=", ExprOperator::Ne),
@@ -72,7 +86,7 @@ impl ExprOperator {
         matches!(self, ExprOperator::In | ExprOperator::NotIn)
     }
 
-    /// Negates the operator.
+    /// The logical negation, such as `<` for `>=`. Always `Some` for the current operators.
     pub fn negate(&self) -> Option<ExprOperator> {
         match self {
             ExprOperator::Eq => Some(ExprOperator::Ne),

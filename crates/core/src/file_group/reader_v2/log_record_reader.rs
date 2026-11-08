@@ -885,6 +885,11 @@ impl BaseHoodieLogRecordReader {
         } else {
             None
         })
+        // What a parquet block is checked against before that filter is pushed
+        // into it. Without a table schema the filter is withheld from parquet
+        // blocks, as the base file read withholds it when the repair cannot be
+        // ruled out.
+        .with_repair_table_schema(self.reader_context.schema_handler.table_schema.clone())
         .with_reader_schema(
             self.reader_context
                 .schema_handler
@@ -2380,5 +2385,84 @@ mod tests {
             gated.instant_to_blocks_map.contains_key("T2_done"),
             "the committed instant must still be merged"
         );
+    }
+
+    /// A reader whose context carries `row_filter` under `mor_pk_safe`, for
+    /// asserting what `block_decoder` installs. The gate lives here rather than
+    /// in `Decoder`, so it is tested here.
+    fn reader_with(
+        mor_pk_safe: bool,
+        row_filter: Option<crate::storage::RowFilterBuilder>,
+    ) -> BaseHoodieLogRecordReader {
+        let mut ctx = ReaderContext::empty();
+        ctx.table_config.insert(
+            crate::config::table::HudiTableConfig::OrderingFields
+                .as_ref()
+                .to_string(),
+            "ts".to_string(),
+        );
+        ctx.rebuild_record_context(String::new());
+        ctx.mor_pk_safe = mor_pk_safe;
+        ctx.row_filter_builder = row_filter;
+        BaseHoodieLogRecordReader {
+            reader_context: Arc::new(ctx),
+            storage: Storage::new_with_base_url(
+                crate::storage::util::parse_uri("file:///tmp").unwrap(),
+            )
+            .unwrap(),
+            log_file_paths: vec![],
+            latest_instant_time: "20260101000000000".to_string(),
+            instant_range: None,
+            force_full_scan: false,
+            record_buffer: make_test_buffer(),
+            allow_inflight_instants: false,
+            completion_gate_inputs: None,
+            valid_block_instants: vec![],
+            total_log_files: 0,
+            total_log_blocks: 0,
+            total_log_records: 0,
+            total_corrupt_blocks: 0,
+            total_rollbacks: 0,
+            progress: 0.0,
+            log_block_read_us: 0,
+            log_block_fetch_us: 0,
+            log_block_decode_us: 0,
+            merge_upsert_us: 0,
+            merge_insert_us: 0,
+        }
+    }
+
+    fn a_row_filter_builder() -> crate::storage::RowFilterBuilder {
+        Arc::new(|_, _| None)
+    }
+
+    /// The decoder checks each parquet block against the table schema before
+    /// pushing the filter. The required schema is not a substitute: with no table
+    /// schema the decoder gets nothing, and so withholds the filter.
+    #[test]
+    fn log_block_decoder_checks_parquet_blocks_against_the_table_schema() {
+        let schema = |name: &str| {
+            Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                name,
+                arrow_schema::DataType::Utf8,
+                true,
+            )]))
+        };
+        let with_schemas = |table: Option<arrow_schema::SchemaRef>,
+                            required: Option<arrow_schema::SchemaRef>| {
+            let mut reader = reader_with(true, Some(a_row_filter_builder()));
+            let mut ctx = (*reader.reader_context).clone();
+            ctx.schema_handler.table_schema = table;
+            ctx.schema_handler.required_schema = required;
+            reader.reader_context = Arc::new(ctx);
+            reader.block_decoder().repair_table_schema().cloned()
+        };
+
+        assert_eq!(
+            with_schemas(Some(schema("table")), Some(schema("required"))),
+            Some(schema("table"))
+        );
+        assert_eq!(with_schemas(None, Some(schema("required"))), None);
+        assert_eq!(with_schemas(None, None), None);
     }
 }

@@ -271,7 +271,15 @@ impl ConfigParser for HudiTableConfig {
                 )
             }),
             Self::OrderingFields => get_result.and_then(|v| {
-                let fields: Vec<String> = v.split(',').map(str::to_string).collect();
+                // Java filters empties after the split; keeping [""] would make
+                // an empty property look like a configured ordering field and
+                // engage event-time merging with nothing to order by.
+                let fields: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|f| !f.is_empty())
+                    .map(str::to_string)
+                    .collect();
                 if fields.len() > 1 {
                     return Err(UnsupportedValue(format!(
                         "Multiple ordering fields '{v}' are not yet supported"
@@ -334,16 +342,8 @@ impl ConfigParser for HudiTableConfig {
                         );
                     }
 
-                    if HudiTableConfig::OrderingFields
-                        .parse_value(configs)
-                        .is_err()
-                    {
-                        // When precombine field is not available, we treat the table as append-only
-                        return HudiConfigValue::String(
-                            RecordMergeStrategyValue::AppendOnly.as_ref().to_string(),
-                        );
-                    }
-
+                    // With meta fields, tables are upsertable. Precombine/ordering is optional
+                    // (Java COMMIT_TIME_ORDERING when absent, EVENT_TIME when present).
                     HudiConfigValue::String(
                         RecordMergeStrategyValue::OverwriteWithLatest
                             .as_ref()
@@ -359,10 +359,14 @@ impl ConfigParser for HudiTableConfig {
 }
 
 /// Config value for [HudiTableConfig::TableType].
+///
+/// Parsing is case-insensitive and also accepts `cow` / `mor` and hyphenated forms.
 #[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum TableTypeValue {
+    /// `COPY_ON_WRITE`: updates rewrite base files.
     #[strum(serialize = "COPY_ON_WRITE")]
     CopyOnWrite,
+    /// `MERGE_ON_READ`: updates go to log files, merged with base files when read.
     #[strum(serialize = "MERGE_ON_READ")]
     MergeOnRead,
 }
@@ -382,11 +386,13 @@ impl FromStr for TableTypeValue {
 /// Config value for [HudiTableConfig::BaseFileFormat].
 #[derive(Clone, Debug, PartialEq, AsRefStr)]
 pub enum BaseFileFormatValue {
+    /// Config value `parquet`, the default.
     #[strum(serialize = "parquet")]
     Parquet,
     /// HFile format - only valid for metadata tables.
     #[strum(serialize = "hfile")]
     HFile,
+    /// Config value `lance`.
     #[strum(serialize = "lance")]
     Lance,
 }
@@ -471,11 +477,23 @@ impl FromStr for BaseFileFormatValue {
 /// Config value for [HudiTableConfig::TimelineTimezone].
 #[derive(Clone, Debug, PartialEq, AsRefStr, Default)]
 pub enum TimelineTimezoneValue {
+    /// Instant times are in UTC, assumed when the config is unset.
     #[strum(serialize = "utc")]
     #[default]
     UTC,
+    /// Instant times are in the local timezone of the process.
     #[strum(serialize = "local")]
     Local,
+}
+
+impl TimelineTimezoneValue {
+    /// The name Java's case-sensitive `HoodieTimelineTimeZone.valueOf` reads.
+    pub(crate) fn java_name(&self) -> &'static str {
+        match self {
+            Self::UTC => "UTC",
+            Self::Local => "LOCAL",
+        }
+    }
 }
 
 impl FromStr for TimelineTimezoneValue {
@@ -746,8 +764,8 @@ mod tests {
             .into();
         assert_eq!(
             actual,
-            RecordMergeStrategyValue::AppendOnly.as_ref(),
-            "Should derive as append-only due to missing precombine field"
+            RecordMergeStrategyValue::OverwriteWithLatest.as_ref(),
+            "With meta fields and no precombine, Java uses COMMIT_TIME_ORDERING (upsertable)"
         );
 
         let hudi_configs = HudiConfigs::new(vec![

@@ -169,9 +169,11 @@ fn schema_to_field_with_props(
         AvroSchema::TimestampNanos => {
             DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIMEZONE.into()))
         }
-        AvroSchema::LocalTimestampMillis => todo!(),
-        AvroSchema::LocalTimestampMicros => todo!(),
-        AvroSchema::LocalTimestampNanos => todo!(),
+        // Timezone-naive: no zone, matching arrow-avro's decode of these types and
+        // a parquet base file written with isAdjustedToUTC=false.
+        AvroSchema::LocalTimestampMillis => DataType::Timestamp(TimeUnit::Millisecond, None),
+        AvroSchema::LocalTimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
+        AvroSchema::LocalTimestampNanos => DataType::Timestamp(TimeUnit::Nanosecond, None),
         AvroSchema::Duration => DataType::Duration(TimeUnit::Millisecond),
     };
 
@@ -315,6 +317,35 @@ pub fn aliased(alias: &Alias, namespace: Option<&str>, default_namespace: Option
 mod tests {
     use super::*;
     use apache_avro::Schema as AvroSchema;
+
+    /// The timezone-naive `local-timestamp-*` types map to a tz-less Arrow timestamp,
+    /// while the UTC `timestamp-*` types keep their zone.
+    #[test]
+    fn test_local_timestamps_convert_to_tz_less_timestamps() {
+        let avro = AvroSchema::parse_str(
+            r#"{"type":"record","name":"r","fields":[
+                 {"name":"l_ms","type":{"type":"long","logicalType":"local-timestamp-millis"}},
+                 {"name":"l_us","type":{"type":"long","logicalType":"local-timestamp-micros"}},
+                 {"name":"l_ns","type":{"type":"long","logicalType":"local-timestamp-nanos"}},
+                 {"name":"u_us","type":{"type":"long","logicalType":"timestamp-micros"}},
+                 {"name":"opt","type":["null",{"type":"long","logicalType":"local-timestamp-micros"}]}]}"#,
+        )
+        .unwrap();
+
+        let schema = to_arrow_schema(&avro).unwrap();
+        let types: Vec<&DataType> = schema.fields().iter().map(|f| f.data_type()).collect();
+        assert_eq!(
+            types,
+            vec![
+                &DataType::Timestamp(TimeUnit::Millisecond, None),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+                &DataType::Timestamp(TimeUnit::Nanosecond, None),
+                &DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIMEZONE.into())),
+                &DataType::Timestamp(TimeUnit::Microsecond, None),
+            ]
+        );
+        assert!(schema.field_with_name("opt").unwrap().is_nullable());
+    }
 
     /// An Avro map becomes an Arrow `Map`, not a dictionary. A dictionary key
     /// must be an integer, so the `Dictionary(Utf8, V)` this used to produce was
