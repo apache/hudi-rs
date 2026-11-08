@@ -45,6 +45,9 @@ use crate::util::collection::extend_if_absent;
 #[derive(Debug, Clone)]
 pub struct TableBuilder {
     option_resolver: OptionResolver,
+    /// A `Storage` of the table this one belongs to, whose object store the new
+    /// table reuses when it resolves the same storage options.
+    shared_storage: Option<Arc<Storage>>,
 }
 
 /// Resolver for options including Hudi options, storage options, and generic options.
@@ -109,7 +112,17 @@ impl TableBuilder {
     /// Create Hudi table builder from base table uri
     pub fn from_base_uri(base_uri: &str) -> Self {
         let option_resolver = OptionResolver::new(base_uri);
-        TableBuilder { option_resolver }
+        TableBuilder {
+            option_resolver,
+            shared_storage: None,
+        }
+    }
+
+    /// Build the table's storage from `storage`, so a table that belongs to
+    /// another (a metadata table to its data table) shares its object store.
+    pub(crate) fn with_shared_storage(mut self, storage: Arc<Storage>) -> Self {
+        self.shared_storage = Some(storage);
+        self
     }
 
     /// Resolves the options, validates the table configs, and loads the timeline.
@@ -124,7 +137,9 @@ impl TableBuilder {
     pub async fn build(&mut self) -> Result<Table> {
         let option_resolver = &mut self.option_resolver;
 
-        option_resolver.resolve_options().await?;
+        let storage = option_resolver
+            .resolve_options_with_storage(self.shared_storage.as_deref())
+            .await?;
 
         // A read config is dropped from the table's own configs only when it
         // selects WHICH read to perform — those are meaningful per call, and one
@@ -146,16 +161,16 @@ impl TableBuilder {
         ));
 
         let storage_options = Arc::from(self.option_resolver.storage_options.clone());
+        let storage = storage.derive(storage_options.clone(), hudi_configs.clone())?;
 
-        let timeline =
-            Timeline::new_from_storage(hudi_configs.clone(), storage_options.clone()).await?;
+        let timeline = Timeline::new_from_storage(hudi_configs.clone(), storage.clone()).await?;
 
-        let file_system_view =
-            FileSystemView::new(hudi_configs.clone(), storage_options.clone()).await?;
+        let file_system_view = FileSystemView::new(hudi_configs.clone(), storage.clone());
 
         Ok(Table {
             hudi_configs,
             storage_options,
+            storage,
             timeline,
             file_system_view,
             cached_metadata_table: std::sync::Arc::new(tokio::sync::OnceCell::new()),
@@ -259,6 +274,16 @@ impl OptionResolver {
     ///
     /// Note: an error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
+        self.resolve_options_with_storage(None).await.map(|_| ())
+    }
+
+    /// [`Self::resolve_options`], returning the `Storage` the table properties
+    /// were read through, derived from `shared` when given, so the caller can
+    /// derive the table's storage from it instead of building another store.
+    pub(crate) async fn resolve_options_with_storage(
+        &mut self,
+        shared: Option<&Storage>,
+    ) -> Result<Arc<Storage>> {
         self.resolve_user_provided_options();
 
         // If any user-provided options are intended for cloud storage and in uppercase,
@@ -267,11 +292,12 @@ impl OptionResolver {
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
         // We can now resolve the hudi options
-        self.resolve_hudi_options().await?;
+        let storage = self.resolve_hudi_options(shared).await?;
 
         // Validate the resolved Hudi options
         let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
-        validate_configs(&hudi_configs)
+        validate_configs(&hudi_configs)?;
+        Ok(storage)
     }
 
     fn resolve_user_provided_options(&mut self) {
@@ -294,12 +320,14 @@ impl OptionResolver {
         resolve_storage_env_vars(&mut self.storage_options);
     }
 
-    async fn resolve_hudi_options(&mut self) -> Result<()> {
+    async fn resolve_hudi_options(&mut self, shared: Option<&Storage>) -> Result<Arc<Storage>> {
         // create a [Storage] instance to load properties from storage layer.
-        let storage = Storage::new(
-            Arc::new(self.storage_options.clone()),
-            Arc::new(HudiConfigs::new(self.hudi_options.iter())),
-        )?;
+        let storage_options = Arc::new(self.storage_options.clone());
+        let hudi_configs = Arc::new(HudiConfigs::new(self.hudi_options.iter()));
+        let storage = match shared {
+            Some(shared) => shared.derive(storage_options, hudi_configs)?,
+            None => Storage::new(storage_options, hudi_configs)?,
+        };
 
         let hudi_options = &mut self.hudi_options;
         Self::imbue_table_properties(hudi_options, storage.clone()).await?;
@@ -308,7 +336,8 @@ impl OptionResolver {
         // (see https://hudi.apache.org/docs/next/s3_hoodie)
         // before loading global configs
 
-        Self::imbue_global_hudi_configs_if_absent(hudi_options, storage.clone()).await
+        Self::imbue_global_hudi_configs_if_absent(hudi_options, storage.clone()).await?;
+        Ok(storage)
     }
 
     async fn imbue_table_properties(
@@ -360,7 +389,10 @@ mod tests {
 
     fn create_table_builder() -> TableBuilder {
         let option_resolver = OptionResolver::new("test_uri");
-        TableBuilder { option_resolver }
+        TableBuilder {
+            option_resolver,
+            shared_storage: None,
+        }
     }
 
     #[test]
