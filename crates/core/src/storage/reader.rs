@@ -17,9 +17,11 @@
  * under the License.
  */
 use crate::config::HudiConfigs;
+use crate::storage::ReadVolume;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use std::future::Future;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,22 +133,38 @@ pub fn stream_window_size(hudi_configs: &HudiConfigs) -> Result<u64> {
     }
 }
 
+/// Await `fut`, timing it as one request when the reader has counters.
+async fn timed<T>(
+    volume: Option<&ReadVolume>,
+    fut: impl Future<Output = Result<T>>,
+    size: impl FnOnce(&T) -> u64,
+) -> Result<T> {
+    match volume {
+        Some(volume) => volume.requests.time(fut, size).await,
+        None => fut.await,
+    }
+}
+
 /// Fetch `[offset, offset + length)` in one ranged request.
 async fn get_range(
     object_store: &Arc<dyn ObjectStore>,
     location: &ObjPath,
     offset: u64,
     length: u64,
+    volume: Option<&ReadVolume>,
 ) -> Result<Bytes> {
     let end = offset.checked_add(length).ok_or_else(|| {
         Error::other(format!(
             "ranged read offset {offset} + length {length} overflows u64"
         ))
     })?;
-    object_store
-        .get_range(location, offset..end)
-        .await
-        .map_err(|e| Error::other(format!("ranged object-store read failed: {e}")))
+    let fetch = async {
+        object_store
+            .get_range(location, offset..end)
+            .await
+            .map_err(|e| Error::other(format!("ranged object-store read failed: {e}")))
+    };
+    timed(volume, fetch, |b| b.len() as u64).await
 }
 
 /// Reads one log block's content range without holding the file.
@@ -162,6 +180,8 @@ pub struct LogBlockFetcher {
     /// What this fetcher has actually read, shared across clones so a caller
     /// holding one clone can account for reads made through another.
     reads: Arc<FetchCounts>,
+    /// The owning `Storage`'s counters, when opened through one.
+    volume: Option<Arc<ReadVolume>>,
 }
 
 /// What a fetcher read, as opposed to what it was asked for.
@@ -216,6 +236,7 @@ impl LogBlockFetcher {
             object_store,
             location,
             reads: Arc::new(FetchCounts::default()),
+            volume: None,
         }
     }
 
@@ -226,7 +247,14 @@ impl LogBlockFetcher {
 
     /// Read `[offset, offset + length)` in one ranged request.
     pub async fn read_content(&self, offset: u64, length: u64) -> Result<Bytes> {
-        let bytes = get_range(&self.object_store, &self.location, offset, length).await?;
+        let bytes = get_range(
+            &self.object_store,
+            &self.location,
+            offset,
+            length,
+            self.volume.as_deref(),
+        )
+        .await?;
         self.reads.record(1, bytes.len() as u64);
         Ok(bytes)
     }
@@ -244,6 +272,7 @@ impl LogBlockFetcher {
     /// one each. Reading them one at a time is the same bytes and many more
     /// round trips, which is what dominates on object storage.
     pub async fn read_contents(&self, ranges: &[std::ops::Range<u64>]) -> Result<Vec<Bytes>> {
+        let request = self.volume.as_deref().map(|v| v.requests.start());
         let fetched = self
             .object_store
             .get_ranges(&self.location, ranges)
@@ -257,8 +286,11 @@ impl LogBlockFetcher {
             })?;
         // One call, whatever coalescing and fan-out did underneath, and the
         // bytes it handed back. Counting `ranges.len()` would count the plan.
-        self.reads
-            .record(1, fetched.iter().map(|b| b.len() as u64).sum());
+        let total: u64 = fetched.iter().map(|b| b.len() as u64).sum();
+        if let Some(request) = request {
+            request.finish(total);
+        }
+        self.reads.record(1, total);
         Ok(fetched)
     }
 }
@@ -290,19 +322,34 @@ pub struct StorageReader {
     window_start: u64,
     /// How much to fetch per window refill. See [`stream_window_size`].
     window_size: u64,
+    /// The owning `Storage`'s counters, when opened through one. Handed on to
+    /// every [`LogBlockFetcher`] this reader creates.
+    volume: Option<Arc<ReadVolume>>,
 }
 
 impl StorageReader {
     /// Read the entire file into one buffer.
     pub async fn new(object_store: Arc<dyn ObjectStore>, object_meta: ObjectMeta) -> Result<Self> {
-        let get_result = object_store
-            .get(&object_meta.location)
-            .await
-            .map_err(|e| Error::other(format!("object-store get failed: {e}")))?;
-        let bytes = get_result
-            .bytes()
-            .await
-            .map_err(|e| Error::other(format!("object-store read failed: {e}")))?;
+        Self::new_counted(object_store, object_meta, None).await
+    }
+
+    /// [`Self::new`], recording the fetch and every later one into `volume`.
+    pub(crate) async fn new_counted(
+        object_store: Arc<dyn ObjectStore>,
+        object_meta: ObjectMeta,
+        volume: Option<Arc<ReadVolume>>,
+    ) -> Result<Self> {
+        let fetch = async {
+            let get_result = object_store
+                .get(&object_meta.location)
+                .await
+                .map_err(|e| Error::other(format!("object-store get failed: {e}")))?;
+            get_result
+                .bytes()
+                .await
+                .map_err(|e| Error::other(format!("object-store read failed: {e}")))
+        };
+        let bytes = timed(volume.as_deref(), fetch, |b| b.len() as u64).await?;
         let file_len = bytes.len() as u64;
         Ok(Self {
             object_store,
@@ -313,6 +360,7 @@ impl StorageReader {
             window: Bytes::new(),
             window_start: 0,
             window_size: DEFAULT_STREAM_WINDOW_SIZE,
+            volume,
         })
     }
 
@@ -336,13 +384,22 @@ impl StorageReader {
             window: Bytes::new(),
             window_start: 0,
             window_size,
+            volume: None,
         }
+    }
+
+    /// Record this reader's fetches, and its block fetchers', into `volume`.
+    pub(crate) fn with_read_volume(mut self, volume: Arc<ReadVolume>) -> Self {
+        self.volume = Some(volume);
+        self
     }
 
     /// A fetcher over the same file, for reading a block's content later
     /// without re-opening it.
     pub fn block_fetcher(&self) -> LogBlockFetcher {
-        LogBlockFetcher::new(self.object_store.clone(), self.location.clone())
+        let mut fetcher = LogBlockFetcher::new(self.object_store.clone(), self.location.clone());
+        fetcher.volume = self.volume.clone();
+        fetcher
     }
 
     /// Length of the whole file, known without reading any of it.
@@ -384,8 +441,14 @@ impl StorageReader {
     /// Fetch a window starting at the cursor.
     async fn fill_window(&mut self) -> Result<()> {
         let end = self.pos.saturating_add(self.window_size).min(self.file_len);
-        self.window =
-            get_range(&self.object_store, &self.location, self.pos, end - self.pos).await?;
+        self.window = get_range(
+            &self.object_store,
+            &self.location,
+            self.pos,
+            end - self.pos,
+            self.volume.as_deref(),
+        )
+        .await?;
         self.window_start = self.pos;
         Ok(())
     }
@@ -429,7 +492,14 @@ impl StorageReader {
         // read. A log block's content can be larger than the window a caller
         // tuned for sweeping headers, and it has to be contiguous to decode.
         if len > self.window_size {
-            let bytes = get_range(&self.object_store, &self.location, self.pos, len).await?;
+            let bytes = get_range(
+                &self.object_store,
+                &self.location,
+                self.pos,
+                len,
+                self.volume.as_deref(),
+            )
+            .await?;
             self.pos = end;
             return Ok(bytes);
         }
@@ -649,5 +719,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&content[..], &expected[1000..1256]);
+    }
+
+    /// Each fetch a counted streaming reader makes is one request of the size
+    /// it fetched: a window fill, a read longer than the window (served
+    /// outside it), and a block fetcher's single range.
+    #[tokio::test]
+    async fn test_counted_reader_records_each_fetch() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let window = 4096u64;
+        let (store, meta, _expected, _dir) = make_store((window as usize) * 4).await;
+        let volume = Arc::new(ReadVolume::default());
+        let mut reader =
+            StorageReader::new_streaming(store, meta, window).with_read_volume(volume.clone());
+        let stats = &volume.requests;
+
+        reader.read_bytes(16).await.unwrap();
+        assert_eq!(stats.count.load(Relaxed), 1);
+        assert_eq!(stats.bytes.load(Relaxed), window);
+
+        reader.seek_to(1000);
+        reader.read_bytes(window * 2).await.unwrap();
+        assert_eq!(stats.count.load(Relaxed), 2);
+        assert_eq!(stats.max_bytes.load(Relaxed), window * 2);
+
+        reader.block_fetcher().read_content(10, 100).await.unwrap();
+        assert_eq!(stats.count.load(Relaxed), 3);
+        assert_eq!(stats.bytes.load(Relaxed), window + window * 2 + 100);
+        assert_eq!(stats.failed.load(Relaxed), 0);
+        assert_eq!(stats.in_flight(), 0);
     }
 }
