@@ -42,7 +42,7 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::stream::{self, BoxStream, TryStreamExt};
 use futures::{Stream, StreamExt};
 
-use crate::{external_error, inexact_usize_from_u64};
+use crate::{external_error, inexact_usize_from_u64, view_type};
 use hudi_core::file_group::file_slice::FileSlice;
 use hudi_core::file_group::reader::FileGroupReader;
 use hudi_core::table::ReadOptions;
@@ -168,21 +168,13 @@ impl HudiScanExec {
 /// declares for them; every other column passes through as the reader made it.
 ///
 /// Columns are matched by position, since the reader produced this batch for
-/// this projection, so a column is cast only when its name matches the declared
-/// one: casting across a misaligned position would hide the misalignment. Each
-/// field keeps the batch's nullability, because a meta field the table does not
-/// populate is declared non-nullable yet read back as nulls.
+/// this projection, so a column is cast only when the batch has the declared
+/// width and its name matches the declared one: casting across a misaligned
+/// position would hide the misalignment. Each field keeps the batch's
+/// nullability, because a meta field the table does not populate is declared
+/// non-nullable yet read back as nulls.
 fn cast_batch_to_schema(batch: RecordBatch, schema: &SchemaRef) -> Result<RecordBatch> {
-    let to_view = |from: &DataType, to: &DataType| {
-        matches!(
-            (from, to),
-            (DataType::Utf8 | DataType::LargeUtf8, DataType::Utf8View)
-                | (
-                    DataType::Binary | DataType::LargeBinary,
-                    DataType::BinaryView
-                )
-        )
-    };
+    let to_view = |from: &DataType, to: &DataType| view_type(from).as_ref() == Some(to);
     let needs_cast = batch
         .columns()
         .iter()
@@ -190,6 +182,13 @@ fn cast_batch_to_schema(batch: RecordBatch, schema: &SchemaRef) -> Result<Record
         .any(|(col, declared)| to_view(col.data_type(), declared.data_type()));
     if !needs_cast {
         return Ok(batch);
+    }
+    if batch.num_columns() != schema.fields().len() {
+        return Err(Execution(format!(
+            "Batch has {} columns but the declared schema has {}",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
     }
     let batch_schema = batch.schema();
     let mut fields: Vec<FieldRef> = Vec::with_capacity(batch.num_columns());
@@ -868,9 +867,11 @@ mod tests {
             Field::new("name", DataType::Utf8View, true),
             Field::new("extra", DataType::Utf8View, true),
         ]));
-        let cast = cast_batch_to_schema(batch, &wider).unwrap();
-        assert_eq!(cast.num_columns(), 2);
-        assert_eq!(cast.schema().field(1).data_type(), &DataType::Utf8View);
+        let err = cast_batch_to_schema(batch, &wider).unwrap_err().to_string();
+        assert!(
+            err.contains("Batch has 2 columns but the declared schema has 3"),
+            "{err}"
+        );
     }
 
     /// A meta field the table does not populate is declared non-nullable but

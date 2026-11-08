@@ -23,6 +23,14 @@
 //! [`HudiTableFactory`] serves `CREATE EXTERNAL TABLE ... STORED AS HUDI`. Both read through
 //! `hudi-core` and accept the same table options.
 //!
+//! Top-level string and binary columns are declared as `Utf8View` and `BinaryView`, following
+//! [`SCHEMA_FORCE_VIEW_TYPES`] (on by default, as in DataFusion). Setting it to `false` keeps the
+//! table's own string and binary types, which code that downcasts to `StringArray` or compares
+//! against `Table::get_schema_with_meta_fields()` needs. A table created through
+//! [`HudiTableFactory`] takes it from the session or the `OPTIONS` clause; a provider built
+//! directly takes it only as an option to [`HudiDataSource::new_with_options`], since it cannot
+//! see the session it is registered with.
+//!
 //! Applications usually reach this crate through the [`hudi`](https://docs.rs/hudi) crate's
 //! `datafusion` feature. The [Python and Rust quick start guide][quick start guide] shows
 //! DataFusion queries on a hudi-rs table, and the [`hudi`](https://docs.rs/hudi) crate docs list
@@ -77,23 +85,27 @@ use hudi_core::table::{ReadOptions, Table as HudiTable};
 /// DataFusion's switch for reading strings and binaries as view types. The
 /// table factory forwards it from the session; otherwise it comes from the
 /// options the provider is built with, defaulting to on as in DataFusion.
-const SCHEMA_FORCE_VIEW_TYPES: &str = "datafusion.execution.parquet.schema_force_view_types";
+pub const SCHEMA_FORCE_VIEW_TYPES: &str = "datafusion.execution.parquet.schema_force_view_types";
+
+/// The view type a string or binary storage type is read as, or `None` for
+/// every other type.
+pub(crate) fn view_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Utf8 | DataType::LargeUtf8 => Some(DataType::Utf8View),
+        DataType::Binary | DataType::LargeBinary => Some(DataType::BinaryView),
+        _ => None,
+    }
+}
 
 /// The schema with every top-level string and binary column as its view type,
-/// which is what `datafusion.execution.parquet.schema_force_view_types` does
-/// to an inferred parquet schema.
+/// which is what [`SCHEMA_FORCE_VIEW_TYPES`] does to an inferred parquet schema.
 fn schema_with_view_types(schema: &Schema) -> Schema {
     let fields: Vec<arrow_schema::FieldRef> = schema
         .fields()
         .iter()
-        .map(|field| match field.data_type() {
-            DataType::Utf8 | DataType::LargeUtf8 => {
-                Arc::new(field.as_ref().clone().with_data_type(DataType::Utf8View))
-            }
-            DataType::Binary | DataType::LargeBinary => {
-                Arc::new(field.as_ref().clone().with_data_type(DataType::BinaryView))
-            }
-            _ => field.clone(),
+        .map(|field| match view_type(field.data_type()) {
+            Some(view) => Arc::new(field.as_ref().clone().with_data_type(view)),
+            None => field.clone(),
         })
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
