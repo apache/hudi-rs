@@ -201,4 +201,23 @@ mod tests {
         expected.insert("key2".to_string(), "value2".to_string());
         assert_eq!(result, expected);
     }
+
+    #[test]
+    fn test_parse_data_keeps_backslashes() {
+        // hudi-defaults.conf is split on the delimiter without Java Properties
+        // unescaping, matching Hudi's DFSPropertiesConfiguration.
+        let data = Bytes::from(
+            "hoodie.write.lock.filesystem.path C:\\tmp\\hudi\\lock\n\
+             hoodie.keygen.timebased.input.dateformat=yyyy-MM-dd'T'HH\\:mm\\:ss",
+        );
+        let result = parse_data_for_options(&data, " \t=").unwrap();
+        assert_eq!(
+            result["hoodie.write.lock.filesystem.path"],
+            r"C:\tmp\hudi\lock"
+        );
+        assert_eq!(
+            result["hoodie.keygen.timebased.input.dateformat"],
+            r"yyyy-MM-dd'T'HH\:mm\:ss"
+        );
+    }
 }
