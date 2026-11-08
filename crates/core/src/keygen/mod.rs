@@ -104,8 +104,13 @@ pub(crate) fn key_generator_kind(hudi_configs: &HudiConfigs) -> Result<KeyGenera
     let kind = match declared_key_generator(hudi_configs) {
         Some(kind) => kind,
         None => {
+            // The parsed field list drops the `field:type` annotations, so read
+            // them from the raw value.
+            let is_custom_spec = declared(hudi_configs, &PartitionFields)
+                .and_then(|v| v.split(',').next())
+                .is_some_and(|f| f.contains(':'));
             let partition_fields: Vec<String> = hudi_configs.get_or_default(PartitionFields).into();
-            if partition_fields.first().is_some_and(|f| f.contains(':')) {
+            if is_custom_spec {
                 // A `field:type` partition spec is the custom key generator.
                 KeyGeneratorKind::Other
             } else {

@@ -3477,3 +3477,93 @@ mod incremental_window_boundaries {
         Ok(())
     }
 }
+
+/// A custom key generator combines an identity partition field with a
+/// time-derived one, so the on-disk shape is `region=eu/ts_str=2024-03-01`. The
+/// reader does not transform filters through `CustomKeyGenerator` — no keygen
+/// rewrite runs — but plain partition-column predicates must still prune.
+///
+/// The pair also pins how each table version spells `partition.fields`: version
+/// 6 records bare names and persists no per-field types at all, while version 9
+/// records `region:SIMPLE,ts_str:TIMESTAMP`, which must not leak the annotation
+/// into schema lookups.
+mod custom_keygen_partition_paths {
+    use super::*;
+    use hudi_core::table::{ReadOptions, Table};
+
+    fn partitions_of(slices: &[hudi_core::file_group::file_slice::FileSlice]) -> Vec<String> {
+        let mut p: Vec<String> = slices
+            .iter()
+            .map(|s| s.partition_path.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        p.sort();
+        p
+    }
+
+    async fn table_and_partitions(table: SampleTable) -> Result<(Table, Vec<String>)> {
+        let base_url = table.url_to_cow();
+        let hudi_table = Table::new(base_url.path()).await?;
+        let all = hudi_table.get_file_slices(&ReadOptions::new()).await?;
+        let partitions = partitions_of(&all);
+        Ok((hudi_table, partitions))
+    }
+
+    #[tokio::test]
+    async fn identity_field_prunes_like_a_plain_partition_column() -> Result<()> {
+        let (hudi_table, partitions) =
+            table_and_partitions(SampleTable::V6CustomkeygenHivestyle).await?;
+        assert_eq!(
+            partitions,
+            vec![
+                "region=eu/ts_str=2024-03-01",
+                "region=eu/ts_str=2024-03-02",
+                "region=eu/ts_str=2024-03-03",
+                "region=us/ts_str=2024-03-01",
+                "region=us/ts_str=2024-03-02",
+            ]
+        );
+
+        let opts = ReadOptions::new().with_filters([("region", "=", "eu")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec![
+                "region=eu/ts_str=2024-03-01",
+                "region=eu/ts_str=2024-03-02",
+                "region=eu/ts_str=2024-03-03",
+            ],
+            "a plain partition-column predicate prunes without any keygen rewrite"
+        );
+
+        let opts = ReadOptions::new().with_filters([("ts_str", "=", "2024-03-02")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["region=eu/ts_str=2024-03-02", "region=us/ts_str=2024-03-02",]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn annotated_partition_field_names_still_resolve_v9() -> Result<()> {
+        let (hudi_table, partitions) =
+            table_and_partitions(SampleTable::V9CustomkeygenHivestyle).await?;
+        assert_eq!(
+            partitions,
+            vec![
+                "region=eu/ts_str=2024-03-01",
+                "region=eu/ts_str=2024-03-02",
+                "region=us/ts_str=2024-03-01",
+            ]
+        );
+
+        // The `:SIMPLE`/`:TIMESTAMP` annotations must not reach the schema
+        // lookup, where `region:SIMPLE` names no column of the table schema.
+        let opts = ReadOptions::new().with_filters([("region", "=", "eu")])?;
+        assert_eq!(
+            partitions_of(&hudi_table.get_file_slices(&opts).await?),
+            vec!["region=eu/ts_str=2024-03-01", "region=eu/ts_str=2024-03-02",]
+        );
+        Ok(())
+    }
+}
