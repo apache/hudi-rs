@@ -249,6 +249,9 @@ impl TableCreateBuilder {
     /// `hoodie.metadata.global.record.level.index.enable` or its alternative
     /// `hoodie.metadata.record.index.enable`, acts as
     /// [`Self::with_record_index_enabled`], read the way Java's `Boolean.parseBoolean` is.
+    /// The write option `hoodie.hfile.compression.algorithm` is not stored: it
+    /// applies to the metadata table's initial files and to writes through the
+    /// returned handle.
     pub fn with_option(mut self, key: impl AsRef<str>, value: impl Into<String>) -> Self {
         let key = key.as_ref();
         let value = value.into();
@@ -433,6 +436,16 @@ impl TableCreateBuilder {
             .unwrap_or(TimelineTimezoneValue::Local)
             .java_name();
         crate::write::set_commit_timezone(timeline_timezone);
+        // A write option, not a table property: it is used for the bootstrap
+        // HFiles and handed to the returned handle, never persisted.
+        let metadata_hfile_compression = self
+            .options
+            .remove(crate::write::metadata::HFILE_COMPRESSION_ALGORITHM);
+        let metadata_hfile_codec = if self.metadata_table_enabled {
+            crate::write::metadata::metadata_hfile_codec(metadata_hfile_compression.as_deref())?
+        } else {
+            crate::write::metadata::DEFAULT_METADATA_HFILE_CODEC
+        };
         props.insert(
             HudiTableConfig::TimelineTimezone.as_ref().to_string(),
             timeline_timezone.to_string(),
@@ -656,6 +669,7 @@ impl TableCreateBuilder {
                     self.record_index_enabled,
                     self.column_stats_enabled,
                     partition_stats_enabled,
+                    metadata_hfile_codec,
                 )
                 .await?;
             }
@@ -680,7 +694,14 @@ impl TableCreateBuilder {
             return Err(error);
         }
 
-        Table::new_with_options(&self.base_uri, self.storage_options).await
+        let mut options = self.storage_options;
+        if let Some(value) = metadata_hfile_compression {
+            options.insert(
+                crate::write::metadata::HFILE_COMPRESSION_ALGORITHM.to_string(),
+                value,
+            );
+        }
+        Table::new_with_options(&self.base_uri, options).await
     }
 }
 

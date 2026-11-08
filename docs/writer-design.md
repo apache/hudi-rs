@@ -302,6 +302,19 @@ correctly. A file slice merges to its base file's schema, so the writer uses
 Java's metadata table writer schema: `HoodieMetadataRecord` with the five
 `_hoodie_*` meta fields prepended, always null.
 
+Metadata HFiles (bootstrap base files, HFile log blocks and compacted bases)
+compress every block with the codec the write option
+`hoodie.hfile.compression.algorithm` (Java's HFile compression key) names,
+parsed as Java parses it: `GZ` when the value is absent or empty, otherwise a
+Java codec name (`gz`, `none`, `snappy`, ...) in any case. Only `gz` and
+`none` are accepted; any other value fails a create or write of a table with a
+metadata table before anything is stored, because this crate's HFile reader
+and released Java readers decode only NONE and GZ. A table without a metadata
+table writes no HFile and does not check the value, as in Java. A write
+resolves the codec once and uses it for its metadata compaction too. The
+option is never stored in `hoodie.properties`: readers take the codec from
+each file's trailer, so files of different codecs can coexist in a file slice.
+
 ### 5.1 Metadata table compaction
 
 After a data write completes, still inside its completion critical section,

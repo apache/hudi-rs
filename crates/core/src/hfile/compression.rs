@@ -19,8 +19,9 @@
 //! Compression codec support for HFile blocks.
 
 use crate::hfile::error::{HFileError, Result};
-use flate2::read::GzDecoder;
-use std::io::Read;
+use flate2::{Compression, read::GzDecoder, write::GzEncoder};
+use std::borrow::Cow;
+use std::io::{Read, Write};
 
 /// Compression codec IDs used in HFile.
 /// These IDs are stored in the HFile trailer and must not change.
@@ -44,6 +45,18 @@ pub enum CompressionCodec {
 }
 
 impl CompressionCodec {
+    pub(crate) fn compress<'a>(&self, data: &'a [u8]) -> Result<Cow<'a, [u8]>> {
+        match self {
+            Self::None => Ok(Cow::Borrowed(data)),
+            Self::Gzip => {
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data)?;
+                Ok(Cow::Owned(encoder.finish()?))
+            }
+            _ => Err(HFileError::UnsupportedCompression(*self as u32)),
+        }
+    }
+
     /// Decode compression codec from ID stored in HFile.
     pub fn from_id(id: u32) -> Result<Self> {
         match id {

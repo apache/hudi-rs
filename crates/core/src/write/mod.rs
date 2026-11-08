@@ -687,6 +687,10 @@ pub(crate) async fn complete_write(
     written_paths: &[String],
 ) -> Result<CompletedWrite> {
     let storage = table.file_system_view.storage.clone();
+    // Resolved once so every metadata HFile of this write, compaction
+    // included, uses one codec; validate_for_write rejected a bad value before
+    // the write started.
+    let codec = metadata::metadata_hfile_codec_for(table)?;
     let mut mdt_stats = HashMap::new();
     if table.is_metadata_table_enabled() {
         let mdt_result = async {
@@ -697,6 +701,7 @@ pub(crate) async fn complete_write(
                         storage.as_ref(),
                         instant,
                         &updates.files,
+                        codec,
                     )
                     .await?,
                 );
@@ -707,6 +712,7 @@ pub(crate) async fn complete_write(
                     instant,
                     std::mem::take(&mut updates.record_index),
                     write_task_parallelism(table),
+                    codec,
                 )
                 .await?;
                 if !stats.is_empty() {
@@ -720,6 +726,7 @@ pub(crate) async fn complete_write(
                     &updates.column_stats,
                     schema,
                     &updates.replaced_paths,
+                    codec,
                 )
                 .await?;
                 mdt_stats.extend(stats);
@@ -762,7 +769,7 @@ pub(crate) async fn complete_write(
     }
     // Under the lock: a compaction instant minted here sorts above every
     // metadata log block written so far and below every one written later.
-    if let Err(error) = metadata_compaction::compact_metadata_table_if_needed(table).await {
+    if let Err(error) = metadata_compaction::compact_metadata_table_if_needed(table, codec).await {
         log::warn!("metadata table compaction after {instant} failed: {error}");
     }
     drop(critical_section);
