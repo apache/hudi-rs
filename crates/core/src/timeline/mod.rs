@@ -35,6 +35,7 @@ use crate::error::CoreError;
 use crate::file_group::FileGroup;
 use crate::file_group::builder::replaced_file_groups_from_replace_commit;
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
+use crate::metadata::clean::CleanMetadata;
 use crate::schema::resolver::{
     resolve_avro_schema_from_commit_metadata, resolve_data_schema_from_commit_metadata,
 };
@@ -418,6 +419,63 @@ impl Timeline {
             &self.hudi_configs,
             self.earliest_active_instant.clone(),
         ))
+    }
+
+    /// Refuse a time-travel timestamp the latest completed clean may have
+    /// deleted data for, as Java's `TimelineUtils.validateTimestampAsOf` does.
+    ///
+    /// The bound is the clean's earliest commit to retain. A clean that records
+    /// none (`KEEP_LATEST_FILE_VERSIONS`) bounds the timestamp by the active
+    /// timeline's first completed commit instead. Without the check a read at a
+    /// cleaned instant skips every file group the clean emptied and returns the
+    /// rest as if it were the whole table.
+    pub(crate) async fn validate_timestamp_as_of(&self, timestamp: &str) -> Result<()> {
+        let selector = TimelineSelector::actions_in_range(
+            &[Action::Clean],
+            &[State::Completed],
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        let Some(clean) = self
+            .load_instants(&selector, true)
+            .await?
+            .into_iter()
+            .next()
+        else {
+            return Ok(());
+        };
+        let metadata = self
+            .load_instant_bytes(&clean)
+            .await
+            .and_then(|bytes| CleanMetadata::from_avro_bytes(&bytes))
+            .map_err(|e| {
+                CoreError::Timeline(format!(
+                    "Failed to read clean instant {}: {e}",
+                    clean.timestamp
+                ))
+            })?;
+        match metadata.earliest_commit_to_retain() {
+            Some(retained) if timestamp < retained => Err(CoreError::InvalidValue(format!(
+                "Cleaner cleaned up the timestamp of interest: '{timestamp}' is earlier than \
+                 '{retained}', the earliest commit retained by clean {}. Please ensure \
+                 sufficient commits are retained with the cleaner for a time travel query \
+                 to work.",
+                clean.timestamp
+            ))),
+            Some(_) => Ok(()),
+            None => match self.completed_commits.first() {
+                Some(first) if timestamp < first.timestamp.as_str() => {
+                    Err(CoreError::InvalidValue(format!(
+                        "Please ensure sufficient commits are retained (uncleaned and \
+                         un-archived) for a time travel query to work: '{timestamp}' is \
+                         earlier than the first active commit '{}'.",
+                        first.timestamp
+                    )))
+                }
+                _ => Ok(()),
+            },
+        }
     }
 
     /// Get the latest [apache_avro::schema::Schema] as [String] from the [Timeline].

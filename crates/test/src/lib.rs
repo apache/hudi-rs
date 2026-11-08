@@ -592,6 +592,7 @@ impl QuickstartTripsTable {
 #[derive(Debug, EnumString, AsRefStr, EnumIter)]
 #[strum(serialize_all = "snake_case")]
 pub enum SampleTable {
+    V6CleanKeepLatestCommits,
     V6ComplexkeygenHivestyle,
     V6Empty,
     V6Nonpartitioned,
@@ -605,6 +606,8 @@ pub enum SampleTable {
     V8Nonpartitioned,
     V8SimplekeygenHivestyleNoMetafields,
     V8SimplekeygenNonhivestyle,
+    V9CleanKeepLatestCommits,
+    V9CleanKeepLatestFileVersions,
     V9NonpartitionedRollback,
     V9TimebasedkeygenEpochmillis,
     V9TimebasedkeygenNonhivestyle,
@@ -670,12 +673,15 @@ impl SampleTable {
 
     pub fn available_formats(&self) -> &'static [TableFormat] {
         match self {
-            Self::V6TimebasedkeygenNonhivestyle
+            Self::V6CleanKeepLatestCommits
+            | Self::V6TimebasedkeygenNonhivestyle
             | Self::V8ComplexkeygenHivestyle
             | Self::V8Empty
             | Self::V8Nonpartitioned
             | Self::V8SimplekeygenHivestyleNoMetafields
             | Self::V8SimplekeygenNonhivestyle
+            | Self::V9CleanKeepLatestCommits
+            | Self::V9CleanKeepLatestFileVersions
             | Self::V9TimebasedkeygenEpochmillis
             | Self::V9TimebasedkeygenUnixtimestamp
             | Self::V9LanceNonpartitioned

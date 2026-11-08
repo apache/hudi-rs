@@ -3507,3 +3507,108 @@ mod incremental_window_boundaries {
         Ok(())
     }
 }
+
+/// Time travel to an instant the cleaner has already cleaned.
+///
+/// The expected outcomes are what Hudi 1.1.1's Spark reader returns for the
+/// same reads of these fixtures.
+mod time_travel_over_cleaned_commits {
+    use super::*;
+
+    const CLEANED: &str = "Cleaner cleaned up the timestamp of interest";
+    const NOT_RETAINED: &str =
+        "Please ensure sufficient commits are retained (uncleaned and un-archived)";
+
+    async fn commit_timestamps(hudi_table: &Table) -> Result<Vec<String>> {
+        Ok(hudi_table
+            .get_timeline()
+            .get_completed_commits(false)
+            .await?
+            .into_iter()
+            .map(|i| i.timestamp)
+            .collect())
+    }
+
+    async fn rows_as_of(hudi_table: &Table, timestamp: &str) -> Result<Vec<(i32, String, bool)>> {
+        let batches = hudi_table
+            .read(&ReadOptions::new().with_as_of_timestamp(timestamp))
+            .await?;
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        Ok(SampleTable::sample_data_order_by_id(&batch)
+            .into_iter()
+            .map(|(id, name, is_active)| (id, name.to_string(), is_active))
+            .collect())
+    }
+
+    fn assert_refused<T: std::fmt::Debug>(result: Result<T>, expected: &str, timestamp: &str) {
+        match result {
+            Err(CoreError::InvalidValue(message)) if message.contains(expected) => {}
+            other => panic!(
+                "as of {timestamp}: expected an error containing '{expected}', got {other:?}"
+            ),
+        }
+    }
+
+    /// The clean after the third commit retains from that commit on and deleted
+    /// id 1's base file from the first, so every earlier as-of read is refused,
+    /// on each planning entry point and on both timeline layouts.
+    #[tokio::test]
+    async fn test_time_travel_before_earliest_commit_to_retain_errors() -> Result<()> {
+        for table in [
+            SampleTable::V6CleanKeepLatestCommits,
+            SampleTable::V9CleanKeepLatestCommits,
+        ] {
+            let hudi_table = Table::new(&table.path_to_cow()).await?;
+            let commits = commit_timestamps(&hudi_table).await?;
+            assert_eq!(commits.len(), 3, "{table:?}");
+            for timestamp in &commits[..2] {
+                let options = ReadOptions::new().with_as_of_timestamp(timestamp);
+                assert_refused(hudi_table.read(&options).await, CLEANED, timestamp);
+                assert_refused(
+                    hudi_table.get_file_slices(&options).await.map(|s| s.len()),
+                    CLEANED,
+                    timestamp,
+                );
+                assert_refused(
+                    hudi_table.read_stream(&options).await.map(|_| ()),
+                    CLEANED,
+                    timestamp,
+                );
+            }
+            assert_eq!(
+                rows_as_of(&hudi_table, &commits[2]).await?,
+                vec![
+                    (1, "Alicia".to_string(), false),
+                    (2, "Bob".to_string(), false)
+                ],
+                "{table:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// File-version cleaning records no earliest commit to retain, so only an
+    /// instant before the active timeline's first commit is refused. Hudi admits
+    /// the first commit itself and returns only id 2, whose base file from it
+    /// survived the clean.
+    #[tokio::test]
+    async fn test_time_travel_under_file_version_cleaning_checks_first_active_commit() -> Result<()>
+    {
+        let hudi_table =
+            Table::new(&SampleTable::V9CleanKeepLatestFileVersions.path_to_cow()).await?;
+        let commits = commit_timestamps(&hudi_table).await?;
+        let before_first = (commits[0].parse::<u64>().unwrap() - 1).to_string();
+        assert_refused(
+            hudi_table
+                .read(&ReadOptions::new().with_as_of_timestamp(&before_first))
+                .await,
+            NOT_RETAINED,
+            &before_first,
+        );
+        assert_eq!(
+            rows_as_of(&hudi_table, &commits[0]).await?,
+            vec![(2, "Bob".to_string(), false)]
+        );
+        Ok(())
+    }
+}

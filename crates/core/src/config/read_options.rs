@@ -109,6 +109,9 @@ impl ReadOptions {
 
     /// Sets the as-of timestamp for snapshot/time-travel queries.
     /// Stored as [`HudiReadConfig::AsOfTimestamp`].
+    ///
+    /// A read fails when the timestamp is older than the latest clean allows,
+    /// since the cleaner may have deleted files the snapshot needs.
     pub fn with_as_of_timestamp<S: AsRef<str>>(mut self, timestamp: S) -> Self {
         self.hudi_options.insert(
             HudiReadConfig::AsOfTimestamp.as_ref().to_string(),
