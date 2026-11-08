@@ -27,6 +27,7 @@ use crate::Result;
 use crate::error::CoreError;
 use crate::storage::file_metadata::FileMetadata;
 use crate::timeline::completion_time::CompletionTimeView;
+use crate::timeline::instant::METADATA_BOOTSTRAP_INSTANT_TS;
 use std::fmt::Display;
 use std::str::FromStr;
 
@@ -104,6 +105,14 @@ impl BaseFile {
             commit_timestamp = self.commit_timestamp,
             extension = self.extension,
         )
+    }
+
+    /// Whether this is a METADATA_ONLY bootstrap skeleton: a base file holding
+    /// only the meta fields, whose data columns stay in the bootstrap source.
+    /// Java identifies one by its instant, as here
+    /// (`AbstractTableFileSystemView#addBootstrapBaseFileIfPresent`).
+    pub fn is_metadata_bootstrap_skeleton(&self) -> bool {
+        self.commit_timestamp == METADATA_BOOTSTRAP_INSTANT_TS
     }
 
     /// Set the completion timestamp from a completion time view.
@@ -193,6 +202,19 @@ mod tests {
         assert_eq!(file_metadata.size, 1024);
         assert_eq!(file_metadata.byte_size, 0);
         assert_eq!(file_metadata.num_records, 0);
+    }
+
+    #[test]
+    fn only_a_metadata_bootstrap_base_file_is_a_skeleton() {
+        let skeleton = |instant: &str| {
+            BaseFile::from_str(&format!("f0-0_0-3-5_{instant}.parquet"))
+                .unwrap()
+                .is_metadata_bootstrap_skeleton()
+        };
+        assert!(skeleton("00000000000001"));
+        // FULL_RECORD bootstrap files carry whole records.
+        assert!(!skeleton("00000000000002"));
+        assert!(!skeleton("20240402144910683"));
     }
 
     #[test]

@@ -49,6 +49,7 @@ use crate::config::table::HudiTableConfig::PartitionFields;
 use crate::config::table::{BaseFileFormatValue, HudiTableConfig, TableTypeValue};
 use crate::error::CoreError;
 use crate::expr::filter::{Filter, validate_fields_against_schemas};
+use crate::file_group::base_file::BaseFile;
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::reader::FileGroupReader;
 use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
@@ -209,7 +210,32 @@ impl Table {
         crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
             &self.hudi_configs,
         ));
-        Ok(())
+        // Boxed so the file slice listing's future does not deepen every write
+        // future's layout past the compiler's query depth limit.
+        Box::pin(self.refuse_write_to_bootstrap_skeletons()).await
+    }
+
+    /// Refuse a write to a table that still holds a METADATA_ONLY bootstrap skeleton.
+    ///
+    /// Rewriting a skeleton's file group would carry its NULL data columns into a real
+    /// base file, and the write's own listings do not refuse, so this runs before any
+    /// instant is fenced. Only a table with `hoodie.bootstrap.base.path` set can hold
+    /// a skeleton, so no other table pays for the listing.
+    async fn refuse_write_to_bootstrap_skeletons(&mut self) -> Result<()> {
+        if self.hudi_configs.get_raw(BOOTSTRAP_BASE_PATH).is_none() {
+            return Ok(());
+        }
+        self.timeline.reload_completed_commits().await?;
+        self.clear_read_caches();
+        let Some(latest) = self
+            .timeline
+            .get_latest_commit_timestamp_as_option()
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let file_slices = self.get_file_slices_inner(&latest, &[], false).await?;
+        refuse_bootstrap_skeletons(&file_slices)
     }
 
     /// Get or initialize the cached `FileStatsEstimator` for this **data table**.
@@ -376,6 +402,9 @@ impl Table {
     /// # Errors
     ///
     /// Fails, among other cases, when `batches` is empty or does not match the table schema.
+    ///
+    /// Returns [`CoreError::Unsupported`] while the table still holds a METADATA_ONLY bootstrap
+    /// skeleton.
     pub async fn overwrite(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
@@ -391,6 +420,9 @@ impl Table {
     ///
     /// Fails, among other cases, with [`CoreError::Unsupported`] on an unpartitioned table, and
     /// when `batches` is empty or does not match the table schema.
+    ///
+    /// Returns [`CoreError::Unsupported`] while the table still holds a METADATA_ONLY bootstrap
+    /// skeleton.
     pub async fn dynamic_partition_overwrite(
         &mut self,
         batches: impl IntoIterator<Item = RecordBatch>,
@@ -441,7 +473,7 @@ impl Table {
     /// # Errors
     ///
     /// Returns [`CoreError::Unsupported`] on a copy-on-write table, which has no log files to
-    /// compact.
+    /// compact, and while the table still holds a METADATA_ONLY bootstrap skeleton.
     pub async fn compact(&mut self) -> Result<CompactionResult> {
         crate::write::compact_table(self).await
     }
@@ -676,7 +708,20 @@ impl Table {
     /// To bucket the result for parallel reads, use
     /// [`crate::util::collection::split_into_chunks`] or your engine's preferred
     /// partitioning policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] when the read reaches a file slice whose base file is
+    /// still a METADATA_ONLY bootstrap skeleton.
     pub async fn get_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
+        let file_slices = self.plan_file_slices(options).await?;
+        refuse_bootstrap_skeletons(&file_slices)?;
+        Ok(file_slices)
+    }
+
+    /// [`Self::get_file_slices`] without the bootstrap skeleton refusal, for write
+    /// planning: a write refuses a bootstrapped table before it fences an instant.
+    pub(crate) async fn plan_file_slices(&self, options: &ReadOptions) -> Result<Vec<FileSlice>> {
         let prepared = self.prepare_reader_options(options)?;
         let base_file_only = self.is_base_file_only(&prepared)?;
         match prepared.query_type()? {
@@ -1333,6 +1378,11 @@ impl Table {
     /// only), and a row-level mask on every returned batch — see [`ReadOptions::filters`]
     /// for the full breakdown. `options.hudi_options` override table-level Hudi configs
     /// for this single read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] when the read reaches a file slice whose base file is
+    /// still a METADATA_ONLY bootstrap skeleton.
     pub async fn read(&self, options: &ReadOptions) -> Result<Vec<RecordBatch>> {
         let prepared = self.prepare_reader_options(options)?;
         match prepared.query_type()? {
@@ -1349,6 +1399,7 @@ impl Table {
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
+        refuse_bootstrap_skeletons(&file_slices)?;
         // The table's current schema, not the base file's: a base file written
         // before a column was widened or added would otherwise force the newer
         // records back into its own narrower shape.
@@ -1368,6 +1419,7 @@ impl Table {
         let file_slices = self
             .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
             .await?;
+        refuse_bootstrap_skeletons(&file_slices)?;
 
         // The table's current schema, not the base file's: a base file written
         // before a column was widened or added would otherwise force the newer
@@ -1459,6 +1511,11 @@ impl Table {
     /// For MOR file slices with log files, file group reader version 2 streams the
     /// merge; version 1 collects it and yields the slice as a single batch.
     ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::Unsupported`] when the read reaches a file slice whose base file is
+    /// still a METADATA_ONLY bootstrap skeleton.
+    ///
     /// # Example
     /// ```ignore
     /// use futures::StreamExt;
@@ -1499,6 +1556,7 @@ impl Table {
         let file_slices = self
             .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
             .await?;
+        refuse_bootstrap_skeletons(&file_slices)?;
 
         if file_slices.is_empty() {
             return Ok(Box::pin(stream::empty()));
@@ -1700,6 +1758,28 @@ fn parse_write_filter(filter: &str) -> Result<Filter> {
     }
     Err(CoreError::Write(format!(
         "write filter must be a single comparison such as `id = 'a'`, got '{filter}'"
+    )))
+}
+
+/// Java `HoodieTableConfig.BOOTSTRAP_BASE_PATH`, set on a bootstrapped table.
+const BOOTSTRAP_BASE_PATH: &str = "hoodie.bootstrap.base.path";
+
+/// Refuse file slices that include a METADATA_ONLY bootstrap skeleton, whose data
+/// columns this crate does not merge in from the bootstrap source.
+fn refuse_bootstrap_skeletons(file_slices: &[FileSlice]) -> Result<()> {
+    let Some(skeleton) = file_slices.iter().find(|fs| {
+        fs.base_file
+            .as_ref()
+            .is_some_and(BaseFile::is_metadata_bootstrap_skeleton)
+    }) else {
+        return Ok(());
+    };
+    Err(CoreError::Unsupported(format!(
+        "METADATA_ONLY bootstrap skeleton file slices are not yet supported: file group '{}' in \
+         partition '{}' still has its bootstrap base file, whose data columns are under \
+         {BOOTSTRAP_BASE_PATH}",
+        skeleton.file_id(),
+        skeleton.partition_path
     )))
 }
 

@@ -81,14 +81,16 @@ const NULL_TOKEN: &str = "<null>";
 ///
 /// Lance fixtures have no Spark snapshot; `table_hfile_log_block` was dumped
 /// against a reader with no HFile support, so what it should assert is still an
-/// open question. Asserted rather than printed so a fixture cannot quietly stop
-/// being compared.
+/// open question; `v9_metadata_only_bootstrap` is refused rather than read.
+/// Asserted rather than printed so a fixture cannot quietly stop being compared.
 const EXPECTED_WITHOUT_GOLD: &[&str] = &[
     "table_hfile_log_block [MorAvro]",
     "v9_lance_nonhivestyle [MorAvro]",
     "v9_lance_nonpartitioned [Cow]",
     "v9_lance_txns_nonpart [Cow]",
     "v9_lance_txns_simple [Cow]",
+    "v9_metadata_only_bootstrap [Cow]",
+    "v9_metadata_only_bootstrap [MorAvro]",
     "v9_trips_lance [Cow]",
     "v9_trips_lance [MorAvro]",
 ];

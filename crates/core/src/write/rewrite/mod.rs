@@ -737,7 +737,7 @@ async fn replaced_groups_from_listing(
     Vec<crate::file_group::file_slice::FileSlice>,
     Vec<String>,
 )> {
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let slices = table.plan_file_slices(&ReadOptions::new()).await?;
     let mut file_ids = Vec::new();
     let mut old_paths = Vec::new();
     // Log-only MOR slices have no base path but must still be excluded by
@@ -846,7 +846,7 @@ where
     F: Fn(&crate::file_group::file_slice::FileSlice) -> bool,
     O: FnMut(&crate::file_group::file_slice::FileSlice) -> GroupOp,
 {
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let slices = table.plan_file_slices(&ReadOptions::new()).await?;
     let mut plans = Vec::new();
     for slice in slices {
         if !include(&slice) {

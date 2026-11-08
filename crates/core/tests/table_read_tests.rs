@@ -1700,6 +1700,130 @@ mod v9_tables {
             Ok(())
         }
     }
+
+    /// A METADATA_ONLY bootstrap leaves the data columns in the source dataset,
+    /// which this crate does not read, so every read reaching a slice whose base
+    /// file is still a bootstrap skeleton is refused. A file group rewritten into
+    /// a new base file since the bootstrap holds ordinary data and stays
+    /// readable; one with only a log file over its skeleton does not.
+    mod metadata_only_bootstrap {
+        use super::*;
+        use arrow_array::Array;
+        use arrow_array::cast::AsArray;
+        use arrow_array::types::Int64Type;
+        use futures::TryStreamExt;
+        use hudi_core::timeline::EARLIEST_START_TIMESTAMP;
+
+        type Row = (Option<String>, Option<i64>);
+
+        fn rows(batches: &[RecordBatch]) -> Vec<Row> {
+            let mut rows: Vec<Row> = batches
+                .iter()
+                .flat_map(|b| {
+                    let ids = b.column_by_name("id").unwrap().as_string::<i32>();
+                    let vs = b.column_by_name("v").unwrap().as_primitive::<Int64Type>();
+                    (0..b.num_rows())
+                        .map(|i| {
+                            (
+                                ids.is_valid(i).then(|| ids.value(i).to_string()),
+                                vs.is_valid(i).then(|| vs.value(i)),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            rows.sort();
+            rows
+        }
+
+        fn assert_refused(result: Result<Vec<RecordBatch>>, read: &str, format: TableFormat) {
+            match result {
+                Err(CoreError::Unsupported(msg)) => assert!(
+                    msg.contains("bootstrap skeleton"),
+                    "{read} on {format:?}: the error must say why: {msg}"
+                ),
+                Err(e) => panic!("{read} on {format:?}: expected Unsupported, got {e:?}"),
+                Ok(batches) => panic!(
+                    "{read} on {format:?} must be refused, but returned {:?}",
+                    rows(&batches)
+                ),
+            }
+        }
+
+        #[tokio::test]
+        async fn skeleton_slices_are_refused_and_rewritten_ones_read() {
+            let fixture = SampleTable::V9MetadataOnlyBootstrap;
+            for &format in fixture.available_formats() {
+                let table = Table::new(&fixture.path(format)).await.unwrap();
+                let commits = &table.get_timeline().completed_commits;
+                assert_eq!(commits[0].timestamp, "00000000000001");
+                let bootstrapped = commits[0].completion_timestamp.clone().unwrap();
+                let us = || {
+                    ReadOptions::new()
+                        .with_filters([("region", "=", "us")])
+                        .unwrap()
+                };
+                let incremental_after_bootstrap = || {
+                    ReadOptions::new()
+                        .with_query_type(QueryType::Incremental)
+                        .with_start_timestamp(&bootstrapped)
+                };
+
+                assert_refused(table.read(&ReadOptions::new()).await, "snapshot", format);
+                let stream = match table.read_stream(&ReadOptions::new()).await {
+                    Ok(stream) => stream.try_collect::<Vec<_>>().await,
+                    Err(e) => Err(e),
+                };
+                assert_refused(stream, "streaming snapshot", format);
+                assert_refused(
+                    table
+                        .get_file_slices(&ReadOptions::new())
+                        .await
+                        .map(|_| Vec::new()),
+                    "get_file_slices",
+                    format,
+                );
+                assert_refused(
+                    table
+                        .read(&ReadOptions::new().with_as_of_timestamp(&bootstrapped))
+                        .await,
+                    "time travel",
+                    format,
+                );
+                assert_refused(
+                    table
+                        .read(
+                            &ReadOptions::new()
+                                .with_query_type(QueryType::Incremental)
+                                .with_start_timestamp(EARLIEST_START_TIMESTAMP),
+                        )
+                        .await,
+                    "incremental over the bootstrap",
+                    format,
+                );
+
+                let rewritten = vec![(Some("a".to_string()), Some(10))];
+                match format {
+                    TableFormat::Cow => {
+                        assert_eq!(rows(&table.read(&us()).await.unwrap()), rewritten);
+                        assert_eq!(
+                            rows(&table.read(&incremental_after_bootstrap()).await.unwrap()),
+                            rewritten
+                        );
+                        assert_eq!(table.get_file_slices(&us()).await.unwrap().len(), 1);
+                    }
+                    _ => {
+                        assert_refused(table.read(&us()).await, "log over a skeleton", format);
+                        assert_refused(
+                            table.read(&incremental_after_bootstrap()).await,
+                            "incremental log over a skeleton",
+                            format,
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Test module for streaming read APIs.

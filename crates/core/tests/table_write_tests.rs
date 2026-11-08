@@ -4750,3 +4750,57 @@ async fn test_commit_seqno_uses_java_form() {
         ]
     );
 }
+
+/// A write to a table that still holds a METADATA_ONLY bootstrap skeleton is
+/// refused before it fences an instant, so it leaves nothing pending behind.
+#[tokio::test]
+async fn writes_to_a_metadata_only_bootstrap_skeleton_are_refused_before_fencing() {
+    use hudi_test::{SampleTable, TableFormat};
+
+    let assert_refused = |err: CoreError, write: &str, format: TableFormat| match err {
+        CoreError::Unsupported(msg) => assert!(
+            msg.contains("bootstrap skeleton"),
+            "{write} on {format:?}: the error must say why: {msg}"
+        ),
+        e => panic!("{write} on {format:?}: expected Unsupported, got {e:?}"),
+    };
+    let fixture = SampleTable::V9MetadataOnlyBootstrap;
+    for &format in fixture.available_formats() {
+        let path = fixture.path_fresh(format);
+        let timeline = std::path::Path::new(&path).join(".hoodie/timeline");
+        let instants = || {
+            let mut names: Vec<String> = std::fs::read_dir(&timeline)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = instants();
+
+        let mut table = Table::new(&path).await.unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("v", DataType::Int64, true),
+            Field::new("region", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["b"])),
+                Arc::new(Int64Array::from(vec![20])),
+                Arc::new(StringArray::from(vec!["eu"])),
+            ],
+        )
+        .unwrap();
+        assert_refused(table.upsert([batch]).await.unwrap_err(), "upsert", format);
+        if format == TableFormat::MorAvro {
+            assert_refused(table.compact().await.unwrap_err(), "compaction", format);
+        }
+        assert_eq!(
+            instants(),
+            before,
+            "a refused write on {format:?} must not leave an instant behind"
+        );
+    }
+}

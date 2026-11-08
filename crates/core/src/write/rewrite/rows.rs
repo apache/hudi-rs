@@ -82,7 +82,7 @@ pub(super) async fn data_for_filter_matches(
     table: &Table,
     filter: &Filter,
 ) -> Result<Option<(RecordBatch, Vec<String>, Vec<Option<String>>, Vec<String>)>> {
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let slices = table.plan_file_slices(&ReadOptions::new()).await?;
     let reader = table
         .create_file_group_reader_with_options(
             Some(&ReadOptions::new()),

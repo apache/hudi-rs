@@ -295,7 +295,7 @@ async fn request_compaction(table: &mut Table) -> Result<Option<(String, Vec<Fil
     table.timeline.reload_completed_commits().await?;
     table.clear_read_caches();
     let mut slices: Vec<FileSlice> = table
-        .get_file_slices(&ReadOptions::new())
+        .plan_file_slices(&ReadOptions::new())
         .await?
         .into_iter()
         .filter(FileSlice::has_log_file)

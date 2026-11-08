@@ -49,7 +49,7 @@ async fn mor_key_locations(
     table: &Table,
     keys: &[HoodieKey],
 ) -> Result<HashMap<HoodieKey, MorFileLocation>> {
-    let slices = table.get_file_slices(&ReadOptions::new()).await?;
+    let slices = table.plan_file_slices(&ReadOptions::new()).await?;
     let mut slices_by_file_id = HashMap::with_capacity(slices.len());
     for slice in slices {
         slices_by_file_id.insert(
@@ -134,7 +134,7 @@ pub(super) async fn mor_upsert_batches(
     let mut moved_candidates: HashMap<String, Vec<String>> = HashMap::new();
     let mut mor_slice_by_file_id: HashMap<String, crate::file_group::file_slice::FileSlice> =
         HashMap::new();
-    for slice in table.get_file_slices(&ReadOptions::new()).await? {
+    for slice in table.plan_file_slices(&ReadOptions::new()).await? {
         mor_slice_by_file_id.insert(slice.file_id().to_string(), slice);
     }
     for (index, key) in incoming_keys.iter().enumerate() {
