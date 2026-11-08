@@ -51,6 +51,9 @@ pub enum Action {
     ///
     /// [`DEFAULT_LOADING_ACTIONS`]: crate::timeline::DEFAULT_LOADING_ACTIONS
     Compaction,
+    /// A clean, which deletes file slices older than its earliest commit to
+    /// retain. Not a commit, so it is loaded only by a caller that names it.
+    Clean,
 }
 
 impl FromStr for Action {
@@ -64,6 +67,7 @@ impl FromStr for Action {
             "rollback" => Ok(Action::Rollback),
             "restore" => Ok(Action::Restore),
             "compaction" => Ok(Action::Compaction),
+            "clean" => Ok(Action::Clean),
             _ => Err(CoreError::Timeline(format!("Invalid action: {s}"))),
         }
     }
@@ -78,6 +82,7 @@ impl AsRef<str> for Action {
             Action::Rollback => "rollback",
             Action::Restore => "restore",
             Action::Compaction => "compaction",
+            Action::Clean => "clean",
         }
     }
 }
@@ -764,6 +769,7 @@ mod tests {
             Action::Rollback,
             Action::Restore,
             Action::Compaction,
+            Action::Clean,
         ] {
             let suffix = action.as_ref();
             assert_eq!(

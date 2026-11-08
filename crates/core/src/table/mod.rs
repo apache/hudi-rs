@@ -684,7 +684,7 @@ impl Table {
                 let Some(timestamp) = prepared.end_timestamp() else {
                     return Ok(Vec::new());
                 };
-                self.get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
+                self.get_snapshot_file_slices(&prepared, timestamp, base_file_only)
                     .await
             }
             QueryType::Incremental => {
@@ -697,6 +697,24 @@ impl Table {
                     .await
             }
         }
+    }
+
+    /// The file slices a snapshot read at `timestamp` plans, after refusing an
+    /// explicit `as_of_timestamp` the cleaner has cleaned (see
+    /// [`Timeline::validate_timestamp_as_of`]). A read with no `as_of_timestamp`
+    /// targets the latest commit, which a clean always retains, so it skips the
+    /// extra timeline listing.
+    async fn get_snapshot_file_slices(
+        &self,
+        prepared: &ReadOptions,
+        timestamp: &str,
+        base_file_only: bool,
+    ) -> Result<Vec<FileSlice>> {
+        if prepared.as_of_timestamp().is_some() {
+            self.timeline.validate_timestamp_as_of(timestamp).await?;
+        }
+        self.get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
+            .await
     }
 
     async fn get_file_slices_inner(
@@ -1347,7 +1365,7 @@ impl Table {
         };
         let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
+            .get_snapshot_file_slices(prepared, timestamp, base_file_only)
             .await?;
         // The table's current schema, not the base file's: a base file written
         // before a column was widened or added would otherwise force the newer
@@ -1497,7 +1515,7 @@ impl Table {
 
         let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_inner(timestamp, &prepared.filters, base_file_only)
+            .get_snapshot_file_slices(prepared, timestamp, base_file_only)
             .await?;
 
         if file_slices.is_empty() {

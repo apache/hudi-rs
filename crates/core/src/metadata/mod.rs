@@ -16,6 +16,7 @@
  * specific language governing permissions and limitations
  * under the License.
  */
+pub mod clean;
 pub mod commit;
 pub mod compaction;
 pub mod merger;

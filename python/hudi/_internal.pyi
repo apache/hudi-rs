@@ -125,6 +125,9 @@ class HudiReadOptions:
         milliseconds, microseconds or nanoseconds, and RFC 3339 (``2024-03-15T14:25:30Z``).
         Epoch and RFC 3339 values are converted to the table's timeline timezone
         (``hoodie.table.timeline.timezone``).
+
+        A read fails when the timestamp is older than the latest clean allows, since the
+        cleaner may have deleted files the snapshot needs.
         """
         ...
     def with_start_timestamp(self, timestamp: str) -> "HudiReadOptions":
