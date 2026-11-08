@@ -150,6 +150,11 @@ because everything below the row mask (which base file, which log blocks) is a
 requested-time decision. Translating twice selects nothing; that is the bug the
 single translation point exists to prevent.
 
+It also carries the end bound as given, which limits the commits that count as
+completed when the window's file slices are planned: a commit requested before the
+re-expressed end can complete after the window. That is not a second translation,
+because it reads the caller's bound, not the re-expressed requested-time one.
+
 ## Cloud storage & config
 
 Storage backends route by URI scheme (`file://`, `s3://`, `az://`, `gs://`) through

@@ -28,8 +28,8 @@ use arrow_schema::{DataType, Field, Schema};
 use hudi_core::config::table::TableTypeValue;
 use hudi_core::metadata::commit::HoodieCommitMetadata;
 use hudi_core::metadata::replace_commit::HoodieRequestedReplaceMetadata;
-use hudi_core::table::Table;
 use hudi_core::table::partition::PartitionPruner;
+use hudi_core::table::{QueryType, ReadOptions, Table};
 use tempfile::tempdir;
 
 fn trips_schema() -> Arc<Schema> {
@@ -412,4 +412,193 @@ async fn test_writing_handle_reads_its_own_writes_through_metadata_table() {
     assert_eq!(result.num_inserts, 0);
     let rows = table.read(&options).await.unwrap();
     assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+}
+
+/// The instant one millisecond after `instant`.
+fn instant_after(instant: &str) -> String {
+    const FORMAT: &str = "%Y%m%d%H%M%S%3f";
+    let at = chrono::NaiveDateTime::parse_from_str(instant, FORMAT).unwrap();
+    (at + chrono::TimeDelta::milliseconds(1))
+        .format(FORMAT)
+        .to_string()
+}
+
+/// `(id, value)` of every row `window` reads, sorted by id, through a fresh
+/// handle so it sees the timeline as it is on storage.
+async fn read_window(base_uri: &str, window: &ReadOptions) -> Vec<(String, i64)> {
+    let batches = Table::new(base_uri)
+        .await
+        .unwrap()
+        .read(window)
+        .await
+        .unwrap();
+    let mut rows = Vec::new();
+    for batch in &batches {
+        let ids = batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let values = batch
+            .column_by_name("value")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            rows.push((ids.value(i).to_string(), values.value(i)));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+/// `(partition, file id, instants of its files)` for every slice `window`
+/// plans, through the entry point the DataFusion scan and the Python binding
+/// call.
+async fn plan_window(base_uri: &str, window: &ReadOptions) -> Vec<(String, String, Vec<String>)> {
+    let table = Table::new(base_uri).await.unwrap();
+    let mut planned: Vec<_> = table
+        .get_file_slices(window)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|slice| {
+            let instants = slice
+                .base_file
+                .iter()
+                .map(|base| base.commit_timestamp.clone())
+                .chain(slice.log_files.iter().map(|log| log.timestamp.clone()))
+                .collect();
+            (
+                slice.partition_path.clone(),
+                slice.file_id().to_string(),
+                instants,
+            )
+        })
+        .collect();
+    planned.sort();
+    planned
+}
+
+/// How the commit that completes after the window writes `a`.
+#[derive(Debug)]
+enum LateCommit {
+    /// Updates `a` in place.
+    Upsert,
+    /// Replaces the file group the insert wrote.
+    PartitionOverwrite,
+    /// Compacts `a`'s file group after a delta commit inside the window
+    /// updated it. Guards against leaving out too much: without the late
+    /// compaction, the slice must still carry that delta commit's log.
+    Compaction,
+}
+
+/// A commit requested inside an incremental window but completed after its end
+/// is outside the window, so the window's answer is the same before and after
+/// that commit completes. Concurrent writers and table services complete out of
+/// requested order this way.
+///
+/// `x` is requested before `c3` and completes after it. The window ends at
+/// `c3`'s completion, so it admits every commit but `x`: it plans the file
+/// slices it planned while `x` was inflight, and none of `x`'s files.
+#[tokio::test]
+async fn test_incremental_window_ignores_a_commit_completing_after_its_end() {
+    use LateCommit::{Compaction, PartitionOverwrite, Upsert};
+    use TableTypeValue::{CopyOnWrite, MergeOnRead};
+
+    for (table_type, late, x_action, a_in_window) in [
+        (CopyOnWrite, Upsert, "commit", 1),
+        (MergeOnRead, Upsert, "deltacommit", 1),
+        (CopyOnWrite, PartitionOverwrite, "replacecommit", 1),
+        (MergeOnRead, Compaction, "commit", 2),
+    ] {
+        let case = format!("{table_type:?} {late:?}");
+        let dir = tempdir().unwrap();
+        let base_uri = dir.path().to_str().unwrap();
+        let mut table = create_partitioned(dir.path(), table_type).await;
+        let c1 = table
+            .append([batch(vec![("a", "sf", 1), ("b", "la", 1)])])
+            .await
+            .unwrap();
+        let a2 = || batch(vec![("a", "sf", 2)]);
+        let (x_requested, x_completion) = match late {
+            Upsert => {
+                let x = table.upsert([a2()]).await.unwrap();
+                (x.requested_time, x.completion_time)
+            }
+            PartitionOverwrite => {
+                let x = table.dynamic_partition_overwrite([a2()]).await.unwrap();
+                (x.requested_time, x.completion_time)
+            }
+            Compaction => {
+                table.upsert([a2()]).await.unwrap();
+                let x = table.compact().await.unwrap();
+                (x.requested_time, x.completion_time)
+            }
+        };
+        let c3 = table.upsert([batch(vec![("b", "la", 2)])]).await.unwrap();
+        let x_requested = x_requested.unwrap();
+
+        let end = c3.completion_time.unwrap();
+        let window = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(c1.requested_time.unwrap())
+            .with_end_timestamp(&end);
+        // Opens after `x` is requested, so it admits `c3` alone: a guard that
+        // the start bound keeps `x`'s file group out of the plan.
+        let opened_after_x = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp(instant_after(&x_requested))
+            .with_end_timestamp(&end);
+        let expected = [
+            (
+                &window,
+                vec![("a".to_string(), a_in_window), ("b".to_string(), 2)],
+            ),
+            (&opened_after_x, vec![("b".to_string(), 2)]),
+        ];
+
+        let timeline = dir.path().join(".hoodie/timeline");
+        let x_completed = timeline.join(format!(
+            "{x_requested}_{}.{x_action}",
+            x_completion.unwrap()
+        ));
+        let x_metadata = std::fs::read(&x_completed).unwrap();
+
+        std::fs::remove_file(&x_completed).unwrap();
+        let planned_while_inflight = plan_window(base_uri, &window).await;
+        for (options, rows) in &expected {
+            assert_eq!(
+                read_window(base_uri, options).await,
+                *rows,
+                "{case}, x inflight"
+            );
+        }
+
+        std::fs::write(
+            timeline.join(format!("{x_requested}_{}.{x_action}", instant_after(&end))),
+            x_metadata,
+        )
+        .unwrap();
+        let planned = plan_window(base_uri, &window).await;
+        assert!(
+            planned
+                .iter()
+                .all(|(_, _, instants)| !instants.contains(&x_requested)),
+            "{case}, x completed after the window: planned x's files {planned:?}"
+        );
+        assert_eq!(
+            planned, planned_while_inflight,
+            "{case}, x completed after the window: planned slices"
+        );
+        for (options, rows) in &expected {
+            assert_eq!(
+                read_window(base_uri, options).await,
+                *rows,
+                "{case}, x completed after the window"
+            );
+        }
+    }
 }

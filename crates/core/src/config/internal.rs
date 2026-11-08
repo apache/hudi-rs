@@ -76,6 +76,16 @@ pub enum HudiInternalConfig {
     /// layout v1 needs — it records no completion times, so its window already
     /// bounds requested times.
     IncrementalInstantTimes,
+    /// The end of an incremental read's window as the caller gave it: a
+    /// completion time on layout v2, a requested time on layout v1.
+    ///
+    /// Set by [`Table::read`](crate::table::Table::read) on the incremental path
+    /// next to [`Self::IncrementalInstantTimes`], and consumed by its file-slice
+    /// planning, which takes each slice from the table as it stood at this
+    /// point. The start and end timestamps cannot stand in for it: they are
+    /// re-expressed over requested times by then, and a commit requested
+    /// before that end can still have completed after the window.
+    IncrementalWindowEnd,
 }
 
 impl AsRef<str> for HudiInternalConfig {
@@ -84,6 +94,7 @@ impl AsRef<str> for HudiInternalConfig {
             Self::SkipConfigValidation => "hoodie.internal.skip.config.validation",
             Self::TimelineArchivedReadEnabled => "hoodie.internal.timeline.archived.enabled",
             Self::IncrementalInstantTimes => "hoodie.internal.read.incremental.instant.times",
+            Self::IncrementalWindowEnd => "hoodie.internal.read.incremental.window.end",
         }
     }
 }
@@ -105,6 +116,7 @@ impl ConfigParser for HudiInternalConfig {
             // different code path rather than an empty list (an empty list would
             // correctly admit nothing).
             Self::IncrementalInstantTimes => None,
+            Self::IncrementalWindowEnd => None,
         }
     }
 
@@ -125,7 +137,7 @@ impl ConfigParser for HudiInternalConfig {
                     bool::from_str(v).map_err(|e| ParseBool(self.key(), v.to_string(), e))
                 })
                 .map(HudiConfigValue::Boolean),
-            Self::IncrementalInstantTimes => {
+            Self::IncrementalInstantTimes | Self::IncrementalWindowEnd => {
                 get_result.map(|v| HudiConfigValue::String(v.to_string()))
             }
         }
