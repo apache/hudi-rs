@@ -430,6 +430,69 @@ mod tests {
     }
 
     #[test]
+    fn test_hoodie_partition_path_whole_path_pruning() {
+        // A timestamp key generator rewrites a source-column predicate into a predicate on
+        // the opaque whole-path meta field, so the pruner holds a single-field schema and
+        // must compare the path as one string rather than split it into segments.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        assert!(!pruner.is_empty());
+        assert!(pruner.should_include("ts_str=2023/04/01/12"));
+        assert!(!pruner.should_include("ts_str=2023/05/01/08"));
+    }
+
+    #[test]
+    fn test_hoodie_partition_path_whole_path_pruning_url_encoded() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "true"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        // The encoded path decodes to `ts_str=2023/04/01/12` before comparison.
+        assert!(pruner.should_include("ts_str%3D2023%2F04%2F01%2F12"));
+        assert!(!pruner.should_include("ts_str%3D2023%2F05%2F01%2F08"));
+    }
+
+    #[test]
     fn test_partition_pruner_parse_segments() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
