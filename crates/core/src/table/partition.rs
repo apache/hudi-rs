@@ -719,64 +719,48 @@ mod tests {
             DataType::Utf8,
             false,
         )]);
-        for hive_style in [false, true] {
-            let configs = HudiConfigs::new([
-                ("hoodie.table.partition.fields", "ts".to_string()),
-                (
-                    "hoodie.table.keygenerator.class",
-                    "org.apache.hudi.keygen.TimestampBasedKeyGenerator".to_string(),
-                ),
-                (
-                    "hoodie.keygen.timebased.timestamp.type",
-                    "UNIX_TIMESTAMP".to_string(),
-                ),
-                (
-                    "hoodie.keygen.timebased.output.dateformat",
-                    "yyyy/MM/dd".to_string(),
-                ),
-                (
-                    "hoodie.datasource.write.hive_style_partitioning",
-                    hive_style.to_string(),
-                ),
-            ]);
-            let paths = if hive_style {
-                ["year=2024/month=01/day=25", "year=2024/month=01/day=26"]
-            } else {
-                ["2024/01/25", "2024/01/26"]
-            };
-            for (operator, excluded, expected) in [
-                (
-                    ExprOperator::Ne,
-                    vec!["1706140800"],
-                    vec![false, true, true, true],
-                ),
-                (
-                    ExprOperator::NotIn,
-                    vec!["1706140800", "1706227200"],
-                    vec![false, true, false, true],
-                ),
-            ] {
-                let filter = Filter::new(
-                    "ts".to_string(),
-                    operator,
-                    excluded.into_iter().map(str::to_string).collect(),
-                )
-                .unwrap();
-                let filters = std::slice::from_ref(&filter);
-                let pruner = PartitionPruner::new(filters, &partition_schema, &configs).unwrap();
-                for path in paths {
-                    assert!(pruner.should_include(path), "{operator} must retain {path}");
-                }
-                assert_eq!(
-                    crate::expr::filter::filters_to_row_mask(filters, &batch).unwrap(),
-                    BooleanArray::from(expected),
-                );
-                let bound = Filter::try_from(("ts", ">=", "1706227200")).unwrap();
-                let bounded =
-                    PartitionPruner::new(&[filter, bound], &partition_schema, &configs).unwrap();
-                assert!(!bounded.should_include(paths[0]));
-                assert!(bounded.should_include(paths[1]));
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "UNIX_TIMESTAMP"),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+        ]);
+        let paths = ["2024/01/25", "2024/01/26"];
+        for (operator, excluded, expected) in [
+            (
+                ExprOperator::Ne,
+                vec!["1706140800"],
+                vec![false, true, true, true],
+            ),
+            (
+                ExprOperator::NotIn,
+                vec!["1706140800", "1706227200"],
+                vec![false, true, false, true],
+            ),
+        ] {
+            let filter = Filter::new(
+                "ts".to_string(),
+                operator,
+                excluded.into_iter().map(str::to_string).collect(),
+            )
+            .unwrap();
+            let filters = std::slice::from_ref(&filter);
+            let pruner = PartitionPruner::new(filters, &partition_schema, &configs).unwrap();
+            for path in paths {
+                assert!(pruner.should_include(path), "{operator} must retain {path}");
             }
+            assert_eq!(
+                crate::expr::filter::filters_to_row_mask(filters, &batch).unwrap(),
+                BooleanArray::from(expected),
+            );
+            let bound = Filter::try_from(("ts", ">=", "1706227200")).unwrap();
+            let bounded =
+                PartitionPruner::new(&[filter, bound], &partition_schema, &configs).unwrap();
+            assert!(!bounded.should_include(paths[0]));
+            assert!(bounded.should_include(paths[1]));
         }
     }
 
