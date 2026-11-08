@@ -57,7 +57,7 @@ It reports per query and exits non-zero if any of them differ.
 
 | Variable  | Values                                            | Default      |
 |-----------|---------------------------------------------------|--------------|
-| `ENGINE`  | `datafusion`, `spark`                             | `datafusion` |
+| `ENGINE`  | `datafusion`, `spark`, `duckdb`                   | `datafusion` |
 | `SF`      | TPC-H scale factor                                | `0.001`      |
 | `QUERIES` | Comma-separated query numbers                     | all 22       |
 | `ENGINES` | Comma-separated engine names (for `tpch-compare`) |              |
@@ -116,6 +116,50 @@ Credentials come from the environment for both engines: DataFusion reads the
 instance role or service account neither engine needs any variable set. For S3
 outside `us-east-1`, set `AWS_REGION` (`object_store` defaults to `us-east-1`
 when the region is neither configured nor derivable from the URL).
+
+### DuckDB
+
+The DuckDB leg reads the Hudi tables through the
+[hudi community extension](https://github.com/alitrack/duckdb-hudi)
+(`read_hudi`) and the parquet through `read_parquet`, with the same query text
+for both. It needs a Python interpreter with the `duckdb` package; community
+extensions are built for current DuckDB releases, not for older patch releases,
+so install the latest one. The DuckDB leg reads local paths and `s3://` URLs.
+On S3 the two formats resolve credentials separately: `read_parquet` through
+DuckDB's `credential_chain` secret and `read_hudi` through hudi-rs's
+`object_store` environment lookup, so set `AWS_REGION` for the DuckDB leg too
+when the bucket is outside `us-east-1`.
+
+```bash
+pip install duckdb
+benchmark/tpch/run.sh validate-duckdb --scale-factor 1
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --output-dir benchmark/tpch/results
+```
+
+Set `DUCKDB_PYTHON` to use an interpreter other than `python3`. Each query runs
+in its own process, so one that crashes the process is reported as failed and
+the rest still run. `bench-duckdb` leaves DuckDB's `threads` and `memory_limit`
+at DuckDB's own defaults unless `--threads` or `--memory-limit` is passed, runs
+each query once cold and then 5 times (`--warmup 1 --iterations 5`), and records
+the cold time next to the median of the 5. Cold here is the first run in a fresh
+DuckDB process; the DataFusion leg records the first run of each query inside one
+session, and the Spark leg records none. `environment.txt` records the
+`duckdb` package version, the threads and memory limit in effect, the extension
+build and the hudi-core release it embeds.
+
+To measure a local build of the extension against the published one, pass its
+path and a label; the label keeps the two result files apart for `compare`:
+
+```bash
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --format parquet \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --format hudi --label community \
+  --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --format hudi --label dev \
+  --extension /path/to/hudi.duckdb_extension --output-dir benchmark/tpch/results
+benchmark/tpch/run.sh compare --scale-factor 1 \
+  --runs duckdb-community_hudi_sf1,duckdb-dev_hudi_sf1,duckdb_parquet_sf1
+```
 
 The two sections below cover running on a cloud VM, one per provider; they are
 alternatives, so follow whichever matches your setup.
@@ -267,7 +311,8 @@ benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
 `compare` reads them from there, so omitting it leaves nothing to compare once
 the runs have finished. To check credentials, region and the S3 path before
 committing hours to a full run, benchmark a couple of queries first with
-`--queries 1,6`.
+`--queries 1,6`. `compare` charts the median of each query's measured runs, with
+the cold time beside it when the run recorded one.
 
 Alongside the results the `bench-*` commands write an environment report, which
 `compare` prints under the chart so a copied result carries the hardware, build

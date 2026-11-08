@@ -194,7 +194,7 @@ enum Commands {
         #[arg(long)]
         memory_limit: Option<String>,
     },
-    /// Parse Spark benchmark JSON output into a timing table
+    /// Parse Spark or DuckDB benchmark JSON output into a timing table
     ParseSparkOutput {
         /// Input file (reads from stdin if omitted)
         #[arg(long)]
@@ -601,6 +601,7 @@ async fn bench_source(
                 results.push(QueryResult {
                     query_num: *query_num,
                     timings_ms: vec![],
+                    cold_ms: None,
                     last_batches: vec![],
                     error: Some(e),
                 });
@@ -609,6 +610,7 @@ async fn bench_source(
         };
 
         let mut timings_ms: Vec<f64> = Vec::with_capacity(iterations);
+        let mut cold_ms = None;
         let mut last_batches: Vec<RecordBatch> = Vec::new();
         let mut error = None;
 
@@ -675,6 +677,8 @@ async fn bench_source(
 
             if i >= warmup {
                 timings_ms.push(elapsed);
+            } else if i == 0 {
+                cold_ms = Some(elapsed);
             }
             if i == total_runs - 1 {
                 last_batches = iter_batches;
@@ -684,6 +688,7 @@ async fn bench_source(
         results.push(QueryResult {
             query_num: *query_num,
             timings_ms,
+            cold_ms,
             last_batches,
             error,
         });
@@ -695,6 +700,8 @@ async fn bench_source(
 struct QueryResult {
     query_num: usize,
     timings_ms: Vec<f64>,
+    /// The first, unmeasured run of the query, when there was a warmup.
+    cold_ms: Option<f64>,
     last_batches: Vec<RecordBatch>,
     error: Option<String>,
 }
@@ -735,6 +742,8 @@ struct PersistedQueryStats {
     min_ms: f64,
     median_ms: f64,
     max_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cold_ms: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -783,6 +792,7 @@ fn save_results(
                     min_ms: stats.min,
                     median_ms: stats.median,
                     max_ms: stats.max,
+                    cold_ms: r.cold_ms,
                 },
             );
         }
@@ -951,7 +961,7 @@ fn run_parse_spark_output(
     if results.is_empty() {
         println!("No benchmark data found in input.");
     } else {
-        print_single_table("Spark", &results);
+        print_single_table(display_name.or(engine_label).unwrap_or("Spark"), &results);
         if let Some(dir) = output_dir {
             let engine = engine_label.unwrap_or("spark");
             let fmt = format_label.unwrap_or("hudi");
@@ -962,26 +972,33 @@ fn run_parse_spark_output(
     Ok(())
 }
 
-/// Parse JSON lines from the PySpark bench script.
+/// Parse JSON lines from the PySpark and DuckDB bench scripts.
 ///
-/// Each line is: {"query": N, "elapsed_ms": X.X}
-/// Warmup iterations are already excluded by the Python script.
+/// Each line is: {"query": N, "elapsed_ms": X.X}, plus "warmup": true on an
+/// unmeasured run. The first warmup run of a query is kept as its cold time.
 fn parse_spark_timings(reader: Box<dyn BufRead>) -> Vec<QueryResult> {
-    let mut all_timings: BTreeMap<usize, Vec<f64>> = BTreeMap::new();
+    let mut all_timings: BTreeMap<usize, (Vec<f64>, Option<f64>)> = BTreeMap::new();
 
     for line in reader.lines().map_while(|l| l.ok()) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
             && let (Some(q), Some(ms)) = (v["query"].as_u64(), v["elapsed_ms"].as_f64())
         {
-            all_timings.entry(q as usize).or_default().push(ms);
+            let (timings, cold) = all_timings.entry(q as usize).or_default();
+            if v["warmup"].as_bool() == Some(true) {
+                cold.get_or_insert(ms);
+            } else {
+                timings.push(ms);
+            }
         }
     }
 
     all_timings
         .into_iter()
-        .map(|(q, times)| QueryResult {
+        .filter(|(_, (times, _))| !times.is_empty())
+        .map(|(q, (times, cold_ms))| QueryResult {
             query_num: q,
             timings_ms: times,
+            cold_ms,
             last_batches: vec![],
             error: None,
         })
@@ -1019,10 +1036,11 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Find global max avg_ms for bar scaling
+    // Bars and totals use the median of the measured runs; the cold run, when
+    // recorded, is printed next to it.
     let global_max = loaded
         .iter()
-        .flat_map(|r| r.queries.values().map(|s| s.avg_ms))
+        .flat_map(|r| r.queries.values().map(|s| s.median_ms))
         .fold(0.0_f64, f64::max);
 
     if global_max == 0.0 {
@@ -1035,7 +1053,7 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
     let max_name_len = engine_names.iter().map(|n| n.len()).max().unwrap_or(0);
 
     println!();
-    println!("TPC-H Query Runtime Comparison");
+    println!("TPC-H Query Runtime Comparison (median of measured runs, then the cold run)");
     println!("{}", "=".repeat(max_name_len + 6 + bar_width + 16));
     println!();
 
@@ -1049,14 +1067,15 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
             };
 
             if let Some(stats) = r.queries.get(&q_str) {
-                let filled = ((stats.avg_ms / global_max) * bar_width as f64).round() as usize;
+                let filled = ((stats.median_ms / global_max) * bar_width as f64).round() as usize;
                 let filled = filled.min(bar_width);
                 let empty = bar_width - filled;
                 println!(
-                    "{label} |{}{} | {:>9.1} ms",
+                    "{label} |{}{} | {:>9.1} ms{}",
                     "\u{2588}".repeat(filled),
                     " ".repeat(empty),
-                    stats.avg_ms,
+                    stats.median_ms,
+                    format_cold(stats.cold_ms),
                 );
             } else {
                 println!("{label} |{} |       N/A", " ".repeat(bar_width),);
@@ -1066,13 +1085,16 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
     }
 
     // Summary: Total and Geometric Mean as bar charts
-    let mut totals: Vec<(String, f64)> = Vec::new();
+    let mut totals: Vec<(String, f64, Option<f64>)> = Vec::new();
     let mut geomeans: Vec<(String, f64)> = Vec::new();
     for r in &loaded {
-        let total: f64 = r.queries.values().map(|s| s.avg_ms).sum();
-        totals.push((r.label().to_string(), total));
+        let total: f64 = r.queries.values().map(|s| s.median_ms).sum();
+        // A cold total only when every query has a cold run, so it adds up the
+        // same queries as the median total.
+        let cold_total: Option<f64> = r.queries.values().map(|s| s.cold_ms).sum();
+        totals.push((r.label().to_string(), total, cold_total));
 
-        let values: Vec<f64> = r.queries.values().map(|s| s.avg_ms).collect();
+        let values: Vec<f64> = r.queries.values().map(|s| s.median_ms).collect();
         if !values.is_empty() && values.iter().all(|v| *v > 0.0) {
             let log_sum: f64 = values.iter().map(|v| v.ln()).sum::<f64>();
             let geomean = (log_sum / values.len() as f64).exp();
@@ -1085,9 +1107,9 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
     println!();
 
     // Total runtime bars
-    let total_max = totals.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+    let total_max = totals.iter().map(|(_, v, _)| *v).fold(0.0_f64, f64::max);
     if total_max > 0.0 {
-        for (i, (engine, total)) in totals.iter().enumerate() {
+        for (i, (engine, total, cold_total)) in totals.iter().enumerate() {
             let label = if i == 0 {
                 format!("Tot  {engine:<max_name_len$}")
             } else {
@@ -1097,10 +1119,11 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
             let filled = filled.min(bar_width);
             let empty = bar_width - filled;
             println!(
-                "{label} |{}{} | {:>9.1} ms",
+                "{label} |{}{} | {:>9.1} ms{}",
                 "\u{2588}".repeat(filled),
                 " ".repeat(empty),
                 total,
+                format_cold(*cold_total),
             );
         }
         println!();
@@ -1133,6 +1156,12 @@ fn run_compare(results_dir: &str, runs: &str) -> Result<()> {
     Ok(())
 }
 
+fn format_cold(cold_ms: Option<f64>) -> String {
+    cold_ms
+        .map(|ms| format!("  (cold {ms:.1} ms)"))
+        .unwrap_or_default()
+}
+
 fn print_single_table(label: &str, results: &[QueryResult]) {
     let mut table = Table::new();
     table.set_header(vec![
@@ -1141,6 +1170,7 @@ fn print_single_table(label: &str, results: &[QueryResult]) {
         Cell::new(format!("{label} Median (ms)")),
         Cell::new(format!("{label} Mean (ms)")),
         Cell::new(format!("{label} Max (ms)")),
+        Cell::new(format!("{label} Cold (ms)")),
         Cell::new("Status"),
     ]);
 
@@ -1148,6 +1178,7 @@ fn print_single_table(label: &str, results: &[QueryResult]) {
         if let Some(ref e) = r.error {
             table.add_row(vec![
                 Cell::new(format!("Q{:02}", r.query_num)),
+                Cell::new("-"),
                 Cell::new("-"),
                 Cell::new("-"),
                 Cell::new("-"),
@@ -1161,6 +1192,7 @@ fn print_single_table(label: &str, results: &[QueryResult]) {
                 Cell::new(format!("{:.1}", stats.median)),
                 Cell::new(format!("{:.1}", stats.mean)),
                 Cell::new(format!("{:.1}", stats.max)),
+                Cell::new(r.cold_ms.map_or("-".to_string(), |ms| format!("{ms:.1}"))),
                 Cell::new("OK"),
             ]);
         }
@@ -1332,4 +1364,71 @@ fn batches_to_csv_rows(batches: &[RecordBatch]) -> std::result::Result<Vec<Strin
     }
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn parse(lines: &str) -> Vec<QueryResult> {
+        parse_spark_timings(Box::new(Cursor::new(lines.to_string())))
+    }
+
+    #[test]
+    fn parse_keeps_the_first_warmup_as_cold_and_out_of_the_timings() {
+        let results = parse(concat!(
+            "{\"query\": 1, \"elapsed_ms\": 900.0, \"warmup\": true}\n",
+            "{\"query\": 1, \"elapsed_ms\": 800.0, \"warmup\": true}\n",
+            "{\"query\": 1, \"elapsed_ms\": 10.0}\n",
+            "{\"query\": 1, \"elapsed_ms\": 30.0}\n",
+            "{\"query\": 1, \"elapsed_ms\": 20.0}\n",
+        ));
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].cold_ms, Some(900.0));
+        assert_eq!(results[0].timings_ms, vec![10.0, 30.0, 20.0]);
+        assert_eq!(compute_stats(&results[0].timings_ms).unwrap().median, 20.0);
+    }
+
+    #[test]
+    fn parse_without_warmup_lines_has_no_cold_time() {
+        let results = parse(concat!(
+            "{\"query\": 2, \"elapsed_ms\": 5.0}\n",
+            "{\"query\": 3, \"elapsed_ms\": 7.0, \"warmup\": false}\n",
+            "not json\n",
+        ));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].cold_ms, None);
+        assert_eq!(results[0].timings_ms, vec![5.0]);
+        assert_eq!(results[1].cold_ms, None);
+        assert_eq!(results[1].timings_ms, vec![7.0]);
+    }
+
+    #[test]
+    fn persisted_cold_time_round_trips_and_older_files_still_load() {
+        let dir = std::env::temp_dir().join(format!("tpch-cold-{}", std::process::id()));
+        let dir = dir.to_str().unwrap();
+        let results = parse(concat!(
+            "{\"query\": 1, \"elapsed_ms\": 50.0, \"warmup\": true}\n",
+            "{\"query\": 1, \"elapsed_ms\": 10.0}\n",
+        ));
+        save_results(&results, "duckdb", None, "hudi", 1.0, dir).unwrap();
+        let loaded = load_results(&format!("{dir}/duckdb_hudi_sf1.json")).unwrap();
+        assert_eq!(loaded.queries["1"].cold_ms, Some(50.0));
+        assert_eq!(loaded.queries["1"].median_ms, 10.0);
+        fs::remove_dir_all(dir).unwrap();
+
+        let old: PersistedQueryStats = serde_json::from_str(
+            r#"{"avg_ms": 1.0, "min_ms": 1.0, "median_ms": 1.0, "max_ms": 1.0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.cold_ms, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("cold_ms"));
+    }
+
+    #[test]
+    fn format_cold_is_empty_without_a_cold_time() {
+        assert_eq!(format_cold(None), "");
+        assert_eq!(format_cold(Some(12.34)), "  (cold 12.3 ms)");
+    }
 }
