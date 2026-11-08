@@ -197,8 +197,13 @@ impl FileGroupReader {
     /// Creates a reader from table configuration the caller already holds,
     /// without reading anything from storage.
     ///
-    /// `hudi_options` is the table's `hoodie.properties` plus the `hoodie.read.*`
-    /// options for this read, and `storage_options` is the full storage option
+    /// `hudi_options` is the table's `hoodie.properties` plus every other
+    /// `hoodie.*` option this read needs: the `hoodie.read.*` options and the
+    /// merge settings (`hoodie.datasource.merge.type`,
+    /// `hoodie.memory.merge.max.size`, `hoodie.memory.merge.max.peak.size`,
+    /// `hoodie.memory.spillable.map.path`,
+    /// `hoodie.common.spillable.diskmap.type`), which take their defaults on
+    /// every task when left out. `storage_options` is the full storage option
     /// set: nothing is read from environment variables or `hudi-defaults.conf`
     /// here. The options are validated the way [`Self::new_with_options`]
     /// validates what it loads, but nothing is loaded: an engine that planned a
@@ -210,17 +215,28 @@ impl FileGroupReader {
     /// Every `hoodie.read.*` option that steers the merge (the reader version,
     /// `hoodie.read.start.timestamp`, `hoodie.read.end.timestamp`) goes in
     /// `hudi_options`; the [`ReadOptions`] of a later read call contribute only
-    /// the projection, filters, batch size and read-optimized mode. A read
-    /// pinned to an instant passes it as `hoodie.read.end.timestamp`:
-    /// `hoodie.read.as.of.timestamp` is resolved against the timeline by
-    /// [`Table`](crate::table::Table) and is rejected here, since nothing on
-    /// this path would honour it.
+    /// the projection, filters, batch size and read-optimized mode.
     ///
-    /// Below table version 8 the log-block scan of a reader built here admits
-    /// blocks of a delta commit that never completed, because the committed
-    /// instant set that gates them comes from the timeline. From version 8 the
-    /// file slice itself excludes such log files, so a caller that builds slices
-    /// from a version 8 or later timeline loses nothing.
+    /// The start and end timestamps here bound *requested* instant times, the
+    /// ones a file name, a log block header and `_hoodie_commit_time` carry,
+    /// and nothing on this path translates them. That is exact on timeline
+    /// layout v1. On layout v2 a [`Table`](crate::table::Table) takes them as
+    /// completion times, and no requested-time range is exact for such a
+    /// window: a commit requested inside the range can complete after the
+    /// window ends, and its rows pass both bounds. So a caller reading a v2
+    /// incremental window here must itself restrict `_hoodie_commit_time` to
+    /// the instants the window admits; this path does not do it. A read pinned
+    /// to an instant passes the instant's requested time as
+    /// `hoodie.read.end.timestamp`: `hoodie.read.as.of.timestamp` is resolved
+    /// against the timeline by [`Table`](crate::table::Table) and is rejected
+    /// here, since nothing on this path would honour it.
+    ///
+    /// Below table version 8 a reader built here can return rows of a delta
+    /// commit that never completed: its log-block scan admits that commit's
+    /// blocks, because the committed instant set that gates them comes from the
+    /// timeline. From version 8 the file slice itself excludes such log files,
+    /// so a caller that builds slices from a version 8 or later timeline loses
+    /// nothing.
     pub fn new_with_resolved_options<I, K, V, S, SK, SV>(
         base_uri: &str,
         hudi_options: I,
@@ -246,7 +262,7 @@ impl FileGroupReader {
         validate_configs(&hudi_configs)?;
         Self::reject_scan_budget(&hudi_configs)?;
         let as_of = HudiReadConfig::AsOfTimestamp.as_ref();
-        if hudi_configs.as_options().contains_key(as_of) {
+        if hudi_configs.contains(as_of) {
             return Err(CoreError::InvalidValue(format!(
                 "{as_of} is resolved against the timeline, which this reader does not \
                  hold. Pass the instant as {} instead.",
@@ -357,9 +373,7 @@ impl FileGroupReader {
     /// `schema` is the schema the slice's records carry: with the `_hoodie_*`
     /// meta fields in front when `hoodie.populate.meta.fields` is on (the
     /// default, and what [`Table::get_schema_with_meta_fields`](crate::table::Table::get_schema_with_meta_fields)
-    /// returns), without them otherwise. The merge keys records on
-    /// `_hoodie_record_key` in the first case and on the record key fields in
-    /// the second, so a schema with the wrong shape fails the read.
+    /// returns), without them otherwise.
     pub fn with_data_schema(mut self, schema: arrow_schema::SchemaRef) -> Self {
         self.set_data_schema(schema);
         self
@@ -1566,8 +1580,7 @@ mod tests {
             .unwrap()
             .join(".hoodie")
             .join("hoodie.properties");
-        let bytes = bytes::Bytes::from(std::fs::read(path).unwrap());
-        crate::config::util::parse_data_for_options(&bytes, "=").unwrap()
+        crate::config::properties::parse_properties(&std::fs::read(path).unwrap()).unwrap()
     }
 
     #[test]
