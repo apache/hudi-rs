@@ -20,7 +20,7 @@
 /// Fabricate a committed log-only MOR file slice (data log block + fenced
 /// and completed deltacommit, no base file) — the layout a Java writer
 /// with log-only inserts produces, which rs verbs never create themselves.
-async fn fabricate_log_only_slice(table: &Table, partition: &str, rows: RecordBatch) {
+async fn fabricate_log_only_slice(table: &mut Table, partition: &str, rows: RecordBatch) {
     let storage = table.file_system_view.storage.clone();
     let instant = crate::write::append::generate_instant_time().await;
     crate::write::fence_timeline_instant(
@@ -48,7 +48,7 @@ async fn fabricate_log_only_slice(table: &Table, partition: &str, rows: RecordBa
     .unwrap();
     let schema = prepared[0].schema();
     let schema_json = crate::write::append::arrow_schema_to_avro_json(schema.as_ref()).unwrap();
-    crate::write::log_file_task(
+    let log_size = crate::write::log_file_task(
         storage.clone(),
         crate::write::append::parquet_writer_props(table),
         prepared,
@@ -58,12 +58,13 @@ async fn fabricate_log_only_slice(table: &Table, partition: &str, rows: RecordBa
         false,
     )
     .await
-    .unwrap();
+    .unwrap()
+    .size;
     let stat = crate::metadata::commit::HoodieWriteStat {
         file_id: Some(file_id),
         path: Some(rel),
         base_file: Some(String::new()),
-        log_files: Some(vec![log_name]),
+        log_files: Some(vec![log_name.clone()]),
         partition_path: Some(partition.to_string()),
         num_writes: Some(rows.num_rows() as i64),
         ..Default::default()
@@ -76,26 +77,64 @@ async fn fabricate_log_only_slice(table: &Table, partition: &str, rows: RecordBa
         schema.as_ref(),
     )
     .unwrap();
-    let completion = if super::is_layout_two(table) {
-        Some(crate::write::append::generate_instant_time().await)
-    } else {
-        None
-    };
-    let completed = crate::timeline::instant::Instant::new_completed(
-        instant.clone(),
+    crate::write::complete_write(
+        table,
+        &instant,
         crate::timeline::instant::Action::DeltaCommit,
-        completion,
+        bytes,
+        schema.as_ref(),
+        crate::write::MetadataTableUpdates {
+            files: vec![(partition.to_string(), log_name, log_size, false)],
+            ..Default::default()
+        },
+        &[],
     )
+    .await
     .unwrap();
-    storage
-        .put_file_if_absent(
-            &completed
-                .relative_path_with_base(&super::timeline_dir(table))
-                .unwrap(),
-            bytes,
-        )
+}
+
+/// A log-only file group listed through the metadata table's `files`
+/// partition is read like the storage listing reads it, and a read-optimized
+/// read skips it.
+#[tokio::test]
+async fn test_mdt_listing_reads_log_only_mor_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_ordering_fields(["ts"])
+        .create()
         .await
         .unwrap();
+    assert!(table.is_metadata_table_enabled());
+    table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
+    fabricate_log_only_slice(&mut table, "city=sf", batch(&[("b", "sf", 1, 20)])).await;
+    table.reload_timeline_for_write().await.unwrap();
+    // A metadata table that fails to open falls back to storage listing.
+    table.get_or_init_metadata_table().await.unwrap();
+    assert_eq!(rows(&table).await, 2, "log-only row must be readable");
+
+    use futures::StreamExt;
+    let read_optimized = ReadOptions::new().with_hudi_option(
+        crate::config::read::HudiReadConfig::UseReadOptimizedMode.as_ref(),
+        "true",
+    );
+    let eager: usize = table
+        .read(&read_optimized)
+        .await
+        .unwrap()
+        .iter()
+        .map(RecordBatch::num_rows)
+        .sum();
+    assert_eq!(eager, 1, "read-optimized read sees base files only");
+    let mut stream = table.read_stream(&read_optimized).await.unwrap();
+    let mut streamed = 0;
+    while let Some(batch) = stream.next().await {
+        streamed += batch.unwrap().num_rows();
+    }
+    assert_eq!(streamed, 1, "read-optimized stream sees base files only");
 }
 
 /// MOR coverage for the replace-commit tombstones: keys living in a
@@ -259,7 +298,7 @@ async fn test_replace_verbs_exclude_log_only_mor_groups() {
             .await
             .unwrap();
         table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
-        fabricate_log_only_slice(&table, "city=sf", batch(&[("b", "sf", 1, 20)])).await;
+        fabricate_log_only_slice(&mut table, "city=sf", batch(&[("b", "sf", 1, 20)])).await;
         table.reload_timeline_for_write().await.unwrap();
         assert_eq!(
             rows(&table).await,

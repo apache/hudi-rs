@@ -200,7 +200,8 @@ impl FileGroup {
     /// - **Without completion_timestamp (v6 tables)**: Use exact matching or range lookup
     ///   based on log timestamp.
     ///
-    /// TODO: support adding log files to file group without base files.
+    /// A log file with no base file to attach to starts (or extends) a log-only
+    /// file slice keyed by the log's own instant (see [`FileSlice::new_log_only`]).
     pub fn add_log_file(&mut self, log_file: LogFile) -> Result<&Self> {
         // Validate file_id matches
         if log_file.file_id != self.file_id {
