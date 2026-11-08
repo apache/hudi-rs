@@ -80,7 +80,7 @@ pub fn to_binary_row_body(record: &RecordBatch) -> Option<Vec<u8>> {
     let generator = arrow_ipc::writer::IpcDataGenerator {};
     let mut dict_tracker = arrow_ipc::writer::DictionaryTracker::new(false);
     let opts = arrow_ipc::writer::IpcWriteOptions::default();
-    let mut compression_context = arrow_ipc::writer::CompressionContext::default();
+    let mut compression_context = arrow_ipc::writer::IpcWriteContext::default();
     let (dictionaries, encoded) = generator
         .encode(record, &mut dict_tracker, &opts, &mut compression_context)
         .ok()?;

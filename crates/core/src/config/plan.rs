@@ -54,6 +54,7 @@ pub enum HudiPlanConfig {
 }
 
 impl HudiPlanConfig {
+    /// The config key, usable in `const` contexts.
     pub const fn key_str(&self) -> &'static str {
         match self {
             Self::ListingParallelism => "hoodie.plan.listing.parallelism",

@@ -16,8 +16,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Setup script for macOS 26 (Tahoe) build environment
-# This script detects macOS version and sets SDK environment variables if needed
+# Build environment wrapper for macOS: sets SDK environment variables on
+# macOS 26 (Tahoe) and later, and optimizes dependencies in dev builds on arm64.
 
 set -e
 
@@ -39,6 +39,31 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
         echo "  SDKROOT=${SDKROOT}"
         echo "  MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET}"
     fi
+fi
+
+# On macOS arm64, dependencies are compiled at opt-level 1 in dev builds.
+# hudi-core links two arrow majors while Lance stays on its own, and at
+# opt-level 0 that puts the code section of the hudi-datafusion test binaries
+# and the Python extension past the arm64 +/-128MB branch range, where the
+# linker cannot reach `ctor`'s startup section (pulled in through
+# lance-io -> opendal). Workspace crates stay at opt-level 0 for debugging.
+# The override is a global cargo flag, so it reaches cargo's built-in
+# subcommands and maturin, but not external ones such as `cargo tarpaulin`.
+# Remove with the Lance arrow bridge: https://github.com/apache/hudi-rs/issues/844
+if [[ "$OSTYPE" == "darwin"* && "$(uname -m)" == "arm64" ]]; then
+    DEP_OPT_LEVEL='profile.dev.package."*".opt-level=1'
+    case "$1" in
+        cargo)
+            echo "Detected macOS arm64: dependencies build at opt-level 1"
+            set -- "$1" --config "$DEP_OPT_LEVEL" "${@:2}"
+            ;;
+        maturin)
+            if [[ "$2" == "build" || "$2" == "develop" ]]; then
+                echo "Detected macOS arm64: dependencies build at opt-level 1"
+                set -- "$1" "$2" --config "$DEP_OPT_LEVEL" "${@:3}"
+            fi
+            ;;
+    esac
 fi
 
 # Run the command passed as arguments

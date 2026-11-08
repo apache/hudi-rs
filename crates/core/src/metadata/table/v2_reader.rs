@@ -103,20 +103,29 @@ impl MetadataTableV2Reader {
         file_slice: &FileSlice,
         keys: &[&str],
     ) -> Result<HashMap<String, FilesPartitionRecord>> {
-        let batch = self.read_files_partition_batch(file_slice, keys).await?;
+        let batch = self
+            .read_partition_batch(file_slice, keys, FilesPartitionRecord::PARTITION_NAME)
+            .await?;
         Self::records_from_batch(&batch, keys)
     }
 
-    /// The merged `files` partition batch, before it is decoded into records.
+    /// The merged batch of one metadata partition, before it is decoded into
+    /// records.
     ///
     /// Separate because the batch is what an Arrow consumer wants and decoding it
     /// only to re-encode would be work in both directions. Nothing about the read
     /// differs between the two; this is the read, and the other is this plus a
     /// decode.
-    pub(crate) async fn read_files_partition_batch(
+    ///
+    /// `partition` is the metadata table partition to read (its Hudi partition
+    /// value: `files`, `record_index`, `column_stats`, `bloom_filters`,
+    /// `partition_stats`, `secondary_index_*`). The decoded-record layer only
+    /// exists for `files`; the others come back as raw Arrow.
+    pub(crate) async fn read_partition_batch(
         &self,
         file_slice: &FileSlice,
         keys: &[&str],
+        partition: &str,
     ) -> Result<RecordBatch> {
         let base_file_path = file_slice.base_file_relative_path()?;
         let log_file_paths = if file_slice.has_log_file() {
@@ -137,7 +146,7 @@ impl MetadataTableV2Reader {
         // The metadata table sets `hoodie.populate.meta.fields=false`, so the record
         // key is its own `key` column rather than `_hoodie_record_key`. Without this
         // the merge keys every record on an empty string and collapses them into one.
-        reader_context.rebuild_record_context(FilesPartitionRecord::PARTITION_NAME.to_string());
+        reader_context.rebuild_record_context(partition.to_string());
 
         // A named-key read is a point lookup, which is the normal shape for the
         // metadata table; an empty key list is the full scan the `files` partition
@@ -165,7 +174,7 @@ impl MetadataTableV2Reader {
                 base_file_path,
                 base_file_commit_time,
                 log_file_paths,
-                FilesPartitionRecord::PARTITION_NAME.to_string(),
+                partition.to_string(),
             ),
             ReaderParameters::default(),
             None,
@@ -175,7 +184,7 @@ impl MetadataTableV2Reader {
         let batch = reader.read().await?;
         log::debug!(
             "metadata read of '{}' with {} named key(s): merge map peaked at {} entries",
-            FilesPartitionRecord::PARTITION_NAME,
+            partition,
             keys.len(),
             reader.read_stats().merge_map_peak_entries
         );

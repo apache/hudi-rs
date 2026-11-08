@@ -22,6 +22,7 @@ build-backend = "maturin"
 [project]
 name = "hudi"
 description = "Native Python binding for Apache Hudi, based on hudi-rs."
+readme = "../README.md"
 urls = { repository = "https://github.com/apache/hudi-rs/tree/main/python/" }
 requires-python = ">=3.10"
 keywords = ["apachehudi", "hudi", "datalake", "arrow"]
@@ -43,19 +44,21 @@ dynamic = ["version"]
 [project.optional-dependencies]
 devel = [
     "pytest==9.1.1",
-    "coverage==7.16.0",
-    "ruff==0.15.18",
-    "mypy==2.3.1",
+    "coverage==7.16.2",
+    "ruff==0.17.3",
+    "mypy==2.4.0",
     "pre-commit",
+    "pandas>=2.2",
+    "polars>=1.0",
 ]
 lint = [
-    "ruff==0.15.18",
-    "mypy==2.3.1",
+    "ruff==0.17.3",
+    "mypy==2.4.0",
 ]
 datafusion = [
     # The FFI contract is per DataFusion major: keep the Python package on the
     # same major as the Rust workspace's datafusion dependency.
-    "datafusion>=54.0.0,<55",
+    "datafusion>=55.0.0,<56",
 ]
 
 [tool.maturin]
@@ -86,6 +89,7 @@ exclude = "^tests"
 strict = true
 
 [tool.pytest.ini_options]
+addopts = "--doctest-modules"
 testpaths = [
     "tests",
     "hudi",
