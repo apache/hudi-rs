@@ -221,7 +221,7 @@ def bench(con, args, query_nums):
         for qn in query_nums:
             statements = load_query(args.query_dir, qn, args.scale_factor)
             # Written only once every iteration has run, so a query that fails
-            # part way leaves no partial timings for compare to average.
+            # part way leaves no partial timings behind.
             timings = []
             for i in range(total_runs):
                 is_warmup = i < args.warmup
@@ -241,11 +241,13 @@ def bench(con, args, query_nums):
                 elapsed_ms = (time.perf_counter() - start) * 1000.0
 
                 print(f" {elapsed_ms:.1f}ms", flush=True)
-                if not is_warmup:
-                    timings.append(elapsed_ms)
+                timings.append((elapsed_ms, is_warmup))
             if qn not in failed:
-                for elapsed_ms in timings:
-                    result_file.write(json.dumps({"query": qn, "elapsed_ms": elapsed_ms}) + "\n")
+                for elapsed_ms, is_warmup in timings:
+                    line = {"query": qn, "elapsed_ms": elapsed_ms}
+                    if is_warmup:
+                        line["warmup"] = True
+                    result_file.write(json.dumps(line) + "\n")
                 result_file.flush()
     return 2 if failed else 0
 

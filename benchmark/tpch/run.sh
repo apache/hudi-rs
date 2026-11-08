@@ -208,10 +208,11 @@ Options (per command):
   --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
   --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
                     holds two sessions at once, so a lower value may be needed), or
-                    DuckDB's memory_limit [*-duckdb] (default: from config for
-                    bench-duckdb, DuckDB's own for validate-duckdb)
-  --iterations N    Number of measured iterations per query [bench-*] (from config)
-  --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
+                    DuckDB's memory_limit [*-duckdb] (default: DuckDB's own)
+  --iterations N    Number of measured iterations per query [bench-*] (from config;
+                    5 for bench-duckdb)
+  --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config;
+                    1 for bench-duckdb, recorded as the cold time)
   --output-dir D    Directory to persist results as JSON [bench-*]
   --engines E       Comma-separated engine names to compare [compare]
   --runs R          Comma-separated result file stems to compare [compare], e.g.
@@ -220,8 +221,7 @@ Options (per command):
   --extension E     'community' or a local hudi.duckdb_extension path [*-duckdb]
                     (default: community)
   --label L         Suffix for the engine name, e.g. a build name [bench-duckdb]
-  --threads N       DuckDB threads [*-duckdb] (default: the config's DataFusion
-                    target_partitions for bench-duckdb, all cores for validate-duckdb)
+  --threads N       DuckDB threads [*-duckdb] (default: DuckDB's own, all cores)
   --hudi-option O   Passed to read_hudi as hudi_option [*-duckdb]
 
 Examples:
@@ -241,11 +241,9 @@ EOF
 
 # --- Commands ---
 
-# Set BENCH_WARMUP, BENCH_ITERATIONS, BENCH_PARTITIONS and BENCH_MEMORY_LIMIT
-# (bytes) from config/sf{N}.yaml; the last two are "-" when the config has none.
+# Set BENCH_WARMUP and BENCH_ITERATIONS from config/sf{N}.yaml.
 read_bench_defaults() {
-  read -r BENCH_WARMUP BENCH_ITERATIONS BENCH_PARTITIONS BENCH_MEMORY_LIMIT \
-    < <("$TPCH_BIN" bench-defaults --scale-factor "$1")
+  read -r BENCH_WARMUP BENCH_ITERATIONS < <("$TPCH_BIN" bench-defaults --scale-factor "$1")
 }
 
 # Set USE_HUDI and USE_PARQUET from --format, or when it is empty from which
@@ -617,16 +615,11 @@ cmd_bench_duckdb() {
     require_hudi_tables "$hudi_dir"
   fi
 
-  # Threads and memory default to the DataFusion leg's budget at this SF, so the
-  # two legs compare on the same parallelism and memory.
-  if [ -z "$warmup" ] || [ -z "$iterations" ] || [ -z "$threads" ] || [ -z "$memory_limit" ]; then
-    read_bench_defaults "$sf"
-    warmup="${warmup:-$BENCH_WARMUP}"
-    iterations="${iterations:-$BENCH_ITERATIONS}"
-    [ "$BENCH_PARTITIONS" != "-" ] && threads="${threads:-$BENCH_PARTITIONS}"
-    # DuckDB reads "2g" as 2 * 10^9 bytes; DataFusion's 2g is 2 GiB, so pass bytes.
-    [ "$BENCH_MEMORY_LIMIT" != "-" ] && memory_limit="${memory_limit:-${BENCH_MEMORY_LIMIT}B}"
-  fi
+  # DuckDB keeps its own threads and memory_limit defaults unless they are
+  # passed, so the numbers are what a DuckDB user gets. The warmup run is
+  # recorded as the cold time, next to the median of the measured runs.
+  warmup="${warmup:-1}"
+  iterations="${iterations:-5}"
 
   # A label keeps results from different extension builds side by side, e.g.
   # duckdb-v021_hudi_sf1 against duckdb-pushdown_hudi_sf1 via 'compare --runs'.

@@ -138,11 +138,14 @@ benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --output-dir benchmark/tpch/
 
 Set `DUCKDB_PYTHON` to use an interpreter other than `python3`. Each query runs
 in its own process, so one that crashes the process is reported as failed and
-the rest still run. `bench-duckdb` gives DuckDB the DataFusion leg's
-`target_partitions` as threads and its `memory_limit` from `config/sf{N}.yaml`
-unless `--threads` or `--memory-limit` is passed, and `environment.txt` records
-the `duckdb` package version, the extension build and the hudi-core release it
-embeds.
+the rest still run. `bench-duckdb` leaves DuckDB's `threads` and `memory_limit`
+at DuckDB's own defaults unless `--threads` or `--memory-limit` is passed, runs
+each query once cold and then 5 times (`--warmup 1 --iterations 5`), and records
+the cold time next to the median of the 5. Cold here is the first run in a fresh
+DuckDB process; the DataFusion leg records the first run of each query inside one
+session, and the Spark leg records none. `environment.txt` records the
+`duckdb` package version, the threads and memory limit in effect, the extension
+build and the hudi-core release it embeds.
 
 To measure a local build of the extension against the published one, pass its
 path and a label; the label keeps the two result files apart for `compare`:
@@ -308,7 +311,8 @@ benchmark/tpch/run.sh compare --scale-factor 100 --engines datafusion,spark
 `compare` reads them from there, so omitting it leaves nothing to compare once
 the runs have finished. To check credentials, region and the S3 path before
 committing hours to a full run, benchmark a couple of queries first with
-`--queries 1,6`.
+`--queries 1,6`. `compare` charts the median of each query's measured runs, with
+the cold time beside it when the run recorded one.
 
 Alongside the results the `bench-*` commands write an environment report, which
 `compare` prints under the chart so a copied result carries the hardware, build
