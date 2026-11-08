@@ -168,15 +168,14 @@ impl Table {
             .await
     }
 
-    /// Drop the listing cache, the metadata-table handle and the file-stats
-    /// sample, after the timeline has been reloaded around a write.
+    /// Drop the metadata-table handle and the file-stats sample, after the
+    /// timeline has been reloaded around a write.
     pub(crate) fn clear_read_caches(&mut self) {
-        self.file_system_view.clear_cache();
         self.cached_metadata_table = Arc::new(OnceCell::new());
         self.cached_estimator = Arc::new(OnceCell::new());
     }
 
-    /// Reload the active timeline and drop listing caches before a write plans.
+    /// Reload the active timeline and drop the read caches before a write plans.
     pub(crate) async fn reload_timeline_for_write(&mut self) -> Result<()> {
         self.validate_for_write().await?;
         // Eager rollback of crashed writes (Java rollbackFailedWrites) before

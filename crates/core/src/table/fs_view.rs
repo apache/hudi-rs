@@ -38,7 +38,6 @@ use crate::table::file_pruner::FilePruner;
 use crate::table::listing::FileLister;
 use crate::table::partition::PartitionPruner;
 use crate::timeline::view::TimelineView;
-use dashmap::DashMap;
 
 /// A view of the Hudi table's data files (files stored outside the `.hoodie/` directory) in the file system. It provides APIs to load and
 /// access the file groups and file slices.
@@ -46,7 +45,6 @@ use dashmap::DashMap;
 pub struct FileSystemView {
     pub(crate) hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
-    partition_to_file_groups: Arc<DashMap<String, Vec<FileGroup>>>,
 }
 
 /// A metadata table together with the instants whose log blocks it may read.
@@ -75,21 +73,14 @@ impl FileSystemView {
         storage_options: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
         let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
-        let partition_to_file_groups = Arc::new(DashMap::new());
         Ok(FileSystemView {
             hudi_configs,
             storage,
-            partition_to_file_groups,
         })
     }
 
-    /// Drop cached partition → file-group mappings so the next planning call reloads from storage.
-    pub(crate) fn clear_cache(&self) {
-        self.partition_to_file_groups.clear();
-    }
-
     /// Load file groups from the appropriate source (storage or metadata table records)
-    /// and apply stats-based pruning.
+    /// and apply stats-based pruning, returning the retained file groups per partition.
     ///
     /// # File Listing Source
     /// - If `files_partition_records` is Some: Uses pre-fetched metadata table records
@@ -119,7 +110,7 @@ impl FileSystemView {
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
         valid_instants: Option<&std::collections::HashSet<String>>,
         estimator: Option<&FileStatsEstimator>,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, Vec<FileGroup>)>> {
         let configured_base_file_format = self.configured_base_file_format()?;
 
         let file_groups_map = if let Some(records) = files_partition_records {
@@ -149,6 +140,9 @@ impl FileSystemView {
                     || partition_pruner.should_include(partition_path)
             })
             .collect();
+        // The listing maps iterate in hash order; sort so that every read
+        // plans its partitions in the same order.
+        pruned_map.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
         // MDT column_stats pruning: one bulk point lookup for every candidate
         // base file x filter column, instead of a parquet footer read per file.
@@ -164,6 +158,7 @@ impl FileSystemView {
             )
             .await;
 
+        let mut partition_to_file_groups = Vec::with_capacity(pruned_map.len());
         for (partition_path, file_groups) in pruned_map {
             let retained = if mdt_pruned {
                 file_groups
@@ -177,11 +172,10 @@ impl FileSystemView {
                 )
                 .await
             };
-            self.partition_to_file_groups
-                .insert(partition_path, retained);
+            partition_to_file_groups.push((partition_path, retained));
         }
 
-        Ok(())
+        Ok(partition_to_file_groups)
     }
 
     /// Prune file groups with MDT `column_stats` ranges when the partition is
@@ -432,35 +426,21 @@ impl FileSystemView {
         retained
     }
 
-    /// Collect file slices from loaded file groups using the timeline view.
-    ///
-    /// File slices are first collected from the DashMap using read locks (released
-    /// promptly), then metadata is loaded on the owned clones without holding any
-    /// locks.
-    async fn collect_file_slices(
-        &self,
-        partition_pruner: &PartitionPruner,
+    /// Select, from file groups returned by [`Self::load_file_groups`], each
+    /// group's file slice as of the timeline view.
+    fn collect_file_slices(
+        partition_to_file_groups: &[(String, Vec<FileGroup>)],
         timeline_view: &TimelineView,
-    ) -> Result<Vec<FileSlice>> {
+    ) -> Vec<FileSlice> {
         let timestamp = timeline_view.as_of_timestamp();
         let excluding_file_groups = timeline_view.excluding_file_groups();
 
-        let mut file_slices = Vec::new();
-        for partition_entry in self.partition_to_file_groups.iter() {
-            if !partition_pruner.should_include(partition_entry.key()) {
-                continue;
-            }
-            for fg in partition_entry.value().iter() {
-                if excluding_file_groups.contains(fg) {
-                    continue;
-                }
-                if let Some(fsl) = fg.get_file_slice_as_of(timestamp) {
-                    file_slices.push(fsl.clone());
-                }
-            }
-        }
-
-        Ok(file_slices)
+        partition_to_file_groups
+            .iter()
+            .flat_map(|(_, file_groups)| file_groups)
+            .filter(|fg| !excluding_file_groups.contains(*fg))
+            .filter_map(|fg| fg.get_file_slice_as_of(timestamp).cloned())
+            .collect()
     }
 
     /// Get file slices using a [`TimelineView`].
@@ -503,19 +483,19 @@ impl FileSystemView {
             None => None,
         };
 
-        self.load_file_groups(
-            partition_pruner,
-            file_pruner,
-            table_schema,
-            timeline_view,
-            files_partition_records.as_ref(),
-            valid_instants,
-            estimator,
-        )
-        .await?;
+        let file_groups = self
+            .load_file_groups(
+                partition_pruner,
+                file_pruner,
+                table_schema,
+                timeline_view,
+                files_partition_records.as_ref(),
+                valid_instants,
+                estimator,
+            )
+            .await?;
 
-        self.collect_file_slices(partition_pruner, timeline_view)
-            .await
+        Ok(Self::collect_file_slices(&file_groups, timeline_view))
     }
 
     /// Get file slices using storage listing only.
@@ -537,19 +517,19 @@ impl FileSystemView {
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
         // Pass None to force storage listing (avoids recursion for metadata table)
-        self.load_file_groups(
-            partition_pruner,
-            file_pruner,
-            table_schema,
-            timeline_view,
-            None,
-            None,
-            estimator,
-        )
-        .await?;
+        let file_groups = self
+            .load_file_groups(
+                partition_pruner,
+                file_pruner,
+                table_schema,
+                timeline_view,
+                None,
+                None,
+                estimator,
+            )
+            .await?;
 
-        self.collect_file_slices(partition_pruner, timeline_view)
-            .await
+        Ok(Self::collect_file_slices(&file_groups, timeline_view))
     }
 }
 
@@ -666,8 +646,6 @@ mod tests {
         let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
         let fs_view = &hudi_table.file_system_view;
 
-        assert!(fs_view.partition_to_file_groups.is_empty());
-
         let timeline_view = hudi_table
             .timeline
             .create_view_as_of(&latest_timestamp)
@@ -689,7 +667,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(fs_view.partition_to_file_groups.len(), 1);
         assert_eq!(file_slices.len(), 1);
         let file_ids = file_slices
             .iter()
@@ -761,9 +738,6 @@ mod tests {
         let base_url = SampleTable::V6SimplekeygenNonhivestyleOverwritetable.url_to_cow();
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
-        let fs_view = &hudi_table.file_system_view;
-
-        assert_eq!(fs_view.partition_to_file_groups.len(), 0);
 
         let partition_counts = partition_counts_as_of(&hudi_table, &latest_timestamp).await;
         assert_eq!(
@@ -773,7 +747,6 @@ mod tests {
         );
         let file_slices = file_slices_as_of(&hudi_table, &latest_timestamp).await;
 
-        assert_eq!(fs_view.partition_to_file_groups.len(), 3);
         assert_eq!(file_slices.len(), 1);
         let file_ids = file_slices
             .iter()
@@ -851,7 +824,7 @@ mod tests {
             "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet";
         let records = HashMap::from([create_files_partition_record("", file_name, 1024)]);
 
-        hudi_table
+        let file_groups = hudi_table
             .file_system_view
             .load_file_groups(
                 &partition_pruner,
@@ -865,12 +838,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            !hudi_table
-                .file_system_view
-                .partition_to_file_groups
-                .is_empty()
-        );
+        assert_eq!(file_groups.len(), 1);
+        assert_eq!(file_groups[0].1.len(), 1);
     }
 
     #[tokio::test]
@@ -972,8 +941,6 @@ mod tests {
         let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();
         let fs_view = &hudi_table.file_system_view;
 
-        assert_eq!(fs_view.partition_to_file_groups.len(), 0);
-
         let timeline_view = hudi_table
             .timeline
             .create_view_as_of(&latest_timestamp)
@@ -1005,7 +972,6 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(fs_view.partition_to_file_groups.len(), 1);
         assert_eq!(file_slices.len(), 1);
 
         let file_ids = file_slices
@@ -1055,7 +1021,7 @@ mod tests {
             create_files_partition_record("20", file_name_20, 1024),
         ]);
 
-        hudi_table
+        let file_groups = hudi_table
             .file_system_view
             .load_file_groups(
                 &partition_pruner,
@@ -1069,18 +1035,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            hudi_table
-                .file_system_view
-                .partition_to_file_groups
-                .contains_key("10")
-        );
-        assert!(
-            !hudi_table
-                .file_system_view
-                .partition_to_file_groups
-                .contains_key("20")
-        );
+        let partitions: Vec<&str> = file_groups.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(partitions, vec!["10"]);
     }
 
     #[tokio::test]
@@ -1316,8 +1272,7 @@ mod tests {
         let partition_schema = hudi_table.get_partition_schema().await.unwrap();
         let table_schema = hudi_table.get_schema().await.unwrap();
 
-        // First load all partitions into the dashmap with an empty pruner.
-        let _ = hudi_table
+        let all_slices = hudi_table
             .file_system_view
             .get_file_slices_by_storage_listing(
                 &PartitionPruner::empty(),
@@ -1328,10 +1283,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let initial_partitions = hudi_table.file_system_view.partition_to_file_groups.len();
-        assert!(initial_partitions > 1);
+        let all_partitions: std::collections::HashSet<_> =
+            all_slices.iter().map(|fsl| &fsl.partition_path).collect();
+        assert!(all_partitions.len() > 1);
 
-        // Then issue a stricter call that prunes some loaded partitions during collection.
         let partition_filters = vec![Filter::try_from(("byteField", "=", "10")).unwrap()];
         let partition_pruner = PartitionPruner::new(
             &partition_filters,
