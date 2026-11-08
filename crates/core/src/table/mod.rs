@@ -66,6 +66,7 @@ use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
 use crate::table::partition::{PartitionPruner, project_partition_schema};
 use crate::timeline::util::format_timestamp;
+use crate::timeline::view::TimelineView;
 use crate::timeline::{EARLIEST_START_TIMESTAMP, Timeline};
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
@@ -693,8 +694,14 @@ impl Table {
                 else {
                     return Ok(Vec::new());
                 };
-                self.get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
-                    .await
+                self.get_file_slices_between_inner(
+                    start,
+                    end,
+                    Self::incremental_window_end(&prepared)?,
+                    &prepared.filters,
+                    base_file_only,
+                )
+                .await
             }
         }
     }
@@ -706,6 +713,19 @@ impl Table {
         base_file_only: bool,
     ) -> Result<Vec<FileSlice>> {
         let timeline_view = self.timeline.create_view_as_of(timestamp).await?;
+        self.get_file_slices_in_view(&timeline_view, filters, base_file_only)
+            .await
+    }
+
+    /// The file slices `timeline_view` sees as of its timestamp, pruned by
+    /// `filters`.
+    async fn get_file_slices_in_view(
+        &self,
+        timeline_view: &TimelineView,
+        filters: &[Filter],
+        base_file_only: bool,
+    ) -> Result<Vec<FileSlice>> {
+        let timestamp = timeline_view.as_of_timestamp();
 
         let partition_schema = self.get_partition_schema().await?;
         // Validate against the meta-inclusive schema so filters on Hudi meta fields
@@ -768,7 +788,7 @@ impl Table {
                 &partition_pruner,
                 &file_pruner,
                 &table_schema,
-                &timeline_view,
+                timeline_view,
                 metadata_listing,
                 estimator,
             )
@@ -910,10 +930,14 @@ impl Table {
         }
     }
 
+    /// `start_timestamp` and `end_timestamp` are the requested-time bounds
+    /// [`Self::resolve_incremental_window`] derives; `window_end` is the window's
+    /// end as the caller gave it.
     async fn get_file_slices_between_inner(
         &self,
         start_timestamp: &str,
         end_timestamp: &str,
+        window_end: &str,
         filters: &[Filter],
         base_file_only: bool,
     ) -> Result<Vec<FileSlice>> {
@@ -922,8 +946,13 @@ impl Table {
         // (size, byte_size, num_records) on each base file.
         let estimator = self.get_or_init_estimator(end_timestamp).await;
 
-        let file_groups = self
-            .timeline
+        // The table as it stood when the window ended. A commit requested before
+        // `end_timestamp` may complete after the window; the mask drops its
+        // rows, so a slice built from its files loses the rows it rewrote, and
+        // the file groups it replaces are still live.
+        let timeline = self.timeline.as_of_completion_time(window_end)?;
+
+        let file_groups = timeline
             .get_file_groups_between(Some(start_timestamp), Some(end_timestamp), estimator)
             .await?;
 
@@ -934,8 +963,8 @@ impl Table {
         // metadata alone is missing either its base file or its newest logs.
         //
         // Read the slice that is live at the end of the range instead, exactly
-        // as a snapshot read at `end_timestamp` would. The commit-time mask then
-        // narrows its rows back to the window.
+        // as a snapshot read of `timeline` at `end_timestamp` would. The
+        // commit-time mask then narrows its rows back to the window.
         let touched: HashSet<(&str, &str)> = file_groups
             .iter()
             .map(|file_group| {
@@ -946,8 +975,9 @@ impl Table {
             })
             .collect();
 
+        let timeline_view = timeline.create_view_as_of(end_timestamp).await?;
         let mut file_slices: Vec<FileSlice> = self
-            .get_file_slices_inner(end_timestamp, filters, base_file_only)
+            .get_file_slices_in_view(&timeline_view, filters, base_file_only)
             .await?
             .into_iter()
             .filter(|slice| touched.contains(&(slice.partition_path.as_str(), slice.file_id())))
@@ -1089,7 +1119,7 @@ impl Table {
     /// scan on the same semantics — a caller assembling slices by hand used to get
     /// a different answer from `Table::read` for the same window.
     ///
-    /// Two things come out of it:
+    /// Three things come out of it:
     ///
     /// 1. The instant times the window admits, for the row-level mask. The window
     ///    may bound *completion* times while `_hoodie_commit_time` holds
@@ -1102,6 +1132,8 @@ impl Table {
     ///    and a block header carry. Left as completion-time bounds they discard the
     ///    very files the window admits. So the range becomes pruning only and the
     ///    mask stays the exact filter, which is how Hudi 1.x divides the same work.
+    /// 3. The window's end as given, for slice planning. See
+    ///    [`HudiInternalConfig::IncrementalWindowEnd`].
     fn resolve_incremental_window(
         &self,
         options: ReadOptions,
@@ -1126,6 +1158,12 @@ impl Table {
                 .collect::<Vec<_>>()
                 .join(","),
         );
+        prepared.hudi_options.insert(
+            HudiInternalConfig::IncrementalWindowEnd
+                .as_ref()
+                .to_string(),
+            end.to_string(),
+        );
         if let (Some(first), Some(last)) = (admitted.first(), admitted.last()) {
             // The start bound is exclusive, so step below the earliest admitted
             // instant to keep it in range. `instant_time_minus_one` steps in the
@@ -1141,6 +1179,26 @@ impl Table {
             );
         }
         Ok(prepared)
+    }
+
+    /// The window end [`Self::resolve_incremental_window`] carries for slice
+    /// planning.
+    ///
+    /// Errors on options that resolution did not produce. Their start and end
+    /// timestamps are no substitute: once resolved they are requested times, and
+    /// planning on them would translate the window twice.
+    fn incremental_window_end(prepared: &ReadOptions) -> Result<&str> {
+        let key = HudiInternalConfig::IncrementalWindowEnd.as_ref();
+        prepared
+            .hudi_options
+            .get(key)
+            .map(String::as_str)
+            .ok_or_else(|| {
+                CoreError::InvalidValue(format!(
+                    "incremental read options carry no '{key}', so they were not resolved \
+                     against the timeline"
+                ))
+            })
     }
 
     /// Build a [`FileGroupReader`] from already-resolved hudi options.
@@ -1366,7 +1424,13 @@ impl Table {
         self.warn_if_window_predates_active_timeline(start);
         let base_file_only = self.is_base_file_only(prepared)?;
         let file_slices = self
-            .get_file_slices_between_inner(start, end, &prepared.filters, base_file_only)
+            .get_file_slices_between_inner(
+                start,
+                end,
+                Self::incremental_window_end(prepared)?,
+                &prepared.filters,
+                base_file_only,
+            )
             .await?;
 
         // The table's current schema, not the base file's: a base file written
@@ -3302,6 +3366,28 @@ mod tests {
         // ...and it is a real time, which the integer decrement was not.
         crate::timeline::instant::Instant::parse_datetime(start, "UTC")
             .expect("the start bound must parse as an instant");
+    }
+
+    /// Resolution carries the window's end as given, which its re-expressed end
+    /// timestamp is not; options it did not produce are refused.
+    #[tokio::test]
+    async fn test_incremental_window_end_comes_only_from_resolution() {
+        use hudi_test::QuickstartTripsTable;
+
+        let table_path = QuickstartTripsTable::V9MorCompactedIncremental.path_to_mor_avro();
+        let table = Table::new(&table_path).await.unwrap();
+        let window = ReadOptions::new()
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp("20260807223520000")
+            .with_end_timestamp("20260807223532000");
+
+        let prepared = table.prepare_reader_options(&window).unwrap();
+        assert_eq!(
+            Table::incremental_window_end(&prepared).unwrap(),
+            "20260807223532000"
+        );
+        assert_ne!(prepared.end_timestamp(), Some("20260807223532000"));
+        assert!(Table::incremental_window_end(&window).is_err());
     }
 
     /// The decrement steps in the time domain, so it never produces an

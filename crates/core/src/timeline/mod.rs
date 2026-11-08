@@ -505,6 +505,24 @@ impl Timeline {
         selector.select(self)
     }
 
+    /// This timeline as it stood at `completion_time`: a commit that completed
+    /// after it no longer counts as completed, even if it was requested before.
+    ///
+    /// On layout v1, which records no completion times, `completion_time`
+    /// bounds requested times instead, as in
+    /// [`Self::get_completed_commits_in_range`].
+    pub(crate) fn as_of_completion_time(&self, completion_time: &str) -> Result<Self> {
+        Ok(Self {
+            hudi_configs: self.hudi_configs.clone(),
+            storage: self.storage.clone(),
+            active_loader: self.active_loader.clone(),
+            archived_loader: self.archived_loader.clone(),
+            completed_commits: self.get_completed_commits_in_range(None, Some(completion_time))?,
+            earliest_active_instant: self.earliest_active_instant.clone(),
+            pending_instants: self.pending_instants.clone(),
+        })
+    }
+
     pub(crate) async fn get_file_groups_between(
         &self,
         start_timestamp: Option<&str>,
@@ -1001,6 +1019,47 @@ mod tests {
         let timestamp = timeline.get_latest_commit_timestamp_as_option();
         assert!(timestamp.is_some());
         assert!(!timestamp.unwrap().is_empty());
+    }
+
+    /// On layout v2 a commit requested before the bound but completed after it
+    /// is dropped; layout v1 records no completion times and keeps every commit
+    /// requested by the bound.
+    #[tokio::test]
+    async fn test_as_of_completion_time_drops_commits_completed_after_it() {
+        for (base_url, file_names, kept) in [
+            (
+                SampleTable::V8Nonpartitioned.url_to_cow(),
+                [
+                    "20240101000001000_20240101000002000.commit",
+                    "20240101000003000_20240101000009000.commit",
+                    "20240101000004000_20240101000005000.commit",
+                ],
+                vec!["20240101000001000", "20240101000004000"],
+            ),
+            (
+                SampleTable::V6Nonpartitioned.url_to_cow(),
+                [
+                    "20240101000001000.commit",
+                    "20240101000003000.commit",
+                    "20240101000006000.commit",
+                ],
+                vec!["20240101000001000", "20240101000003000"],
+            ),
+        ] {
+            let mut timeline = create_test_timeline(base_url).await;
+            timeline.completed_commits = file_names
+                .iter()
+                .map(|name| Instant::from_str(name).unwrap())
+                .collect();
+
+            let as_of = timeline.as_of_completion_time("20240101000005000").unwrap();
+            let requested: Vec<&str> = as_of
+                .completed_commits
+                .iter()
+                .map(|instant| instant.timestamp.as_str())
+                .collect();
+            assert_eq!(requested, kept);
+        }
     }
 
     /// Regression test: a completed instant is not also reported as pending.
