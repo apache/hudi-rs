@@ -487,9 +487,10 @@ mod tests {
         let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
 
         let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
-        // The encoded path decodes to `ts_str=2023/04/01/12` before comparison.
-        assert!(pruner.should_include("ts_str%3D2023%2F04%2F01%2F12"));
-        assert!(!pruner.should_include("ts_str%3D2023%2F05%2F01%2F08"));
+        // Hudi url-encodes the value before adding the hive prefix, so the path on
+        // storage is `ts_str=2023%2F04%2F01%2F12`.
+        assert!(pruner.should_include("ts_str=2023%2F04%2F01%2F12"));
+        assert!(!pruner.should_include("ts_str=2023%2F05%2F01%2F08"));
     }
 
     #[test]
