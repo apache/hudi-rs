@@ -208,7 +208,8 @@ Options (per command):
   --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
   --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
                     holds two sessions at once, so a lower value may be needed), or
-                    DuckDB's memory_limit [*-duckdb] (default: DuckDB's own)
+                    DuckDB's memory_limit [*-duckdb] (default: from config for
+                    bench-duckdb, DuckDB's own for validate-duckdb)
   --iterations N    Number of measured iterations per query [bench-*] (from config)
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
   --output-dir D    Directory to persist results as JSON [bench-*]
@@ -219,7 +220,8 @@ Options (per command):
   --extension E     'community' or a local hudi.duckdb_extension path [*-duckdb]
                     (default: community)
   --label L         Suffix for the engine name, e.g. a build name [bench-duckdb]
-  --threads N       DuckDB threads [*-duckdb] (default: all cores)
+  --threads N       DuckDB threads [*-duckdb] (default: the config's DataFusion
+                    target_partitions for bench-duckdb, all cores for validate-duckdb)
   --hudi-option O   Passed to read_hudi as hudi_option [*-duckdb]
 
 Examples:
@@ -238,6 +240,42 @@ EOF
 }
 
 # --- Commands ---
+
+# Set BENCH_WARMUP, BENCH_ITERATIONS, BENCH_PARTITIONS and BENCH_MEMORY_LIMIT
+# (bytes) from config/sf{N}.yaml; the last two are "-" when the config has none.
+read_bench_defaults() {
+  read -r BENCH_WARMUP BENCH_ITERATIONS BENCH_PARTITIONS BENCH_MEMORY_LIMIT \
+    < <("$TPCH_BIN" bench-defaults --scale-factor "$1")
+}
+
+# Set USE_HUDI and USE_PARQUET from --format, or when it is empty from which
+# data exists (cloud URLs are trusted), and exit if a selected format has none.
+resolve_bench_formats() {
+  local format="$1" sf="$2" hudi_dir="$3" parquet_dir="$4"
+  USE_HUDI=false
+  USE_PARQUET=false
+  case "$format" in
+    hudi)    USE_HUDI=true ;;
+    parquet) USE_PARQUET=true ;;
+    "")
+      if is_cloud_url "$hudi_dir" || [ -d "$hudi_dir" ]; then USE_HUDI=true; fi
+      if is_cloud_url "$parquet_dir" || [ -d "$parquet_dir" ]; then USE_PARQUET=true; fi
+      ;;
+    *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
+  esac
+  if [ "$USE_HUDI" = false ] && [ "$USE_PARQUET" = false ]; then
+    echo "Error: no data found for sf$sf. Run 'generate' and/or 'create-tables' first." >&2
+    exit 1
+  fi
+  if [ "$USE_HUDI" = true ] && ! is_cloud_url "$hudi_dir" && [ ! -d "$hudi_dir" ]; then
+    echo "Error: Hudi data not found at $hudi_dir. Run 'create-tables' first." >&2
+    exit 1
+  fi
+  if [ "$USE_PARQUET" = true ] && ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
+    echo "Error: Parquet data not found at $parquet_dir. Run 'generate' first." >&2
+    exit 1
+  fi
+}
 
 cmd_generate() {
   local sf="$DEFAULT_SCALE_FACTOR"
@@ -352,15 +390,10 @@ cmd_bench_spark() {
 
   build_tpch
 
-  # Read defaults from config via the tpch binary
   if [ -z "$warmup" ] || [ -z "$iterations" ]; then
-    local defaults
-    defaults=$("$TPCH_BIN" bench-defaults --scale-factor "$sf")
-    local cfg_warmup cfg_iterations
-    cfg_warmup=$(echo "$defaults" | awk '{print $1}')
-    cfg_iterations=$(echo "$defaults" | awk '{print $2}')
-    warmup="${warmup:-$cfg_warmup}"
-    iterations="${iterations:-$cfg_iterations}"
+    read_bench_defaults "$sf"
+    warmup="${warmup:-$BENCH_WARMUP}"
+    iterations="${iterations:-$BENCH_ITERATIONS}"
   fi
 
   local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
@@ -451,44 +484,11 @@ cmd_bench_datafusion() {
   local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
-  # Determine which formats to bench
-  local use_hudi=false
-  local use_parquet=false
-  case "$format" in
-    hudi)    use_hudi=true ;;
-    parquet) use_parquet=true ;;
-    "")
-      # Default: for cloud URLs trust the user; for local paths check existence
-      if is_cloud_url "$hudi_dir"; then
-        use_hudi=true
-      else
-        [ -d "$hudi_dir" ] && use_hudi=true
-      fi
-      if is_cloud_url "$parquet_dir"; then
-        use_parquet=true
-      else
-        [ -d "$parquet_dir" ] && use_parquet=true
-      fi
-      ;;
-    *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
-  esac
-
-  if [ "$use_hudi" = false ] && [ "$use_parquet" = false ]; then
-    echo "Error: no data found for sf$sf. Run 'generate' and/or 'create-tables' first." >&2
-    exit 1
-  fi
-  if [ "$use_hudi" = true ] && ! is_cloud_url "$hudi_dir" && [ ! -d "$hudi_dir" ]; then
-    echo "Error: Hudi data not found at $hudi_dir. Run 'create-tables' first." >&2
-    exit 1
-  fi
-  if [ "$use_parquet" = true ] && ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
-    echo "Error: Parquet data not found at $parquet_dir. Run 'generate' first." >&2
-    exit 1
-  fi
+  resolve_bench_formats "$format" "$sf" "$hudi_dir" "$parquet_dir"
 
   build_tpch
 
-  if [ "$use_hudi" = true ]; then
+  if [ "$USE_HUDI" = true ]; then
     require_hudi_tables "$hudi_dir"
   fi
 
@@ -505,7 +505,7 @@ cmd_bench_datafusion() {
     # Describe the data actually being read, which is not the Hudi directory
     # when only the parquet leg runs.
     local reported_dir="$hudi_dir"
-    [ "$use_hudi" = false ] && reported_dir="$parquet_dir"
+    [ "$USE_HUDI" = false ] && reported_dir="$parquet_dir"
     write_env_report "$output_dir/environment.txt" "$sf" "$reported_dir"
   fi
 
@@ -525,10 +525,10 @@ cmd_bench_datafusion() {
     "$TPCH_BIN" "${args[@]}"
   }
 
-  if [ "$use_hudi" = true ]; then
+  if [ "$USE_HUDI" = true ]; then
     run_datafusion_bench hudi --hudi-dir "$hudi_dir" "datafusion+hudi-rs"
   fi
-  if [ "$use_parquet" = true ]; then
+  if [ "$USE_PARQUET" = true ]; then
     run_datafusion_bench parquet --parquet-dir "$parquet_dir" "datafusion+parquet"
   fi
 }
@@ -601,32 +601,10 @@ cmd_bench_duckdb() {
   local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
   local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
 
-  local use_hudi=false
-  local use_parquet=false
-  case "$format" in
-    hudi)    use_hudi=true ;;
-    parquet) use_parquet=true ;;
-    "")
-      if is_cloud_url "$hudi_dir" || [ -d "$hudi_dir" ]; then use_hudi=true; fi
-      if is_cloud_url "$parquet_dir" || [ -d "$parquet_dir" ]; then use_parquet=true; fi
-      ;;
-    *) echo "Error: unknown format '$format'. Use 'hudi' or 'parquet'." >&2; exit 1 ;;
-  esac
-  if [ "$use_hudi" = false ] && [ "$use_parquet" = false ]; then
-    echo "Error: no data found for sf$sf. Run 'generate' and/or 'create-tables' first." >&2
-    exit 1
-  fi
-  if [ "$use_hudi" = true ] && ! is_cloud_url "$hudi_dir" && [ ! -d "$hudi_dir" ]; then
-    echo "Error: Hudi data not found at $hudi_dir. Run 'create-tables' first." >&2
-    exit 1
-  fi
-  if [ "$use_parquet" = true ] && ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
-    echo "Error: Parquet data not found at $parquet_dir. Run 'generate' first." >&2
-    exit 1
-  fi
+  resolve_bench_formats "$format" "$sf" "$hudi_dir" "$parquet_dir"
   require_duckdb_extension "$extension"
-  [ "$use_hudi" = true ] && require_duckdb_storage "$hudi_dir"
-  [ "$use_parquet" = true ] && require_duckdb_storage "$parquet_dir"
+  [ "$USE_HUDI" = true ] && require_duckdb_storage "$hudi_dir"
+  [ "$USE_PARQUET" = true ] && require_duckdb_storage "$parquet_dir"
   # The label names the result files.
   if [ -n "$label" ] && [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ ]]; then
     echo "Error: --label may contain only letters, digits, '.', '_' and '-'." >&2
@@ -635,15 +613,19 @@ cmd_bench_duckdb() {
 
   require_duckdb_python
   build_tpch
-  if [ "$use_hudi" = true ]; then
+  if [ "$USE_HUDI" = true ]; then
     require_hudi_tables "$hudi_dir"
   fi
 
-  if [ -z "$warmup" ] || [ -z "$iterations" ]; then
-    local defaults
-    defaults=$("$TPCH_BIN" bench-defaults --scale-factor "$sf")
-    warmup="${warmup:-$(echo "$defaults" | awk '{print $1}')}"
-    iterations="${iterations:-$(echo "$defaults" | awk '{print $2}')}"
+  # Threads and memory default to the DataFusion leg's budget at this SF, so the
+  # two legs compare on the same parallelism and memory.
+  if [ -z "$warmup" ] || [ -z "$iterations" ] || [ -z "$threads" ] || [ -z "$memory_limit" ]; then
+    read_bench_defaults "$sf"
+    warmup="${warmup:-$BENCH_WARMUP}"
+    iterations="${iterations:-$BENCH_ITERATIONS}"
+    [ "$BENCH_PARTITIONS" != "-" ] && threads="${threads:-$BENCH_PARTITIONS}"
+    # DuckDB reads "2g" as 2 * 10^9 bytes; DataFusion's 2g is 2 GiB, so pass bytes.
+    [ "$BENCH_MEMORY_LIMIT" != "-" ] && memory_limit="${memory_limit:-${BENCH_MEMORY_LIMIT}B}"
   fi
 
   # A label keeps results from different extension builds side by side, e.g.
@@ -655,19 +637,24 @@ cmd_bench_duckdb() {
   [ -n "$memory_limit" ] && common_args+=(--memory-limit "$memory_limit")
   [ -n "$hudi_option" ] && common_args+=(--hudi-option "$hudi_option")
 
+  # Loading the extension once up front means one that will not load stops the
+  # run with a single error, before any previous report is overwritten.
+  local versions
+  versions=$("$DUCKDB_PY" "$SCRIPT_DIR/infra/duckdb/bench.py" "${common_args[@]}" \
+    --print-versions --engine-label "$engine")
+
   if [ -n "$output_dir" ]; then
     mkdir -p "$output_dir"
     local env_file="$output_dir/environment.txt"
     local reported_dir="$hudi_dir"
-    [ "$use_hudi" = false ] && reported_dir="$parquet_dir"
+    [ "$USE_HUDI" = false ] && reported_dir="$parquet_dir"
     # Runs of other extension builds share this report, so their version lines
     # are carried over; this run's replaces any earlier one of the same label.
     local other_builds=""
     [ -f "$env_file" ] && other_builds=$(grep '^duckdb-hudi \[' "$env_file" | grep -vF "[$engine]" || true)
     write_env_report "$env_file" "$sf" "$reported_dir"
     [ -n "$other_builds" ] && echo "$other_builds" >> "$env_file"
-    "$DUCKDB_PY" "$SCRIPT_DIR/infra/duckdb/bench.py" "${common_args[@]}" --print-versions \
-      --engine-label "$engine" >> "$env_file"
+    echo "$versions" >> "$env_file"
   fi
 
   local tmp_dir
@@ -695,10 +682,10 @@ cmd_bench_duckdb() {
     "$TPCH_BIN" "${parse_args[@]}"
   }
 
-  if [ "$use_hudi" = true ]; then
+  if [ "$USE_HUDI" = true ]; then
     run_duckdb_bench hudi --hudi-base "$hudi_dir"
   fi
-  if [ "$use_parquet" = true ]; then
+  if [ "$USE_PARQUET" = true ]; then
     run_duckdb_bench parquet --parquet-base "$parquet_dir"
   fi
   rm -rf "$tmp_dir"

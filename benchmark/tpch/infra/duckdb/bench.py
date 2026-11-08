@@ -33,6 +33,7 @@ import argparse
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -85,6 +86,49 @@ def connect(args):
         con.execute("LOAD httpfs")
         con.execute("CREATE OR REPLACE SECRET tpch_s3 (TYPE s3, PROVIDER credential_chain)")
     return con
+
+
+def embedded_hudi_rs(path):
+    """The hudi-rs an extension binary was built from, read from the source
+    paths Rust keeps for panic locations, or None when neither a crates.io
+    release nor a git checkout shows up (a path dependency)."""
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    git = re.search(rb"/hudi-rs-[0-9a-f]+/([0-9a-f]{7,40})/crates/core/src/", data)
+    if git:
+        return f"hudi-rs git {git.group(1).decode()}"
+    release = re.search(rb"/hudi-core-([0-9][0-9A-Za-z.+-]*)/src/", data)
+    if release:
+        return f"hudi-core {release.group(1).decode()}"
+    return None
+
+
+def print_versions(args):
+    try:
+        con = connect(args)
+        ext = con.execute(
+            "SELECT extension_version, install_mode, install_path FROM duckdb_extensions() "
+            "WHERE extension_name = 'hudi'").fetchone()
+        threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
+        memory = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    except duckdb.Error as e:
+        print(f"Error: could not load the hudi extension: {e}", file=sys.stderr)
+        return 1
+    # install_mode and install_path describe the installed copy even when LOAD
+    # took a file path.
+    if args.extension == "community":
+        mode, binary = ext[1], ext[2]
+    else:
+        mode, binary = "local", args.extension
+    hudi_rs = embedded_hudi_rs(binary) or "hudi-rs unknown"
+    print(f"duckdb:          {duckdb.__version__}")
+    print(f"duckdb-hudi [{args.engine_label}]: {ext[0]} ({mode}, {args.extension}; {hudi_rs})")
+    print(f"duckdb threads:  {threads}")
+    print(f"duckdb memory:   {memory}")
+    return 0
 
 
 def register_views(con, args):
@@ -223,8 +267,9 @@ def run_isolated(args, query_nums):
     base_cmd = [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]
     probe = subprocess.run([*base_cmd, "--print-versions"], capture_output=True, text=True)
     if probe.returncode != 0:
-        print("Error: could not load the hudi extension:", file=sys.stderr)
-        print(probe.stderr.strip() or f"exit status {probe.returncode}", file=sys.stderr)
+        print(probe.stderr.strip()
+              or f"Error: could not load the hudi extension: exit status {probe.returncode}",
+              file=sys.stderr)
         return 1 if args.validate else 2
 
     failed = []
@@ -271,15 +316,7 @@ def main():
     args = parser.parse_args()
 
     if args.print_versions:
-        con = connect(args)
-        ext = con.execute(
-            "SELECT extension_version, install_mode FROM duckdb_extensions() "
-            "WHERE extension_name = 'hudi'").fetchone()
-        print(f"duckdb:          {duckdb.__version__}")
-        print(f"duckdb-hudi [{args.engine_label}]: {ext[0]} ({ext[1]}, {args.extension})")
-        threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
-        print(f"duckdb threads:  {threads}")
-        return 0
+        return print_versions(args)
 
     if args.validate:
         if not (args.hudi_base and args.parquet_base):

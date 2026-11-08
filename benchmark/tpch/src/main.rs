@@ -120,7 +120,8 @@ enum Commands {
         #[arg(long)]
         command: String,
     },
-    /// Print bench defaults from config (warmup and iterations)
+    /// Print bench defaults from config: warmup, iterations, DataFusion target partitions and
+    /// memory limit in bytes, space-separated, with "-" for a setting the config leaves unset
     BenchDefaults {
         /// TPC-H scale factor (loads config/sf{N}.yaml)
         #[arg(long, default_value_t = 1.0)]
@@ -404,7 +405,21 @@ async fn main() -> Result<()> {
         Commands::BenchDefaults { scale_factor } => {
             let cfg = config::ScaleFactorConfig::load(scale_factor)
                 .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
-            println!("{} {}", cfg.bench.warmup, cfg.bench.iterations);
+            let df_conf = &cfg.bench.datafusion_conf;
+            let partitions = df_conf
+                .settings
+                .get("datafusion.execution.target_partitions")
+                .map_or("-", String::as_str);
+            let memory_limit = match &df_conf.memory_limit {
+                Some(limit) => parse_memory_size(limit)
+                    .map_err(datafusion::error::DataFusionError::Plan)?
+                    .to_string(),
+                None => "-".to_string(),
+            };
+            println!(
+                "{} {} {partitions} {memory_limit}",
+                cfg.bench.warmup, cfg.bench.iterations
+            );
             Ok(())
         }
         Commands::Bench {

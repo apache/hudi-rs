@@ -125,6 +125,10 @@ The DuckDB leg reads the Hudi tables through the
 for both. It needs a Python interpreter with the `duckdb` package; community
 extensions are built for current DuckDB releases, not for older patch releases,
 so install the latest one. The DuckDB leg reads local paths and `s3://` URLs.
+On S3 the two formats resolve credentials separately: `read_parquet` through
+DuckDB's `credential_chain` secret and `read_hudi` through hudi-rs's
+`object_store` environment lookup, so set `AWS_REGION` for the DuckDB leg too
+when the bucket is outside `us-east-1`.
 
 ```bash
 pip install duckdb
@@ -134,7 +138,11 @@ benchmark/tpch/run.sh bench-duckdb --scale-factor 1 --output-dir benchmark/tpch/
 
 Set `DUCKDB_PYTHON` to use an interpreter other than `python3`. Each query runs
 in its own process, so one that crashes the process is reported as failed and
-the rest still run.
+the rest still run. `bench-duckdb` gives DuckDB the DataFusion leg's
+`target_partitions` as threads and its `memory_limit` from `config/sf{N}.yaml`
+unless `--threads` or `--memory-limit` is passed, and `environment.txt` records
+the `duckdb` package version, the extension build and the hudi-core release it
+embeds.
 
 To measure a local build of the extension against the published one, pass its
 path and a label; the label keeps the two result files apart for `compare`:
