@@ -904,4 +904,28 @@ mod tests {
         let stats = create_stats_with_int_range("id", 10, 100);
         assert!(!pruner.should_include(&stats));
     }
+
+    /// A row group without column-chunk statistics leaves the file-level min/max
+    /// unknown, so a filter outside the other row groups' bounds keeps the file.
+    #[test]
+    fn row_group_without_stats_keeps_file_when_filter_outside_known_bounds() {
+        use crate::statistics::StatisticsContainer;
+        use crate::statistics::tests::{id_file_metadata, id_schema};
+        use parquet::file::statistics::Statistics;
+
+        // Row group 0 has id in [50, 100]; row group 1 holds 10 values without statistics.
+        let md = id_file_metadata(vec![
+            Some(Statistics::int64(Some(50), Some(100), None, Some(0), false)),
+            None,
+        ]);
+        let arrow_schema = id_schema();
+        let stats = StatisticsContainer::from_parquet_metadata(&md, &arrow_schema);
+
+        let filters = vec![Filter::try_from(("id", "=", "5")).unwrap()];
+        let pruner = FilePruner::new(&filters, &arrow_schema, &Schema::empty()).unwrap();
+        assert!(
+            pruner.should_include(&stats),
+            "file was pruned for `id = 5` although row group 1 has no stats"
+        );
+    }
 }
