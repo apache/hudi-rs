@@ -22,9 +22,11 @@ use crate::error::CoreError;
 use arrow::array::ArrayRef;
 use arrow::array::RecordBatch;
 use arrow::array::StringArray;
+use arrow::array::{AsArray, make_array};
 use arrow_array::{Array, UInt32Array};
+use arrow_buffer::NullBuffer;
 use arrow_row::{RowConverter, SortField};
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, DataType, FieldRef, Fields, SchemaRef};
 
 pub trait ColumnAsArray {
     fn get_array(&self, column_name: &str) -> Result<ArrayRef>;
@@ -104,6 +106,71 @@ where
                 .ok_or_else(|| CoreError::Schema(format!("Column {} not found", col.as_ref())))
         })
         .collect()
+}
+
+/// The child index at each level from a top-level field down to the field at
+/// `path`, a dotted path through struct fields (`meta.ts`) split the way Java
+/// splits a nested ordering field (`HoodieUnsafeRowUtils.composeNestedFieldPath`).
+/// A top-level field of that exact name wins, because the version 1 merger's
+/// delete batch names its flat ordering column by the full path. `None` when
+/// any segment is missing or a non-leaf segment is not a struct.
+fn nested_field_indices(fields: &Fields, path: &str) -> Option<Vec<usize>> {
+    if let Some((index, _)) = fields.find(path) {
+        return Some(vec![index]);
+    }
+    let mut indices = Vec::new();
+    let mut level = Some(fields);
+    for segment in path.split('.') {
+        let (index, field) = level?.find(segment)?;
+        indices.push(index);
+        level = match field.data_type() {
+            DataType::Struct(children) => Some(children),
+            _ => None,
+        };
+    }
+    Some(indices)
+}
+
+/// The field at `path`, a top-level name or a dotted path through struct
+/// fields, resolved as `nested_field_indices` describes.
+pub fn nested_field<'a>(fields: &'a Fields, path: &str) -> Option<&'a FieldRef> {
+    let indices = nested_field_indices(fields, path)?;
+    let (first, rest) = indices.split_first()?;
+    let mut field = &fields[*first];
+    for &index in rest {
+        let DataType::Struct(children) = field.data_type() else {
+            return None;
+        };
+        field = &children[index];
+    }
+    Some(field)
+}
+
+/// The column at `path`, resolved as [`nested_field`] resolves it. A row whose
+/// enclosing struct is null is null in the result, since a struct's children
+/// carry no validity of their own for its null rows.
+pub fn nested_column(batch: &RecordBatch, path: &str) -> Result<Option<ArrayRef>> {
+    let Some(indices) = nested_field_indices(batch.schema_ref().fields(), path) else {
+        return Ok(None);
+    };
+    let Some((first, rest)) = indices.split_first() else {
+        return Ok(None);
+    };
+    let mut column = batch.column(*first).clone();
+    let mut ancestor_nulls: Option<NullBuffer> = None;
+    for &index in rest {
+        let Some(parent) = column.as_struct_opt() else {
+            return Ok(None);
+        };
+        ancestor_nulls = NullBuffer::union(ancestor_nulls.as_ref(), parent.nulls());
+        column = parent.column(index).clone();
+    }
+    let Some(ancestor_nulls) = ancestor_nulls else {
+        return Ok(Some(column));
+    };
+    let nulls = NullBuffer::union(Some(&ancestor_nulls), column.nulls());
+    let data = column.to_data().into_builder().nulls(nulls).build()?;
+    Ok(Some(make_array(data)))
 }
 
 /// Project a [`RecordBatch`] to a subset of columns by name. Returns the batch
@@ -244,5 +311,52 @@ mod tests {
         let err = project_batch_by_names(batch, Some(&bad)).unwrap_err();
         assert!(matches!(err, CoreError::Schema(_)));
         assert!(err.to_string().contains("missing"));
+    }
+
+    /// A nested path resolves through two struct levels on a sliced batch,
+    /// folding every ancestor's nulls into the leaf; a top-level column whose
+    /// name contains the dot wins over the path.
+    #[test]
+    fn test_nested_column_resolves_path_with_ancestor_nulls() {
+        use arrow_array::{Int64Array, StructArray};
+        use arrow_schema::{Field, Schema};
+        let ts = Arc::new(Field::new("ts", DataType::Int64, true));
+        let inner = StructArray::try_new(
+            vec![ts].into(),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef],
+            Some(NullBuffer::from(vec![true, true, false, true])),
+        )
+        .unwrap();
+        let inner_field = Arc::new(Field::new("inner", inner.data_type().clone(), true));
+        let outer = StructArray::try_new(
+            vec![inner_field].into(),
+            vec![Arc::new(inner) as ArrayRef],
+            Some(NullBuffer::from(vec![true, false, true, true])),
+        )
+        .unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("outer", outer.data_type().clone(), true),
+                Field::new("outer.inner", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(outer) as ArrayRef,
+                Arc::new(StringArray::from(vec!["w", "x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+
+        let sliced = batch.slice(1, 3);
+        let leaf = nested_column(&sliced, "outer.inner.ts").unwrap().unwrap();
+        let leaf = leaf.as_primitive::<arrow_array::types::Int64Type>();
+        assert_eq!(leaf.iter().collect::<Vec<_>>(), vec![None, None, Some(4)]);
+        assert_eq!(
+            nested_field(batch.schema_ref().fields(), "outer.inner.ts").map(|f| f.name().as_str()),
+            Some("ts")
+        );
+
+        let literal = nested_column(&batch, "outer.inner").unwrap().unwrap();
+        assert_eq!(literal.data_type(), &DataType::Utf8);
+        assert!(nested_column(&batch, "outer.absent").unwrap().is_none());
     }
 }

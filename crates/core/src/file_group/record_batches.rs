@@ -21,6 +21,7 @@ use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
 use crate::error::CoreError;
 use crate::schema::delete::transform_delete_record_batch;
+use crate::util::arrow::nested_field;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use arrow_select::concat::concat_batches;
@@ -130,10 +131,8 @@ impl RecordBatches {
             return Ok(RecordBatch::new_empty(SchemaRef::from(Schema::empty())));
         }
 
-        let target_ordering_type = data_schema
-            .field_with_name(ordering_field)
-            .ok()
-            .map(|f| f.data_type().clone());
+        let target_ordering_type =
+            nested_field(data_schema.fields(), ordering_field).map(|f| f.data_type().clone());
 
         let mut delete_batches = Vec::with_capacity(self.delete_batches.len());
         for (batch, instant_time) in &self.delete_batches {

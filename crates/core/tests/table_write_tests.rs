@@ -20,9 +20,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::{Array, BooleanArray, Int64Array, StringArray};
+use arrow::array::{Array, BooleanArray, Int64Array, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use hudi_core::config::read::HudiReadConfig;
 use hudi_core::config::table::{HudiTableConfig, TableTypeValue};
 use hudi_core::error::CoreError;
 use hudi_core::index::{HoodieIndex, HoodieKey, SimpleIndex};
@@ -4749,4 +4750,236 @@ async fn test_commit_seqno_uses_java_form() {
             ("b".to_string(), "_0_1".to_string()),
         ]
     );
+}
+
+/// `(id, city, v, meta{ts})` rows, for tables ordered by the nested `meta.ts`.
+fn nested_ordering_batch(rows: Vec<(&str, &str, &str, i64)>) -> RecordBatch {
+    let ts_field = Arc::new(Field::new("ts", DataType::Int64, true));
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("city", DataType::Utf8, false),
+        Field::new("v", DataType::Utf8, false),
+        Field::new(
+            "meta",
+            DataType::Struct(vec![ts_field.clone()].into()),
+            true,
+        ),
+    ]));
+    let meta = StructArray::from(vec![(
+        ts_field,
+        Arc::new(Int64Array::from(
+            rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+        )) as Arc<dyn Array>,
+    )]);
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+            Arc::new(meta),
+        ],
+    )
+    .unwrap()
+}
+
+/// `(id, v)` for every row, sorted by id.
+fn ids_and_values(batches: &[RecordBatch]) -> Vec<(String, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let column = |name| {
+            batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .clone()
+        };
+        let (ids, values) = (column("id"), column("v"));
+        for row in 0..batch.num_rows() {
+            rows.push((ids.value(row).to_string(), values.value(row).to_string()));
+        }
+    }
+    rows.sort();
+    rows
+}
+
+async fn create_nested_ordering_table(base_uri: &str, table_type: TableTypeValue) -> Table {
+    Table::create(base_uri)
+        .with_table_name("t")
+        .with_table_type(table_type)
+        .with_record_key_fields(["id"])
+        .with_partition_fields(["city"])
+        .with_ordering_fields(["meta.ts"])
+        .create()
+        .await
+        .unwrap()
+}
+
+/// A merge-on-read snapshot orders a log record against the base row by a
+/// nested ordering field, on both readers. A delete block, which this writer
+/// gives the default ordering value, applies; version 1 finds that block's
+/// ordering column under the field's full dotted name.
+#[tokio::test]
+async fn test_merge_on_read_orders_by_nested_ordering_field() {
+    let dir = tempdir().unwrap();
+    let mut table =
+        create_nested_ordering_table(dir.path().to_str().unwrap(), TableTypeValue::MergeOnRead)
+            .await;
+    table
+        .append([nested_ordering_batch(vec![
+            ("a", "sf", "x", 5),
+            ("b", "sf", "x", 1),
+            ("d", "sf", "x", 5),
+        ])])
+        .await
+        .unwrap();
+    table
+        .upsert([nested_ordering_batch(vec![
+            ("a", "sf", "y", 1),
+            ("b", "sf", "y", 5),
+        ])])
+        .await
+        .unwrap();
+    table.delete("id = 'd'").await.unwrap();
+    let expected = vec![
+        ("a".to_string(), "x".to_string()),
+        ("b".to_string(), "y".to_string()),
+    ];
+    for reader_version in ["2", "1"] {
+        let options = ReadOptions::new().with_hudi_option(
+            HudiReadConfig::FileGroupReaderVersion.as_ref(),
+            reader_version,
+        );
+        let all = table.read(&options).await.unwrap();
+        assert_eq!(ids_and_values(&all), expected, "reader {reader_version}");
+        let projected = table
+            .read(&options.with_projection(["id", "v"]))
+            .await
+            .unwrap();
+        // The projection applies after the merge, so leaving out `meta` must not
+        // change which row wins.
+        assert_eq!(
+            ids_and_values(&projected),
+            expected,
+            "reader {reader_version}, projection without meta"
+        );
+        assert!(projected.iter().all(|b| b.column_by_name("meta").is_none()));
+    }
+}
+
+/// An upsert orders by a nested ordering field like a top-level one: among
+/// duplicate keys in the incoming batch, and, on copy-on-write, against the
+/// stored row.
+#[tokio::test]
+async fn test_upsert_orders_by_nested_ordering_field() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table =
+            create_nested_ordering_table(dir.path().to_str().unwrap(), table_type.clone()).await;
+        table
+            .append([nested_ordering_batch(vec![("a", "sf", "x", 5)])])
+            .await
+            .unwrap();
+        table
+            .upsert([nested_ordering_batch(vec![
+                ("a", "sf", "y", 1),
+                ("c", "sf", "p", 7),
+                ("c", "sf", "q", 3),
+            ])])
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_and_values(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![
+                ("a".to_string(), "x".to_string()),
+                ("c".to_string(), "p".to_string()),
+            ],
+            "{table_type:?}"
+        );
+    }
+}
+
+/// A partial upsert that updates the struct holding the ordering field sets
+/// that field, so it merges by event time; one that leaves the struct out
+/// merges by commit time and keeps the stored ordering value.
+#[tokio::test]
+async fn test_partial_upsert_orders_by_nested_ordering_field_when_setting_its_struct() {
+    let dir = tempdir().unwrap();
+    let mut table =
+        create_nested_ordering_table(dir.path().to_str().unwrap(), TableTypeValue::CopyOnWrite)
+            .await;
+    table
+        .append([nested_ordering_batch(vec![("a", "sf", "x", 5)])])
+        .await
+        .unwrap();
+    let partial = |columns: &[&str]| UpsertOptions {
+        update_columns: Some(columns.iter().map(|c| c.to_string()).collect()),
+    };
+    for (columns, value, ts, expected) in [
+        (&["meta", "v"][..], "y", 1, "x"),
+        (&["meta", "v"][..], "z", 9, "z"),
+        (&["v"][..], "w", 1, "w"),
+    ] {
+        table
+            .upsert_with(
+                [nested_ordering_batch(vec![("a", "sf", value, ts)])],
+                partial(columns),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_and_values(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), expected.to_string())],
+            "update_columns {columns:?}"
+        );
+    }
+}
+
+/// A cross-partition update loses to the stored row by the nested ordering
+/// field, as it does by a top-level one.
+#[tokio::test]
+async fn test_stale_partition_move_rejected_by_nested_ordering_field() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        let dir = tempdir().unwrap();
+        let mut table =
+            create_nested_ordering_table(dir.path().to_str().unwrap(), table_type.clone()).await;
+        table
+            .append([nested_ordering_batch(vec![("a", "sf", "x", 5)])])
+            .await
+            .unwrap();
+        table
+            .upsert([nested_ordering_batch(vec![("a", "nyc", "y", 3)])])
+            .await
+            .unwrap();
+        let sf = table
+            .read(
+                &ReadOptions::new()
+                    .with_filters([("city", "=", "sf")])
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_and_values(&sf),
+            vec![("a".to_string(), "x".to_string())],
+            "{table_type:?}: stale move stays in sf"
+        );
+        table
+            .upsert([nested_ordering_batch(vec![("a", "la", "z", 7)])])
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_and_values(&table.read(&ReadOptions::new()).await.unwrap()),
+            vec![("a".to_string(), "z".to_string())],
+            "{table_type:?}: winning move"
+        );
+    }
 }

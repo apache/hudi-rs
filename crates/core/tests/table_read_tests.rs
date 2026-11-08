@@ -1218,6 +1218,50 @@ mod v9_tables {
             );
             Ok(())
         }
+
+        /// Spark-written and ordered by the nested `meta.ts`: a stale update
+        /// and a stale delete both lose to the base row, as in Hudi's own read,
+        /// on both readers and merging by key or by record position.
+        #[tokio::test]
+        async fn test_nested_ordering_field_mor_snapshot() -> Result<()> {
+            let base_url = SampleTable::V9NestedOrderingField.url_to_mor_avro();
+            let hudi_table = open_table(base_url.path()).await?;
+            for (reader_version, by_position) in [("1", "false"), ("2", "false"), ("2", "true")] {
+                let options = ReadOptions::new()
+                    .with_hudi_option(
+                        HudiReadConfig::FileGroupReaderVersion.as_ref(),
+                        reader_version,
+                    )
+                    .with_hudi_option(
+                        HudiReadConfig::MergeUseRecordPositions.as_ref(),
+                        by_position,
+                    );
+                let batches = hudi_table.read(&options).await?;
+                let batch = concat_batches(&batches[0].schema(), &batches)?;
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let values = batch
+                    .column_by_name("v")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                let mut rows: Vec<(&str, &str)> = (0..batch.num_rows())
+                    .map(|i| (ids.value(i), values.value(i)))
+                    .collect();
+                rows.sort();
+                assert_eq!(
+                    rows,
+                    vec![("a", "x"), ("b", "y"), ("d", "x")],
+                    "reader {reader_version}, by position {by_position}"
+                );
+            }
+            Ok(())
+        }
     }
 
     mod time_travel_queries {

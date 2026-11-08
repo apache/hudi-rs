@@ -45,6 +45,7 @@ use crate::metadata::meta_field::MetaField;
 use crate::metadata::table::encode::RecordIndexEntry;
 use crate::table::{ReadOptions, Table};
 use crate::timeline::instant::Action;
+use crate::util::arrow::nested_column;
 use crate::write::WriteResult;
 use crate::write::append::{
     ensure_copy_on_write, generate_instant_time, is_layout_two, prepare_batches_for_write,

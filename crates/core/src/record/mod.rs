@@ -19,20 +19,31 @@
 use crate::Result;
 use crate::error::CoreError;
 use crate::metadata::meta_field::MetaField;
-use crate::util::arrow::{create_row_converter, get_column_arrays};
-use arrow_array::RecordBatch;
-use arrow_row::{RowConverter, Rows};
+use crate::util::arrow::{create_row_converter, get_column_arrays, nested_column, nested_field};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_row::{RowConverter, Rows, SortField};
 use arrow_schema::SchemaRef;
 
 pub fn create_record_key_converter(schema: SchemaRef) -> Result<RowConverter> {
     create_row_converter(schema, [MetaField::RecordKey.as_ref()])
 }
 
+/// `ordering_field` is a top-level name or a dotted path to a nested field.
 pub fn create_event_time_ordering_converter(
     schema: SchemaRef,
     ordering_field: &str,
 ) -> Result<RowConverter> {
-    create_row_converter(schema, [ordering_field])
+    let field = nested_field(schema.fields(), ordering_field)
+        .ok_or_else(|| CoreError::Schema(format!("Column {ordering_field} not found")))?;
+    RowConverter::new(vec![SortField::new(field.data_type().clone())])
+        .map_err(CoreError::ArrowError)
+}
+
+/// The column of `ordering_field`, a top-level name or a dotted path to a
+/// nested field.
+pub fn event_time_ordering_column(batch: &RecordBatch, ordering_field: &str) -> Result<ArrayRef> {
+    nested_column(batch, ordering_field)?
+        .ok_or_else(|| CoreError::Schema(format!("Column {ordering_field} not found")))
 }
 
 pub fn create_commit_time_ordering_converter(schema: SchemaRef) -> Result<RowConverter> {
@@ -51,9 +62,9 @@ pub fn extract_event_time_ordering_values(
     batch: &RecordBatch,
     ordering_field: &str,
 ) -> Result<Rows> {
-    let ordering_columns = get_column_arrays(batch, [ordering_field])?;
+    let ordering_column = event_time_ordering_column(batch, ordering_field)?;
     converter
-        .convert_columns(&ordering_columns)
+        .convert_columns(&[ordering_column])
         .map_err(CoreError::ArrowError)
 }
 
