@@ -63,7 +63,10 @@ impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
         let volume = self.volume.clone();
         let fut = self.inner.get_bytes(range);
         Box::pin(async move {
-            let bytes = fut.await?;
+            let bytes = volume
+                .requests
+                .time(fut, |b: &bytes::Bytes| b.len() as u64)
+                .await?;
             volume.add_bytes(bytes.len() as u64);
             Ok(bytes)
         })
@@ -76,10 +79,12 @@ impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
         let volume = self.volume.clone();
         let fut = self.inner.get_byte_ranges(ranges);
         Box::pin(async move {
+            let request = volume.requests.start();
             let chunks = fut.await?;
             // One call, many ranges: count the call once and every byte it
             // returned, so `io_calls` stays a count of round trips.
             let total: u64 = chunks.iter().map(|b| b.len() as u64).sum();
+            request.finish(total);
             volume.add_bytes(total);
             Ok(chunks)
         })

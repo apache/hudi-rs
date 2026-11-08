@@ -45,7 +45,10 @@ pub mod error;
 pub(crate) mod fault;
 pub mod file_metadata;
 pub mod reader;
+mod request_stats;
 pub mod util;
+
+pub use request_stats::RequestStats;
 
 /// Builds a parquet `RowFilter` for a read, given the file's parquet schema and
 /// the Arrow schema it maps to. Returning `None` means no filter is pushed.
@@ -85,8 +88,8 @@ pub struct Storage {
     pub(crate) object_store: Arc<dyn ObjectStore>,
     pub(crate) options: Arc<HashMap<String, String>>,
     pub(crate) hudi_configs: Arc<HudiConfigs>,
-    /// Read-volume counters for the base-file reads made through this
-    /// `Storage`.
+    /// Read counters for the reads made through this `Storage`; which reads
+    /// each one covers is documented on [`ReadVolume`].
     ///
     /// Here rather than on a read parameter so no read signature changes. The
     /// scope is this `Storage`'s lifetime, which is as narrow as the caller
@@ -111,7 +114,8 @@ pub struct Storage {
 /// which is what makes these the transferable numbers when comparing read paths.
 /// The boundary also bounds the scope: footer fetches happen before the
 /// counting wrapper is installed and log-file IO never crosses it, so these
-/// two count base-file column-chunk reads only.
+/// two count base-file column-chunk reads only. [`Self::requests`] covers
+/// more of the read path; see [`RequestStats`] for what it counts.
 ///
 /// All fields are `AtomicU64` under an `Arc` because the parquet stream is
 /// polled on whichever worker thread drives it, while a consumer may read the
@@ -173,6 +177,8 @@ pub struct ReadVolume {
     /// rows_out` is what filtering removed; `bytes_read` says what it cost to
     /// remove it.
     pub rows_out: AtomicU64,
+    /// Count, latency, size and concurrency of the fetch requests.
+    pub requests: RequestStats,
 }
 
 impl ReadVolume {
@@ -315,16 +321,23 @@ impl Storage {
     pub async fn get_file_data(&self, relative_path: &str) -> Result<Bytes> {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
-        let result = self.object_store.get(&obj_path).await?;
-        let bytes = result.bytes().await?;
-        Ok(bytes)
+        self.get_whole_object(&obj_path).await
     }
 
     pub async fn get_file_data_from_absolute_path(&self, absolute_path: &str) -> Result<Bytes> {
         let obj_path = ObjPath::from_absolute_path(PathBuf::from(absolute_path))?;
-        let result = self.object_store.get(&obj_path).await?;
-        let bytes = result.bytes().await?;
-        Ok(bytes)
+        self.get_whole_object(&obj_path).await
+    }
+
+    async fn get_whole_object(&self, obj_path: &ObjPath) -> Result<Bytes> {
+        let fetch = async {
+            let result = self.object_store.get(obj_path).await?;
+            Ok::<_, StorageError>(result.bytes().await?)
+        };
+        self.read_volume
+            .requests
+            .time(fetch, |b: &Bytes| b.len() as u64)
+            .await
     }
 
     pub async fn get_storage_reader(&self, relative_path: &str) -> Result<StorageReader> {
@@ -332,7 +345,7 @@ impl Storage {
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
         let obj_meta = obj_store.head(&obj_path).await?;
-        StorageReader::new(obj_store, obj_meta)
+        StorageReader::new_counted(obj_store, obj_meta, Some(self.read_volume.clone()))
             .await
             .map_err(StorageError::ReaderError)
     }
@@ -348,11 +361,10 @@ impl Storage {
         let obj_meta = obj_store.head(&obj_path).await?;
         let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
             .map_err(StorageError::ReaderError)?;
-        Ok(StorageReader::new_streaming(
-            obj_store,
-            obj_meta,
-            window_size,
-        ))
+        Ok(
+            StorageReader::new_streaming(obj_store, obj_meta, window_size)
+                .with_read_volume(self.read_volume.clone()),
+        )
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
@@ -703,6 +715,45 @@ mod tests {
         assert!(!storage.exists("nested/renamed.txt").await.unwrap());
         // Idempotent delete of missing object
         storage.delete_file("nested/renamed.txt").await.unwrap();
+    }
+
+    /// Whole-file reads (timeline, properties, small HFiles) and reads through
+    /// a `StorageReader` and its block fetchers count as requests on the
+    /// `Storage` that opened them. Writes and HEADs do not.
+    #[tokio::test]
+    async fn storage_reads_record_request_stats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            Storage::new_with_base_url(Url::from_directory_path(dir.path()).unwrap()).unwrap();
+        storage.put_file("f.bin", vec![7u8; 1000]).await.unwrap();
+        let stats = &storage.read_volume.requests;
+        assert_eq!(stats.count.load(Relaxed), 0);
+
+        assert_eq!(storage.get_file_data("f.bin").await.unwrap().len(), 1000);
+        assert_eq!(stats.count.load(Relaxed), 1);
+        assert_eq!(stats.bytes.load(Relaxed), 1000);
+
+        let mut whole = storage.get_storage_reader("f.bin").await.unwrap();
+        assert_eq!(
+            stats.count.load(Relaxed),
+            2,
+            "the whole read is one request"
+        );
+        whole.read_bytes(10).await.unwrap();
+        assert_eq!(stats.count.load(Relaxed), 2, "resident bytes cost nothing");
+
+        let mut streaming = storage.get_streaming_storage_reader("f.bin").await.unwrap();
+        streaming.read_bytes(10).await.unwrap();
+        streaming
+            .block_fetcher()
+            .read_contents(&[0..100, 500..600])
+            .await
+            .unwrap();
+        assert_eq!(stats.count.load(Relaxed), 4);
+        assert_eq!(stats.bytes.load(Relaxed), 1000 + 1000 + 1000 + 200);
+        assert_eq!(stats.in_flight(), 0);
+        assert_eq!(storage.read_volume.io_calls.load(Relaxed), 0);
     }
 
     /// Timeline files rely on create-if-absent: a second write to the same

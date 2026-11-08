@@ -38,7 +38,7 @@ use crate::file_group::reader_v2::reader_context::CompletionGateInputs;
 use crate::file_group::record_batches::RecordBatches;
 use crate::merge::record_merger::RecordMerger;
 use crate::metadata::meta_field::MetaField;
-use crate::storage::Storage;
+use crate::storage::{ReadVolume, Storage};
 
 use crate::table::ReadOptions;
 use crate::table::builder::OptionResolver;
@@ -1120,6 +1120,15 @@ impl FileGroupReader {
             .into();
         crate::util::path::is_metadata_table_path(&base_path)
     }
+
+    /// The read counters for every read made through this reader, including
+    /// its clones, which share them.
+    ///
+    /// They accumulate over the reader's lifetime, so a caller wanting
+    /// per-reader numbers reads them from a reader it does not share.
+    pub fn read_volume(&self) -> Arc<ReadVolume> {
+        self.storage.read_volume()
+    }
 }
 
 /// Creates a commit time filtering mask based on the provided configs.
@@ -2164,6 +2173,93 @@ mod tests {
         assert!(formatted.contains("hudi_configs"));
         assert!(formatted.contains("storage"));
         assert!(formatted.contains("base_file_format"));
+        Ok(())
+    }
+
+    /// (requests, request bytes, io_calls, bytes_read) of a reader's storage.
+    fn request_and_volume_counts(reader: &FileGroupReader) -> (u64, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let v = reader.read_volume();
+        (
+            v.requests.count.load(Relaxed),
+            v.requests.bytes.load(Relaxed),
+            v.io_calls.load(Relaxed),
+            v.bytes_read.load(Relaxed),
+        )
+    }
+
+    /// A base-file-only read is timed at the same boundary as `io_calls` and
+    /// `bytes_read`, so the request counters agree with them exactly, and the
+    /// latency, size and concurrency fields describe the same requests.
+    #[tokio::test]
+    async fn test_request_stats_match_read_volume_on_base_file_read() -> Result<()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (base_uri, partition, base_file_name, _) = v8_trips_mor_first_slice();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+        let before = request_and_volume_counts(&reader);
+
+        let batch = reader
+            .read_file_slice_from_paths(
+                &format!("{partition}/{base_file_name}"),
+                Vec::<String>::new(),
+                &ReadOptions::new(),
+            )
+            .await?;
+        assert!(batch.num_rows() > 0);
+
+        let after = request_and_volume_counts(&reader);
+        let requests = after.0 - before.0;
+        let request_bytes = after.1 - before.1;
+        assert!(requests > 0);
+        assert_eq!(requests, after.2 - before.2, "requests == io_calls");
+        assert_eq!(request_bytes, after.3 - before.3, "bytes == bytes_read");
+
+        let volume = reader.read_volume();
+        let stats = &volume.requests;
+        let count = stats.count.load(Relaxed);
+        let latency = stats.latency_nanos.load(Relaxed);
+        assert!(latency > 0);
+        assert!(stats.max_latency_nanos.load(Relaxed) <= latency);
+        assert!(stats.max_bytes.load(Relaxed) <= stats.bytes.load(Relaxed));
+        let bucketed =
+            |b: &[std::sync::atomic::AtomicU64]| -> u64 { b.iter().map(|x| x.load(Relaxed)).sum() };
+        assert_eq!(bucketed(&stats.latency_buckets), count);
+        assert_eq!(bucketed(&stats.size_buckets), count);
+        assert_eq!(stats.in_flight(), 0);
+        assert!(stats.peak_in_flight.load(Relaxed) >= 1);
+        let busy = stats.busy_nanos.load(Relaxed);
+        assert!(busy > 0 && busy <= latency, "busy {busy} latency {latency}");
+        Ok(())
+    }
+
+    /// Log-file reads do not cross the parquet boundary, so they show up in
+    /// the request counters and not in `io_calls` / `bytes_read`.
+    #[tokio::test]
+    async fn test_request_stats_cover_log_file_reads() -> Result<()> {
+        let (base_uri, partition, base_file_name, log_file_name) = v8_trips_mor_first_slice();
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+        let before = request_and_volume_counts(&reader);
+
+        reader
+            .read_file_slice_from_paths(
+                &format!("{partition}/{base_file_name}"),
+                vec![format!("{partition}/{log_file_name}")],
+                &ReadOptions::new(),
+            )
+            .await?;
+
+        let after = request_and_volume_counts(&reader);
+        let (requests, request_bytes) = (after.0 - before.0, after.1 - before.1);
+        let (io_calls, bytes_read) = (after.2 - before.2, after.3 - before.3);
+        assert!(io_calls > 0, "the base file was read");
+        assert!(
+            requests > io_calls,
+            "{requests} requests, {io_calls} io_calls"
+        );
+        assert!(
+            request_bytes > bytes_read,
+            "{request_bytes} vs {bytes_read}"
+        );
         Ok(())
     }
 

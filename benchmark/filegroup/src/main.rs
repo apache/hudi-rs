@@ -135,6 +135,17 @@ struct Args {
     /// of `/tmp` every 100 ms to do it.
     #[arg(long)]
     spill_dir: Option<String>,
+
+    /// Read with this many concurrent readers, each a `FileGroupReader` of its
+    /// own on its own task, taking the slices round-robin and reading its share
+    /// one at a time. This is the engine-thread shape: one reader per thread.
+    ///
+    /// Replaces the shared reader and `--slice-concurrency` fan-out. A shared
+    /// reader pools every slice's requests into one set of counters, so its
+    /// `peak_in_flight` cannot tell concurrent slices from pipelined requests;
+    /// a reader each keeps the per-reader request report meaningful.
+    #[arg(long)]
+    readers: Option<usize>,
 }
 
 /// A fresh spill directory for this run, under the system temp directory.
@@ -164,6 +175,8 @@ struct ReadConfig {
     /// without this the reader would spill somewhere the watcher is not
     /// looking and every run would report no spill.
     spill_dir: String,
+    /// One reader per task instead of one shared reader; see `Args::readers`.
+    readers: Option<usize>,
 }
 
 /// A global allocator that refuses to exceed a byte ceiling.
@@ -233,6 +246,10 @@ async fn main() {
         );
     }
     let args = Args::parse();
+    if args.readers.is_some() && args.scan_memory_budget.is_some() {
+        eprintln!("fg-bench failed: --readers and --scan-memory-budget cannot be combined");
+        std::process::exit(2);
+    }
     if let Err(e) = run(&args).await {
         eprintln!("fg-bench failed: {e:?}");
         std::process::exit(1);
@@ -325,9 +342,10 @@ async fn run(args: &Args) -> Result<()> {
             slice_concurrency: args.slice_concurrency,
             scan_memory_budget: args.scan_memory_budget,
             spill_dir: spill_dir_string.clone(),
+            readers: args.readers,
         };
         let spill_watch = SpillWatcher::start(spill_dir.clone());
-        let rows =
+        let (rows, readers) =
             read_all_slices(&file_slices, &hoodie_options, &args.table, &read_config).await?;
 
         let wall_ms = wall_start.elapsed().as_millis() as u64;
@@ -343,6 +361,9 @@ async fn run(args: &Args) -> Result<()> {
             ru_delta.max_rss_kb / 1024,
             rows
         );
+        for r in &readers {
+            r.print();
+        }
 
         // The memory gate. `HoodieReadStats` carried the merge map's accounted
         // peak, which the old drift detector compared against RSS; the public
@@ -382,6 +403,7 @@ async fn run(args: &Args) -> Result<()> {
             accounting_drift: over_budget,
             spilled,
             spill_peak_bytes,
+            readers,
             host: HostReport {
                 load1: host_pre.load1,
                 mem_available_kb: host_pre.mem_available_kb,
@@ -508,7 +530,8 @@ fn spill_dir_bytes(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
-/// Read every discovered file slice to completion, returning total rows.
+/// Read every discovered file slice to completion, returning total rows and
+/// each reader's request report.
 ///
 /// Built on the public `FileGroupReader` surface rather than assembling a
 /// reader from `reader_v2` internals, which are `pub(crate)`. Every knob this
@@ -523,7 +546,7 @@ async fn read_all_slices(
     hoodie_options: &HashMap<String, String>,
     table_path: &str,
     cfg: &ReadConfig,
-) -> Result<usize> {
+) -> Result<(usize, Vec<ReaderReport>)> {
     let mut options: Vec<(String, String)> = hoodie_options
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -547,7 +570,6 @@ async fn read_all_slices(
             "true".to_string(),
         ));
     }
-    let reader = FileGroupReader::new_with_options(table_path, options).await?;
 
     let read_options = hudi_core::config::read_options::ReadOptions {
         projection: cfg.requested_schema.as_ref().map(|schema| {
@@ -559,6 +581,20 @@ async fn read_all_slices(
         }),
         ..Default::default()
     };
+
+    if let Some(readers) = cfg.readers {
+        return read_with_reader_each(
+            file_slices,
+            options,
+            table_path,
+            read_options,
+            cfg.streaming,
+            readers,
+        )
+        .await;
+    }
+
+    let reader = FileGroupReader::new_with_options(table_path, options).await?;
 
     // The fan-out under test. `buffer_unordered(1)` is sequential with no
     // coordination cost, which is what the single-slice baseline must stay.
@@ -583,34 +619,213 @@ async fn read_all_slices(
             cfg.slice_concurrency,
         );
     }
+    let start = Instant::now();
     let total_rows = futures::stream::iter(file_slices.iter())
-        .map(|slice| {
-            let reader = &reader;
-            let read_options = &read_options;
-            let streaming = cfg.streaming;
-            async move {
-                if streaming {
-                    // The streaming path yields batches and drops each as it
-                    // goes, so the whole result is never resident. The eager
-                    // path below retains it. That difference is the point of
-                    // the comparison, so rows are counted without collecting.
-                    let mut stream = reader.read_file_slice_stream(slice, read_options).await?;
-                    let mut rows = 0usize;
-                    while let Some(batch) = stream.next().await {
-                        rows += batch?.num_rows();
-                    }
-                    Ok::<usize, hudi_core::error::CoreError>(rows)
-                } else {
-                    let batch = reader.read_file_slice(slice, read_options).await?;
-                    Ok::<usize, hudi_core::error::CoreError>(batch.num_rows())
-                }
-            }
-        })
+        .map(|slice| read_slice(&reader, slice, &read_options, cfg.streaming))
         .buffer_unordered(concurrency)
         .try_fold(0usize, |acc, n| async move { Ok(acc + n) })
         .await?;
+    let report = ReaderReport::capture(
+        0,
+        file_slices.len(),
+        start.elapsed(),
+        &reader.read_volume().requests,
+    );
 
-    Ok(total_rows)
+    Ok((total_rows, vec![report]))
+}
+
+/// `readers` tasks, each with a reader of its own, reading slices
+/// `i, i + readers, ...` one at a time.
+async fn read_with_reader_each(
+    file_slices: &[FileSlice],
+    options: Vec<(String, String)>,
+    table_path: &str,
+    read_options: hudi_core::config::read_options::ReadOptions,
+    streaming: bool,
+    readers: usize,
+) -> Result<(usize, Vec<ReaderReport>)> {
+    let readers = readers.clamp(1, file_slices.len().max(1));
+    let tasks: Vec<_> = (0..readers)
+        .map(|i| {
+            let slices: Vec<FileSlice> = file_slices
+                .iter()
+                .skip(i)
+                .step_by(readers)
+                .cloned()
+                .collect();
+            let options = options.clone();
+            let table_path = table_path.to_string();
+            let read_options = read_options.clone();
+            tokio::spawn(async move {
+                let reader = FileGroupReader::new_with_options(&table_path, options).await?;
+                let start = Instant::now();
+                let mut rows = 0usize;
+                for slice in &slices {
+                    rows += read_slice(&reader, slice, &read_options, streaming).await?;
+                }
+                let report = ReaderReport::capture(
+                    i,
+                    slices.len(),
+                    start.elapsed(),
+                    &reader.read_volume().requests,
+                );
+                Ok::<_, hudi_core::error::CoreError>((rows, report))
+            })
+        })
+        .collect();
+
+    let mut total_rows = 0usize;
+    let mut reports = Vec::with_capacity(readers);
+    for task in tasks {
+        let (rows, report) = task.await.map_err(|e| {
+            hudi_core::error::CoreError::ReadFileSliceError(format!("reader task failed: {e}"))
+        })??;
+        total_rows += rows;
+        reports.push(report);
+    }
+    Ok((total_rows, reports))
+}
+
+/// Read one slice to completion, returning its row count.
+async fn read_slice(
+    reader: &FileGroupReader,
+    slice: &FileSlice,
+    read_options: &hudi_core::config::read_options::ReadOptions,
+    streaming: bool,
+) -> Result<usize> {
+    if streaming {
+        // The streaming path yields batches and drops each as it goes, so the
+        // whole result is never resident. The eager path below retains it.
+        // That difference is the point of the comparison, so rows are counted
+        // without collecting.
+        let mut stream = reader.read_file_slice_stream(slice, read_options).await?;
+        let mut rows = 0usize;
+        while let Some(batch) = stream.next().await {
+            rows += batch?.num_rows();
+        }
+        Ok(rows)
+    } else {
+        Ok(reader
+            .read_file_slice(slice, read_options)
+            .await?
+            .num_rows())
+    }
+}
+
+/// One reader's object-store requests over an iteration, from its
+/// `ReadVolume::requests`. Latencies are microseconds, sizes bytes.
+#[derive(Serialize)]
+struct ReaderReport {
+    reader: usize,
+    slices: usize,
+    /// From this reader's first read to its last, excluding construction.
+    wall_ms: u64,
+    requests: u64,
+    failed_requests: u64,
+    request_bytes: u64,
+    mean_latency_us: u64,
+    max_latency_us: u64,
+    peak_in_flight: u64,
+    /// Fraction of `wall_ms` with at least one request outstanding. Well
+    /// under 1 with `mean_in_flight_while_busy` near 1 means fetch and decode
+    /// take turns.
+    busy_fraction: f64,
+    mean_in_flight_while_busy: f64,
+    /// Lower bound of the log2 bucket holding the median / 99th percentile.
+    latency_us_p50: u64,
+    latency_us_p99: u64,
+    request_bytes_p50: u64,
+    request_bytes_p99: u64,
+    /// Non-empty log2 buckets as `[lower_bound, count]`.
+    latency_us_histogram: Vec<[u64; 2]>,
+    request_bytes_histogram: Vec<[u64; 2]>,
+}
+
+impl ReaderReport {
+    fn capture(
+        reader: usize,
+        slices: usize,
+        wall: std::time::Duration,
+        stats: &hudi_core::storage::RequestStats,
+    ) -> Self {
+        let load = |a: &AtomicU64| a.load(Ordering::Relaxed);
+        let latency_counts: Vec<u64> = stats.latency_buckets.iter().map(load).collect();
+        let size_counts: Vec<u64> = stats.size_buckets.iter().map(load).collect();
+        let requests = load(&stats.count);
+        let failed_requests = load(&stats.failed);
+        let latency_nanos = load(&stats.latency_nanos);
+        let busy_nanos = load(&stats.busy_nanos);
+        let wall_nanos = wall.as_nanos() as f64;
+        let ratio = |num: f64, den: f64| if den > 0.0 { num / den } else { 0.0 };
+        ReaderReport {
+            reader,
+            slices,
+            wall_ms: wall.as_millis() as u64,
+            requests,
+            failed_requests,
+            request_bytes: load(&stats.bytes),
+            mean_latency_us: (latency_nanos / (requests + failed_requests).max(1)) / 1000,
+            max_latency_us: load(&stats.max_latency_nanos) / 1000,
+            peak_in_flight: load(&stats.peak_in_flight),
+            busy_fraction: ratio(busy_nanos as f64, wall_nanos),
+            mean_in_flight_while_busy: ratio(latency_nanos as f64, busy_nanos as f64),
+            latency_us_p50: bucket_percentile(&latency_counts, 0.50),
+            latency_us_p99: bucket_percentile(&latency_counts, 0.99),
+            request_bytes_p50: bucket_percentile(&size_counts, 0.50),
+            request_bytes_p99: bucket_percentile(&size_counts, 0.99),
+            latency_us_histogram: nonempty_buckets(&latency_counts),
+            request_bytes_histogram: nonempty_buckets(&size_counts),
+        }
+    }
+
+    fn print(&self) {
+        eprintln!(
+            "[fg-bench]   reader {}: slices={} requests={} failed={} bytes={}KB \
+             mean={}us max={}us p50>={}us p99>={}us size_p50>={}B peak_in_flight={} \
+             busy={:.0}% in_flight_while_busy={:.2}",
+            self.reader,
+            self.slices,
+            self.requests,
+            self.failed_requests,
+            self.request_bytes / 1024,
+            self.mean_latency_us,
+            self.max_latency_us,
+            self.latency_us_p50,
+            self.latency_us_p99,
+            self.request_bytes_p50,
+            self.peak_in_flight,
+            self.busy_fraction * 100.0,
+            self.mean_in_flight_while_busy,
+        );
+    }
+}
+
+/// Lower bound of the log2 bucket in which the `q` quantile falls, or 0 when
+/// the histogram is empty.
+fn bucket_percentile(counts: &[u64], q: f64) -> u64 {
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let rank = ((total as f64) * q).ceil().max(1.0) as u64;
+    let mut seen = 0u64;
+    for (i, &n) in counts.iter().enumerate() {
+        seen += n;
+        if seen >= rank {
+            return hudi_core::storage::RequestStats::bucket_lower_bound(i);
+        }
+    }
+    hudi_core::storage::RequestStats::bucket_lower_bound(counts.len() - 1)
+}
+
+fn nonempty_buckets(counts: &[u64]) -> Vec<[u64; 2]> {
+    counts
+        .iter()
+        .enumerate()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(i, &n)| [hudi_core::storage::RequestStats::bucket_lower_bound(i), n])
+        .collect()
 }
 
 /// Build a requested `SchemaRef` from named columns, typed against the table schema.
@@ -697,6 +912,9 @@ struct IterationReport {
     spilled: bool,
     /// Largest total seen in the spill directory while the read ran.
     spill_peak_bytes: u64,
+    /// Object-store requests per reader: one entry for the shared reader, or
+    /// one per reader with `--readers`.
+    readers: Vec<ReaderReport>,
     host: HostReport,
 }
 
@@ -762,4 +980,35 @@ fn read_rustc() -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bucket_percentile() {
+        // 1 in bucket 0, 8 in bucket 3 ([4, 8)), 1 in bucket 10 ([512, 1024)).
+        let mut counts = vec![0u64; 12];
+        counts[0] = 1;
+        counts[3] = 8;
+        counts[10] = 1;
+        assert_eq!(bucket_percentile(&counts, 0.0), 0);
+        assert_eq!(bucket_percentile(&counts, 0.5), 4);
+        assert_eq!(bucket_percentile(&counts, 0.9), 4);
+        assert_eq!(bucket_percentile(&counts, 0.99), 512);
+        assert_eq!(bucket_percentile(&[0; 4], 0.5), 0);
+        assert_eq!(nonempty_buckets(&counts), vec![[0, 1], [4, 8], [512, 1]]);
+    }
+
+    #[test]
+    fn test_reader_report_from_empty_stats_is_zero_not_nan() {
+        let stats = hudi_core::storage::RequestStats::default();
+        let r = ReaderReport::capture(0, 0, std::time::Duration::ZERO, &stats);
+        assert_eq!(r.requests, 0);
+        assert_eq!(r.mean_latency_us, 0);
+        assert_eq!(r.busy_fraction, 0.0);
+        assert_eq!(r.mean_in_flight_while_busy, 0.0);
+        assert!(r.latency_us_histogram.is_empty());
+    }
 }

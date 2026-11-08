@@ -115,6 +115,33 @@ before/after comparison sees an empty directory both times. Even sampling during
 the read, treat `spilled: true` as proof and `false` as unproven — compaction
 can erase the evidence between two samples.
 
+## Object-store requests per reader
+
+Each iteration's `readers` array reports the requests each `FileGroupReader`
+made, from `FileGroupReader::read_volume().requests`: count, failed count,
+bytes, mean / max latency, p50 / p99 latency and request size (as the lower
+bound of the log2 bucket they fall in), the non-empty histogram buckets,
+`peak_in_flight`, `busy_fraction` (share of the reader's wall time with a
+request outstanding) and `mean_in_flight_while_busy`. A one-line summary per
+reader also goes to stderr. HEADs, listings and parquet footer fetches are not
+counted.
+
+By default one reader serves every slice, so its counters pool the
+`--slice-concurrency` fan-out. `--readers N` instead runs N tasks with a reader
+each, taking the slices round-robin and reading its share one slice at a time,
+which is how an engine with one reader per thread reads. There,
+`mean_in_flight_while_busy` near 1 with `busy_fraction` well under 1 says the
+reader fetches and decodes in turn rather than overlapping them. `--readers`
+cannot be combined with `--scan-memory-budget`.
+
+```shell
+AWS_REGION=us-west-2 ./target/release/fg-bench --table s3://example-bucket/path/to/table \
+    --readers 8 --iterations 3 --output-json readers8.json
+```
+
+`--table` accepts an object-store URI here; credentials come from the usual
+`AWS_*` / `AZURE_*` / `GOOGLE_*` environment variables.
+
 ## Key-based vs position-based merge
 
 `--use-record-position` selects the position-based merge buffer, which matches
