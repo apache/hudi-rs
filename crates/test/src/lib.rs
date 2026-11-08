@@ -600,6 +600,8 @@ pub enum SampleTable {
     V6SimplekeygenNonhivestyle,
     V6SimplekeygenNonhivestyleOverwritetable,
     V6TimebasedkeygenNonhivestyle,
+    V6TimebasedkeygenHivestyleDay,
+    V6TimebasedkeygenHivestyleHour,
     V8ComplexkeygenHivestyle,
     V8Empty,
     V8Nonpartitioned,
@@ -671,6 +673,8 @@ impl SampleTable {
     pub fn available_formats(&self) -> &'static [TableFormat] {
         match self {
             Self::V6TimebasedkeygenNonhivestyle
+            | Self::V6TimebasedkeygenHivestyleDay
+            | Self::V6TimebasedkeygenHivestyleHour
             | Self::V8ComplexkeygenHivestyle
             | Self::V8Empty
             | Self::V8Nonpartitioned

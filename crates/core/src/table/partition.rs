@@ -104,6 +104,14 @@ pub struct PartitionPruner {
     is_url_encoded: bool,
     is_partitioned: bool,
     and_filters: Vec<SchemableFilter>,
+    /// Filters that reached the pruner but could not be bound to the partition schema, and
+    /// so prune nothing. Retained so a caller can tell "no partition matches your
+    /// predicate" apart from "your predicate was discarded and every partition was
+    /// scanned" — otherwise indistinguishable, since neither returns an error.
+    unapplied_filters: Vec<Filter>,
+    /// True when the table declares a key generator that needs filter rewriting but whose
+    /// configuration could not be loaded, so no rewriting happened.
+    keygen_unavailable: bool,
 }
 
 impl PartitionPruner {
@@ -115,13 +123,35 @@ impl PartitionPruner {
         hudi_configs: &HudiConfigs,
     ) -> Result<Self> {
         // Transform filters based on key generator configuration
-        let transformed_filters =
+        let (transformed_filters, keygen_unavailable) =
             Self::transform_filters_for_keygen(and_filters, partition_schema, hudi_configs)?;
 
-        let and_filters: Vec<SchemableFilter> = transformed_filters
-            .iter()
-            .filter_map(|filter| SchemableFilter::try_from((filter.clone(), partition_schema)).ok())
-            .collect();
+        // A filter that does not bind to the partition schema is dropped here, which is
+        // correct for a genuine data-column predicate but is also how a partition predicate
+        // silently disappears when its key generator could not rewrite it. Dropping it
+        // quietly then reads as a successful unfiltered scan, so record every drop.
+        let mut unapplied_filters = Vec::new();
+        let mut and_filters: Vec<SchemableFilter> = Vec::new();
+        for filter in &transformed_filters {
+            match SchemableFilter::try_from((filter.clone(), partition_schema)) {
+                Ok(bound) => and_filters.push(bound),
+                Err(e) => {
+                    log::warn!(
+                        "Filter on `{}` does not apply to the partition schema ({e}); it will \
+                         not prune any partition{}.",
+                        filter.field,
+                        if keygen_unavailable {
+                            ", because this table's key-generator configuration could not be \
+                             loaded and the filter was therefore never rewritten to a \
+                             partition-path predicate"
+                        } else {
+                            ""
+                        }
+                    );
+                    unapplied_filters.push(filter.clone());
+                }
+            }
+        }
 
         let schema = Arc::new(partition_schema.clone());
         let is_hive_style: bool = hudi_configs
@@ -137,6 +167,8 @@ impl PartitionPruner {
             is_url_encoded,
             is_partitioned,
             and_filters,
+            unapplied_filters,
+            keygen_unavailable,
         })
     }
 
@@ -148,7 +180,34 @@ impl PartitionPruner {
             is_url_encoded: false,
             is_partitioned: false,
             and_filters: Vec::new(),
+            unapplied_filters: Vec::new(),
+            keygen_unavailable: false,
         }
+    }
+
+    /// Filters that reached the pruner but prune nothing, because they could not be bound
+    /// to the partition schema.
+    ///
+    /// A non-empty result means the returned partitions are wider than the caller's
+    /// predicate asked for. That is not in itself an error — a predicate on a non-partition
+    /// data column belongs here and is enforced when rows are read — but a caller that
+    /// requires partition pruning to happen, rather than degrade to a full scan, should
+    /// check this and treat a partition-column entry as a failure.
+    pub fn unapplied_filters(&self) -> &[Filter] {
+        &self.unapplied_filters
+    }
+
+    /// Whether this table declares a key generator that needs filter rewriting but whose
+    /// configuration could not be loaded.
+    ///
+    /// The `hoodie.keygen.timebased.*` options are writer-side and are not guaranteed to be
+    /// persisted into `hoodie.properties`, so a table can name `TimestampBasedKeyGenerator`
+    /// while carrying nothing that says which timestamp type, timezone or output format it
+    /// used. There is no safe way to guess a granularity from the class name alone, so
+    /// pruning is skipped rather than approximated — and reported here rather than passed
+    /// off as a successful scan.
+    pub fn is_keygen_config_unavailable(&self) -> bool {
+        self.keygen_unavailable
     }
 
     /// Returns `true` if the partition pruner does not have any filters.
@@ -185,26 +244,39 @@ impl PartitionPruner {
 
     /// Transforms user filters on data columns to filters on partition path columns
     /// based on the configured key generator.
+    ///
+    /// Returns the (possibly rewritten) filters and whether a key generator was declared but
+    /// could not be built. The second value matters because failing to build one is not
+    /// benign: the untransformed filter still names the source data column, which is absent
+    /// from the partition schema, so it is dropped when bound and the table is scanned in
+    /// full. Reporting it lets the caller say so instead of returning a silent full scan.
     fn transform_filters_for_keygen(
         filters: &[Filter],
         _partition_schema: &Schema,
         hudi_configs: &HudiConfigs,
-    ) -> Result<Vec<Filter>> {
+    ) -> Result<(Vec<Filter>, bool)> {
         if is_timestamp_based_keygen(hudi_configs)? {
             match TimestampBasedKeyGenerator::from_configs(hudi_configs) {
                 Ok(transformer) => {
-                    return Self::apply_transformer_to_filters(filters, &transformer);
+                    return Ok((
+                        Self::apply_transformer_to_filters(filters, &transformer)?,
+                        false,
+                    ));
                 }
                 Err(e) => {
                     log::warn!(
-                        "Failed to create TimestampBasedKeyGenerator: {e}. \
-                         Filters will not be transformed."
+                        "Table declares TimestampBasedKeyGenerator but one could not be built \
+                         ({e}); the hoodie.keygen.timebased.* options are writer-side and may \
+                         not be present in hoodie.properties. Filters on the timestamp source \
+                         column cannot be rewritten into partition-path predicates and will \
+                         not prune; every partition will be read."
                     );
+                    return Ok((filters.to_vec(), true));
                 }
             }
         }
 
-        Ok(filters.to_vec())
+        Ok((filters.to_vec(), false))
     }
 
     fn apply_transformer_to_filters(
@@ -430,6 +502,70 @@ mod tests {
     }
 
     #[test]
+    fn test_hoodie_partition_path_whole_path_pruning() {
+        // A timestamp key generator rewrites a source-column predicate into a predicate on
+        // the opaque whole-path meta field, so the pruner holds a single-field schema and
+        // must compare the path as one string rather than split it into segments.
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        assert!(!pruner.is_empty());
+        assert!(pruner.should_include("ts_str=2023/04/01/12"));
+        assert!(!pruner.should_include("ts_str=2023/05/01/08"));
+    }
+
+    #[test]
+    fn test_hoodie_partition_path_whole_path_pruning_url_encoded() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts_str"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ss.SSSZ",
+            ),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd/HH"),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "true"),
+        ]);
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let filter = Filter::try_from(("ts_str", "=", "2023-04-01T12:01:00.123Z")).unwrap();
+
+        let pruner = PartitionPruner::new(&[filter], &partition_schema, &configs).unwrap();
+        // Hudi url-encodes the value before adding the hive prefix, so the path on
+        // storage is `ts_str=2023%2F04%2F01%2F12`.
+        assert!(pruner.should_include("ts_str=2023%2F04%2F01%2F12"));
+        assert!(!pruner.should_include("ts_str=2023%2F05%2F01%2F08"));
+    }
+
+    #[test]
     fn test_partition_pruner_parse_segments() {
         let schema = create_test_schema();
         let configs = create_hudi_configs(true, false);
@@ -490,6 +626,106 @@ mod tests {
         assert!(includes(("category", "=", "A"), default_count));
         // Filters on the other fields still prune.
         assert!(!includes(("date", ">", "2024-01-01"), default_category));
+    }
+
+    /// A value containing a structural character is escaped by the writer precisely so the
+    /// split stays unambiguous, so each decoded value must keep its escaped `/`, `=`, space
+    /// and `%` inside the one segment.
+    #[test]
+    fn test_partition_pruner_url_encoded_value_contains_separators() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        for (encoded, decoded) in [
+            ("category=a%2Fb", "a/b"),
+            ("category=a%3Db", "a=b"),
+            ("category=a%20b", "a b"),
+            ("category=a%25b", "a%b"),
+        ] {
+            let segments = pruner.parse_segments(encoded).unwrap();
+            let expected = SchemableFilter::cast_value(&[decoded], &DataType::Utf8).unwrap();
+            assert_eq!(
+                segments["category"]
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+                    .into_inner()
+                    .as_ref(),
+                expected.into_inner().as_ref(),
+                "decoding {encoded}"
+            );
+        }
+    }
+
+    /// Decoding happens exactly once: a literal `%2F` in the source value is written as
+    /// `%252F`, and one decode pass must yield `%2F`, not `/`.
+    #[test]
+    fn test_partition_pruner_url_decodes_exactly_once() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, true);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner.parse_segments("category=a%252Fb").unwrap();
+        let expected = SchemableFilter::cast_value(&["a%2Fb"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments["category"]
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_inner()
+                .as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
+    /// With url-encoding off, a `%` in a value is a literal `%` and must survive untouched.
+    #[test]
+    fn test_partition_pruner_no_decode_when_urlencode_disabled() {
+        let schema = Schema::new(vec![Field::new("category", DataType::Utf8, false)]);
+        let configs = create_hudi_configs(true, false);
+        let pruner = PartitionPruner::new(&[], &schema, &configs).unwrap();
+
+        let segments = pruner.parse_segments("category=a%2Fb").unwrap();
+        let expected = SchemableFilter::cast_value(&["a%2Fb"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments["category"]
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_inner()
+                .as_ref(),
+            expected.into_inner().as_ref()
+        );
+    }
+
+    /// The `_hoodie_partition_path` meta field takes the whole path as a single
+    /// opaque value with no segment structure to preserve, so it is decoded in one
+    /// pass — the separators inside it are part of the value, not delimiters the
+    /// decode has to stay clear of.
+    #[test]
+    fn partition_path_meta_field_decodes_the_whole_path_at_once() {
+        let schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let pruner = PartitionPruner::new(&[], &schema, &create_hudi_configs(true, true)).unwrap();
+
+        let segments = pruner
+            .parse_segments("date%3D2023-02-01%2Fcategory%3DA")
+            .unwrap();
+        let expected =
+            SchemableFilter::cast_value(&["date=2023-02-01/category=A"], &DataType::Utf8).unwrap();
+        assert_eq!(
+            segments[MetaField::PartitionPath.as_ref()]
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_inner()
+                .as_ref(),
+            expected.into_inner().as_ref()
+        );
     }
 
     #[test]
@@ -601,7 +837,7 @@ mod tests {
             values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
             &partition_schema,
             &configs,
@@ -611,7 +847,7 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field, MetaField::PartitionPath.as_ref());
         assert_eq!(transformed[0].operator, ExprOperator::Gte);
-        assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
+        assert_eq!(transformed[0].values[0], "ts_str=2023/04/15");
 
         // Equality filter: UNIX_TIMESTAMP Eq → single path
         let configs = HudiConfigs::new([
@@ -632,7 +868,7 @@ mod tests {
             values: vec!["1706140800".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
             &partition_schema,
             &configs,
@@ -662,7 +898,7 @@ mod tests {
             values: vec!["2023-04-15T12:00:00.000Z".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             &[user_filter],
             &partition_schema,
             &configs,
@@ -670,7 +906,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].values[0], "year=2023/month=04/day=15");
+        assert_eq!(transformed[0].values[0], "ts_str=2023/04/15");
     }
 
     #[test]
@@ -692,7 +928,7 @@ mod tests {
             values: vec!["us-west".to_string()],
         };
 
-        let transformed = PartitionPruner::transform_filters_for_keygen(
+        let (transformed, _) = PartitionPruner::transform_filters_for_keygen(
             std::slice::from_ref(&user_filter),
             &partition_schema,
             &configs,
@@ -799,13 +1035,13 @@ mod tests {
         assert!(!pruner.is_empty());
 
         // Full path string comparison on _hoodie_partition_path
-        assert!(pruner.should_include("year=2024/month=01/day=15"));
-        assert!(pruner.should_include("year=2024/month=06/day=30"));
-        assert!(pruner.should_include("year=2025/month=01/day=01"));
+        assert!(pruner.should_include("ts=2024/01/15"));
+        assert!(pruner.should_include("ts=2024/06/30"));
+        assert!(pruner.should_include("ts=2025/01/01"));
 
         // Should exclude partitions < 2024/01/15
-        assert!(!pruner.should_include("year=2023/month=12/day=31"));
-        assert!(!pruner.should_include("year=2022/month=01/day=01"));
+        assert!(!pruner.should_include("ts=2023/12/31"));
+        assert!(!pruner.should_include("ts=2022/01/01"));
 
         // Non-hive-style: verify the same logic works
         let configs = HudiConfigs::new([
@@ -833,5 +1069,258 @@ mod tests {
         assert!(pruner.should_include("2024/01/15"));
         assert!(!pruner.should_include("2024/01/16"));
         assert!(!pruner.should_include("2023/12/31"));
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Hive-style timestamp-keygen pruning. Every timestamp-keygen fixture in
+    // crates/test/data is non-hive-style, so this branch previously had no table-backed
+    // coverage at all.
+    // ---------------------------------------------------------------------------------
+
+    fn hive_style_ts_configs(output_dateformat: &str) -> HudiConfigs {
+        HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "DATE_STRING"),
+            (
+                "hoodie.keygen.timebased.input.dateformat",
+                "yyyy-MM-dd'T'HH:mm:ssZ",
+            ),
+            (
+                "hoodie.keygen.timebased.output.dateformat",
+                output_dateformat,
+            ),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+            ("hoodie.datasource.write.partitionpath.urlencode", "false"),
+        ])
+    }
+
+    fn partition_path_schema() -> Schema {
+        Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )])
+    }
+
+    fn ts_filter(operator: ExprOperator, value: &str) -> Filter {
+        Filter {
+            field: "ts".to_string(),
+            operator,
+            values: vec![value.to_string()],
+        }
+    }
+
+    /// The hive prefix is the declared partition field, applied once to the whole formatted
+    /// value. It never comes from the format tokens.
+    #[test]
+    fn hive_style_path_uses_declared_field_name_not_format_tokens() {
+        for (output_dateformat, expected) in [
+            ("yyyy-MM-dd", "ts=2024-03-01"),
+            ("yyyy/MM/dd", "ts=2024/03/01"),
+            ("yyyy-MM-dd-HH", "ts=2024-03-01-08"),
+            ("yyyyMMdd", "ts=20240301"),
+        ] {
+            let keygen =
+                TimestampBasedKeyGenerator::from_configs(&hive_style_ts_configs(output_dateformat))
+                    .unwrap();
+            let transformed = keygen
+                .transform_filter(&ts_filter(ExprOperator::Eq, "2024-03-01T08:00:00Z"))
+                .unwrap();
+            assert_eq!(
+                transformed[0].values[0], expected,
+                "output.dateformat {output_dateformat}"
+            );
+        }
+    }
+
+    /// A predicate no partition can satisfy must exclude every partition.
+    #[test]
+    fn impossible_predicate_excludes_every_day_partition() {
+        let pruner = PartitionPruner::new(
+            &[ts_filter(ExprOperator::Eq, "1900-01-01T00:00:00Z")],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        for path in ["ts=2024-03-01", "ts=2024-03-02", "ts=2023-12-31"] {
+            assert!(!pruner.should_include(path), "{path} should be excluded");
+        }
+    }
+
+    #[test]
+    fn day_granularity_range_selects_only_days_in_range() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-03-01T00:00:00Z"),
+                ts_filter(ExprOperator::Lt, "2024-03-04T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        for included in ["ts=2024-03-01", "ts=2024-03-02", "ts=2024-03-03"] {
+            assert!(pruner.should_include(included), "{included}");
+        }
+        for excluded in ["ts=2024-02-29", "ts=2024-03-05", "ts=2025-01-01"] {
+            assert!(!pruner.should_include(excluded), "{excluded}");
+        }
+    }
+
+    /// A half-open upper bound widens from `<` to `<=` at partition granularity, so the
+    /// boundary partition is retained. That is deliberate: `ts < 2024-03-02T06:00:00Z`
+    /// genuinely has matching rows inside `ts=2024-03-02`, and the transform has already
+    /// discarded the time of day, so the partition cannot be ruled out here. Row-level
+    /// evaluation removes the rows that do not match.
+    #[test]
+    fn half_open_upper_bound_retains_the_boundary_partition() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-03-01T00:00:00Z"),
+                ts_filter(ExprOperator::Lt, "2024-03-02T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        assert!(pruner.should_include("ts=2024-03-01"));
+        assert!(pruner.should_include("ts=2024-03-02"));
+        assert!(!pruner.should_include("ts=2024-03-03"));
+        assert!(!pruner.should_include("ts=2024-02-29"));
+    }
+
+    #[test]
+    fn hour_granularity_range_spans_a_day_boundary() {
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-03-01T22:00:00Z"),
+                ts_filter(ExprOperator::Lte, "2024-03-02T01:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd-HH"),
+        )
+        .unwrap();
+
+        for included in [
+            "ts=2024-03-01-22",
+            "ts=2024-03-01-23",
+            "ts=2024-03-02-00",
+            "ts=2024-03-02-01",
+        ] {
+            assert!(pruner.should_include(included), "{included}");
+        }
+        for excluded in ["ts=2024-03-01-21", "ts=2024-03-02-02"] {
+            assert!(!pruner.should_include(excluded), "{excluded}");
+        }
+    }
+
+    /// Leap day and year rollover are ordinary calendar arithmetic, but a format that
+    /// zero-padded inconsistently would break the ordered string comparison, so pin them.
+    #[test]
+    fn leap_day_and_year_rollover_compare_correctly() {
+        let configs = hive_style_ts_configs("yyyy-MM-dd");
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-02-28T00:00:00Z"),
+                ts_filter(ExprOperator::Lte, "2024-03-01T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &configs,
+        )
+        .unwrap();
+        assert!(pruner.should_include("ts=2024-02-29"), "leap day");
+        assert!(!pruner.should_include("ts=2023-02-28"));
+
+        let pruner = PartitionPruner::new(
+            &[
+                ts_filter(ExprOperator::Gte, "2024-12-31T00:00:00Z"),
+                ts_filter(ExprOperator::Lte, "2025-01-01T00:00:00Z"),
+            ],
+            &partition_path_schema(),
+            &configs,
+        )
+        .unwrap();
+        assert!(pruner.should_include("ts=2024-12-31"));
+        assert!(pruner.should_include("ts=2025-01-01"));
+        assert!(!pruner.should_include("ts=2024-12-30"));
+        assert!(!pruner.should_include("ts=2025-01-02"));
+    }
+
+    /// A table can name TimestampBasedKeyGenerator while carrying none of the writer-side
+    /// `hoodie.keygen.timebased.*` options that say which granularity, timezone or format
+    /// it used. Guessing is unsafe, so pruning is skipped — but the caller must be able to
+    /// see that. Previously the filter was discarded without a trace and the resulting full
+    /// scan was indistinguishable from a successful one.
+    #[test]
+    fn missing_timebased_config_is_reported_rather_than_silently_ignored() {
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.datasource.write.hive_style_partitioning", "true"),
+        ]);
+        let pruner = PartitionPruner::new(
+            &[ts_filter(ExprOperator::Eq, "1900-01-01T00:00:00Z")],
+            &partition_path_schema(),
+            &configs,
+        )
+        .unwrap();
+
+        assert!(
+            pruner.is_keygen_config_unavailable(),
+            "the reader must report that it could not load the key-generator config"
+        );
+        assert_eq!(
+            pruner.unapplied_filters().len(),
+            1,
+            "the discarded predicate must be reported, not dropped in silence"
+        );
+        assert_eq!(pruner.unapplied_filters()[0].field, "ts");
+
+        // Pruning is deliberately skipped rather than approximated, so every partition is
+        // still returned; the point is that the accessors above make that visible.
+        assert!(pruner.should_include("ts=2024-03-01"));
+    }
+
+    /// A predicate on a plain data column legitimately prunes nothing and is reported as
+    /// unapplied, but it must not be mistaken for a broken key generator.
+    #[test]
+    fn data_column_filter_is_unapplied_without_blaming_the_keygen() {
+        let pruner = PartitionPruner::new(
+            &[Filter {
+                field: "amount".to_string(),
+                operator: ExprOperator::Gt,
+                values: vec!["100".to_string()],
+            }],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        assert_eq!(pruner.unapplied_filters().len(), 1);
+        assert!(!pruner.is_keygen_config_unavailable());
+        assert!(pruner.should_include("ts=2024-03-01"));
+    }
+
+    /// When the key generator is usable, nothing is left unapplied.
+    #[test]
+    fn a_usable_keygen_leaves_no_unapplied_filter() {
+        let pruner = PartitionPruner::new(
+            &[ts_filter(ExprOperator::Eq, "2024-03-01T00:00:00Z")],
+            &partition_path_schema(),
+            &hive_style_ts_configs("yyyy-MM-dd"),
+        )
+        .unwrap();
+
+        assert!(pruner.unapplied_filters().is_empty());
+        assert!(!pruner.is_keygen_config_unavailable());
     }
 }
