@@ -39,7 +39,8 @@ mod ffi {
 
     /// One column predicate, `field op value`. `op` is one of `=`, `!=`, `<`,
     /// `<=`, `>`, `>=`, `IN`, `NOT IN`; the last two take a comma-separated
-    /// `value`.
+    /// `value` whose items are trimmed, where `\,` is a literal comma and
+    /// `\\` a literal backslash.
     struct HudiFilter {
         field: String,
         op: String,
