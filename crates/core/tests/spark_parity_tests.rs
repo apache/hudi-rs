@@ -1322,29 +1322,13 @@ async fn parity_j_spark_sql_dml_on_rs_tables() {
 #[tokio::test]
 #[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
 async fn parity_k_rs_compaction_spark_interop() {
-    rs_compaction_spark_interop("NONE").await;
-}
-
-#[tokio::test]
-#[ignore = "Spark parity: run via `make parity` (needs SPARK_HOME)"]
-async fn parity_k_gzip_metadata_compaction_spark_interop() {
-    rs_compaction_spark_interop("GZ").await;
-}
-
-async fn rs_compaction_spark_interop(codec: &str) {
     if !enabled() {
         return;
     }
     let env = spark_env();
     let dir = tempdir().unwrap();
     let path = dir.path();
-    rs_create_with(
-        path,
-        TableTypeValue::MergeOnRead,
-        true,
-        &[("hoodie.hfile.compression.algorithm", codec)],
-    )
-    .await;
+    rs_create(path, TableTypeValue::MergeOnRead, true).await;
     // rs handles compact the metadata table every two delta commits, so the
     // Spark reads below, which run with and without the metadata table, read
     // rs-compacted metadata base files.

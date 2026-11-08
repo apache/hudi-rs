@@ -57,30 +57,29 @@ pub(crate) const DEFAULT_COLUMN_STATS_NUM_FILE_GROUPS: usize = 2;
 /// Java `hoodie.metadata.index.partition.stats.file.group.count` default.
 pub(crate) const DEFAULT_PARTITION_STATS_NUM_FILE_GROUPS: usize = 1;
 
-/// Metadata writes inherit the data table's resolved compression option.
-pub(crate) fn hfile_compression(configs: &crate::config::HudiConfigs) -> Result<CompressionCodec> {
-    const KEY: &str = "hoodie.hfile.compression.algorithm";
-    let value = configs.get_raw(KEY).unwrap_or("NONE");
-    match value.to_ascii_lowercase().as_str() {
-        "none" => Ok(CompressionCodec::None),
-        "gz" => Ok(CompressionCodec::Gzip),
-        _ => Err(crate::error::CoreError::InvalidValue(format!(
-            "{KEY}='{value}' is not supported for metadata writes; expected NONE or GZ"
-        ))),
-    }
+/// Codec of every metadata-table HFile. Java's metadata write config does not
+/// inherit the data table's `hoodie.hfile.compression.algorithm`, so Java
+/// metadata HFiles always take the HFile default, GZ.
+pub(crate) const METADATA_HFILE_CODEC: CompressionCodec = CompressionCodec::Gzip;
+
+/// Encode one metadata-table HFile, with the writer schema as file info.
+fn encode_metadata_hfile(entries: &[(String, Vec<u8>)], schema_json: &str) -> Result<Vec<u8>> {
+    HFileWriter::write_with_compression(
+        entries,
+        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
+        METADATA_HFILE_CODEC,
+    )
+    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))
 }
 
 async fn write_metadata_hfile(
-    storage: &Storage,
     entries: Vec<(String, Vec<u8>)>,
     schema_json: &str,
 ) -> Result<Vec<u8>> {
-    let codec = hfile_compression(&storage.hudi_configs)?;
-    let info = BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]);
-    tokio::task::spawn_blocking(move || HFileWriter::write_with_compression(&entries, info, codec))
+    let schema_json = schema_json.to_string();
+    tokio::task::spawn_blocking(move || encode_metadata_hfile(&entries, &schema_json))
         .await
         .map_err(|e| crate::error::CoreError::Write(format!("metadata HFile task failed: {e}")))?
-        .map_err(|e| crate::error::CoreError::HFile(e.to_string()))
 }
 
 fn column_stats_file_id(shard: usize) -> String {
@@ -143,7 +142,6 @@ pub async fn bootstrap_metadata_table(
     column_stats_enabled: bool,
     partition_stats_enabled: bool,
 ) -> Result<()> {
-    let codec = hfile_compression(&data_table_storage.hudi_configs)?;
     let mdt_name = format!("{table_name}_metadata");
     let checksum = crate::write::create::table_checksum("", &mdt_name);
     // The MDT's table version follows the data table's (Java initializes the
@@ -187,18 +185,13 @@ pub async fn bootstrap_metadata_table(
     let files_instant = bootstrap_instant(0);
     let all_partitions = encode_all_partitions(Vec::new())?;
     let files_base_name = format!("{FILES_FILE_ID}_0-0-0_{files_instant}.hfile");
-    let hfile = HFileWriter::write_with_compression(
+    let hfile = encode_metadata_hfile(
         &[(
             FilesPartitionRecord::ALL_PARTITIONS_KEY.to_string(),
             all_partitions,
         )],
-        BTreeMap::from([(
-            "schema".to_string(),
-            files_metadata_avro_schema_json()?.as_bytes().to_vec(),
-        )]),
-        codec,
-    )
-    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+        files_metadata_avro_schema_json()?,
+    )?;
     let files_base_size = hfile.len() as i64;
     crate::write::ensure_partition_metadata(
         data_table_storage,
@@ -278,7 +271,6 @@ async fn bootstrap_empty_hfile_partition(
     file_id_fn: &(dyn Fn(usize) -> String + Sync),
     schema_json: &str,
 ) -> Result<()> {
-    let codec = hfile_compression(&storage.hudi_configs)?;
     crate::write::ensure_partition_metadata(
         storage,
         &format!("{METADATA_BASE}/{partition_name}"),
@@ -289,12 +281,7 @@ async fn bootstrap_empty_hfile_partition(
     for shard in 0..num_file_groups {
         let file_id = file_id_fn(shard);
         let base_name = format!("{file_id}_0-0-0_{instant}.hfile");
-        let empty = HFileWriter::write_with_compression(
-            &[],
-            BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
-            codec,
-        )
-        .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+        let empty = encode_metadata_hfile(&[], schema_json)?;
         let size = empty.len() as i64;
         storage
             .put_file(
@@ -372,7 +359,7 @@ pub async fn update_files_partition_entries(
     }
     let schema_json = files_metadata_avro_schema_json()?.to_string();
     let num_writes = entries.len() as i64;
-    let hfile = write_metadata_hfile(data_storage, entries, &schema_json).await?;
+    let hfile = write_metadata_hfile(entries, &schema_json).await?;
     // Java HFile data blocks embed SCHEMA (ordinal 2) alongside INSTANT_TIME.
     let block = LogFileWriter::write_log_block(
         BlockType::HfileData,
@@ -418,7 +405,6 @@ pub async fn update_record_index(
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    let codec = hfile_compression(&data_storage.hudi_configs)?;
     let num_groups = detect_rli_num_file_groups(data_storage).await?;
     let schema_json = record_index_metadata_avro_schema_json()?.to_string();
     // Only the routing happens here; each shard encodes its own entries on
@@ -472,12 +458,7 @@ pub async fn update_record_index(
                 let mut num_writes = 0i64;
                 if !puts.is_empty() {
                     num_writes += puts.len() as i64;
-                    let hfile = HFileWriter::write_with_compression(
-                        &puts,
-                        BTreeMap::from([("schema".to_string(), schema_json.as_bytes().to_vec())]),
-                        codec,
-                    )
-                    .map_err(|error| crate::error::CoreError::HFile(error.to_string()))?;
+                    let hfile = encode_metadata_hfile(&puts, &schema_json)?;
                     log_bytes.extend(LogFileWriter::write_log_block(
                         BlockType::HfileData,
                         HashMap::from([
@@ -594,7 +575,6 @@ pub(crate) async fn ensure_supported_metadata_layout(table: &Table) -> Result<()
     if !table.is_metadata_table_enabled() {
         return Ok(());
     }
-    hfile_compression(&table.hudi_configs)?;
     let supported = [
         MetadataPartitionType::Files,
         MetadataPartitionType::ColumnStats,
@@ -1402,7 +1382,7 @@ async fn write_stats_log_blocks(
     for (shard, entries) in by_shard {
         let file_id = file_id_fn(shard);
         let num_writes = entries.len() as i64;
-        let hfile = write_metadata_hfile(data_storage, entries, &schema_json).await?;
+        let hfile = write_metadata_hfile(entries, &schema_json).await?;
         let block = LogFileWriter::write_log_block(
             BlockType::HfileData,
             HashMap::from([

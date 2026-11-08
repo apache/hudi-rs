@@ -572,9 +572,6 @@ impl TableCreateBuilder {
         // Refuse what opening the table would reject before any file is written.
         crate::table::validation::validate_configs(&configs)?;
         crate::write::archival::validated_keep_range(&configs)?;
-        if self.metadata_table_enabled {
-            crate::write::metadata::hfile_compression(&configs)?;
-        }
         let mut storage_options = self.storage_options.clone();
         crate::table::builder::resolve_storage_env_vars(&mut storage_options);
         let storage = Storage::new(Arc::new(storage_options), Arc::new(configs))?;

@@ -302,16 +302,12 @@ correctly. A file slice merges to its base file's schema, so the writer uses
 Java's metadata table writer schema: `HoodieMetadataRecord` with the five
 `_hoodie_*` meta fields prepended, always null.
 
-Metadata HFiles support `hoodie.hfile.compression.algorithm=GZ` (GZIP) or
-`NONE` (the default). The data table's resolved option applies to bootstrap
-base files, HFile log blocks and compacted bases, including every metadata
-index partition. As with other options, a value persisted in
-`hoodie.properties` takes precedence over a value supplied when reopening the
-table. Unsupported values fail before a write starts. Compression
-runs per HFile block; readers use each file's trailer, so old uncompressed
-files and new GZIP files can coexist. Changing the write option does not
-rewrite existing files. Compaction rewrites slices with logs using the current
-option; it does not remove old file versions.
+Metadata HFiles (bootstrap base files, HFile log blocks and compacted bases)
+compress every block with GZ, as Java's metadata writer does: its metadata
+write config does not inherit the data table's
+`hoodie.hfile.compression.algorithm`, so neither does this writer. Readers take
+the codec from each file's trailer, so uncompressed and GZ files can coexist in
+a file slice, and compaction writes the merged base as GZ.
 
 ### 5.1 Metadata table compaction
 
