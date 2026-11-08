@@ -210,7 +210,9 @@ impl Table {
         crate::write::set_commit_timezone(&crate::write::metadata::timeline_timezone(
             &self.hudi_configs,
         ));
-        self.refuse_write_to_bootstrap_skeletons().await
+        // Boxed so the file slice listing's future does not deepen every write
+        // future's layout past the compiler's query depth limit.
+        Box::pin(self.refuse_write_to_bootstrap_skeletons()).await
     }
 
     /// Refuse a write to a table that still holds a METADATA_ONLY bootstrap skeleton.
