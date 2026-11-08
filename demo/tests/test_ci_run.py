@@ -68,7 +68,9 @@ exit 0
             check=False,
             timeout=10,
         )
-        self.assertEqual(self.log.read_text().splitlines(), ["up", "inspect", "exec", "down"])
+        self.assertEqual(
+            self.log.read_text().splitlines(), ["up", "inspect", "exec", "down"]
+        )
         return result
 
     def test_success_returns_zero_and_cleans_up(self):
