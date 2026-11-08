@@ -27,4 +27,4 @@
 - Removed `reader.rs` (not needed for Hudi use case).
 - Original tests are removed.
 - DataFusion errors (`datafusion_common::error::Result`) replaced with Hudi errors (`crate::error::Result`).
-- Adjusted `AvroArrowArrayReader` to work with `Iterator<Item = AvroResult<Value>>` instead of a reader-based approach.
+- Only the schema conversion (`schema.rs`, `to_arrow_schema`) is kept; the array reader is removed.

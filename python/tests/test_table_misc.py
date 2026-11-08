@@ -17,8 +17,23 @@
 
 """Tests for HudiTable accessor and stats APIs."""
 
-from hudi import HudiFileGroupReader, HudiQueryType, HudiReadOptions, HudiTable
+import pytest
+
+from hudi import (
+    HudiCoreError,
+    HudiFileGroupReader,
+    HudiQueryType,
+    HudiReadOptions,
+    HudiTable,
+)
 from hudi._internal import get_test_table_path
+
+
+def test_core_errors_raise_hudi_core_error(tmp_path):
+    assert issubclass(HudiCoreError, Exception)
+    assert HudiCoreError.__module__ == "hudi._internal"
+    with pytest.raises(HudiCoreError):
+        HudiTable(str(tmp_path / "missing"))
 
 
 def test_table_metadata_getters(v8_trips_table):
@@ -141,10 +156,8 @@ def test_read_dispatches_on_query_type(v8_trips_table):
 
 
 def test_read_stream_errors_on_incremental(v8_trips_table):
-    import pytest
-
     table = HudiTable(v8_trips_table)
-    with pytest.raises(Exception, match="not yet supported"):
+    with pytest.raises(HudiCoreError, match="not yet supported"):
         table.read_stream(HudiReadOptions().with_query_type(HudiQueryType.Incremental))
 
 

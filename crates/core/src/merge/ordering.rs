@@ -63,10 +63,15 @@ pub fn process_batch_for_max_orderings(
     }
 
     let ordering_fields: Vec<String> = hudi_configs.get(HudiTableConfig::OrderingFields)?.into();
+    let ordering_field = ordering_fields.first().ok_or_else(|| {
+        crate::error::CoreError::Config(crate::config::error::ConfigError::NotFound(
+            HudiTableConfig::OrderingFields.as_ref().to_string(),
+        ))
+    })?;
 
     let keys = extract_record_keys(key_converter, batch)?;
     let event_times =
-        extract_event_time_ordering_values(event_time_converter, batch, &ordering_fields[0])?;
+        extract_event_time_ordering_values(event_time_converter, batch, ordering_field)?;
     let commit_times = extract_commit_time_ordering_values(commit_time_converter, batch)?;
     for i in 0..batch.num_rows() {
         let key = keys.row(i).owned();
@@ -578,6 +583,25 @@ mod tests {
         let result = process_batch_for_max_orderings(
             &batch,
             &mut max_ordering,
+            &key_converter,
+            &event_time_converter,
+            &commit_time_converter,
+            hudi_configs,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_process_batch_for_max_orderings_empty_ordering_config() {
+        let batch = create_test_delete_batch();
+        let (key_converter, event_time_converter, commit_time_converter) =
+            create_test_converters(batch.schema());
+        let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::OrderingFields, "")]));
+
+        let result = process_batch_for_max_orderings(
+            &batch,
+            &mut HashMap::new(),
             &key_converter,
             &event_time_converter,
             &commit_time_converter,

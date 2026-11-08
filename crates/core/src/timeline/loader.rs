@@ -23,6 +23,7 @@ use crate::config::table::HudiTableConfig::{ArchiveLogFolder, TimelineHistoryPat
 use crate::error::CoreError;
 use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::HoodieCommitMetadata;
+use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::storage::Storage;
 use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
@@ -44,6 +45,14 @@ enum TimelineLayout {
     V1Archived,
     V2Active,
     V2Archived,
+}
+
+/// The layout-2 LSM history directory, shared by the reader and the archiver
+/// so both resolve the same folder.
+pub(crate) fn lsm_history_dir(hudi_configs: &HudiConfigs) -> String {
+    let timeline_path: String = hudi_configs.get_or_default(TimelinePath).into();
+    let history_path: String = hudi_configs.get_or_default(TimelineHistoryPath).into();
+    format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
 }
 
 #[allow(dead_code)]
@@ -126,11 +135,7 @@ impl TimelineLoader {
                 self.hudi_configs.get_or_default(ArchiveLogFolder).into()
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                // Layout 2 uses LSM history directory
-                let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
-                let history_path: String =
-                    self.hudi_configs.get_or_default(TimelineHistoryPath).into();
-                format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
+                lsm_history_dir(&self.hudi_configs)
             }
         }
     }
@@ -151,7 +156,7 @@ impl TimelineLoader {
     /// Every instant time that has a `requested` or `inflight` file and no
     /// completed one, for **any** action.
     ///
-    /// Deliberately not built on [`TimelineSelector`], which resolves the action
+    /// Deliberately not built on `TimelineSelector`, which resolves the action
     /// through [`Action`](crate::timeline::instant::Action) and so can only see
     /// the three commit actions the enum names. Java's `getValidInstantTimestamps`
     /// takes its `datasetPendingInstants` from `filterInflightsAndRequested()`
@@ -366,9 +371,12 @@ impl TimelineLoader {
                 })
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                // Layout 2: Avro format
-                let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
-                metadata.to_json_map()
+                // Layout 2: Avro format — replace commits use a distinct Java schema.
+                if instant.is_replacecommit() {
+                    HoodieReplaceCommitMetadata::from_avro_bytes(&bytes)?.to_json_map()
+                } else {
+                    HoodieCommitMetadata::from_avro_bytes(&bytes)?.to_json_map()
+                }
             }
         }
     }
@@ -390,11 +398,17 @@ impl TimelineLoader {
                 })
             }
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                // Layout 2: Avro format - deserialize then serialize to JSON
-                let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
-                serde_json::to_string(&metadata).map_err(|e| {
-                    CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
-                })
+                if instant.is_replacecommit() {
+                    let metadata = HoodieReplaceCommitMetadata::from_avro_bytes(&bytes)?;
+                    serde_json::to_string(&metadata).map_err(|e| {
+                        CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
+                    })
+                } else {
+                    let metadata = HoodieCommitMetadata::from_avro_bytes(&bytes)?;
+                    serde_json::to_string(&metadata).map_err(|e| {
+                        CoreError::Timeline(format!("Failed to serialize metadata to JSON: {e}"))
+                    })
+                }
             }
         }
     }

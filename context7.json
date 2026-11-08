@@ -1,0 +1,31 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Apache Hudi Rust and Python (hudi-rs)",
+  "description": "Native Rust implementation of Apache Hudi with Python and C++ bindings: create, write (append, upsert, update, delete, overwrite), and read Hudi tables as Arrow without a JVM.",
+  "excludeFolders": [
+    ".github",
+    "benchmark",
+    "crates/test",
+    "demo/infra",
+    "python/tests",
+    "release",
+    "scripts"
+  ],
+  "excludeFiles": [
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md"
+  ],
+  "rules": [
+    "Docs and resources: quick start guide https://hudi.apache.org/docs/python-rust-quick-start-guide and the shorter README quick start https://github.com/apache/hudi-rs#quick-start; Rust API reference https://docs.rs/hudi (re-exports https://docs.rs/hudi-core and, with the `datafusion` feature, https://docs.rs/hudi-datafusion); Python API reference in the docstrings of the bundled type stubs https://github.com/apache/hudi-rs/blob/main/python/hudi/_internal.pyi; runnable Rust example https://github.com/apache/hudi-rs/blob/main/crates/core/examples/table_writes.rs; reader semantics https://github.com/apache/hudi-rs/blob/main/docs/reader-spec.md; writer design https://github.com/apache/hudi-rs/blob/main/docs/writer-design.md; packages https://pypi.org/project/hudi/ and https://crates.io/crates/hudi; source https://github.com/apache/hudi-rs; Hudi concepts (timeline, table types, query types) https://hudi.apache.org/docs/overview.",
+    "Versions: the write APIs (create, append, upsert, update, delete, overwrite, compact) ship in hudi-rs 0.6; 0.5 and earlier only read. Python: install with `pip install hudi` and import from `hudi` (`HudiTable`, `HudiTableBuilder`, `HudiReadOptions`, `HudiQueryType`). Reads return a list of `pyarrow.RecordBatch`; build a table with `pyarrow.Table.from_batches`.",
+    "Rust: depend on the `hudi` crate; its APIs are async (tokio). Entry points are `hudi::table::Table` (`Table::create` to create, `append`/`upsert`/`update`/`delete`/`delete_keys`/`overwrite` to write (each returns a `WriteResult`, `HudiWriteResult` in Python, with `requested_time`, `completion_time` and row counts; both times are `None` when the write made no commit), `compact`/`await_compaction` to compact a merge-on-read table, `read`/`read_stream` to read) and `hudi::table::builder::TableBuilder` to open an existing table with options.",
+    "Write inputs: in Rust, `append`/`upsert`/`overwrite` take `RecordBatch` iterators, `update` takes a filter plus a one-row `RecordBatch`, `delete` takes a filter string, and `delete_keys` takes `HoodieKey`s (record key plus partition path); in Python, `append`/`upsert`/`overwrite` take a PyArrow table, record batch, reader, list of batches, or any object with `__arrow_c_stream__` (polars, pandas >= 2.2), `update` takes a predicate plus a dict or one-row batch, `delete` takes a predicate, and `delete_keys` takes keys or `(key, partition_path)` tuples.",
+    "For an incremental read after a write, pass the write result's `completion_time` (not `requested_time`) as the start timestamp: on table version 8 and later the incremental window bounds commit completion time. The start is exclusive and the end inclusive.",
+    "Compaction (experimental, merge-on-read only): upserts, updates and deletes on a MOR table write log files; `Table::compact` (Rust) / `HudiTable.compact()` (Python) folds them into new base files under one compaction commit, and returns a result whose `requested_time` is `None` when there is nothing to compact. To compact automatically once `hoodie.compact.inline.max.delta.commits` (default 5) delta commits accumulate, set `hoodie.compact.inline=true` (in the write call) or `hoodie.datasource.compaction.async.enable=true` (background task; `await_compaction` waits for it) as table options, e.g. `with_option` on the Rust create builder or `hudi_options` in Python. A copy-on-write table rejects `compact`. The metadata table compacts itself.",
+    "Reads support table versions 6, 8 and 9; writes support 8 and 9 (plus a narrow append path on 6). Both Copy-on-Write and Merge-on-Read tables are supported.",
+    "To query with SQL, use DataFusion: the Rust `datafusion` feature provides `hudi::HudiDataSource`; in Python, `HudiDataFusionDataSource` is always available and the `hudi[datafusion]` extra installs the `datafusion` package. Register it on a `SessionContext`.",
+    "Storage is chosen by the table URI's scheme (e.g. `s3://`, `az://`, `gs://`). Credentials and storage settings come from `AWS_*`, `AZURE_*`, `GOOGLE_*` environment variables or from table options such as `aws_region`.",
+    "Hudi configs are `hoodie.*` string keys; in Rust and Python prefer the typed enums `HudiReadConfig`, `HudiTableConfig` and `HudiPlanConfig` over raw strings."
+  ]
+}

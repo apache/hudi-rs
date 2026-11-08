@@ -55,6 +55,16 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: An instance of the builder.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder.base_uri
+            's3://my-bucket/trips'
+            >>> builder.hudi_options
+            {}
+            >>> builder.storage_options
+            {}
         """
         builder = cls(base_uri)
         return builder
@@ -75,6 +85,13 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: The builder instance.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder = builder.with_hudi_option("read.timeline.num-instants", "5")
+            >>> builder.hudi_options
+            {'read.timeline.num-instants': '5'}
         """
         self._add_options({_coerce_key(k): v}, "hudi")
         return self
@@ -88,6 +105,16 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: The builder instance.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder = builder.with_hudi_options({
+            ...     "read.timeline.num-instants": "5",
+            ...     "read.use.new.log.record.reader": "true",
+            ... })
+            >>> sorted(builder.hudi_options.items())
+            [('read.timeline.num-instants', '5'), ('read.use.new.log.record.reader', 'true')]
         """
         self._add_options(hudi_options, "hudi")
         return self
@@ -102,6 +129,13 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: The builder instance.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder = builder.with_storage_option("aws.region", "us-east-1")
+            >>> builder.storage_options
+            {'aws.region': 'us-east-1'}
         """
         self._add_options({k: v}, "storage")
         return self
@@ -117,6 +151,13 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: The builder instance.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder = builder.with_storage_options({"aws.region": "us-east-1"})
+            >>> builder.storage_options
+            {'aws.region': 'us-east-1'}
         """
         self._add_options(storage_options, "storage")
         return self
@@ -131,6 +172,13 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: The builder instance.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder = builder.with_option("aws.region", "eu-west-1")
+            >>> builder.options
+            {'aws.region': 'eu-west-1'}
         """
         self._add_options({_coerce_key(k): v})
         return self
@@ -144,6 +192,13 @@ class HudiTableBuilder:
 
         Returns:
             HudiTableBuilder: The builder instance.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> builder = HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            >>> builder = builder.with_options({"aws.region": "ap-southeast-1"})
+            >>> builder.options
+            {'aws.region': 'ap-southeast-1'}
         """
         self._add_options(options)
         return self
@@ -154,6 +209,15 @@ class HudiTableBuilder:
 
         Returns:
             HudiTable: The constructed HudiTable object.
+
+        Examples:
+            >>> from hudi import HudiTableBuilder
+            >>> table = (
+            ...     HudiTableBuilder.from_base_uri("s3://my-bucket/trips")
+            ...     .with_hudi_option("read.timeline.num-instants", "5")
+            ...     .with_storage_option("aws.region", "us-east-1")
+            ...     .build()
+            ... )  # doctest: +SKIP
         """
         return build_hudi_table(
             self.base_uri, self.hudi_options, self.storage_options, self.options
