@@ -351,10 +351,10 @@ jobs:
           manylinux: '2_28'
           before-script-linux: |
             bash .github/scripts/manylinux-build-deps.sh
-      # A wheel that compiles is not necessarily a wheel that loads: the
-      # bindings rocksdb generates come from the container's older libclang, and
-      # bad bindings tend to surface on import or first use rather than at
-      # compile time. Each runner installs the wheel it just built.
+      # A wheel that compiles is not necessarily a wheel that loads: auditwheel
+      # only checks symbols, and bad bindings tend to surface on import or first
+      # use rather than at compile time. Each runner installs the wheel it just
+      # built.
       - name: Import the built wheel
         run: |
           python -m pip install --upgrade pip

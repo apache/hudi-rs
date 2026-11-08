@@ -182,6 +182,8 @@ under [Documentation](#documentation).
 ## Requirements
 
 - Python 3.10 or later. Wheels are published to PyPI.
+- Linux wheels are `manylinux_2_28` for x86_64 and aarch64, so they need glibc 2.28 or later;
+  CentOS 7, Ubuntu 18.04 and Amazon Linux 2 are not supported.
 - Rust 1.94.1 or later.
 - The `hudi` crate carries two features: `datafusion` (off by default, see
   [Apache DataFusion](#apache-datafusion)) and `spill-rocksdb` (on by default), the merge map's
