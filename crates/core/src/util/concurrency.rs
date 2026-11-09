@@ -22,6 +22,27 @@ use crate::Result;
 use crate::error::CoreError;
 use std::future::Future;
 
+/// Aborts the spawned task when dropped. The task stops at its next await;
+/// work it already handed to the blocking pool still runs to completion.
+pub(crate) struct AbortOnDrop<T>(pub(crate) tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = std::result::Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
 /// Run `fut` as a task on the current multi-thread runtime, so it can make
 /// progress on another worker thread than the one awaiting it. Without one (no
 /// runtime, or a current-thread runtime with no other thread to use) `fut` is
@@ -36,18 +57,11 @@ where
     R: Send + 'static,
     Fut: Future<Output = Result<R>> + Send + 'static,
 {
-    struct AbortOnDrop<R>(tokio::task::JoinHandle<R>);
-    impl<R> Drop for AbortOnDrop<R> {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
     let handle = match tokio::runtime::Handle::try_current() {
         Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => h,
         _ => return fut.await,
     };
-    let mut task = AbortOnDrop(handle.spawn(fut));
-    (&mut task.0).await.unwrap_or_else(|e| {
+    AbortOnDrop(handle.spawn(fut)).await.unwrap_or_else(|e| {
         Err(CoreError::ReadFileSliceError(format!(
             "read task failed: {e}"
         )))
