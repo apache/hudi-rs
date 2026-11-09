@@ -308,7 +308,8 @@ impl OptionResolver {
         // (see https://hudi.apache.org/docs/next/s3_hoodie)
         // before loading global configs
 
-        Self::imbue_global_hudi_configs_if_absent(hudi_options, storage.clone()).await
+        Self::imbue_global_hudi_configs_if_absent(hudi_options).await;
+        Ok(())
     }
 
     async fn imbue_table_properties(
@@ -328,19 +329,17 @@ impl OptionResolver {
         Ok(())
     }
 
-    async fn imbue_global_hudi_configs_if_absent(
-        options: &mut HashMap<String, String>,
-        storage: Arc<Storage>,
-    ) -> Result<()> {
+    /// `hudi-defaults.conf` is a local file, so it is read from the local
+    /// filesystem rather than through the table's object store, which would
+    /// look for it in the table's bucket.
+    async fn imbue_global_hudi_configs_if_absent(options: &mut HashMap<String, String>) {
         let global_config_path = std::env::var(HUDI_CONF_DIR)
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/etc/hudi/conf"))
             .join("hudi-defaults.conf");
 
-        if let Ok(bytes) = storage
-            .get_file_data_from_absolute_path(global_config_path.to_str().unwrap())
-            .await
-            && let Ok(global_configs) = parse_data_for_options(&bytes, " \t=")
+        if let Ok(bytes) = tokio::fs::read(&global_config_path).await
+            && let Ok(global_configs) = parse_data_for_options(&bytes.into(), " \t=")
         {
             for (key, value) in global_configs {
                 if key.starts_with("hoodie.") && !options.contains_key(&key) {
@@ -348,8 +347,6 @@ impl OptionResolver {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -575,5 +572,29 @@ mod tests {
                 "{config} must be reachable by key lookup for the table-level filter to see it"
             );
         }
+    }
+
+    /// `hudi-defaults.conf` is read as a local file, so a relative
+    /// `HUDI_CONF_DIR` resolves against the working directory.
+    #[tokio::test]
+    #[serial(env_vars)]
+    async fn test_resolve_options_reads_hudi_defaults_from_relative_conf_dir() {
+        let base_path = std::fs::canonicalize("tests/data/table_props_partial").unwrap();
+        let base_url = url::Url::from_file_path(base_path).unwrap();
+        let mut resolver = OptionResolver::new_with_options(
+            base_url.as_str(),
+            [("hoodie.internal.skip.config.validation", "true")],
+        );
+        unsafe {
+            std::env::set_var(HUDI_CONF_DIR, "tests/data/hudi_conf_dir");
+        }
+        let resolved = resolver.resolve_options().await;
+        unsafe {
+            std::env::remove_var(HUDI_CONF_DIR);
+        }
+        resolved.unwrap();
+
+        assert_eq!(resolver.hudi_options["hoodie.database.name"], "tmpdb");
+        assert_eq!(resolver.hudi_options["hoodie.table.type"], "mor");
     }
 }
