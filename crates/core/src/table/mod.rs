@@ -61,6 +61,7 @@ use crate::schema::resolver::{
     resolve_avro_schema, resolve_avro_schema_with_meta_fields, resolve_data_schema, resolve_schema,
 };
 use crate::statistics::estimator::FileStatsEstimator;
+use crate::storage::Storage;
 use crate::table::builder::TableBuilder;
 use crate::table::file_pruner::FilePruner;
 use crate::table::fs_view::FileSystemView;
@@ -84,6 +85,9 @@ pub struct Table {
     pub hudi_configs: Arc<HudiConfigs>,
     /// Options for the storage backend, such as cloud credentials.
     pub storage_options: Arc<HashMap<String, String>>,
+    /// The storage every other `Storage` of this table derives from, so they
+    /// share one object store with its credentials and connection pool.
+    pub(crate) storage: Arc<Storage>,
     /// The table's timeline of commits.
     pub timeline: Timeline,
     /// Listing of the table's file groups and file slices.
@@ -105,6 +109,7 @@ impl Clone for Table {
         Self {
             hudi_configs: self.hudi_configs.clone(),
             storage_options: self.storage_options.clone(),
+            storage: self.storage.clone(),
             timeline: self.timeline.clone(),
             file_system_view: self.file_system_view.clone(),
             cached_metadata_table: self.cached_metadata_table.clone(),
@@ -965,7 +970,9 @@ impl Table {
     ///
     /// `read_options.hudi_options` override table-level Hudi configs
     /// (last-writer-wins). `extra_storage_overrides` override table-level
-    /// storage options (cloud credentials, endpoints, etc).
+    /// storage options (cloud credentials, endpoints, etc). On a table opened
+    /// with [`TableBuilder::with_object_store`] they do not change where I/O
+    /// goes: the reader still uses the injected store.
     ///
     /// When `read_options` is `Some`, timestamps are resolved into the
     /// `StartTimestamp` / `EndTimestamp` that [`FileGroupReader`] needs for
@@ -1162,7 +1169,12 @@ impl Table {
         for (k, v) in extra_storage_overrides {
             storage_opts.insert(k.as_ref().to_string(), v.into());
         }
-        FileGroupReader::new_with_overrides(self.hudi_configs.clone(), hudi_opts, storage_opts)
+        FileGroupReader::new_with_overrides(
+            Some(&self.storage),
+            self.hudi_configs.clone(),
+            hudi_opts,
+            storage_opts,
+        )
     }
 
     /// The scan's memory budget, when the table set one.
@@ -1725,6 +1737,40 @@ fn ensure_record_key_list_parsable(hudi_configs: &HudiConfigs, filter: &Filter) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opening a table, planning it through its metadata table and reading it
+    /// builds one object store. The store holds the resolved credentials and the
+    /// connection pool, so every `Storage` the table makes must reuse it.
+    ///
+    /// The counter is thread-local, which holds on the current-thread runtime
+    /// `#[tokio::test]` uses.
+    #[tokio::test]
+    async fn table_open_plan_and_read_build_one_object_store() -> Result<()> {
+        use hudi_test::QuickstartTripsTable;
+        let before = crate::storage::object_stores_built();
+
+        let table = Table::new(&QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro()).await?;
+        assert!(table.is_metadata_table_enabled());
+        let rows: usize = table
+            .read(&ReadOptions::new())
+            .await?
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        assert!(rows > 0);
+        assert!(table.compute_table_stats(None).await.is_some());
+        assert!(
+            table.cached_metadata_table.initialized(),
+            "the plan must have opened the metadata table, not fallen back to listing"
+        );
+
+        assert_eq!(
+            crate::storage::object_stores_built() - before,
+            1,
+            "a table open, plan and read must share one object store"
+        );
+        Ok(())
+    }
 
     /// The only thing telling a caller their incremental range came back short.
     ///

@@ -70,17 +70,12 @@ impl FileSystemView {
         Ok(BaseFileFormatValue::from_configs(&self.hudi_configs)?)
     }
 
-    pub async fn new(
-        hudi_configs: Arc<HudiConfigs>,
-        storage_options: Arc<HashMap<String, String>>,
-    ) -> Result<Self> {
-        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
-        let partition_to_file_groups = Arc::new(DashMap::new());
-        Ok(FileSystemView {
+    pub(crate) fn new(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
+        FileSystemView {
             hudi_configs,
             storage,
-            partition_to_file_groups,
-        })
+            partition_to_file_groups: Arc::new(DashMap::new()),
+        }
     }
 
     /// Drop cached partition → file-group mappings so the next planning call reloads from storage.
@@ -621,9 +616,8 @@ mod tests {
             (BasePath.as_ref(), base_url.as_str()),
             (BaseFileFormat.as_ref(), base_file_format),
         ]));
-        FileSystemView::new(hudi_configs, Arc::new(HashMap::new()))
-            .await
-            .unwrap()
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
+        FileSystemView::new(hudi_configs, storage)
     }
 
     fn create_files_partition_record(
@@ -1273,9 +1267,8 @@ mod tests {
             (BasePath.as_ref(), base_url.as_str()),
             (BaseFileFormat.as_ref(), "orc"),
         ]));
-        let fs_view = FileSystemView::new(hudi_configs, Arc::new(HashMap::new()))
-            .await
-            .unwrap();
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
+        let fs_view = FileSystemView::new(hudi_configs, storage);
 
         let hudi_table = Table::new(base_url.path()).await.unwrap();
         let latest_timestamp = hudi_table.timeline.get_latest_commit_timestamp().unwrap();

@@ -481,6 +481,7 @@ mod tests {
         let configs = HudiConfigs::new(options);
 
         let version_one = FileGroupReader::new_with_overrides(
+            None,
             Arc::new(configs.clone()),
             HashMap::new(),
             HashMap::new(),
