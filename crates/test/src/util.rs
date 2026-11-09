@@ -22,16 +22,28 @@ use arrow_array::{Array, BooleanArray, Int32Array, StringArray};
 use datafusion::prelude::SessionContext;
 use std::env;
 
-pub fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
-    record_batch
-        .column_by_name(name)
-        .unwrap()
+/// The values of a string array, whether it is `Utf8` or `Utf8View` (which a
+/// DataFusion session with view types produces). Nulls are not expected.
+pub fn str_values(array: &dyn Array) -> Vec<&str> {
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        return array.iter().map(|s| s.unwrap()).collect();
+    }
+    array
         .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap()
+        .downcast_ref::<arrow_array::StringViewArray>()
+        .unwrap_or_else(|| {
+            panic!(
+                "array is neither Utf8 nor Utf8View: {:?}",
+                array.data_type()
+            )
+        })
         .iter()
         .map(|s| s.unwrap())
-        .collect::<Vec<_>>()
+        .collect()
+}
+
+pub fn get_str_column<'a>(record_batch: &'a RecordBatch, name: &str) -> Vec<&'a str> {
+    str_values(record_batch.column_by_name(name).unwrap().as_ref())
 }
 
 pub fn get_i32_column(record_batch: &RecordBatch, name: &str) -> Vec<i32> {

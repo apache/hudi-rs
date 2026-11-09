@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use arrow_array::{Int64Array, StringArray};
+use arrow_array::Int64Array;
 use datafusion::prelude::SessionContext;
 use hudi_datafusion::HudiDataSource;
 
@@ -54,12 +54,9 @@ async fn query_str_col(ctx: &SessionContext, sql: &str) -> Vec<String> {
     batches
         .iter()
         .flat_map(|b| {
-            b.column(0)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .unwrap()
-                .iter()
-                .map(|v| v.unwrap().to_string())
+            crate::util::str_values(b.column(0).as_ref())
+                .into_iter()
+                .map(str::to_string)
                 .collect::<Vec<_>>()
         })
         .collect()

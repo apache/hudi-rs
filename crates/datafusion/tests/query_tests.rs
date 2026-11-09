@@ -23,7 +23,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use arrow_array::{ArrayRef, Float64Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, Float64Array, RecordBatch};
 use arrow_schema::{Field, Schema, SchemaRef};
 use datafusion::prelude::SessionContext;
 use hudi_core::config::internal::HudiInternalConfig;
@@ -43,12 +43,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 fn rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, f64)> {
     let mut rows = Vec::new();
     for batch in batches {
-        let riders = batch
-            .column_by_name("rider")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let riders = hudi_test::util::str_values(batch.column_by_name("rider").unwrap().as_ref());
         let fares = batch
             .column_by_name("fare")
             .unwrap()
@@ -56,8 +51,8 @@ fn rider_fare_rows(batches: &[RecordBatch]) -> Vec<(String, f64)> {
             .downcast_ref::<Float64Array>()
             .unwrap();
 
-        for row_idx in 0..batch.num_rows() {
-            rows.push((riders.value(row_idx).to_string(), fares.value(row_idx)));
+        for (rider, fare) in riders.iter().zip(fares.values()) {
+            rows.push((rider.to_string(), *fare));
         }
     }
     rows.sort_unstable_by(|left, right| left.0.cmp(&right.0));
