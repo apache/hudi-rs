@@ -19,6 +19,7 @@
 
 //! [`TableBuilder`] opens a [`Table`] with options.
 
+use chrono::{DateTime, Utc};
 use paste::paste;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ use crate::table::Table;
 use crate::table::fs_view::FileSystemView;
 use crate::table::validation::validate_configs;
 use crate::timeline::Timeline;
+use crate::timeline::loader::{PrelistedTimeline, layout_two_active_timeline_dir};
 use crate::util::collection::extend_if_absent;
 
 /// Builder that opens an existing [`Table`] with options.
@@ -124,7 +126,9 @@ impl TableBuilder {
     pub async fn build(&mut self) -> Result<Table> {
         let option_resolver = &mut self.option_resolver;
 
-        option_resolver.resolve_options().await?;
+        let prelisted_timeline = option_resolver
+            .resolve_options_with_timeline_listing()
+            .await?;
 
         // A read config is dropped from the table's own configs only when it
         // selects WHICH read to perform — those are meaningful per call, and one
@@ -147,8 +151,12 @@ impl TableBuilder {
 
         let storage_options = Arc::from(self.option_resolver.storage_options.clone());
 
-        let timeline =
-            Timeline::new_from_storage(hudi_configs.clone(), storage_options.clone()).await?;
+        let timeline = Timeline::new_from_storage(
+            hudi_configs.clone(),
+            storage_options.clone(),
+            prelisted_timeline,
+        )
+        .await?;
 
         let file_system_view =
             FileSystemView::new(hudi_configs.clone(), storage_options.clone()).await?;
@@ -259,6 +267,55 @@ impl OptionResolver {
     ///
     /// Note: an error may occur when 1 and 2 have conflicts.
     pub async fn resolve_options(&mut self) -> Result<()> {
+        let storage = self.resolve_storage()?;
+        self.resolve_hudi_options(storage).await.map(|_| ())
+    }
+
+    /// [`Self::resolve_options`], while listing the layout-2 active timeline
+    /// directory concurrently with the `hoodie.properties` read.
+    ///
+    /// Which directory holds the active timeline is only known once the
+    /// properties are read, so the listing is a guess: it is returned only when
+    /// it succeeded and is known to postdate the properties that were read, and
+    /// the timeline loader uses it only when the resolved configs point at the
+    /// same directory. On a layout-1 table it is one unused LIST.
+    pub(crate) async fn resolve_options_with_timeline_listing(
+        &mut self,
+    ) -> Result<Option<PrelistedTimeline>> {
+        let storage = self.resolve_storage()?;
+        let dir = layout_two_active_timeline_dir(&storage.hudi_configs);
+        let (resolved, listing) = futures::future::join(
+            self.resolve_hudi_options(storage.clone()),
+            storage.list_files_with_latest_modified(Some(&dir)),
+        )
+        .await;
+        let properties_last_modified = resolved?;
+        let Ok((files, latest_modified)) = listing else {
+            return Ok(None);
+        };
+
+        // A writer changes the timeline before it rewrites `hoodie.properties`
+        // (a layout upgrade migrates the timeline first), so the listing is known
+        // to reflect the properties that were read only when it holds a file the
+        // store stamped after them. Both times are the store's, so the reader's
+        // clock does not enter; equal times are ambiguous at the store's
+        // granularity (a second on S3) and do not count. A store that keeps no
+        // last-modified time reports the Unix epoch, which orders nothing.
+        if properties_last_modified <= DateTime::UNIX_EPOCH
+            || latest_modified.is_none_or(|latest| latest <= properties_last_modified)
+        {
+            return Ok(None);
+        }
+        Ok(Some(PrelistedTimeline {
+            base_url: storage.base_url.clone(),
+            dir,
+            files,
+        }))
+    }
+
+    /// Resolves the user-provided options and env vars, and creates the
+    /// [`Storage`] that the Hudi options are then read through.
+    fn resolve_storage(&mut self) -> Result<Arc<Storage>> {
         self.resolve_user_provided_options();
 
         // If any user-provided options are intended for cloud storage and in uppercase,
@@ -266,12 +323,10 @@ impl OptionResolver {
         self.resolve_env_vars();
 
         // At this point, we have resolved the storage options needed for accessing the storage layer.
-        // We can now resolve the hudi options
-        self.resolve_hudi_options().await?;
-
-        // Validate the resolved Hudi options
-        let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
-        validate_configs(&hudi_configs)
+        Ok(Storage::new(
+            Arc::new(self.storage_options.clone()),
+            Arc::new(HudiConfigs::new(self.hudi_options.iter())),
+        )?)
     }
 
     fn resolve_user_provided_options(&mut self) {
@@ -294,28 +349,31 @@ impl OptionResolver {
         resolve_storage_env_vars(&mut self.storage_options);
     }
 
-    async fn resolve_hudi_options(&mut self) -> Result<()> {
-        // create a [Storage] instance to load properties from storage layer.
-        let storage = Storage::new(
-            Arc::new(self.storage_options.clone()),
-            Arc::new(HudiConfigs::new(self.hudi_options.iter())),
-        )?;
-
+    /// Returns the last-modified time of `hoodie.properties`.
+    async fn resolve_hudi_options(&mut self, storage: Arc<Storage>) -> Result<DateTime<Utc>> {
         let hudi_options = &mut self.hudi_options;
-        Self::imbue_table_properties(hudi_options, storage.clone()).await?;
+        let properties_last_modified =
+            Self::imbue_table_properties(hudi_options, storage.clone()).await?;
 
         // TODO support imbuing Hudi options from env vars HOODIE_ENV.*
         // (see https://hudi.apache.org/docs/next/s3_hoodie)
         // before loading global configs
 
-        Self::imbue_global_hudi_configs_if_absent(hudi_options, storage.clone()).await
+        Self::imbue_global_hudi_configs_if_absent(hudi_options, storage).await?;
+
+        // Validate the resolved Hudi options
+        let hudi_configs = HudiConfigs::new(self.hudi_options.iter());
+        validate_configs(&hudi_configs)?;
+        Ok(properties_last_modified)
     }
 
     async fn imbue_table_properties(
         options: &mut HashMap<String, String>,
         storage: Arc<Storage>,
-    ) -> Result<()> {
-        let bytes = storage.get_file_data(".hoodie/hoodie.properties").await?;
+    ) -> Result<DateTime<Utc>> {
+        let (bytes, last_modified) = storage
+            .get_file_data_and_last_modified(".hoodie/hoodie.properties")
+            .await?;
         let table_properties = parse_properties(&bytes)?;
 
         // Table properties on storage (hoodie.properties) should have the highest precedence,
@@ -325,7 +383,7 @@ impl OptionResolver {
             options.insert(k.to_string(), v.to_string());
         }
 
-        Ok(())
+        Ok(last_modified)
     }
 
     async fn imbue_global_hudi_configs_if_absent(
@@ -356,6 +414,9 @@ impl OptionResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::recording::{
+        RequestKind, record_storage_requests, record_storage_requests_around_first_list,
+    };
     use serial_test::serial;
 
     fn create_table_builder() -> TableBuilder {
@@ -562,6 +623,292 @@ mod tests {
         assert!(TableBuilder::keep_at_table_level(
             "hoodie.memory.merge.max.size"
         ));
+    }
+
+    const REQUEST_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// Asserts the opened timeline equals one loaded with no pre-listing.
+    async fn assert_timeline_as_listed_on_open(table: &Table) {
+        let listed = Timeline::new_from_storage(
+            table.hudi_configs.clone(),
+            table.storage_options.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(table.timeline.completed_commits, listed.completed_commits);
+        assert_eq!(table.timeline.pending_instants, listed.pending_instants);
+        assert_eq!(
+            table.timeline.earliest_active_instant,
+            listed.earliest_active_instant
+        );
+    }
+
+    fn set_modified(path: &std::path::Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    /// The files directly under `dir`, sorted by name; none if it is missing.
+    fn files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+        let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .collect();
+        files.sort();
+        files
+    }
+
+    /// A private copy of `table` whose `hoodie.properties` the store stamped a
+    /// day ago and whose timeline files it stamped since, as on a table that has
+    /// committed after its properties last changed.
+    fn table_with_settled_properties(table: hudi_test::SampleTable) -> String {
+        let base_uri = table.path_to_cow_fresh();
+        let hoodie = PathBuf::from(&base_uri).join(".hoodie");
+        let now = std::time::SystemTime::now();
+        set_modified(
+            &hoodie.join("hoodie.properties"),
+            now - std::time::Duration::from_secs(86_400),
+        );
+        for file in files_in(&hoodie.join("timeline")) {
+            set_modified(&file, now - std::time::Duration::from_secs(3_600));
+        }
+        base_uri
+    }
+
+    /// Regression test: the active timeline LIST of a layout-2 table overlaps
+    /// the `hoodie.properties` GET instead of waiting for it, and is not
+    /// repeated once the properties confirm the directory.
+    #[tokio::test]
+    async fn test_build_lists_layout_two_timeline_while_reading_properties() {
+        let base_uri = table_with_settled_properties(hudi_test::SampleTable::V8Nonpartitioned);
+        let recording = record_storage_requests(REQUEST_DELAY, false);
+        let table = TableBuilder::from_base_uri(&base_uri)
+            .build()
+            .await
+            .unwrap();
+        let properties = recording
+            .log
+            .matching(RequestKind::Get, ".hoodie/hoodie.properties");
+        let timeline_lists = recording
+            .log
+            .matching(RequestKind::List, ".hoodie/timeline");
+        drop(recording);
+
+        assert_eq!(properties.len(), 1);
+        assert_eq!(timeline_lists.len(), 1, "{timeline_lists:?}");
+        assert!(
+            timeline_lists[0].start < properties[0].end,
+            "the timeline LIST started only after the properties GET ended: \
+             {timeline_lists:?} {properties:?}"
+        );
+        assert!(!table.timeline.completed_commits.is_empty());
+        assert_timeline_as_listed_on_open(&table).await;
+    }
+
+    /// A layout-1 table ignores the `.hoodie/timeline` listing, whether it
+    /// succeeded or failed, and lists `.hoodie` as before; a layout-2 table
+    /// whose listing failed lists its timeline again. The properties are
+    /// settled, and the layout-1 table has a stray `.hoodie/timeline` file
+    /// newer than them, so a successful listing would be returned for reuse.
+    #[tokio::test]
+    async fn test_build_ignores_unusable_timeline_listing() {
+        for (table, fail_listing) in [
+            (hudi_test::SampleTable::V6Nonpartitioned, false),
+            (hudi_test::SampleTable::V6Nonpartitioned, true),
+            (hudi_test::SampleTable::V8Nonpartitioned, true),
+            (hudi_test::SampleTable::V9TxnsSimpleMeta, true),
+        ] {
+            let base_uri = table_with_settled_properties(table);
+            let timeline = PathBuf::from(&base_uri).join(".hoodie/timeline");
+            if !timeline.exists() {
+                std::fs::create_dir(&timeline).unwrap();
+                std::fs::write(timeline.join("not_an_instant"), b"").unwrap();
+            }
+            let recording = record_storage_requests(REQUEST_DELAY, fail_listing);
+            let table = TableBuilder::from_base_uri(&base_uri)
+                .build()
+                .await
+                .unwrap();
+            let requests = recording.log.requests();
+            drop(recording);
+
+            assert!(
+                !table.timeline.completed_commits.is_empty(),
+                "{base_uri}: {requests:?}"
+            );
+            assert_timeline_as_listed_on_open(&table).await;
+        }
+    }
+
+    /// A timeline path given as an option is overridden by the one in
+    /// `hoodie.properties`, so the listing taken of it must not be used even
+    /// though it holds a file newer than the properties.
+    #[tokio::test]
+    async fn test_build_ignores_listing_of_overridden_timeline_path() {
+        let base_uri = table_with_settled_properties(hudi_test::SampleTable::V8Nonpartitioned);
+        let not_the_timeline = PathBuf::from(&base_uri).join(".hoodie/not_the_timeline");
+        std::fs::create_dir(&not_the_timeline).unwrap();
+        std::fs::write(not_the_timeline.join("not_an_instant"), b"").unwrap();
+
+        let recording = record_storage_requests(REQUEST_DELAY, false);
+        let table = TableBuilder::from_base_uri(&base_uri)
+            .with_hudi_option(HudiTableConfig::TimelinePath, "not_the_timeline")
+            .build()
+            .await
+            .unwrap();
+        let speculative = recording
+            .log
+            .matching(RequestKind::List, ".hoodie/not_the_timeline");
+        drop(recording);
+
+        assert_eq!(speculative.len(), 1);
+        assert!(!table.timeline.completed_commits.is_empty());
+        assert_timeline_as_listed_on_open(&table).await;
+    }
+
+    /// Regression test: a layout upgrade migrates the timeline and only then
+    /// rewrites `hoodie.properties`, so a timeline LIST served before the
+    /// migration finished must not be used with the upgraded properties that a
+    /// GET served after it returns.
+    ///
+    /// Run with the store's clock in step with this host and a day behind it:
+    /// the decision compares the store's timestamps only, so a reader clock far
+    /// ahead of the store must not let the partial listing through.
+    #[tokio::test]
+    async fn test_build_discards_timeline_listing_older_than_properties() {
+        let day = std::time::Duration::from_secs(86_400);
+        for store_clock_behind in [std::time::Duration::ZERO, day] {
+            let base_uri = table_with_settled_properties(hudi_test::SampleTable::V8Nonpartitioned);
+            let hoodie = PathBuf::from(&base_uri).join(".hoodie");
+            let timeline = hoodie.join("timeline");
+            let migrated = PathBuf::from(&base_uri).join("migrated_timeline");
+            let upgraded_properties = std::fs::read(hoodie.join("hoodie.properties")).unwrap();
+            let store_now = std::time::SystemTime::now() - store_clock_behind;
+
+            // Mid-upgrade: only the first timeline file has been migrated.
+            std::fs::create_dir(&migrated).unwrap();
+            let files = files_in(&timeline);
+            for file in &files {
+                set_modified(file, store_now - std::time::Duration::from_secs(10));
+            }
+            for file in &files[1..] {
+                std::fs::rename(file, migrated.join(file.file_name().unwrap())).unwrap();
+            }
+
+            let recording = record_storage_requests_around_first_list(REQUEST_DELAY, move || {
+                for file in files_in(&migrated) {
+                    std::fs::rename(&file, timeline.join(file.file_name().unwrap())).unwrap();
+                }
+                let properties = hoodie.join("hoodie.properties");
+                std::fs::write(&properties, upgraded_properties).unwrap();
+                set_modified(&properties, store_now);
+            });
+            let table = TableBuilder::from_base_uri(&base_uri)
+                .build()
+                .await
+                .unwrap();
+            let timeline_lists = recording
+                .log
+                .matching(RequestKind::List, ".hoodie/timeline");
+            drop(recording);
+
+            assert!(
+                !table.timeline.completed_commits.is_empty(),
+                "store clock behind by {store_clock_behind:?}: the timeline was read from \
+                 the listing taken mid-upgrade"
+            );
+            assert_timeline_as_listed_on_open(&table).await;
+            assert_eq!(
+                timeline_lists.len(),
+                2,
+                "the listing taken before the properties rewrite must be listed again: \
+                 {timeline_lists:?}"
+            );
+        }
+    }
+
+    /// A listing whose files are stamped no later than `hoodie.properties`, as
+    /// on a table copied in bulk, cannot be shown to postdate them, so the
+    /// timeline is listed again.
+    #[tokio::test]
+    async fn test_build_lists_again_when_timeline_is_not_newer_than_properties() {
+        let base_uri = table_with_settled_properties(hudi_test::SampleTable::V8Nonpartitioned);
+        let hoodie = PathBuf::from(&base_uri).join(".hoodie");
+        let copied_at = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        set_modified(&hoodie.join("hoodie.properties"), copied_at);
+        for file in files_in(&hoodie.join("timeline")) {
+            set_modified(&file, copied_at);
+        }
+
+        let recording = record_storage_requests(REQUEST_DELAY, false);
+        let table = TableBuilder::from_base_uri(&base_uri)
+            .build()
+            .await
+            .unwrap();
+        let timeline_lists = recording
+            .log
+            .matching(RequestKind::List, ".hoodie/timeline");
+        drop(recording);
+
+        assert_eq!(timeline_lists.len(), 2, "{timeline_lists:?}");
+        assert!(!table.timeline.completed_commits.is_empty());
+        assert_timeline_as_listed_on_open(&table).await;
+    }
+
+    /// A `hoodie.properties` stamped at the Unix epoch, as a store reports when
+    /// it keeps no last-modified time, cannot be ordered against the listing,
+    /// so the timeline is listed again even though its files are newer.
+    #[tokio::test]
+    async fn test_build_lists_again_when_properties_have_no_last_modified_time() {
+        let base_uri = table_with_settled_properties(hudi_test::SampleTable::V8Nonpartitioned);
+        set_modified(
+            &PathBuf::from(&base_uri).join(".hoodie/hoodie.properties"),
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+
+        let recording = record_storage_requests(REQUEST_DELAY, false);
+        let table = TableBuilder::from_base_uri(&base_uri)
+            .build()
+            .await
+            .unwrap();
+        let timeline_lists = recording
+            .log
+            .matching(RequestKind::List, ".hoodie/timeline");
+        drop(recording);
+
+        assert_eq!(timeline_lists.len(), 2, "{timeline_lists:?}");
+        assert!(!table.timeline.completed_commits.is_empty());
+        assert_timeline_as_listed_on_open(&table).await;
+    }
+
+    /// A table whose properties cannot be read fails with the same error as
+    /// resolving its options alone, not with the failed timeline listing.
+    #[tokio::test]
+    async fn test_build_without_properties_fails_with_properties_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_uri = dir.path().to_str().unwrap();
+        let expected = OptionResolver::new(base_uri)
+            .resolve_options()
+            .await
+            .unwrap_err()
+            .to_string();
+
+        let recording = record_storage_requests(REQUEST_DELAY, true);
+        let err = TableBuilder::from_base_uri(base_uri)
+            .build()
+            .await
+            .unwrap_err();
+        drop(recording);
+
+        assert_eq!(err.to_string(), expected);
+        assert!(expected.contains("hoodie.properties"), "{expected}");
     }
 
     /// Every read config must state a scope, so a new one cannot silently
