@@ -331,8 +331,8 @@ impl Storage {
         let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
         let obj_path = ObjPath::from_url_path(obj_url.path())?;
         let obj_store = self.object_store.clone();
-        let obj_meta = obj_store.head(&obj_path).await?;
-        StorageReader::new(obj_store, obj_meta)
+        let get_result = obj_store.get(&obj_path).await?;
+        StorageReader::from_get_result(obj_store, get_result)
             .await
             .map_err(StorageError::ReaderError)
     }
