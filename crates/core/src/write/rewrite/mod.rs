@@ -670,13 +670,14 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         return mor_delete_keys(table, delete_keys).await;
     }
     ensure_rewrite_supported(table)?;
-    let locations = crate::index::for_table_checked(table)
+    let copies = crate::index::for_table_checked(table)
         .await
-        .tag_location(table, delete_keys)
+        .stored_copies(table, delete_keys)
         .await?;
-    let affected_file_ids = locations
+    let affected_file_ids = copies
         .values()
-        .filter_map(|loc| loc.as_ref().map(|l| l.file_id.clone()))
+        .flatten()
+        .map(|location| location.file_id.clone())
         .collect::<HashSet<_>>();
     if affected_file_ids.is_empty() {
         return Ok(WriteResult::default());

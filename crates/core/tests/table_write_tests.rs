@@ -4618,6 +4618,60 @@ async fn test_delete_keys_removes_each_requested_partition_copy() {
     }
 }
 
+/// A delete that names only the key removes every stored copy of it, across
+/// partitions and file groups, as a delete on a non-key column does.
+#[tokio::test]
+async fn test_delete_without_partition_removes_every_copy_of_the_key() {
+    for table_type in [TableTypeValue::CopyOnWrite, TableTypeValue::MergeOnRead] {
+        for by_filter in [true, false] {
+            let label = format!("{table_type:?}, by_filter={by_filter}");
+            let dir = tempdir().unwrap();
+            let mut table = Table::create(dir.path().to_str().unwrap())
+                .with_table_name("trips")
+                .with_table_type(table_type.clone())
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_metadata_table_enabled(false)
+                .create()
+                .await
+                .unwrap();
+            for (id, city) in [("a", "sf"), ("a", "nyc"), ("a", "nyc"), ("b", "sf")] {
+                table
+                    .append([city_batch(vec![(id, city, 1)])])
+                    .await
+                    .unwrap();
+            }
+            let result = if by_filter {
+                table.delete("id = 'a'").await.unwrap()
+            } else {
+                table
+                    .delete_keys([HoodieKey {
+                        record_key: "a".to_string(),
+                        partition_path: String::new(),
+                    }])
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(result.num_deletes, 3, "{label}");
+            let rows = Table::new(dir.path().to_str().unwrap())
+                .await
+                .unwrap()
+                .read(&ReadOptions::new())
+                .await
+                .unwrap();
+            let ids: Vec<String> = rows
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch.column_by_name("id").unwrap();
+                    let ids = column.as_any().downcast_ref::<StringArray>().unwrap();
+                    ids.iter().flatten().map(str::to_string).collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(ids, ["b"], "{label}");
+        }
+    }
+}
+
 /// Archival must keep at least one commit and trigger at or above the count
 /// it trims to. Create refuses any other range before writing, and a write
 /// opened with one fails before it starts.

@@ -32,32 +32,53 @@ use crate::table::{ReadOptions, Table};
 #[derive(Clone, Debug, Default)]
 pub struct SimpleIndex;
 
-impl HoodieIndex for SimpleIndex {
-    async fn tag_location(
+impl SimpleIndex {
+    /// Every stored copy each key names: in any partition for an empty
+    /// `partition_path`, otherwise only in that partition.
+    pub(super) async fn stored_copies(
         &self,
         table: &Table,
         keys: &[HoodieKey],
-    ) -> Result<HashMap<HoodieKey, Option<RecordLocation>>> {
+    ) -> Result<HashMap<HoodieKey, Vec<RecordLocation>>> {
+        let by_record_key = self.copies_by_record_key(table, keys).await?;
+        Ok(keys
+            .iter()
+            .map(|key| {
+                let copies = by_record_key
+                    .get(&key.record_key)
+                    .into_iter()
+                    .flatten()
+                    .filter(|location| {
+                        key.partition_path.is_empty()
+                            || location.partition_path == key.partition_path
+                    })
+                    .cloned()
+                    .collect();
+                (key.clone(), copies)
+            })
+            .collect())
+    }
+
+    async fn copies_by_record_key(
+        &self,
+        table: &Table,
+        keys: &[HoodieKey],
+    ) -> Result<HashMap<String, Vec<RecordLocation>>> {
         let requested = keys
             .iter()
             .map(|key| key.record_key.clone())
             .collect::<HashSet<_>>();
-        let mut locations = keys
-            .iter()
-            .cloned()
-            .map(|key| (key, None))
-            .collect::<HashMap<_, _>>();
+        let mut by_record_key: HashMap<String, Vec<RecordLocation>> = HashMap::new();
         if requested.is_empty() {
-            return Ok(locations);
+            return Ok(by_record_key);
         }
         let slices = table.get_file_slices(&ReadOptions::new()).await?;
         if slices.is_empty() {
-            return Ok(locations);
+            return Ok(by_record_key);
         }
         let reader = table
             .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
             .await?;
-        let mut by_record_key: HashMap<String, Vec<RecordLocation>> = HashMap::new();
         for slice in slices {
             let batch = reader.read_file_slice(&slice, &ReadOptions::new()).await?;
             let location = RecordLocation {
@@ -91,6 +112,22 @@ impl HoodieIndex for SimpleIndex {
                     .for_each(|key| tag(key)),
             }
         }
+        Ok(by_record_key)
+    }
+}
+
+impl HoodieIndex for SimpleIndex {
+    async fn tag_location(
+        &self,
+        table: &Table,
+        keys: &[HoodieKey],
+    ) -> Result<HashMap<HoodieKey, Option<RecordLocation>>> {
+        let by_record_key = self.copies_by_record_key(table, keys).await?;
+        let mut locations = keys
+            .iter()
+            .cloned()
+            .map(|key| (key, None))
+            .collect::<HashMap<_, _>>();
         // A key stored in several partitions (a non-global Java index allows
         // it) resolves to the copy in the incoming record's partition. With no
         // copy there the lookup stays global, as for a single copy: the record
