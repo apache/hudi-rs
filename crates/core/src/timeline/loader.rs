@@ -25,12 +25,14 @@ use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::storage::Storage;
+use crate::storage::file_metadata::FileMetadata;
 use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
 use log::debug;
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
+use url::Url;
 
 #[derive(Debug, Clone)]
 pub struct TimelineLoader {
@@ -45,6 +47,21 @@ enum TimelineLayout {
     V1Archived,
     V2Active,
     V2Archived,
+}
+
+/// The layout-2 active timeline directory, `.hoodie/{timeline_path}`.
+pub(crate) fn layout_two_active_timeline_dir(hudi_configs: &HudiConfigs) -> String {
+    let timeline_path: String = hudi_configs.get_or_default(TimelinePath).into();
+    format!("{HUDI_METADATA_DIR}/{timeline_path}")
+}
+
+/// A listing of a directory taken before the table's layout was known, so the
+/// layout-2 active timeline loader can reuse it instead of listing again.
+#[derive(Debug)]
+pub(crate) struct PrelistedTimeline {
+    pub(crate) base_url: Arc<Url>,
+    pub(crate) dir: String,
+    pub(crate) files: Vec<FileMetadata>,
 }
 
 /// The layout-2 LSM history directory, shared by the reader and the archiver
@@ -118,8 +135,7 @@ impl TimelineLoader {
         match self.layout {
             TimelineLayout::V1Active | TimelineLayout::V1Archived => HUDI_METADATA_DIR.to_string(),
             TimelineLayout::V2Active | TimelineLayout::V2Archived => {
-                let timeline_path: String = self.hudi_configs.get_or_default(TimelinePath).into();
-                format!("{HUDI_METADATA_DIR}/{timeline_path}")
+                layout_two_active_timeline_dir(&self.hudi_configs)
             }
         }
     }
@@ -216,6 +232,18 @@ impl TimelineLoader {
         selector: &TimelineSelector,
         desc: bool,
     ) -> Result<Vec<Instant>> {
+        self.load_instants_with_listing(selector, desc, None).await
+    }
+
+    /// [`Self::load_instants`], taking the layout-2 active listing from
+    /// `prelisted` when it is of this loader's directory on this loader's
+    /// storage. Any other listing is ignored.
+    pub(crate) async fn load_instants_with_listing(
+        &self,
+        selector: &TimelineSelector,
+        desc: bool,
+        prelisted: Option<PrelistedTimeline>,
+    ) -> Result<Vec<Instant>> {
         match self.layout {
             TimelineLayout::V1Active => {
                 let files = self.storage.list_files(Some(HUDI_METADATA_DIR)).await?;
@@ -241,7 +269,15 @@ impl TimelineLoader {
             }
             TimelineLayout::V2Active => {
                 let timeline_dir = self.get_timeline_dir();
-                let files = self.storage.list_files(Some(&timeline_dir)).await?;
+                let files = match prelisted {
+                    Some(listing)
+                        if listing.dir == timeline_dir
+                            && listing.base_url == self.storage.base_url =>
+                    {
+                        listing.files
+                    }
+                    _ => self.storage.list_files(Some(&timeline_dir)).await?,
+                };
                 let mut instants = Vec::new();
 
                 for file_info in files {
