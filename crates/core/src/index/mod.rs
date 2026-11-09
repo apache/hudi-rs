@@ -81,6 +81,26 @@ impl HoodieIndex for TableIndex {
     }
 }
 
+impl TableIndex {
+    /// Every stored copy each key names, for a delete that must reach all of
+    /// them. The record index is global, so it holds at most one per key.
+    pub(crate) async fn stored_copies(
+        &self,
+        table: &Table,
+        keys: &[HoodieKey],
+    ) -> Result<HashMap<HoodieKey, Vec<RecordLocation>>> {
+        match self {
+            Self::Record(index) => Ok(index
+                .tag_location(table, keys)
+                .await?
+                .into_iter()
+                .map(|(key, location)| (key, location.into_iter().collect()))
+                .collect()),
+            Self::Simple(index) => index.stored_copies(table, keys).await,
+        }
+    }
+}
+
 /// Select the write-path index: RLI when enabled, otherwise SimpleIndex.
 pub fn for_table(table: &Table) -> TableIndex {
     if is_record_index_enabled(table) {

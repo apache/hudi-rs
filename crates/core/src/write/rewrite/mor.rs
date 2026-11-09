@@ -21,6 +21,7 @@
 //! groups the index locates, with inserts written to new base file groups.
 
 use super::*;
+use crate::index::RecordLocation;
 
 pub(super) struct MorFileLocation {
     pub(super) file_id: String,
@@ -43,12 +44,10 @@ pub(super) async fn mor_file_locations(
         .collect())
 }
 
-/// Locations by requested key: a key stored in several partitions resolves
-/// per requested partition.
-async fn mor_key_locations(
-    table: &Table,
-    keys: &[HoodieKey],
-) -> Result<HashMap<HoodieKey, MorFileLocation>> {
+/// Base file and creation instant of each latest slice, by partition and file id.
+type SliceFiles = HashMap<(String, String), (Option<String>, String)>;
+
+async fn latest_slice_files(table: &Table) -> Result<SliceFiles> {
     let slices = table.get_file_slices(&ReadOptions::new()).await?;
     let mut slices_by_file_id = HashMap::with_capacity(slices.len());
     for slice in slices {
@@ -60,33 +59,59 @@ async fn mor_key_locations(
             ),
         );
     }
+    Ok(slices_by_file_id)
+}
 
+/// `None` for a stale index entry (group replaced, row gone): treat as absent
+/// so the incoming record inserts instead of erroring.
+fn mor_location(location: RecordLocation, slices: &SliceFiles) -> Option<MorFileLocation> {
+    let (base_file_path, base_instant) =
+        slices.get(&(location.partition_path.clone(), location.file_id.clone()))?;
+    Some(MorFileLocation {
+        file_id: location.file_id,
+        partition_path: location.partition_path,
+        base_file_path: base_file_path.clone(),
+        base_instant: base_instant.clone(),
+    })
+}
+
+/// Locations by requested key: a key stored in several partitions resolves
+/// per requested partition.
+async fn mor_key_locations(
+    table: &Table,
+    keys: &[HoodieKey],
+) -> Result<HashMap<HoodieKey, MorFileLocation>> {
+    let slices = latest_slice_files(table).await?;
     let tagged = crate::index::for_table_checked(table)
         .await
         .tag_location(table, keys)
         .await?;
-    let mut locations = HashMap::with_capacity(tagged.len());
-    for (key, location) in tagged {
-        if let Some(location) = location {
-            // Stale index entry (group replaced, row gone): treat as absent
-            // so the incoming record inserts instead of erroring.
-            let Some((base_file_path, base_instant)) =
-                slices_by_file_id.get(&(location.partition_path.clone(), location.file_id.clone()))
-            else {
-                continue;
-            };
-            locations.insert(
-                key,
-                MorFileLocation {
-                    file_id: location.file_id,
-                    partition_path: location.partition_path,
-                    base_file_path: base_file_path.clone(),
-                    base_instant: base_instant.clone(),
-                },
-            );
-        }
-    }
-    Ok(locations)
+    Ok(tagged
+        .into_iter()
+        .filter_map(|(key, location)| Some((key, mor_location(location?, &slices)?)))
+        .collect())
+}
+
+/// Every stored copy each key names, as a delete must reach all of them.
+async fn mor_stored_copies(
+    table: &Table,
+    keys: &[HoodieKey],
+) -> Result<HashMap<HoodieKey, Vec<MorFileLocation>>> {
+    let slices = latest_slice_files(table).await?;
+    let copies = crate::index::for_table_checked(table)
+        .await
+        .stored_copies(table, keys)
+        .await?;
+    Ok(copies
+        .into_iter()
+        .map(|(key, locations)| {
+            let locations = locations
+                .into_iter()
+                .filter_map(|location| mor_location(location, &slices))
+                .collect();
+            (key, locations)
+        })
+        .collect())
 }
 
 pub(super) async fn mor_upsert_batches(
@@ -640,26 +665,25 @@ pub(super) async fn mor_delete_keys(
             "delete requires at least one record key".to_string(),
         ));
     }
-    let locations = mor_key_locations(table, delete_keys).await?;
+    let copies = mor_stored_copies(table, delete_keys).await?;
     // Each stored copy a requested key resolves to is deleted once. A key
     // requested in a partition it is not stored in matches nothing, as on COW.
     let mut grouped: HashMap<(String, String), (&MorFileLocation, Vec<HoodieKey>)> = HashMap::new();
     let mut seen = HashSet::new();
     for key in delete_keys {
-        let Some(location) = locations.get(key) else {
-            continue;
-        };
-        if (key.partition_path.is_empty() || key.partition_path == location.partition_path)
-            && seen.insert((&key.record_key, &location.partition_path, &location.file_id))
-        {
-            grouped
-                .entry((location.partition_path.clone(), location.file_id.clone()))
-                .or_insert_with(|| (location, Vec::new()))
-                .1
-                .push(HoodieKey {
-                    record_key: key.record_key.clone(),
-                    partition_path: location.partition_path.clone(),
-                });
+        for location in copies.get(key).into_iter().flatten() {
+            if (key.partition_path.is_empty() || key.partition_path == location.partition_path)
+                && seen.insert((&key.record_key, &location.partition_path, &location.file_id))
+            {
+                grouped
+                    .entry((location.partition_path.clone(), location.file_id.clone()))
+                    .or_insert_with(|| (location, Vec::new()))
+                    .1
+                    .push(HoodieKey {
+                        record_key: key.record_key.clone(),
+                        partition_path: location.partition_path.clone(),
+                    });
+            }
         }
     }
     if grouped.is_empty() {
