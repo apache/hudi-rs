@@ -125,6 +125,8 @@ pub struct ReadVolume {
     /// Number of `get_bytes` / `get_byte_ranges` calls — round trips, not ranges.
     /// A two-pass read (predicate columns, then the selected rows) shows up here
     /// as roughly double the calls of a single-pass read over the same file.
+    /// A call the store serves with several concurrent requests (ranges too far
+    /// apart to coalesce, or a large range split into parts) still counts once.
     pub io_calls: AtomicU64,
     /// Row groups the reader was configured to scan. Equal to `file_row_groups`
     /// until something prunes; the gap between the two is what pruning bought.
