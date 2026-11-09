@@ -72,6 +72,7 @@ use crate::schema::delete::{
 use crate::storage::Storage;
 use crate::table::partition::PARTITION_METAFIELD_PREFIX;
 use crate::timeline::instant::{Action, Instant};
+use crate::util::concurrency::AbortOnDrop;
 
 /// Write `.hoodie_partition_metadata` if missing (required for Spark FS partition listing).
 pub(crate) async fn ensure_partition_metadata(
@@ -325,27 +326,6 @@ pub(crate) async fn run_write_tasks<T: Send + 'static>(
         .into_iter()
         .map(|r| r.unwrap_or_else(|| Err(CoreError::Write("write task vanished".to_string()))))
         .collect()
-}
-
-/// Aborts the spawned task when dropped. The task stops at its next await;
-/// work it already handed to the blocking pool still runs to completion.
-struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
-
-impl<T> Drop for AbortOnDrop<T> {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-impl<T> std::future::Future for AbortOnDrop<T> {
-    type Output = std::result::Result<T, tokio::task::JoinError>;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        std::pin::Pin::new(&mut self.0).poll(cx)
-    }
 }
 
 /// Output of one parquet base-file or log-file write task.
