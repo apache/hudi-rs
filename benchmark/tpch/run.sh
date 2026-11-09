@@ -194,6 +194,7 @@ Commands:
   bench-datafusion  Run TPC-H queries against Hudi tables via DataFusion
   compare           Compare persisted benchmark results with bar charts
   validate          Check Hudi query results against the same queries on parquet
+  explain           Print the DataFusion plans of the queries on Hudi and on parquet
   env-report        Rewrite the environment report for results already collected
 
 Options (per command):
@@ -202,10 +203,11 @@ Options (per command):
   --recreate        Rebuild tables that already exist [create-tables] (default: reuse them)
   --hudi-dir D      Hudi data directory or cloud URL [create-tables, bench-*] (default: data/sf{N}-hudi)
   --parquet-dir D   Parquet data directory or cloud URL [generate, create-tables, bench-*,
-                    validate] (default: data/sf{N}-parquet)
-  --queries Q       Comma-separated query numbers [bench-*, validate] (default: all 22)
-  --memory-limit M  DataFusion memory limit [validate] (default: from config; validate
+                    validate, explain] (default: data/sf{N}-parquet)
+  --queries Q       Comma-separated query numbers [bench-*, validate, explain] (default: all 22)
+  --memory-limit M  DataFusion memory limit [validate, explain] (default: from config; validate
                     holds two sessions at once, so a lower value may be needed)
+  --analyze         Run the queries and add per-operator metrics (EXPLAIN ANALYZE) [explain]
   --iterations N    Number of measured iterations per query [bench-*] (from config)
   --warmup N        Number of unmeasured warmup iterations per query [bench-*] (from config)
   --output-dir D    Directory to persist results as JSON [bench-*]
@@ -559,6 +561,46 @@ cmd_validate() {
   "$TPCH_BIN" "${validate_args[@]}"
 }
 
+# Print the plans DataFusion picks for the Hudi tables and for the parquet they
+# were built from, with the same session config the benchmark uses.
+cmd_explain() {
+  local sf="$DEFAULT_SCALE_FACTOR"
+  local custom_hudi_dir=""
+  local custom_parquet_dir=""
+  local queries=""
+  local memory_limit=""
+  local analyze=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --scale-factor) sf="$2"; shift 2 ;;
+      --hudi-dir) custom_hudi_dir="$2"; shift 2 ;;
+      --parquet-dir) custom_parquet_dir="$2"; shift 2 ;;
+      --queries) queries="$2"; shift 2 ;;
+      --memory-limit) memory_limit="$2"; shift 2 ;;
+      --analyze) analyze=true; shift ;;
+      *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+  done
+
+  local hudi_dir="${custom_hudi_dir:-$SCRIPT_DIR/data/sf$sf-hudi}"
+  local parquet_dir="${custom_parquet_dir:-$SCRIPT_DIR/data/sf$sf-parquet}"
+
+  if ! is_cloud_url "$parquet_dir" && [ ! -d "$parquet_dir" ]; then
+    echo "Error: parquet data not found at $parquet_dir. Run 'generate' first." >&2
+    exit 1
+  fi
+
+  build_tpch
+  require_hudi_tables "$hudi_dir"
+
+  local explain_args=(explain --scale-factor "$sf" --hudi-dir "$hudi_dir" --parquet-dir "$parquet_dir")
+  [ -n "$queries" ] && explain_args+=(--queries "$queries")
+  [ -n "$memory_limit" ] && explain_args+=(--memory-limit "$memory_limit")
+  [ "$analyze" = true ] && explain_args+=(--analyze)
+
+  "$TPCH_BIN" "${explain_args[@]}"
+}
+
 # Rewrite the environment report against results that already exist, so a run
 # whose report is wrong or missing does not have to be repeated to correct it.
 cmd_env_report() {
@@ -640,6 +682,7 @@ case "$COMMAND" in
   bench-datafusion) cmd_bench_datafusion "$@" ;;
   compare)          cmd_compare "$@" ;;
   validate)         cmd_validate "$@" ;;
+  explain)          cmd_explain "$@" ;;
   env-report)       cmd_env_report "$@" ;;
   *)
     echo "Unknown command: $COMMAND" >&2

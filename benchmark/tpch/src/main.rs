@@ -38,6 +38,7 @@ use datafusion::error::Result;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::memory_pool::FairSpillPool;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionConfig;
 use hudi::HudiDataSource;
 use serde::{Deserialize, Serialize};
@@ -171,6 +172,32 @@ enum Commands {
         /// Display name for charts (e.g., "datafusion+hudi-rs"); defaults to engine_label
         #[arg(long)]
         display_name: Option<String>,
+    },
+    /// Print DataFusion plans (EXPLAIN / EXPLAIN ANALYZE) for TPC-H queries
+    Explain {
+        /// Hudi tables location (local path or cloud URL)
+        #[arg(long)]
+        hudi_dir: Option<String>,
+
+        /// Parquet tables location (local path or cloud URL)
+        #[arg(long)]
+        parquet_dir: Option<String>,
+
+        /// TPC-H scale factor (used for query parameter substitution and config loading)
+        #[arg(long, default_value_t = 1.0)]
+        scale_factor: f64,
+
+        /// Comma-separated query numbers to run (e.g., "1,3,6"); defaults to all 22
+        #[arg(long)]
+        queries: Option<String>,
+
+        /// Execute the queries and report per-operator runtime metrics (EXPLAIN ANALYZE)
+        #[arg(long)]
+        analyze: bool,
+
+        /// DataFusion memory limit (e.g., "3g", "512m"); unlimited if not set
+        #[arg(long)]
+        memory_limit: Option<String>,
     },
     /// Validate Hudi query results against Parquet (runs each query once, compares output)
     Validate {
@@ -420,14 +447,9 @@ async fn main() -> Result<()> {
             format_label,
             display_name,
         } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor)
-                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
-            let warmup = warmup.unwrap_or(cfg.bench.warmup);
-            let iterations = iterations.unwrap_or(cfg.bench.iterations);
-            let mut df_conf = cfg.bench.datafusion_conf;
-            if memory_limit.is_some() {
-                df_conf.memory_limit = memory_limit;
-            }
+            let cfg = load_bench_config(scale_factor, memory_limit)?;
+            let warmup = warmup.unwrap_or(cfg.warmup);
+            let iterations = iterations.unwrap_or(cfg.iterations);
             run_bench(
                 hudi_dir.as_deref(),
                 parquet_dir.as_deref(),
@@ -435,11 +457,30 @@ async fn main() -> Result<()> {
                 queries,
                 warmup,
                 iterations,
-                &df_conf,
+                &cfg.datafusion_conf,
                 output_dir.as_deref(),
                 engine_label.as_deref(),
                 format_label.as_deref(),
                 display_name.as_deref(),
+            )
+            .await
+        }
+        Commands::Explain {
+            hudi_dir,
+            parquet_dir,
+            scale_factor,
+            queries,
+            analyze,
+            memory_limit,
+        } => {
+            let cfg = load_bench_config(scale_factor, memory_limit)?;
+            run_explain(
+                hudi_dir.as_deref(),
+                parquet_dir.as_deref(),
+                scale_factor,
+                queries,
+                analyze,
+                &cfg.datafusion_conf,
             )
             .await
         }
@@ -450,13 +491,15 @@ async fn main() -> Result<()> {
             queries,
             memory_limit,
         } => {
-            let cfg = config::ScaleFactorConfig::load(scale_factor)
-                .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?;
-            let mut df_conf = cfg.bench.datafusion_conf;
-            if memory_limit.is_some() {
-                df_conf.memory_limit = memory_limit;
-            }
-            run_validate(&hudi_dir, &parquet_dir, scale_factor, queries, &df_conf).await
+            let cfg = load_bench_config(scale_factor, memory_limit)?;
+            run_validate(
+                &hudi_dir,
+                &parquet_dir,
+                scale_factor,
+                queries,
+                &cfg.datafusion_conf,
+            )
+            .await
         }
         Commands::ParseSparkOutput {
             input,
@@ -475,6 +518,21 @@ async fn main() -> Result<()> {
         ),
         Commands::Compare { results_dir, runs } => run_compare(&results_dir, &runs),
     }
+}
+
+/// The scale factor's `bench` config, with `--memory-limit` (when given)
+/// overriding the configured DataFusion memory limit.
+fn load_bench_config(
+    scale_factor: f64,
+    memory_limit: Option<String>,
+) -> Result<config::BenchConfig> {
+    let mut bench = config::ScaleFactorConfig::load(scale_factor)
+        .map_err(|e| datafusion::error::DataFusionError::Plan(format!("{e}")))?
+        .bench;
+    if memory_limit.is_some() {
+        bench.datafusion_conf.memory_limit = memory_limit;
+    }
+    Ok(bench)
 }
 
 /// Parse query numbers from the user-provided comma-separated string, or return all 22.
@@ -578,9 +636,191 @@ async fn register_parquet_tables(ctx: &SessionContext, base_dir: &str) -> Result
     Ok(())
 }
 
+/// A table format the TPC-H tables are read from.
+#[derive(Clone, Copy)]
+enum Source {
+    Hudi,
+    Parquet,
+}
+
+impl Source {
+    fn label(self) -> &'static str {
+        match self {
+            Source::Hudi => "hudi",
+            Source::Parquet => "parquet",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Source::Hudi => "Hudi",
+            Source::Parquet => "Parquet",
+        }
+    }
+
+    /// A fresh session from `df_conf` with the TPC-H tables under `dir` registered.
+    async fn context(
+        self,
+        dir: &str,
+        df_conf: &config::DataFusionConfig,
+    ) -> Result<SessionContext> {
+        let ctx =
+            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
+        match self {
+            Source::Hudi => register_hudi_tables(&ctx, dir).await?,
+            Source::Parquet => register_parquet_tables(&ctx, dir).await?,
+        }
+        Ok(ctx)
+    }
+}
+
+/// The sources given on the command line, Hudi first; at least one is required.
+fn given_sources<'a>(
+    hudi_dir: Option<&'a str>,
+    parquet_dir: Option<&'a str>,
+) -> Result<Vec<(Source, &'a str)>> {
+    let sources: Vec<_> = [(Source::Hudi, hudi_dir), (Source::Parquet, parquet_dir)]
+        .into_iter()
+        .filter_map(|(source, dir)| Some((source, dir?)))
+        .collect();
+    if sources.is_empty() {
+        return Err(datafusion::error::DataFusionError::Plan(
+            "At least one of --hudi-dir or --parquet-dir must be provided".to_string(),
+        ));
+    }
+    Ok(sources)
+}
+
 /// Collect a DataFrame into a Vec of RecordBatches.
 async fn collect_results(df: DataFrame) -> Result<Vec<RecordBatch>> {
     df.collect().await
+}
+
+/// Split a query file into executable statements. Comment lines are stripped
+/// first so semicolons inside comments (e.g., license headers) don't produce
+/// spurious empty statements; Q15 is CREATE VIEW; SELECT; DROP VIEW.
+fn split_statements(sql: &str) -> Vec<String> {
+    let sql_no_comments: String = sql
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("--"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    sql_no_comments
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+fn explain_keyword(analyze: bool) -> &'static str {
+    if analyze {
+        "EXPLAIN ANALYZE"
+    } else {
+        "EXPLAIN"
+    }
+}
+
+/// Print EXPLAIN result batches as raw text; a bordered table wraps badly for
+/// wide plans.
+fn print_plan_batches(batches: &[RecordBatch]) -> Result<()> {
+    let options = FormatOptions::default();
+    for batch in batches {
+        let formatters = batch
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &options))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let schema = batch.schema();
+        for row in 0..batch.num_rows() {
+            for (i, field) in schema.fields().iter().enumerate() {
+                println!("{}:", field.name());
+                println!("{}", formatters[i].value(row));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run EXPLAIN (or EXPLAIN ANALYZE) for each query against one registered source.
+///
+/// `plan` is the time spent in `SessionState::create_logical_plan` (parsing +
+/// logical planning); `collect` is the time to produce the EXPLAIN output, which covers
+/// physical planning including `TableProvider::scan` (for Hudi: timeline load
+/// and file listing), and with --analyze also full query execution. The
+/// hudi-vs-parquet difference in plain EXPLAIN's `collect` is therefore the
+/// per-query planning overhead.
+async fn explain_source(
+    ctx: &SessionContext,
+    label: &str,
+    query_nums: &[usize],
+    scale_factor: f64,
+    analyze: bool,
+) {
+    let mode = explain_keyword(analyze);
+    for query_num in query_nums {
+        println!();
+        println!("=== Q{query_num:02} [{label}] {mode} ===");
+        // One failing query shouldn't kill the remaining queries or the other
+        // source's pass; report it under the query header and move on.
+        let result = match load_query(*query_num, scale_factor) {
+            Ok(sql) => explain_query(ctx, &sql, analyze).await,
+            Err(e) => Err(datafusion::error::DataFusionError::Plan(e)),
+        };
+        if let Err(e) = result {
+            println!("ERROR: {e}");
+        }
+    }
+}
+
+async fn explain_query(ctx: &SessionContext, sql: &str, analyze: bool) -> Result<()> {
+    for stmt in &split_statements(sql) {
+        let start = Instant::now();
+        let plan = ctx.state().create_logical_plan(stmt).await?;
+        let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
+        // DDL (Q15's CREATE VIEW / DROP VIEW) runs unwrapped so the query
+        // statement can plan against the view.
+        if matches!(plan, LogicalPlan::Ddl(_)) {
+            let head = stmt.lines().next().unwrap_or_default();
+            println!("running without EXPLAIN (DDL statement): {head}");
+            ctx.execute_logical_plan(plan).await?.collect().await?;
+            continue;
+        }
+        let start = Instant::now();
+        let batches = DataFrame::new(ctx.state(), plan)
+            .explain(false, analyze)?
+            .collect()
+            .await?;
+        let collect_ms = start.elapsed().as_secs_f64() * 1000.0;
+        println!("plan: {plan_ms:.1} ms, collect: {collect_ms:.1} ms");
+        print_plan_batches(&batches)?;
+    }
+    Ok(())
+}
+
+/// Run EXPLAIN / EXPLAIN ANALYZE against Hudi and/or Parquet registrations.
+async fn run_explain(
+    hudi_dir: Option<&str>,
+    parquet_dir: Option<&str>,
+    scale_factor: f64,
+    queries: Option<String>,
+    analyze: bool,
+    df_conf: &config::DataFusionConfig,
+) -> Result<()> {
+    let sources = given_sources(hudi_dir, parquet_dir)?;
+    let query_nums = parse_query_numbers(queries);
+
+    for (source, dir) in sources {
+        let start = Instant::now();
+        let ctx = source.context(dir, df_conf).await?;
+        println!(
+            "Registered {} tables from {dir} in {:.1} ms",
+            source.title(),
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+        explain_source(&ctx, source.label(), &query_nums, scale_factor, analyze).await;
+    }
+
+    Ok(())
 }
 
 /// Benchmark a single source (hudi or parquet) and return per-query timings and last batches.
@@ -612,20 +852,7 @@ async fn bench_source(
         let mut last_batches: Vec<RecordBatch> = Vec::new();
         let mut error = None;
 
-        // Strip SQL comment lines before splitting, so semicolons inside
-        // comments (e.g., license headers) don't produce spurious empty statements.
-        let sql_no_comments: String = sql
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        // Split multi-statement queries (e.g., Q15: CREATE VIEW; SELECT; DROP VIEW)
-        let statements: Vec<&str> = sql_no_comments
-            .split(';')
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let statements = split_statements(&sql);
 
         for i in 0..total_runs {
             if i < warmup {
@@ -837,12 +1064,7 @@ async fn run_bench(
     format_label: Option<&str>,
     display_name: Option<&str>,
 ) -> Result<()> {
-    if hudi_dir.is_none() && parquet_dir.is_none() {
-        return Err(datafusion::error::DataFusionError::Plan(
-            "At least one of --hudi-dir or --parquet-dir must be provided".to_string(),
-        ));
-    }
-
+    let sources = given_sources(hudi_dir, parquet_dir)?;
     let query_nums = parse_query_numbers(queries);
 
     if let Some(limit) = &df_conf.memory_limit {
@@ -850,33 +1072,15 @@ async fn run_bench(
     }
     println!("Warmup: {warmup} iteration(s), Measured: {iterations} iteration(s)");
 
-    if let Some(hudi_dir) = hudi_dir {
-        let ctx =
-            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
-        println!("Registering Hudi tables from {hudi_dir}");
-        register_hudi_tables(&ctx, hudi_dir).await?;
-        println!("Benchmarking Hudi...");
+    for (source, data_dir) in sources {
+        println!("Registering {} tables from {data_dir}", source.title());
+        let ctx = source.context(data_dir, df_conf).await?;
+        println!("Benchmarking {}...", source.title());
         let results = bench_source(&ctx, &query_nums, warmup, iterations, scale_factor).await;
-        print_single_table("Hudi", &results);
+        print_single_table(source.title(), &results);
         if let Some(dir) = output_dir {
             let engine = engine_label.unwrap_or("datafusion");
-            let fmt = format_label.unwrap_or("hudi");
-            save_results(&results, engine, display_name, fmt, scale_factor, dir)
-                .map_err(datafusion::error::DataFusionError::Plan)?;
-        }
-    }
-
-    if let Some(parquet_dir) = parquet_dir {
-        let ctx =
-            create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
-        println!("Registering Parquet tables from {parquet_dir}");
-        register_parquet_tables(&ctx, parquet_dir).await?;
-        println!("Benchmarking Parquet...");
-        let results = bench_source(&ctx, &query_nums, warmup, iterations, scale_factor).await;
-        print_single_table("Parquet", &results);
-        if let Some(dir) = output_dir {
-            let engine = engine_label.unwrap_or("datafusion");
-            let fmt = format_label.unwrap_or("parquet");
+            let fmt = format_label.unwrap_or(source.label());
             save_results(&results, engine, display_name, fmt, scale_factor, dir)
                 .map_err(datafusion::error::DataFusionError::Plan)?;
         }
@@ -900,14 +1104,10 @@ async fn run_validate(
     }
 
     println!("Registering Hudi tables from {hudi_dir}");
-    let hudi_ctx =
-        create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
-    register_hudi_tables(&hudi_ctx, hudi_dir).await?;
+    let hudi_ctx = Source::Hudi.context(hudi_dir, df_conf).await?;
 
     println!("Registering Parquet tables from {parquet_dir}");
-    let parquet_ctx =
-        create_session_context(df_conf).map_err(datafusion::error::DataFusionError::Plan)?;
-    register_parquet_tables(&parquet_ctx, parquet_dir).await?;
+    let parquet_ctx = Source::Parquet.context(parquet_dir, df_conf).await?;
 
     println!("Running Hudi queries...");
     let hudi_results = bench_source(&hudi_ctx, &query_nums, 0, 1, scale_factor).await;
@@ -1332,4 +1532,43 @@ fn batches_to_csv_rows(batches: &[RecordBatch]) -> std::result::Result<Vec<Strin
     }
 
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_statements_strips_comments_and_splits_on_semicolons() {
+        let sql = "-- Licensed to the ASF;\n-- under the License.\nselect 1;\n\ncreate view v as\nselect 2;\ndrop view v;\n";
+        let statements = split_statements(sql);
+        assert_eq!(
+            statements,
+            vec!["select 1", "create view v as\nselect 2", "drop view v"]
+        );
+    }
+
+    #[test]
+    fn test_split_statements_single_query_without_trailing_semicolon() {
+        assert_eq!(split_statements("select 1"), vec!["select 1"]);
+    }
+
+    #[tokio::test]
+    async fn test_explain_query_runs_view_ddl_around_the_explained_query() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.sql("create table t as values (1), (2), (3)")
+            .await?
+            .collect()
+            .await?;
+        let sql = "create view v as select column1 from t where column1 > 1;\n\
+                   (select count(*) from v) union all (select 0);\n\
+                   drop view v;\n";
+        // The second pass creates the view again, so it fails if the first
+        // pass left the view behind.
+        for analyze in [false, true] {
+            explain_query(&ctx, sql, analyze).await?;
+            assert!(ctx.table("v").await.is_err());
+        }
+        Ok(())
+    }
 }
