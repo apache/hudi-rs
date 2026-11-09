@@ -45,8 +45,9 @@ pub mod util;
 
 pub use read_options::{QueryType, ReadOptions};
 
-/// Environment variable naming the directory that holds `hudi-defaults.conf`, whose options a
-/// table picks up when they are not set otherwise. Defaults to `/etc/hudi/conf` when unset.
+/// Environment variable naming the local directory that holds `hudi-defaults.conf`, whose options
+/// a table picks up when they are not set otherwise. A relative path resolves against the working
+/// directory. Defaults to `/etc/hudi/conf` when unset.
 pub const HUDI_CONF_DIR: &str = "HUDI_CONF_DIR";
 
 /// An alternative key for a configuration, optionally marked as deprecated.
