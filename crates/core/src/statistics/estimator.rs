@@ -28,7 +28,8 @@ use std::sync::Arc;
 /// TODO: this assumes base file format is Parquet. It should support other base file format as the table supports.
 #[derive(Clone, Debug)]
 pub(crate) struct FileStatsEstimator {
-    /// Average row size on disk in bytes (compressed).
+    /// Average file bytes per row on disk, counting the footer and other
+    /// file-level metadata, so a file like the sample estimates to its own row count.
     avg_row_size_on_disk: f64,
     /// Ratio of uncompressed to compressed size.
     compression_ratio: f64,
@@ -47,8 +48,8 @@ impl FileStatsEstimator {
         storage: &Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
-        let parquet_meta = ParquetBaseFileReader::new(storage.clone())
-            .get_parquet_metadata(relative_path)
+        let (parquet_meta, file_size) = ParquetBaseFileReader::new(storage.clone())
+            .get_parquet_metadata_and_size(relative_path)
             .await?;
         let on_disk: i64 = parquet_meta
             .row_groups()
@@ -68,7 +69,7 @@ impl FileStatsEstimator {
             1.0
         };
         let avg_row_size_on_disk = if num_rows > 0 {
-            on_disk as f64 / num_rows as f64
+            file_size as f64 / num_rows as f64
         } else {
             0.0
         };
@@ -80,7 +81,8 @@ impl FileStatsEstimator {
     pub(crate) fn estimate(&self, size: u64) -> (i64, i64) {
         let byte_size = (size as f64 * self.compression_ratio) as i64;
         let num_records = if self.avg_row_size_on_disk > 0.0 {
-            (size as f64 / self.avg_row_size_on_disk) as i64
+            // Rounded because `size / (size / n)` can land just below `n` in floating point.
+            (size as f64 / self.avg_row_size_on_disk).round() as i64
         } else {
             0
         };
@@ -105,6 +107,10 @@ mod tests {
     use url::Url;
 
     fn write_single_row_parquet_file(path: &Path) {
+        write_parquet_file_with_rows(path, &[1]);
+    }
+
+    fn write_parquet_file_with_rows(path: &Path, values: &[i64]) {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "value",
             DataType::Int64,
@@ -112,7 +118,7 @@ mod tests {
         )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(Int64Array::from(vec![1_i64]))],
+            vec![Arc::new(Int64Array::from(values.to_vec()))],
         )
         .unwrap();
 
@@ -160,6 +166,25 @@ mod tests {
         let (estimated_size, estimated_rows) = empty_estimator.estimate(1024);
         assert_eq!(estimated_size, 1024);
         assert_eq!(estimated_rows, 0);
+    }
+
+    /// The sample's own size must map back to its own row count, even when
+    /// file-level metadata dominates the file.
+    #[tokio::test]
+    async fn test_from_parquet_footer_small_file_estimates_own_row_count() {
+        let temp_dir = tempdir().unwrap();
+        let base_url = Url::from_directory_path(temp_dir.path()).unwrap();
+        let storage = new_storage_at(&base_url).await;
+
+        let path = temp_dir.path().join("small.parquet");
+        write_parquet_file_with_rows(&path, &[1, 2, 3, 4, 5]);
+        let file_size = std::fs::metadata(&path).unwrap().len();
+
+        let estimator = FileStatsEstimator::from_parquet_footer(&storage, "small.parquet")
+            .await
+            .unwrap();
+        let (_, num_records) = estimator.estimate(file_size);
+        assert_eq!(num_records, 5);
     }
 
     #[test]
