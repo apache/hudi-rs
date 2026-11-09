@@ -22,8 +22,8 @@ use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use futures::StreamExt;
 use futures::future::BoxFuture;
+use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use object_store::path::Path as ObjPath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -87,6 +87,164 @@ impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
             volume.add_bytes(total);
             Ok(chunks)
         })
+    }
+
+    fn get_metadata<'a>(
+        &'a mut self,
+        options: Option<&'a ArrowReaderOptions>,
+    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+        self.inner.get_metadata(options)
+    }
+}
+
+/// Size of one part of a split read. Large enough that a part's transfer time
+/// dominates its request latency, small enough that a large column chunk
+/// spreads over several connections.
+const PART_SIZE: u64 = 8 * 1024 * 1024;
+
+/// Parts in flight per call. Bounds the connections one read takes from the
+/// store's pool.
+const MAX_PARTS_IN_FLIGHT: usize = 8;
+
+/// `AsyncFileReader` wrapper that fetches large reads as concurrent ranged
+/// requests, since one connection's throughput caps a single large GET.
+///
+/// The requested ranges are coalesced the way `object_store` does it; a call
+/// where every coalesced range fits in one part is passed to the inner reader
+/// unchanged. Otherwise each coalesced range is split into near-equal parts of
+/// at most `part_size`, each fetched with its own `get_bytes` in any order and
+/// copied into one buffer per coalesced range as it lands, and the requested
+/// ranges are sliced out of those buffers. Memory is thus the coalesced ranges
+/// plus the parts in flight, the same retention as `object_store`'s coalesced
+/// read. Any part failing fails the call with that part's error.
+#[derive(Clone)]
+struct SplittingReader<R> {
+    inner: R,
+    part_size: u64,
+}
+
+/// Merge `ranges`, sorted, joining ranges at most
+/// [`object_store::OBJECT_STORE_COALESCE_DEFAULT`] bytes apart.
+fn coalesce(ranges: &[Range<u64>]) -> Vec<Range<u64>> {
+    let mut sorted = ranges.to_vec();
+    sorted.sort_unstable_by_key(|r| r.start);
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(sorted.len());
+    for range in sorted {
+        match merged.last_mut() {
+            Some(last)
+                if range.start.saturating_sub(last.end)
+                    <= object_store::OBJECT_STORE_COALESCE_DEFAULT =>
+            {
+                last.end = last.end.max(range.end);
+            }
+            _ => merged.push(range),
+        }
+    }
+    merged
+}
+
+/// Contiguous, near-equal parts of `range`, none longer than `part_size`.
+fn split(range: &Range<u64>, part_size: u64) -> impl Iterator<Item = Range<u64>> {
+    let len = range.end.saturating_sub(range.start);
+    let step = len.div_ceil(len.div_ceil(part_size.max(1)).max(1)).max(1);
+    let end = range.end;
+    (range.start..end)
+        .step_by(step as usize)
+        .map(move |start| start..(start + step).min(end))
+}
+
+impl<R: AsyncFileReader + Clone> SplittingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            part_size: PART_SIZE,
+        }
+    }
+
+    async fn read_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> parquet::errors::Result<Vec<bytes::Bytes>> {
+        let merged = coalesce(&ranges);
+        if merged
+            .iter()
+            .all(|r| r.end.saturating_sub(r.start) <= self.part_size)
+        {
+            return self.inner.get_byte_ranges(ranges).await;
+        }
+        let part_size = self.part_size;
+        let parts: Vec<(usize, Range<u64>)> = merged
+            .iter()
+            .enumerate()
+            .flat_map(|(i, r)| split(r, part_size).map(move |part| (i, part)))
+            .collect();
+        let mut buffers: Vec<bytes::BytesMut> = merged
+            .iter()
+            .map(|r| bytes::BytesMut::zeroed(r.end.saturating_sub(r.start) as usize))
+            .collect();
+        let inner = self.inner.clone();
+        let mut fetches = futures::stream::iter(parts)
+            .map(move |(i, part)| {
+                let mut reader = inner.clone();
+                async move {
+                    let data = reader.get_bytes(part.clone()).await?;
+                    // A mis-sized part would land on the wrong bytes.
+                    if data.len() as u64 != part.end - part.start {
+                        return Err(parquet::errors::ParquetError::General(format!(
+                            "read of range {part:?} returned {} bytes",
+                            data.len()
+                        )));
+                    }
+                    Ok((i, part, data))
+                }
+            })
+            .buffer_unordered(MAX_PARTS_IN_FLIGHT);
+        while let Some((i, part, data)) = fetches.try_next().await? {
+            let from = (part.start - merged[i].start) as usize;
+            buffers[i][from..from + data.len()].copy_from_slice(&data);
+        }
+        let buffers: Vec<bytes::Bytes> = buffers.into_iter().map(|b| b.freeze()).collect();
+        ranges
+            .iter()
+            .map(|want| {
+                merged
+                    .partition_point(|m| m.start <= want.start)
+                    .checked_sub(1)
+                    .filter(|&i| want.start <= want.end && contains(&merged[i], want))
+                    .map(|i| {
+                        let base = merged[i].start;
+                        buffers[i].slice((want.start - base) as usize..(want.end - base) as usize)
+                    })
+                    .ok_or_else(|| {
+                        parquet::errors::ParquetError::General(format!(
+                            "range {want:?} is not covered by the ranges read"
+                        ))
+                    })
+            })
+            .collect()
+    }
+}
+
+impl<R: AsyncFileReader + Clone> AsyncFileReader for SplittingReader<R> {
+    fn get_bytes(
+        &mut self,
+        range: Range<u64>,
+    ) -> BoxFuture<'_, parquet::errors::Result<bytes::Bytes>> {
+        if range.end.saturating_sub(range.start) <= self.part_size {
+            return self.inner.get_bytes(range);
+        }
+        Box::pin(async move {
+            self.read_ranges(vec![range]).await?.pop().ok_or_else(|| {
+                parquet::errors::ParquetError::General("reader returned no bytes".to_string())
+            })
+        })
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<bytes::Bytes>>> {
+        Box::pin(self.read_ranges(ranges))
     }
 
     fn get_metadata<'a>(
@@ -379,11 +537,13 @@ where
     }
 }
 
-/// The builder every read here is driven from: a parquet object reader with the
-/// read-volume counters and the row-group prefetch wrapped around it.
+/// The builder every read here is driven from: a parquet object reader that
+/// splits large reads, with the read-volume counters and the row-group prefetch
+/// wrapped around it.
 #[allow(deprecated)]
-type CountedBuilder =
-    ParquetRecordBatchStreamBuilder<PrefetchingReader<CountingReader<ParquetObjectReader>>>;
+type CountedBuilder = ParquetRecordBatchStreamBuilder<
+    PrefetchingReader<CountingReader<SplittingReader<ParquetObjectReader>>>,
+>;
 
 /// Parquet implementation of [`BaseFileReader`].
 ///
@@ -446,7 +606,7 @@ impl ParquetBaseFileReader {
         )?;
 
         let reader = CountingReader {
-            inner: reader,
+            inner: SplittingReader::new(reader),
             volume: self.storage.read_volume.clone(),
         };
         let plan = ReadPlanCell::default();
@@ -1762,6 +1922,324 @@ mod tests {
                 keep.len() as u64,
                 "the first group's own request plus one prefetch per later group"
             );
+        }
+
+        fn splitting(inner: MemReader, part_size: u64) -> SplittingReader<MemReader> {
+            SplittingReader { inner, part_size }
+        }
+
+        /// Counts the `get_bytes` calls in flight, each held over a few
+        /// yields, and changes each answer's length by `resize` bytes.
+        #[derive(Clone)]
+        struct Probe {
+            inner: MemReader,
+            resize: isize,
+            live: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+        }
+
+        impl Probe {
+            fn new(inner: MemReader, resize: isize) -> Self {
+                Self {
+                    inner,
+                    resize,
+                    live: Arc::default(),
+                    peak: Arc::default(),
+                }
+            }
+        }
+
+        impl AsyncFileReader for Probe {
+            fn get_bytes(
+                &mut self,
+                range: Range<u64>,
+            ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
+                Box::pin(async move {
+                    let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                    self.peak.fetch_max(now, Ordering::SeqCst);
+                    yield_a_few().await;
+                    let data = self.inner.get_bytes(range).await?;
+                    self.live.fetch_sub(1, Ordering::SeqCst);
+                    let mut data = data.to_vec();
+                    data.resize(data.len().saturating_add_signed(self.resize), 0);
+                    Ok(Bytes::from(data))
+                })
+            }
+
+            fn get_byte_ranges(
+                &mut self,
+                ranges: Vec<Range<u64>>,
+            ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+                self.inner.get_byte_ranges(ranges)
+            }
+
+            fn get_metadata<'a>(
+                &'a mut self,
+                options: Option<&'a ArrowReaderOptions>,
+            ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
+                self.inner.get_metadata(options)
+            }
+        }
+
+        fn pattern(len: usize) -> Bytes {
+            Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>())
+        }
+
+        fn slices(data: &Bytes, ranges: &[Range<u64>]) -> Vec<Bytes> {
+            ranges
+                .iter()
+                .map(|r| data.slice(r.start as usize..r.end as usize))
+                .collect()
+        }
+
+        /// Column chunks larger than the part size are fetched in parts, and
+        /// the batches match an unsplit read, with and without the prefetch
+        /// and the page index.
+        #[tokio::test]
+        async fn split_reads_match_unsplit_reads() {
+            const PART: u64 = 32;
+            let data = parquet_bytes(5);
+            let selection = RowSelection::from(vec![
+                RowSelector::skip(13),
+                RowSelector::select(4),
+                RowSelector::skip(33),
+            ]);
+            let cases = [
+                Scan::default(),
+                Scan::default().with_projection(vec![1]),
+                Scan::default()
+                    .with_projection(vec![1, 2])
+                    .with_filter(|id| id % 3 == 0),
+                Scan::default().with_groups(vec![4, 1, 3]),
+                Scan::default().with_selection(selection),
+            ];
+            for page_index in [false, true] {
+                let meta = metadata(&data, page_index);
+                let first = chunk(meta.metadata(), 0, 1);
+                assert!(first.end - first.start > 2 * PART, "chunks span parts");
+                for scan in &cases {
+                    let plain = scan
+                        .collect(MemReader::new(data.clone()), &meta)
+                        .await
+                        .unwrap();
+                    let reader = MemReader::new(data.clone());
+                    let log = reader.log.clone();
+                    let split = scan
+                        .collect(splitting(reader.clone(), PART), &meta)
+                        .await
+                        .unwrap();
+                    assert_eq!(split, plain);
+                    let plan = ReadPlanCell::new(OnceLock::from(ReadPlan {
+                        row_groups: scan.read_order(&meta),
+                        filtered: scan.filter.is_some(),
+                    }));
+                    let reader = PrefetchingReader::new(
+                        splitting(reader, PART),
+                        meta.metadata().clone(),
+                        plan,
+                    );
+                    assert_eq!(scan.collect(reader, &meta).await.unwrap(), plain);
+                    assert!(
+                        fetched(&log).iter().all(|r| r.end - r.start <= PART),
+                        "a range larger than a part reached the file"
+                    );
+                }
+            }
+        }
+
+        /// A range larger than the part size is fetched as parts that tile it
+        /// exactly, at most `MAX_PARTS_IN_FLIGHT` at once.
+        #[tokio::test]
+        async fn a_large_range_is_fetched_as_concurrent_parts_that_tile_it() {
+            let data = pattern(2000);
+            let want = 50..1950;
+            let mut reader = splitting(MemReader::new(data.clone()), 100);
+            let log = reader.inner.log.clone();
+            let got = reader.get_bytes(want.clone()).await.unwrap();
+            assert_eq!(got, data.slice(50..1950));
+            let mut parts = fetched(&log);
+            parts.sort_by_key(|r| r.start);
+            assert_eq!(parts.len(), 19);
+            assert!(parts.iter().all(|r| r.end - r.start <= 100));
+            assert_eq!(parts.first().map(|r| r.start), Some(want.start));
+            assert_eq!(parts.last().map(|r| r.end), Some(want.end));
+            assert!(
+                parts.windows(2).all(|w| w[0].end == w[1].start),
+                "parts overlap or leave gaps: {parts:?}"
+            );
+
+            // Parts that take a while overlap, up to the bound.
+            let probe = Probe::new(MemReader::new(data.clone()), 0);
+            let peak = probe.peak.clone();
+            let mut reader = SplittingReader {
+                inner: probe,
+                part_size: 100,
+            };
+            assert_eq!(reader.get_bytes(want.clone()).await.unwrap(), got);
+            assert_eq!(peak.load(Ordering::SeqCst), MAX_PARTS_IN_FLIGHT);
+        }
+
+        /// A stalled part holds no slot hostage: every part after it still
+        /// starts.
+        #[tokio::test]
+        async fn a_stalled_part_does_not_hold_back_the_parts_after_it() {
+            let mut stalling = MemReader::new(pattern(2000));
+            stalling.stall_at = Some(50);
+            let log = stalling.log.clone();
+            let mut reader = splitting(stalling, 100);
+            let mut call = reader.get_byte_ranges(vec![50..1000, 1000..1950]);
+            assert!(futures::FutureExt::now_or_never(&mut call).is_none());
+            assert_eq!(fetched(&log).len(), 19, "every part was requested");
+        }
+
+        /// A part that comes back short or long fails the call rather than
+        /// shifting the bytes after it.
+        #[tokio::test]
+        async fn a_mis_sized_part_fails_the_call() {
+            for resize in [-1, 1] {
+                let mut reader = SplittingReader {
+                    inner: Probe::new(MemReader::new(pattern(1000)), resize),
+                    part_size: 100,
+                };
+                let err = reader
+                    .get_byte_ranges(vec![0..400, 400..1000])
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("returned"), "{resize}: {err}");
+            }
+        }
+
+        /// Random range sets, sorted or not, with duplicates, empty ranges,
+        /// ranges ending at EOF, and ranges far enough apart to coalesce into
+        /// more than one range, read the same split as sliced directly.
+        #[tokio::test]
+        async fn split_reads_return_the_requested_bytes() {
+            let data = pattern(4 * 1024 * 1024);
+            let len = data.len() as u64;
+            let bases = [0, 2 * 1024 * 1024, len - 600];
+            let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+            let mut next = |bound: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % bound
+            };
+            for round in 0..200 {
+                let part_size = [1, 3, 7, 64, 100][round % 5];
+                let mut ranges: Vec<Range<u64>> = (0..1 + next(8))
+                    .map(|_| {
+                        let start = (bases[next(3) as usize] + next(600)).min(len);
+                        let end = match next(4) {
+                            0 => start,
+                            1 if start >= bases[2] => len,
+                            2 => (start / part_size + 1 + next(3)) * part_size,
+                            _ => start + next(400),
+                        };
+                        start..end.min(len)
+                    })
+                    .collect();
+                if let Some(first) = ranges.first().cloned() {
+                    ranges.push(first);
+                }
+                if round % 7 == 0 {
+                    ranges.push(len..len);
+                }
+                let mut reader = splitting(MemReader::new(data.clone()), part_size);
+                let got = reader.get_byte_ranges(ranges.clone()).await.unwrap();
+                assert_eq!(got, slices(&data, &ranges), "{ranges:?} at {part_size}");
+            }
+        }
+
+        /// Over a real object store, a split read returns what an unsplit
+        /// one does.
+        #[tokio::test]
+        async fn split_reads_over_an_object_store_match_unsplit_reads() {
+            let data = parquet_bytes(5);
+            let store: Arc<dyn object_store::ObjectStore> =
+                Arc::new(object_store::memory::InMemory::new());
+            let path = ObjPath::from("multi.parquet");
+            store.put(&path, data.clone().into()).await.unwrap();
+            #[allow(deprecated)]
+            let object_reader =
+                ParquetObjectReader::new(store, path).with_file_size(data.len() as u64);
+            let cases = [
+                Scan::default(),
+                Scan::default()
+                    .with_projection(vec![1, 2])
+                    .with_filter(|id| id % 3 == 0),
+            ];
+            for page_index in [false, true] {
+                let meta = metadata(&data, page_index);
+                for scan in &cases {
+                    let plain = scan.collect(object_reader.clone(), &meta).await.unwrap();
+                    let split = SplittingReader {
+                        inner: object_reader.clone(),
+                        part_size: 32,
+                    };
+                    assert_eq!(scan.collect(split, &meta).await.unwrap(), plain);
+                }
+            }
+        }
+
+        /// A call whose coalesced ranges all fit in a part reaches the inner
+        /// reader unchanged; otherwise small ranges are coalesced before the
+        /// split, so they cost no more requests than their coalesced range.
+        #[tokio::test]
+        async fn small_adjacent_ranges_are_coalesced_before_splitting() {
+            let data = pattern(1000);
+            let mut reader = splitting(MemReader::new(data.clone()), 100);
+            let log = reader.inner.log.clone();
+
+            let small = vec![0..30, 30..60, 70..100];
+            let got = reader.get_byte_ranges(small.clone()).await.unwrap();
+            assert_eq!(got, slices(&data, &small));
+            let events = std::mem::take(&mut *log.lock().unwrap());
+            assert!(
+                matches!(events.as_slice(), [Event::Fetch(r)] if *r == small),
+                "{events:?}"
+            );
+
+            // Coalesced to 0..250: three parts, two of the ranges straddling
+            // a part boundary.
+            let adjacent = vec![120..170, 0..60, 60..120, 170..250];
+            let got = reader.get_byte_ranges(adjacent.clone()).await.unwrap();
+            assert_eq!(got, slices(&data, &adjacent));
+            let mut parts = fetched(&log);
+            parts.sort_by_key(|r| r.start);
+            assert_eq!(parts, vec![0..84, 84..168, 168..250]);
+        }
+
+        #[tokio::test]
+        async fn a_failed_part_fails_the_call() {
+            let mut inner = MemReader::new(pattern(1000));
+            inner.fail_at = Some(500);
+            inner.failures_left.store(1, Ordering::SeqCst);
+            let mut reader = splitting(inner, 100);
+            let err = reader
+                .get_byte_ranges(vec![0..400, 400..1000])
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("injected"), "{err}");
+        }
+
+        /// Counted above the split, a call is one `io_calls` however many
+        /// parts it took, and its bytes are counted once.
+        #[tokio::test]
+        async fn a_split_call_counts_once() {
+            let inner = MemReader::new(pattern(1000));
+            let log = inner.log.clone();
+            let volume = Arc::new(ReadVolume::default());
+            let mut reader = CountingReader {
+                inner: splitting(inner, 100),
+                volume: volume.clone(),
+            };
+            reader
+                .get_byte_ranges(vec![0..400, 400..1000])
+                .await
+                .unwrap();
+            assert_eq!(fetched(&log).len(), 10);
+            assert_eq!(volume.io_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(volume.bytes_read.load(Ordering::Relaxed), 1000);
         }
     }
 }
