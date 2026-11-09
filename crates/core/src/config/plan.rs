@@ -49,7 +49,8 @@ use crate::config::{ConfigParser, HudiConfigValue};
 ///
 #[derive(Clone, Debug, PartialEq, Eq, Hash, EnumIter, IntoStaticStr)]
 pub enum HudiPlanConfig {
-    /// Parallelism for listing files on storage.
+    /// Parallelism for listing files on storage, and for reading their parquet footers when
+    /// pruning files by column statistics.
     ListingParallelism,
 }
 

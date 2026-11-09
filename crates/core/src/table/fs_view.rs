@@ -21,9 +21,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::Schema;
+use futures::{StreamExt, stream};
 
 use crate::Result;
 use crate::config::HudiConfigs;
+use crate::config::plan::HudiPlanConfig::ListingParallelism;
 use crate::config::table::BaseFileFormatValue;
 use crate::file_group::FileGroup;
 use crate::file_group::base_file::parquet::ParquetBaseFileReader;
@@ -373,61 +375,66 @@ impl FileSystemView {
         }
 
         let parquet_reader = ParquetBaseFileReader::new(self.storage.clone());
-        let mut retained = Vec::with_capacity(file_groups.len());
 
-        for mut fg in file_groups {
-            if let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) {
-                let relative_path = match fsl.base_file_relative_path() {
-                    // No base file means no parquet footer to prune on; the
-                    // slice's records are all in its log files.
-                    Ok(None) => {
-                        retained.push(fg);
-                        continue;
-                    }
-                    Ok(Some(path)) => path,
-                    Err(e) => {
-                        log::warn!(
-                            "Cannot get base file path for pruning: {e}. Including file group."
-                        );
-                        retained.push(fg);
-                        continue;
-                    }
-                };
+        // Each footer is a round trip and the file groups are independent, so
+        // the reads go out together, bounded by the listing's parallelism.
+        // `buffered` keeps the input order.
+        let parallelism: usize = self.hudi_configs.get_or_default(ListingParallelism).into();
+        let retained: Vec<FileGroup> = stream::iter(file_groups)
+            .map(|mut fg| {
+                let parquet_reader = &parquet_reader;
+                async move {
+                    let Some(fsl) = fg.get_file_slice_mut_as_of(as_of_timestamp) else {
+                        // No file slice as of timestamp, include the file group
+                        // (it will be filtered out later in collect_file_slices)
+                        return Some(fg);
+                    };
+                    let relative_path = match fsl.base_file_relative_path() {
+                        // No base file means no parquet footer to prune on; the
+                        // slice's records are all in its log files.
+                        Ok(None) => return Some(fg),
+                        Ok(Some(path)) => path,
+                        Err(e) => {
+                            log::warn!(
+                                "Cannot get base file path for pruning: {e}. Including file group."
+                            );
+                            return Some(fg);
+                        }
+                    };
 
-                if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
-                    retained.push(fg);
-                    continue;
+                    if !BaseFileFormatValue::Parquet.matches_extension(&relative_path) {
+                        return Some(fg);
+                    }
+
+                    let (file_metadata, col_stats) = match parquet_reader
+                        .get_metadata_and_stats(&relative_path, table_schema)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to load file stats for {relative_path}: {e}. Including file."
+                            );
+                            return Some(fg);
+                        }
+                    };
+
+                    if file_pruner.should_include(&col_stats) {
+                        if let Some(base_file) = fsl.base_file.as_mut() {
+                            base_file.file_metadata = Some(file_metadata);
+                        }
+                        fsl.base_file_column_stats = Some(col_stats);
+                        Some(fg)
+                    } else {
+                        log::debug!("Pruned file {relative_path} based on column stats");
+                        None
+                    }
                 }
-
-                let (file_metadata, col_stats) = match parquet_reader
-                    .get_metadata_and_stats(&relative_path, table_schema)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to load file stats for {relative_path}: {e}. Including file."
-                        );
-                        retained.push(fg);
-                        continue;
-                    }
-                };
-
-                if file_pruner.should_include(&col_stats) {
-                    if let Some(base_file) = fsl.base_file.as_mut() {
-                        base_file.file_metadata = Some(file_metadata);
-                    }
-                    fsl.base_file_column_stats = Some(col_stats);
-                    retained.push(fg);
-                } else {
-                    log::debug!("Pruned file {relative_path} based on column stats");
-                }
-            } else {
-                // No file slice as of timestamp, include the file group
-                // (it will be filtered out later in collect_file_slices)
-                retained.push(fg);
-            }
-        }
+            })
+            .buffered(parallelism.max(1))
+            .filter_map(std::future::ready)
+            .collect()
+            .await;
 
         retained
     }
@@ -1129,6 +1136,47 @@ mod tests {
             .await;
 
         assert!(retained.is_empty());
+    }
+
+    #[tokio::test]
+    async fn fs_view_apply_stats_pruning_reads_footers_concurrently() {
+        use crate::storage::counting::CountingObjectStore;
+
+        let (mut hudi_table, table_schema, file_pruner, as_of) =
+            build_file_pruning_context(("intField", ">", "0")).await;
+        let fs_view = &mut hudi_table.file_system_view;
+        let (store, counts) = CountingObjectStore::new(fs_view.storage.object_store.clone());
+        fs_view.storage = Storage::new_with_object_store(
+            fs_view.storage.base_url.as_ref().clone(),
+            store,
+            fs_view.hudi_configs.clone(),
+        );
+
+        let file_groups: Vec<FileGroup> = (0..4)
+            .map(|_| {
+                FileGroup::new_with_base_file_name(
+                    "a079bdb3-731c-4894-b855-abfcd6921007-0_0-203-274_20240418173551906.parquet",
+                    "",
+                )
+                .unwrap()
+            })
+            .collect();
+        let retained = fs_view
+            .apply_stats_pruning_from_footers(
+                file_groups,
+                &file_pruner,
+                &table_schema,
+                &as_of,
+                Some(&BaseFileFormatValue::Parquet),
+            )
+            .await;
+
+        assert_eq!(retained.len(), 4);
+        assert!(
+            counts.max_in_flight() > 1,
+            "footer reads should overlap, but at most {} was in flight",
+            counts.max_in_flight()
+        );
     }
 
     #[tokio::test]
