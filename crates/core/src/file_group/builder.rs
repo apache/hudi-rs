@@ -779,7 +779,7 @@ mod tests {
                 .unwrap();
             assert_eq!(m.size, 4096);
             assert_eq!(m.byte_size, 10240); // 4096 * 2.5
-            assert_eq!(m.num_records, 40); // 4096 / 100
+            assert_eq!(m.num_records, 41); // 4096 / 100, rounded
         }
 
         #[test]

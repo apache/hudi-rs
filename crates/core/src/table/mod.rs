@@ -2871,7 +2871,7 @@ mod tests {
             .unwrap();
         assert_eq!(m0.size, 440878);
         assert_eq!(m0.byte_size, 326703);
-        assert_eq!(m0.num_records, 458);
+        assert_eq!(m0.num_records, 2);
 
         let m1 = file_slice_1
             .base_file
@@ -2882,7 +2882,7 @@ mod tests {
             .unwrap();
         assert_eq!(m1.size, 440616);
         assert_eq!(m1.byte_size, 326509);
-        assert_eq!(m1.num_records, 458);
+        assert_eq!(m1.num_records, 2);
 
         let m2 = file_slice_2
             .base_file
@@ -2893,7 +2893,7 @@ mod tests {
             .unwrap();
         assert_eq!(m2.size, 440638);
         assert_eq!(m2.byte_size, 326525);
-        assert_eq!(m2.num_records, 458);
+        assert_eq!(m2.num_records, 2);
     }
 
     #[tokio::test]
@@ -3023,6 +3023,29 @@ mod tests {
         let initialized = table.get_or_init_estimator(&latest_ts).await.unwrap();
         let cached = table.get_or_init_estimator(early_ts).await.unwrap();
         assert!(std::ptr::eq(initialized, cached));
+    }
+
+    /// On a single-file-group table the latest base file is also the
+    /// estimator's sample, so its estimated row count must be exact.
+    #[tokio::test]
+    async fn test_get_file_slices_single_file_estimates_exact_num_records() {
+        let base_url = SampleTable::V6Nonpartitioned.url_to_cow();
+        let table = Table::new(base_url.path()).await.unwrap();
+
+        let file_slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
+        assert_eq!(file_slices.len(), 1);
+        let metadata = file_slices[0]
+            .base_file
+            .as_ref()
+            .unwrap()
+            .file_metadata
+            .as_ref()
+            .unwrap();
+
+        let batches = table.read(&ReadOptions::new()).await.unwrap();
+        let actual_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(actual_rows, 4);
+        assert_eq!(metadata.num_records, actual_rows as i64);
     }
 
     /// A write on the handle drops the footer sample taken before it.

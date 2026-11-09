@@ -312,8 +312,20 @@ impl ParquetBaseFileReader {
     /// Exposed for callers that need format-specific details such as row group
     /// compressed sizes for statistics estimation.
     pub async fn get_parquet_metadata(&self, relative_path: &str) -> Result<ParquetMetaData> {
-        let builder = self.open_builder(relative_path, None).await?;
-        Ok(builder.metadata().as_ref().clone())
+        let (metadata, _) = self.get_parquet_metadata_and_size(relative_path).await?;
+        Ok(metadata)
+    }
+
+    /// Read the raw Parquet footer metadata together with the file's size in bytes.
+    pub(crate) async fn get_parquet_metadata_and_size(
+        &self,
+        relative_path: &str,
+    ) -> Result<(ParquetMetaData, u64)> {
+        let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
+        let builder = self
+            .open_builder_with_size(obj_path, file_size, None)
+            .await?;
+        Ok((builder.metadata().as_ref().clone(), file_size))
     }
 
     /// Get the Arrow schema from a Parquet file's footer.
