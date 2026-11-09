@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
+use clap::ValueEnum;
 use serde::Deserialize;
 
 /// Canonical table ordering for SQL output (matches TPC-H dependency order).
@@ -28,12 +29,34 @@ const TABLE_ORDER: &[&str] = &[
     "nation", "region", "part", "supplier", "partsupp", "customer", "orders", "lineitem",
 ];
 
+/// Hudi table type the benchmark tables are created as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum TableType {
+    /// Copy-on-write: one commit, base files only.
+    Cow,
+    /// Merge-on-read: the bulk insert plus one update commit that leaves a log
+    /// file in every file group.
+    Mor,
+}
+
+impl TableType {
+    /// The value Spark SQL's `type` table property takes.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TableType::Cow => "cow",
+            TableType::Mor => "mor",
+        }
+    }
+}
+
 /// Common table definition shared across all scale factors (from tables.yaml).
 #[derive(Deserialize)]
 struct CommonTableConfig {
     primary_key: String,
-    pre_combine_field: String,
+    /// Absent when the table has no real ordering column; see tables.yaml.
+    pre_combine_field: Option<String>,
     record_size_estimate: u32,
+    update_field: String,
 }
 
 /// Common tables file (tables.yaml).
@@ -53,9 +76,17 @@ struct ScaleFactorOverrides {
 /// Merged table config used at runtime.
 pub struct TableConfig {
     pub primary_key: String,
-    pub pre_combine_field: String,
+    pub pre_combine_field: Option<String>,
     pub record_size_estimate: u32,
+    pub update_field: String,
     pub shuffle_parallelism: u32,
+}
+
+impl TableConfig {
+    /// The primary key columns, in declaration order.
+    fn key_columns(&self) -> Vec<&str> {
+        self.primary_key.split(',').map(str::trim).collect()
+    }
 }
 
 pub struct ScaleFactorConfig {
@@ -151,6 +182,7 @@ impl ScaleFactorConfig {
                     primary_key: common_table.primary_key,
                     pre_combine_field: common_table.pre_combine_field,
                     record_size_estimate: common_table.record_size_estimate,
+                    update_field: common_table.update_field,
                     shuffle_parallelism,
                 },
             );
@@ -164,7 +196,12 @@ impl ScaleFactorConfig {
     }
 
     /// Generate CTAS SQL for creating Hudi tables from parquet sources.
-    pub fn render_ctas_sql(&self, parquet_base: &str, hudi_base: &str) -> String {
+    pub fn render_ctas_sql(
+        &self,
+        parquet_base: &str,
+        hudi_base: &str,
+        table_type: TableType,
+    ) -> String {
         let mut sql = String::new();
         for &name in TABLE_ORDER {
             let Some(table) = self.tables.get(name) else {
@@ -176,9 +213,18 @@ impl ScaleFactorConfig {
             writeln!(sql, "CREATE TABLE {name} USING hudi").unwrap();
             writeln!(sql, "LOCATION '{hudi_base}/{name}'").unwrap();
             writeln!(sql, "TBLPROPERTIES (").unwrap();
-            writeln!(sql, "  type = 'cow',").unwrap();
+            writeln!(sql, "  type = '{}',", table_type.as_str()).unwrap();
             writeln!(sql, "  primaryKey = '{}',", table.primary_key).unwrap();
-            writeln!(sql, "  preCombineField = '{}',", table.pre_combine_field).unwrap();
+            match &table.pre_combine_field {
+                Some(field) => writeln!(sql, "  preCombineField = '{field}',").unwrap(),
+                // Hudi infers this when no ordering field is given; stated so
+                // the rendered SQL says how the update commit is merged.
+                None => writeln!(
+                    sql,
+                    "  'hoodie.record.merge.mode' = 'COMMIT_TIME_ORDERING',"
+                )
+                .unwrap(),
+            }
             writeln!(sql, "  'hoodie.table.name' = '{name}',").unwrap();
             writeln!(
                 sql,
@@ -196,6 +242,55 @@ impl ScaleFactorConfig {
             writeln!(sql).unwrap();
         }
         sql
+    }
+
+    /// Generate the update commit that gives every file group a log file.
+    ///
+    /// One `UPDATE` per table, run in the session that created the tables. Two
+    /// clauses select the rows: a hash of the key picks one row in every
+    /// `round(1 / update_fraction)` uniformly (exactly the fraction only when
+    /// that reciprocal is whole), and the smallest key in each file group is
+    /// added so a table too small for the fraction to land a row still gets
+    /// its log file.
+    /// The assigned value is the column's own, so the merged rows, and every
+    /// query over them, are identical to the parquet the table was built
+    /// from — which is what lets `validate` run unchanged against a
+    /// merge-on-read table.
+    pub fn render_update_sql(&self, update_fraction: f64) -> Result<String, String> {
+        if !(update_fraction > 0.0 && update_fraction <= 1.0) {
+            return Err(format!(
+                "update fraction must be in (0, 1], got {update_fraction}"
+            ));
+        }
+        let modulus = (1.0 / update_fraction).round().max(1.0) as u64;
+
+        let mut sql = String::new();
+        for &name in TABLE_ORDER {
+            let Some(table) = self.tables.get(name) else {
+                continue;
+            };
+            let keys = table.key_columns();
+            let key_list = keys.join(", ");
+            let first_key = keys
+                .iter()
+                .map(|k| format!("first_key.{k}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let field = &table.update_field;
+            writeln!(sql, "UPDATE {name} SET {field} = {field}").unwrap();
+            writeln!(sql, "WHERE pmod(hash({key_list}), {modulus}) = 0").unwrap();
+            writeln!(sql, "   OR ({key_list}) IN (").unwrap();
+            writeln!(sql, "     SELECT {first_key} FROM (").unwrap();
+            writeln!(
+                sql,
+                "       SELECT min(struct({key_list})) AS first_key FROM {name} GROUP BY _hoodie_file_name"
+            )
+            .unwrap();
+            writeln!(sql, "     )").unwrap();
+            writeln!(sql, "   );").unwrap();
+            writeln!(sql).unwrap();
+        }
+        Ok(sql)
     }
 
     /// Generate benchmark SQL: table registrations followed by query iterations.
@@ -260,5 +355,77 @@ impl ScaleFactorConfig {
         }
 
         Ok(args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sf1() -> ScaleFactorConfig {
+        ScaleFactorConfig::load(1.0).expect("sf1 config loads")
+    }
+
+    fn statements_for(sql: &str, table: &str) -> Vec<String> {
+        sql.split(";\n")
+            .filter(|stmt| {
+                stmt.contains(&format!(" {table} ")) || stmt.contains(&format!(" {table}\n"))
+            })
+            .map(|stmt| stmt.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn test_render_ctas_sql_mor_sets_table_type_per_table() {
+        let sql = sf1().render_ctas_sql("/pq", "/hudi", TableType::Mor);
+        assert_eq!(sql.matches("type = 'mor',").count(), 8);
+        assert!(!sql.contains("type = 'cow'"));
+        let cow = sf1().render_ctas_sql("/pq", "/hudi", TableType::Cow);
+        assert_eq!(cow.matches("type = 'cow',").count(), 8);
+    }
+
+    #[test]
+    fn test_render_ctas_sql_ordering_follows_pre_combine_field() {
+        let sql = sf1().render_ctas_sql("/pq", "/hudi", TableType::Mor);
+        let lineitem = statements_for(&sql, "lineitem").join(";");
+        assert!(lineitem.contains("preCombineField = 'l_shipdate'"));
+        assert!(!lineitem.contains("COMMIT_TIME_ORDERING"));
+        let customer = statements_for(&sql, "customer").join(";");
+        assert!(!customer.contains("preCombineField"));
+        assert!(customer.contains("'hoodie.record.merge.mode' = 'COMMIT_TIME_ORDERING'"));
+    }
+
+    #[test]
+    fn test_render_update_sql_assigns_update_field_to_itself() {
+        let sql = sf1().render_update_sql(0.001).expect("renders");
+        assert_eq!(sql.matches("UPDATE ").count(), 8);
+        assert!(sql.contains("UPDATE lineitem SET l_comment = l_comment"));
+        assert!(sql.contains("UPDATE customer SET c_comment = c_comment"));
+    }
+
+    #[test]
+    fn test_render_update_sql_fraction_becomes_hash_modulus() {
+        let sql = sf1().render_update_sql(0.001).expect("renders");
+        assert!(sql.contains("pmod(hash(o_orderkey), 1000) = 0"));
+        let sql = sf1().render_update_sql(0.25).expect("renders");
+        assert!(sql.contains("pmod(hash(o_orderkey), 4) = 0"));
+    }
+
+    #[test]
+    fn test_render_update_sql_composite_key_selects_first_key_per_file_group() {
+        let sql = sf1().render_update_sql(0.001).expect("renders");
+        assert!(sql.contains("OR (l_orderkey, l_linenumber) IN ("));
+        assert!(sql.contains("SELECT first_key.l_orderkey, first_key.l_linenumber FROM ("));
+        assert!(sql.contains(
+            "SELECT min(struct(l_orderkey, l_linenumber)) AS first_key FROM lineitem GROUP BY _hoodie_file_name"
+        ));
+    }
+
+    #[test]
+    fn test_render_update_sql_rejects_fraction_outside_unit_interval() {
+        for bad in [0.0, -0.1, 1.5, f64::NAN] {
+            let err = sf1().render_update_sql(bad).expect_err("rejects");
+            assert!(err.contains("update fraction"), "{err}");
+        }
     }
 }
