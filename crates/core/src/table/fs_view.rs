@@ -63,6 +63,10 @@ pub struct FileSystemView {
 pub(crate) struct MetadataListing<'a> {
     pub table: &'a Table,
     pub valid_instants: &'a std::collections::HashSet<String>,
+    /// List storage when reading the metadata table fails, for a metadata
+    /// table held to an older snapshot: its cleaner may remove the file slices
+    /// that snapshot reads at any time.
+    pub list_storage_on_read_error: bool,
 }
 
 impl FileSystemView {
@@ -490,17 +494,22 @@ impl FileSystemView {
         metadata_table: Option<MetadataListing<'_>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
-        let valid_instants = metadata_table
-            .as_ref()
-            .map(|listing| listing.valid_instants);
-        let files_partition_records = match metadata_table {
-            Some(listing) => Some(
-                listing
-                    .table
-                    .fetch_files_partition_records(partition_pruner, listing.valid_instants)
-                    .await?,
-            ),
-            None => None,
+        let (valid_instants, files_partition_records) = match metadata_table {
+            Some(listing) => match listing
+                .table
+                .fetch_files_partition_records(partition_pruner, listing.valid_instants)
+                .await
+            {
+                Ok(records) => (Some(listing.valid_instants), Some(records)),
+                Err(e) if listing.list_storage_on_read_error => {
+                    log::warn!(
+                        "Reading the metadata table as of this snapshot failed, falling back to storage listing: {e}"
+                    );
+                    (None, None)
+                }
+                Err(e) => return Err(e),
+            },
+            None => (None, None),
         };
 
         self.load_file_groups(
@@ -1193,6 +1202,7 @@ mod tests {
                 Some(MetadataListing {
                     table: metadata_table,
                     valid_instants: &valid_instants,
+                    list_storage_on_read_error: false,
                 }),
                 None,
             )

@@ -92,8 +92,9 @@ pub struct Table {
     /// Shared across clones via `Arc`; [`Table::clear_read_caches`] gives this
     /// handle a fresh cell, so a handle that writes reopens the metadata table
     /// and sees its own delta commits while clones keep the one that matches
-    /// their timeline.
-    cached_metadata_table: Arc<OnceCell<Table>>,
+    /// their timeline. Holds the reason instead when the metadata table cannot
+    /// serve this handle's snapshot, so later reads do not list it again.
+    cached_metadata_table: Arc<OnceCell<std::result::Result<Table, String>>>,
     /// Cached file stats estimator. Materialized on first successful call to
     /// [`Table::get_or_init_estimator`]. Failed or inapplicable attempts do not
     /// populate the cache, allowing later calls with newer timestamps to retry.
@@ -158,14 +159,29 @@ impl Table {
     /// Get or initialize the cached metadata table instance.
     ///
     /// Returns `Ok(&Table)` if metadata table is successfully created or was already cached.
-    /// The instance is created once and reused until [`Self::clear_read_caches`].
+    /// The instance is created once and reused until [`Self::clear_read_caches`], and is
+    /// held to this table's snapshot (see [`Self::pin_metadata_table_to_snapshot`]).
     pub(crate) async fn get_or_init_metadata_table(&self) -> Result<&Table> {
         self.cached_metadata_table
             .get_or_try_init(|| async {
                 log::debug!("Initializing cached metadata table instance");
-                self.new_metadata_table().await
+                let mut mdt = self.new_metadata_table().await?;
+                Ok::<_, CoreError>(match self.pin_metadata_table_to_snapshot(&mut mdt).await? {
+                    None => Ok(mdt),
+                    Some(refusal) => {
+                        log::warn!("{refusal}; reads of this table list storage instead");
+                        Err(refusal)
+                    }
+                })
             })
-            .await
+            .await?
+            .as_ref()
+            .map_err(|refusal| CoreError::MetadataTable(refusal.clone()))
+    }
+
+    /// Whether this handle's metadata table refused to serve its snapshot.
+    pub(crate) fn metadata_table_refused(&self) -> bool {
+        matches!(self.cached_metadata_table.get(), Some(Err(_)))
     }
 
     /// Drop the listing cache, the metadata-table handle and the file-stats
@@ -733,9 +749,11 @@ impl Table {
             match self.get_or_init_metadata_table().await {
                 Ok(mdt) => Some(mdt),
                 Err(e) => {
-                    log::warn!(
-                        "Failed to create metadata table, falling back to storage listing: {e}"
-                    );
+                    if !self.metadata_table_refused() {
+                        log::warn!(
+                            "Failed to create metadata table, falling back to storage listing: {e}"
+                        );
+                    }
                     None
                 }
             }
@@ -758,6 +776,7 @@ impl Table {
             (Some(table), Some(valid_instants)) => Some(crate::table::fs_view::MetadataListing {
                 table,
                 valid_instants,
+                list_storage_on_read_error: self.metadata_table_past_snapshot(table),
             }),
             _ => None,
         };

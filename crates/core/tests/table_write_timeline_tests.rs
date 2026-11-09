@@ -314,6 +314,10 @@ async fn test_mdt_commit_without_any_data_instant_is_read_like_java() {
         }
     }
     let _ = orphan_completion;
+    // A later data commit keeps the orphan inside the snapshot a reader opens
+    // on: a handle reads no metadata commit newer than every instant on the
+    // data timeline it listed, since a write it cannot see looks the same.
+    table.append([batch(vec![("c", "ny", 3)])]).await.unwrap();
     let mdt_timeline = dir.path().join(".hoodie/metadata/.hoodie/timeline");
     assert!(
         completed_times(&mdt_timeline, ".deltacommit")

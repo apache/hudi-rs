@@ -25,6 +25,7 @@ use crate::metadata::HUDI_METADATA_DIR;
 use crate::metadata::commit::HoodieCommitMetadata;
 use crate::metadata::replace_commit::HoodieReplaceCommitMetadata;
 use crate::storage::Storage;
+use crate::storage::file_metadata::FileMetadata;
 use crate::timeline::instant::Instant;
 use crate::timeline::selector::TimelineSelector;
 use log::debug;
@@ -53,6 +54,34 @@ pub(crate) fn lsm_history_dir(hudi_configs: &HudiConfigs) -> String {
     let timeline_path: String = hudi_configs.get_or_default(TimelinePath).into();
     let history_path: String = hudi_configs.get_or_default(TimelineHistoryPath).into();
     format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
+}
+
+/// `(requested time, completion time, pending)` of an active timeline file of
+/// any action, or `None` for a file that names no instant.
+///
+/// Parsed from the name's structure rather than through
+/// [`Action`](crate::timeline::instant::Action), which names only some actions:
+/// the state is the suffix, and the instant time is what precedes the first
+/// `.`, with the completion time timeline layout 2 appends after a `_`.
+fn instant_file_times(name: &str) -> Option<(&str, Option<&str>, bool)> {
+    if name.starts_with("history/") || name.ends_with(".crc") {
+        return None;
+    }
+    let (timestamp_part, suffix) = name.split_once('.')?;
+    let (requested, completion) = match timestamp_part.split_once('_') {
+        Some((requested, completion)) => (requested, Some(completion)),
+        None => (timestamp_part, None),
+    };
+    if requested.is_empty() {
+        return None;
+    }
+    // `{ts}.inflight` with no action is a legacy commit inflight.
+    let state = suffix.rsplit_once('.').map_or(suffix, |(_, state)| state);
+    Some((
+        requested,
+        completion,
+        matches!(state, "requested" | "inflight"),
+    ))
 }
 
 #[allow(dead_code)]
@@ -180,35 +209,84 @@ impl TimelineLoader {
             }
         };
 
+        Ok(Self::pending_instant_times(
+            &self.storage.list_files(Some(&dir)).await?,
+        ))
+    }
+
+    /// [`Self::list_pending_instant_times`] over a listing already taken.
+    pub(crate) fn pending_instant_times(files: &[FileMetadata]) -> HashSet<String> {
         let mut pending: HashSet<String> = HashSet::new();
         let mut completed: HashSet<String> = HashSet::new();
-        for file_info in self.storage.list_files(Some(&dir)).await? {
-            let name = file_info.name.as_str();
-            if name.starts_with("history/") || name.ends_with(".crc") {
-                continue;
-            }
-            let Some((timestamp_part, suffix)) = name.split_once('.') else {
+        for file_info in files {
+            let Some((timestamp, _, is_pending)) = instant_file_times(&file_info.name) else {
                 continue;
             };
-            // The instant time only; layout 2 completed files append the
-            // completion time after a `_`.
-            let timestamp = timestamp_part
-                .split_once('_')
-                .map_or(timestamp_part, |(requested, _)| requested);
-            if timestamp.is_empty() {
-                continue;
+            if is_pending {
+                pending.insert(timestamp.to_string());
+            } else {
+                completed.insert(timestamp.to_string());
             }
-            // `{ts}.inflight` with no action is a legacy commit inflight.
-            match suffix.rsplit_once('.').map_or(suffix, |(_, state)| state) {
-                "requested" | "inflight" => pending.insert(timestamp.to_string()),
-                _ => completed.insert(timestamp.to_string()),
-            };
         }
 
         // An instant is listed once per state file it has, so one that completed
         // also has a requested and an inflight file. Pending means it reached no
         // completed state at all.
-        Ok(&pending - &completed)
+        &pending - &completed
+    }
+
+    /// The greatest requested or completion time in a listing of the active
+    /// timeline, across every action.
+    pub(crate) fn latest_instant_time(files: &[FileMetadata]) -> Option<String> {
+        files
+            .iter()
+            .filter_map(|file_info| instant_file_times(&file_info.name))
+            .flat_map(|(requested, completion, _)| std::iter::once(requested).chain(completion))
+            .filter(|time| time.bytes().all(|b| b.is_ascii_digit()))
+            .max()
+            .map(str::to_string)
+    }
+
+    /// One listing of the active timeline directory, every action and state.
+    pub(crate) async fn list_active_files(&self) -> Result<Vec<FileMetadata>> {
+        let dir = match self.layout {
+            TimelineLayout::V1Active => HUDI_METADATA_DIR.to_string(),
+            TimelineLayout::V2Active => self.get_timeline_dir(),
+            _ => {
+                return Err(CoreError::Unsupported(
+                    "Loading from this timeline layout is not implemented yet.".to_string(),
+                ));
+            }
+        };
+        Ok(self.storage.list_files(Some(&dir)).await?)
+    }
+
+    /// The instants `selector` admits from a listing already taken.
+    pub(crate) fn instants_from_files(
+        files: &[FileMetadata],
+        selector: &TimelineSelector,
+        desc: bool,
+    ) -> Vec<Instant> {
+        let mut instants = Vec::new();
+        for file_info in files {
+            // TODO: make `storage.list_files` api support such filtering, like ignore crc and return files only
+            if file_info.name.starts_with("history/") || file_info.name.ends_with(".crc") {
+                continue;
+            }
+            match selector.try_create_instant(file_info.name.as_str()) {
+                Ok(instant) => instants.push(instant),
+                Err(e) => {
+                    debug!("Instant not created from file {file_info:?} due to: {e:?}");
+                }
+            }
+        }
+
+        instants.sort_unstable();
+        instants.shrink_to_fit();
+        if desc {
+            instants.reverse();
+        }
+        instants
     }
 
     pub async fn load_instants(
@@ -216,60 +294,8 @@ impl TimelineLoader {
         selector: &TimelineSelector,
         desc: bool,
     ) -> Result<Vec<Instant>> {
-        match self.layout {
-            TimelineLayout::V1Active => {
-                let files = self.storage.list_files(Some(HUDI_METADATA_DIR)).await?;
-                let mut instants = Vec::with_capacity(files.len() / 3);
-
-                for file_info in files {
-                    match selector.try_create_instant(file_info.name.as_str()) {
-                        Ok(instant) => instants.push(instant),
-                        Err(e) => {
-                            debug!("Instant not created from file {file_info:?} due to: {e:?}");
-                        }
-                    }
-                }
-
-                instants.sort_unstable();
-                instants.shrink_to_fit();
-
-                if desc {
-                    Ok(instants.into_iter().rev().collect())
-                } else {
-                    Ok(instants)
-                }
-            }
-            TimelineLayout::V2Active => {
-                let timeline_dir = self.get_timeline_dir();
-                let files = self.storage.list_files(Some(&timeline_dir)).await?;
-                let mut instants = Vec::new();
-
-                for file_info in files {
-                    // TODO: make `storage.list_files` api support such filtering, like ignore crc and return files only
-                    if file_info.name.starts_with("history/") || file_info.name.ends_with(".crc") {
-                        continue;
-                    }
-                    match selector.try_create_instant(file_info.name.as_str()) {
-                        Ok(instant) => instants.push(instant),
-                        Err(e) => {
-                            debug!("Instant not created from file {file_info:?} due to: {e:?}");
-                        }
-                    }
-                }
-
-                instants.sort_unstable();
-                instants.shrink_to_fit();
-
-                if desc {
-                    Ok(instants.into_iter().rev().collect())
-                } else {
-                    Ok(instants)
-                }
-            }
-            _ => Err(CoreError::Unsupported(
-                "Loading from this timeline layout is not implemented yet.".to_string(),
-            )),
-        }
+        let files = self.list_active_files().await?;
+        Ok(Self::instants_from_files(&files, selector, desc))
     }
 
     /// Load archived timeline instants based on selector criteria.
