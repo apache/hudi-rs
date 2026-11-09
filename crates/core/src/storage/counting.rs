@@ -43,6 +43,9 @@ pub(crate) struct RequestCounts {
     gets: AtomicUsize,
     /// Metadata-only lookups.
     heads: AtomicUsize,
+    /// Reads in flight now, and the most that ever were at once.
+    in_flight: AtomicUsize,
+    max_in_flight: AtomicUsize,
 }
 
 impl RequestCounts {
@@ -52,6 +55,11 @@ impl RequestCounts {
 
     pub(crate) fn heads(&self) -> usize {
         self.heads.load(Ordering::Relaxed)
+    }
+
+    /// The most reads (of either kind) that were in flight at once.
+    pub(crate) fn max_in_flight(&self) -> usize {
+        self.max_in_flight.load(Ordering::Relaxed)
     }
 }
 
@@ -109,7 +117,11 @@ impl ObjectStore for CountingObjectStore {
         } else {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
         }
-        self.inner.get_opts(location, options).await
+        let now = self.counts.in_flight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.counts.max_in_flight.fetch_max(now, Ordering::Relaxed);
+        let result = self.inner.get_opts(location, options).await;
+        self.counts.in_flight.fetch_sub(1, Ordering::Relaxed);
+        result
     }
 
     fn delete_stream(
