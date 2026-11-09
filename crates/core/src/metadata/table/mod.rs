@@ -44,6 +44,7 @@ pub(crate) mod test_support;
 
 use crate::config::HudiConfigs;
 use crate::storage::Storage;
+use crate::table::builder::TableBuilder;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -158,11 +159,11 @@ impl Table {
         }
 
         let mdt_url = join_url_segments(&self.base_url(), &[".hoodie", "metadata"])?;
-        Table::new_with_options(
-            mdt_url.as_str(),
-            [(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)],
-        )
-        .await
+        TableBuilder::from_base_uri(mdt_url.as_str())
+            .with_storage_options(self.storage_options.iter())
+            .with_hudi_option(PartitionFields.as_ref(), METADATA_TABLE_PARTITION_FIELD)
+            .build()
+            .await
     }
 
     /// Fetch records from the `files` partition of metadata table
@@ -1181,6 +1182,24 @@ mod tests {
             metadata_table.is_metadata_table(),
             "Metadata table should be recognized as a metadata table"
         );
+    }
+
+    #[tokio::test]
+    async fn new_metadata_table_opens_with_data_table_storage_options() -> Result<()> {
+        // A key no environment variable resolves to, so only forwarding can set it.
+        let table_path = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let data_table =
+            Table::new_with_options(&table_path, [("test_storage_option", "from_data_table")])
+                .await?;
+        let metadata_table = data_table.new_metadata_table().await?;
+        assert_eq!(
+            metadata_table
+                .storage_options()
+                .get("test_storage_option")
+                .map(String::as_str),
+            Some("from_data_table")
+        );
+        Ok(())
     }
 
     #[tokio::test]
