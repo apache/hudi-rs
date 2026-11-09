@@ -127,9 +127,9 @@ jobs:
           target: ${{ matrix.target }}
           command: build
           args: --release -m python/Cargo.toml --out dist
-          manylinux: '2014'
+          manylinux: '2_28'
           before-script-linux: |
-            source .github/scripts/manylinux-build-deps.sh
+            bash .github/scripts/manylinux-build-deps.sh
       - uses: actions/upload-artifact@v7
         with:
           name: wheels-manylinux-${{ matrix.target }}
