@@ -190,7 +190,7 @@ pub(crate) async fn compact_metadata_table_if_needed(table: &mut Table) -> Resul
     }
     table.timeline.reload_completed_commits().await?;
     let mdt = table.new_metadata_table().await?;
-    let valid = table.valid_instant_timestamps(&mdt).await?;
+    let valid = table.latest_valid_instant_timestamps(&mdt).await?;
     let range = InstantRange::exact_match(valid.into_iter(), "UTC");
     let version = crate::write::metadata::current_stats_index_version(table).await?;
     let instant = crate::write::append::generate_instant_time().await;

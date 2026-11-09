@@ -83,6 +83,26 @@ pub struct Timeline {
     /// instant can still carry blocks appended by a later instant that never
     /// completed, and only the instant's state can tell.
     pub(crate) pending_instants: HashSet<String>,
+    /// The listing [`Self::completed_commits`] came from, as the metadata
+    /// table's valid-instant set needs it: pending instants of every action,
+    /// completed rollbacks and restores, and the latest instant time listed.
+    pub(crate) listed: ListedInstants,
+}
+
+/// What a read of the metadata table takes from the data timeline, read from
+/// the same listing as [`Timeline::completed_commits`] so that the read sees
+/// the metadata table as of the snapshot the handle opened on.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ListedInstants {
+    /// Request times of instants of any action with no completed file, unlike
+    /// [`Timeline::pending_instants`], which covers only
+    /// [`DEFAULT_LOADING_ACTIONS`].
+    pub pending: HashSet<String>,
+    /// Completed rollback and restore instants.
+    pub rollbacks_and_restores: Vec<Instant>,
+    /// The greatest requested or completion time listed, across every action.
+    /// An instant created after the listing sorts above it.
+    pub latest: Option<String>,
 }
 
 pub const EARLIEST_START_TIMESTAMP: &str = "19700101000000000";
@@ -114,6 +134,7 @@ impl Timeline {
             completed_commits: Vec::new(),
             earliest_active_instant: None,
             pending_instants: HashSet::new(),
+            listed: ListedInstants::default(),
         }
     }
 
@@ -134,9 +155,32 @@ impl Timeline {
             None,
             None,
         )?;
-        let all_active = timeline.load_instants(&selector, false).await?;
+        let all_active = timeline.load_active_listing(&selector).await?;
         timeline.set_active_instants(all_active);
         Ok(timeline)
+    }
+
+    /// The active instants `selector` admits, from one listing that also sets
+    /// [`Self::listed`].
+    async fn load_active_listing(&mut self, selector: &TimelineSelector) -> Result<Vec<Instant>> {
+        let files = self.active_loader.list_active_files().await?;
+        let rollbacks_and_restores = TimelineSelector::actions_in_range(
+            &[Action::Rollback, Action::Restore],
+            &[State::Completed],
+            self.hudi_configs.clone(),
+            None,
+            None,
+        )?;
+        self.listed = ListedInstants {
+            pending: TimelineLoader::pending_instant_times(&files),
+            rollbacks_and_restores: TimelineLoader::instants_from_files(
+                &files,
+                &rollbacks_and_restores,
+                false,
+            ),
+            latest: TimelineLoader::latest_instant_time(&files),
+        };
+        Ok(TimelineLoader::instants_from_files(&files, selector, false))
     }
 
     /// Set the completed commits, the pending instants and the archival
@@ -193,8 +237,8 @@ impl Timeline {
     /// Separate from [`Self::pending_instants`], which this deliberately does
     /// not widen: that field also feeds [`Self::completion_gate_inputs`], where
     /// a wider inflight set would start rejecting log blocks the gate admits
-    /// today. The metadata table's valid-instant set is the one caller that
-    /// needs Java's whole-timeline view.
+    /// today. Listed afresh, for a write; a read takes the same set from the
+    /// listing the handle opened on, [`ListedInstants::pending`].
     pub(crate) async fn all_pending_instant_times(&self) -> Result<HashSet<String>> {
         self.active_loader.list_pending_instant_times().await
     }
@@ -215,7 +259,7 @@ impl Timeline {
             None,
             None,
         )?;
-        let all_active = self.load_instants(&selector, false).await?;
+        let all_active = self.load_active_listing(&selector).await?;
         self.set_active_instants(all_active);
         Ok(())
     }

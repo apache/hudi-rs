@@ -510,10 +510,59 @@ const SOLO_COMMIT_TIMESTAMP: &str = "00000000000000";
 const ROLLBACK_READ_CONCURRENCY: usize = 8;
 
 impl Table {
-    /// The valid-instant set for reading this data table's metadata partitions.
+    /// The valid-instant set as of the data timeline in storage now rather than
+    /// as of this handle's snapshot, for a write and for the record index, which
+    /// fences its own reads to a snapshot.
     pub(crate) async fn valid_metadata_instants(&self) -> Result<HashSet<String>> {
-        let mdt = self.get_or_init_metadata_table().await?;
-        self.valid_instant_timestamps(mdt).await
+        // The handle's metadata table may refuse to open for this snapshot; the
+        // latest set does not depend on the snapshot.
+        match self.get_or_init_metadata_table().await {
+            Ok(mdt) => self.latest_valid_instant_timestamps(mdt).await,
+            Err(_) if self.metadata_table_refused() => {
+                let mdt = self.new_metadata_table().await?;
+                self.latest_valid_instant_timestamps(&mdt).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The instants whose metadata log blocks a read of this handle may read:
+    /// those of the data snapshot the handle opened on.
+    ///
+    /// Built from the listing the handle's timeline was loaded from, so a
+    /// pending instant that has since completed stays excluded, as Java builds
+    /// the set from the data meta client's cached timeline. Capped at the latest
+    /// instant time in that listing, which Java does not do: Java loads the
+    /// metadata table's timeline with the data one, while this handle opens the
+    /// metadata table at its first read, and an instant above the cap was
+    /// created after the snapshot.
+    pub(crate) async fn valid_instant_timestamps(&self, mdt: &Table) -> Result<HashSet<String>> {
+        let listed = &self.timeline.listed;
+        let mut valid = self
+            .collect_valid_instants(
+                mdt,
+                &listed.pending,
+                &listed.rollbacks_and_restores,
+                &mdt.timeline.listed.rollbacks_and_restores,
+            )
+            .await?;
+        if let Some(latest) = listed.latest.as_deref() {
+            valid.retain(|instant| instant.as_str() <= latest);
+        }
+        Ok(valid)
+    }
+
+    /// [`Self::valid_instant_timestamps`] for a write, from the data and
+    /// metadata timelines as they are in storage now.
+    pub(crate) async fn latest_valid_instant_timestamps(
+        &self,
+        mdt: &Table,
+    ) -> Result<HashSet<String>> {
+        let data_pending = self.timeline.all_pending_instant_times().await?;
+        let data_rollbacks = self.rollback_and_restore_instants().await?;
+        let mdt_rollbacks = mdt.rollback_and_restore_instants().await?;
+        self.collect_valid_instants(mdt, &data_pending, &data_rollbacks, &mdt_rollbacks)
+            .await
     }
 
     /// The instants whose metadata log blocks may be read.
@@ -527,14 +576,17 @@ impl Table {
     ///
     /// `self` is the data table; `mdt` its metadata table. Both timelines are
     /// needed, which is why this lives here rather than on either one alone.
-    pub(crate) async fn valid_instant_timestamps(&self, mdt: &Table) -> Result<HashSet<String>> {
-        // Java's `datasetPendingInstants`: every action, not only the commit
-        // actions the timeline loads by default. Read once and handed down,
-        // because it costs a listing.
-        let data_pending = self.timeline.all_pending_instant_times().await?;
-
+    /// `data_pending` is Java's `datasetPendingInstants`: every action, not only
+    /// the commit actions the timeline loads by default.
+    async fn collect_valid_instants(
+        &self,
+        mdt: &Table,
+        data_pending: &HashSet<String>,
+        data_rollbacks: &[Instant],
+        mdt_rollbacks: &[Instant],
+    ) -> Result<HashSet<String>> {
         let mut valid: HashSet<String> = self.valid_from_completed_data_instants();
-        valid.extend(self.valid_from_mdt_delta_commits(mdt, &data_pending));
+        valid.extend(self.valid_from_mdt_delta_commits(mdt, data_pending));
         valid.extend(Self::valid_from_sentinel_commits(mdt));
 
         // 3. Commits rolled back by the data table's rollbacks and restores.
@@ -550,10 +602,8 @@ impl Table {
             .min()
             .cloned()
             .unwrap_or_else(|| SOLO_COMMIT_TIMESTAMP.to_string());
-        let in_scope: Vec<Instant> = self
-            .rollback_and_restore_instants()
-            .await?
-            .into_iter()
+        let in_scope: Vec<&Instant> = data_rollbacks
+            .iter()
             .filter(|instant| instant.timestamp > earliest)
             .collect();
         // Each of these is an awaited GET, and the bound above is the only thing
@@ -569,11 +619,208 @@ impl Table {
         valid.extend(rolled_back.into_iter().flatten());
 
         // 4. The metadata table's own rollback and restore instants.
-        for instant in mdt.rollback_and_restore_instants().await? {
+        for instant in mdt_rollbacks {
             valid.insert(instant.timestamp.clone());
         }
 
         Ok(valid)
+    }
+
+    /// Hold `mdt` to this handle's snapshot: drop from its timeline every
+    /// compaction that may have folded in a metadata instant the snapshot
+    /// cannot see, so its reads take the file slices from before it, as a
+    /// metadata table opened together with the snapshot would.
+    ///
+    /// No instant filter can take a later instant's changes back out of a
+    /// compacted base file, so the slice before it has to be readable: on
+    /// storage, which the metadata table's cleaner may already have changed,
+    /// and with every instant since its base still on the timeline. Returns
+    /// why not when it is not, and the handle then lists storage instead.
+    pub(crate) async fn pin_metadata_table_to_snapshot(
+        &self,
+        mdt: &mut Table,
+    ) -> Result<Option<String>> {
+        let Some(bound) = self.metadata_compaction_bound(mdt) else {
+            return Ok(None);
+        };
+        let dropped: HashSet<String> = mdt
+            .timeline
+            .completed_commits
+            .iter()
+            .filter(|instant| instant.action == Action::Commit && instant.timestamp > bound)
+            .map(|instant| instant.timestamp.clone())
+            .collect();
+        if dropped.is_empty() {
+            return Ok(None);
+        }
+        let timeline = &mdt.timeline;
+        let base = timeline
+            .completed_commits
+            .iter()
+            .filter(|instant| {
+                instant.action == Action::Commit && !dropped.contains(&instant.timestamp)
+            })
+            .map(|instant| instant.timestamp.as_str())
+            .max();
+        // Without an earlier compaction, the base is the one written when the
+        // metadata table was initialized, at a sentinel instant.
+        let archived_past = match (timeline.earliest_active_instant.as_deref(), base) {
+            (None, _) => false,
+            (Some(earliest), Some(base)) => earliest > base,
+            (Some(earliest), None) => !earliest.starts_with(SOLO_COMMIT_TIMESTAMP),
+        };
+        if archived_past {
+            return Ok(Some(format!(
+                "The metadata table was compacted after {bound} and has since archived the \
+                 instants this table's snapshot needs"
+            )));
+        }
+        if let Some(group) = Self::file_group_missing_earlier_slice(mdt, &dropped).await? {
+            return Ok(Some(format!(
+                "The metadata table was compacted after {bound} and no longer holds the file \
+                 slice of {group} from before that"
+            )));
+        }
+        mdt.timeline
+            .completed_commits
+            .retain(|instant| !dropped.contains(&instant.timestamp));
+        Ok(None)
+    }
+
+    /// The first metadata file group, as `partition/file id`, that a dropped
+    /// compaction rewrote and that has nothing left on storage of its slice
+    /// from before it: no committed earlier base, and no log older than the
+    /// dropped base.
+    ///
+    /// The metadata table's cleaner removes a slice's base and logs together,
+    /// so a slice it has removed leaves neither.
+    async fn file_group_missing_earlier_slice(
+        mdt: &Table,
+        dropped: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        use crate::file_group::base_file::BaseFile;
+        use crate::file_group::log_file::LogFile;
+        use std::str::FromStr;
+
+        let timeline = &mdt.timeline;
+        let completed: HashSet<&str> = timeline
+            .completed_commits
+            .iter()
+            .map(|instant| instant.timestamp.as_str())
+            .collect();
+        let committed_earlier = |timestamp: &str| {
+            !dropped.contains(timestamp)
+                && (completed.contains(timestamp)
+                    || timeline
+                        .earliest_active_instant
+                        .as_deref()
+                        .is_some_and(|earliest| timestamp < earliest))
+        };
+        let storage = &mdt.file_system_view.storage;
+        for partition in storage.list_dirs(None).await? {
+            if partition.starts_with('.') {
+                continue;
+            }
+            #[derive(Default)]
+            struct Group {
+                earliest_dropped_base: Option<String>,
+                has_earlier_base: bool,
+                earliest_log: Option<String>,
+            }
+            let mut groups: HashMap<String, Group> = HashMap::new();
+            for file in storage.list_files(Some(&partition)).await? {
+                let name = file.name.as_str();
+                if name.ends_with(".hfile") && !name.starts_with('.') {
+                    let Ok(base) = BaseFile::from_str(name) else {
+                        continue;
+                    };
+                    let group = groups.entry(base.file_id).or_default();
+                    if dropped.contains(&base.commit_timestamp) {
+                        if group
+                            .earliest_dropped_base
+                            .as_ref()
+                            .is_none_or(|earliest| base.commit_timestamp < *earliest)
+                        {
+                            group.earliest_dropped_base = Some(base.commit_timestamp);
+                        }
+                    } else if committed_earlier(&base.commit_timestamp) {
+                        group.has_earlier_base = true;
+                    }
+                } else if LogFile::is_log_file_name(name)
+                    && let Ok(log) = LogFile::from_str(name)
+                {
+                    let group = groups.entry(log.file_id).or_default();
+                    if group
+                        .earliest_log
+                        .as_ref()
+                        .is_none_or(|earliest| log.timestamp < *earliest)
+                    {
+                        group.earliest_log = Some(log.timestamp);
+                    }
+                }
+            }
+            for (file_id, group) in groups {
+                if let Some(dropped_base) = group.earliest_dropped_base
+                    && !group.has_earlier_base
+                    && group.earliest_log.is_none_or(|log| log >= dropped_base)
+                {
+                    return Ok(Some(format!("{partition}/{file_id}")));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `mdt` holds instants this handle's snapshot cannot see.
+    pub(crate) fn metadata_table_past_snapshot(&self, mdt: &Table) -> bool {
+        self.metadata_compaction_bound(mdt).is_some()
+    }
+
+    /// The instant above which a metadata compaction may have folded in an
+    /// instant this handle's snapshot cannot see, or `None` when the metadata
+    /// table holds no such instant.
+    ///
+    /// A compaction folds in only what completed before it, so the bound is the
+    /// earliest completion among the unseen instants. The compaction's own
+    /// instant cannot decide this alone: hudi-rs compacts after the data commit
+    /// that triggers it completes, so a compaction that folded in nothing new
+    /// often sorts above every instant the snapshot listed.
+    fn metadata_compaction_bound(&self, mdt: &Table) -> Option<String> {
+        let listed = &self.timeline.listed;
+        let latest = listed.latest.as_deref()?;
+        // An unseen instant the metadata table has archived is not on its
+        // timeline, and completed no earlier than it was requested.
+        let floor = listed
+            .pending
+            .iter()
+            .map(String::as_str)
+            .fold(latest, |floor, pending| floor.min(pending));
+        if mdt
+            .timeline
+            .earliest_active_instant
+            .as_deref()
+            .is_some_and(|earliest| earliest > floor)
+        {
+            return Some(floor.to_string());
+        }
+        mdt.timeline
+            .completed_commits
+            .iter()
+            .filter(|instant| instant.action == Action::DeltaCommit)
+            .chain(&mdt.timeline.listed.rollbacks_and_restores)
+            .filter(|instant| {
+                let timestamp = instant.timestamp.as_str();
+                !timestamp.starts_with(SOLO_COMMIT_TIMESTAMP)
+                    && (timestamp > latest || listed.pending.contains(timestamp))
+            })
+            .map(|instant| {
+                instant
+                    .completion_timestamp
+                    .as_deref()
+                    .unwrap_or(&instant.timestamp)
+            })
+            .min()
+            .map(str::to_string)
     }
 
     /// Source 1 — every completed data instant.
@@ -602,7 +849,7 @@ impl Table {
     /// exclusion is the whole content of this source.
     ///
     /// `data_pending` is the data table's pending instants across **every**
-    /// action, from [`Timeline::all_pending_instant_times`]. Passed in rather
+    /// action, not only the commit actions. Passed in rather
     /// than read from `self.timeline.pending_instants`, which covers only
     /// commit, delta commit and replace commit: a metadata delta commit written
     /// for a compaction or a clean that then crashed mid-commit leaves a
@@ -1459,8 +1706,9 @@ mod tests {
         copy_tree(src_root, &root);
 
         // A metadata delta commit for a data compaction, at an instant the
-        // fixture does not otherwise use.
-        const COMPACTION_TS: &str = "20260101000000000";
+        // fixture does not otherwise use. Below the fixture's latest data
+        // instant, since a handle reads none above it.
+        const COMPACTION_TS: &str = "20251220000000000";
         std::fs::write(
             root.join(format!(
                 ".hoodie/metadata/.hoodie/timeline/{COMPACTION_TS}_{COMPACTION_TS}.deltacommit"
@@ -1542,7 +1790,10 @@ mod tests {
         // earliest valid instant" bound admits it.
         const ROLLBACK_TS: &str = "20260101000000000";
         const ROLLED_BACK: &str = "20259999000000000";
-        const MDT_ROLLBACK_TS: &str = "20260102000000000";
+        // At or below the data timeline's latest instant; one above it is
+        // past every snapshot of this timeline.
+        const MDT_ROLLBACK_TS: &str = "20251231000000000";
+        const MDT_ROLLBACK_PAST_SNAPSHOT_TS: &str = "20260102000000000";
 
         let write_rollback = |dir: &std::path::Path, ts: &str, rolls: &[&str]| {
             std::fs::write(
@@ -1552,11 +1803,9 @@ mod tests {
             .unwrap();
         };
         write_rollback(&root.join(".hoodie/timeline"), ROLLBACK_TS, &[ROLLED_BACK]);
-        write_rollback(
-            &root.join(".hoodie/metadata/.hoodie/timeline"),
-            MDT_ROLLBACK_TS,
-            &[],
-        );
+        for ts in [MDT_ROLLBACK_TS, MDT_ROLLBACK_PAST_SNAPSHOT_TS] {
+            write_rollback(&root.join(".hoodie/metadata/.hoodie/timeline"), ts, &[]);
+        }
 
         let table = Table::new(root.to_str().unwrap()).await?;
         let mdt = table.get_or_init_metadata_table().await?;
@@ -1583,6 +1832,17 @@ mod tests {
         assert!(
             valid.contains(MDT_ROLLBACK_TS),
             "source 4: the metadata table's own rollback instant must be valid"
+        );
+        assert!(
+            !valid.contains(MDT_ROLLBACK_PAST_SNAPSHOT_TS),
+            "a metadata rollback newer than the data timeline is past the snapshot"
+        );
+        assert!(
+            table
+                .latest_valid_instant_timestamps(mdt)
+                .await?
+                .contains(MDT_ROLLBACK_PAST_SNAPSHOT_TS),
+            "a write reads the metadata table as it is now"
         );
         Ok(())
     }
@@ -1695,5 +1955,548 @@ mod tests {
             "the error must name the partition, got {err}"
         );
         Ok(())
+    }
+
+    /// A handle reads the metadata table as of the data snapshot it opened on,
+    /// not as of the moment it plans.
+    mod snapshot_fence {
+        use super::*;
+        use crate::table::ReadOptions;
+        use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+
+        const MAX_DELTA_COMMITS: &str = "hoodie.metadata.compact.max.delta.commits";
+
+        fn rows(city: &str, rows: &[(&str, i64)]) -> RecordBatch {
+            let schema = Arc::new(ArrowSchema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("city", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+            ]));
+            let ids: Vec<&str> = rows.iter().map(|r| r.0).collect();
+            let cities: Vec<&str> = rows.iter().map(|_| city).collect();
+            let ts: Vec<i64> = rows.iter().map(|r| r.1).collect();
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(StringArray::from(ids)) as ArrayRef,
+                    Arc::new(StringArray::from(cities)),
+                    Arc::new(Int64Array::from(ts)),
+                ],
+            )
+            .unwrap()
+        }
+
+        /// A copy-on-write table with one file group in `sf`, written at c5.
+        async fn table_at_c5(path: &std::path::Path) -> Table {
+            let mut table = Table::create(path.to_str().unwrap())
+                .with_table_name("t")
+                .with_record_key_fields(["id"])
+                .with_partition_fields(["city"])
+                .with_ordering_fields(["ts"])
+                .create()
+                .await
+                .unwrap();
+            table
+                .append([rows("sf", &[("a", 1), ("b", 1)])])
+                .await
+                .unwrap();
+            table
+        }
+
+        /// `(partition, base file name)` of every planned slice, sorted.
+        async fn planned(table: &Table) -> Vec<(String, String)> {
+            let mut planned: Vec<(String, String)> = table
+                .get_file_slices(&ReadOptions::new())
+                .await
+                .unwrap()
+                .iter()
+                .map(|fs| {
+                    let base = fs.base_file.as_ref().expect("a copy-on-write slice");
+                    (fs.partition_path.clone(), base.file_name())
+                })
+                .collect();
+            planned.sort();
+            planned
+        }
+
+        /// Write the metadata delta commit `instant` with `files` entries, the
+        /// way a data instant records its file changes.
+        async fn metadata_delta(
+            table: &Table,
+            instant: &str,
+            files: &[(String, String, i64, bool)],
+        ) {
+            let storage = table.file_system_view.storage.clone();
+            let stats = crate::write::metadata::update_files_partition_entries(
+                storage.as_ref(),
+                instant,
+                files,
+            )
+            .await
+            .unwrap();
+            crate::write::metadata::write_metadata_commit(
+                storage.as_ref(),
+                instant,
+                HashMap::from([(FilesPartitionRecord::PARTITION_NAME.to_string(), stats)]),
+            )
+            .await
+            .unwrap();
+        }
+
+        async fn put_timeline_file(table: &Table, name: &str) {
+            table
+                .file_system_view
+                .storage
+                .put_file(&format!(".hoodie/timeline/{name}"), Vec::<u8>::new())
+                .await
+                .unwrap();
+        }
+
+        /// A clean that deletes `file` from `partition`: its metadata delta
+        /// commit, then its completed instant on the data timeline. The file
+        /// itself is left for the caller to delete or keep.
+        async fn clean(table: &Table, partition: &str, file: &str) -> String {
+            let instant = crate::write::append::generate_instant_time().await;
+            put_timeline_file(table, &format!("{instant}.clean.requested")).await;
+            put_timeline_file(table, &format!("{instant}.clean.inflight")).await;
+            metadata_delta(
+                table,
+                &instant,
+                &[(partition.to_string(), file.to_string(), 0, true)],
+            )
+            .await;
+            let completion = crate::write::append::generate_instant_time().await;
+            put_timeline_file(table, &format!("{instant}_{completion}.clean")).await;
+            instant
+        }
+
+        /// A handle opened at c5 plans c5's slice after a later commit c6
+        /// rewrites the file group and a clean c7 removes c5's base file from
+        /// the metadata table. Admitting c6 and c7 left the file group with
+        /// only a slice the handle cannot see, and its rows vanished.
+        #[tokio::test]
+        async fn a_stale_handle_plans_its_own_snapshot_after_a_commit_and_clean() {
+            let dir = tempfile::tempdir().unwrap();
+            let mut writer = table_at_c5(dir.path()).await;
+
+            // Not planned until after the writes: the first plan opens the
+            // metadata table.
+            let handle = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            let at_c5 = planned(&Table::new(dir.path().to_str().unwrap()).await.unwrap()).await;
+            assert_eq!(at_c5.len(), 1, "one file group: {at_c5:?}");
+            let (partition, c5_base) = at_c5[0].clone();
+
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            let c6 = writer.timeline.get_latest_commit_timestamp().unwrap();
+            let fresh = planned(&Table::new(dir.path().to_str().unwrap()).await.unwrap()).await;
+            assert_eq!(fresh.len(), 1);
+            assert_ne!(fresh[0].1, c5_base, "c6 must rewrite the file group");
+            clean(&writer, &partition, &c5_base).await;
+            writer
+                .file_system_view
+                .storage
+                .delete_file(&format!("{partition}/{c5_base}"))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                planned(&handle).await,
+                at_c5,
+                "the handle must plan the slice of the snapshot it opened on"
+            );
+            let err = handle
+                .read(&ReadOptions::new())
+                .await
+                .expect_err("c5's base file is gone, so the read must fail, not come back short");
+            assert!(err.to_string().contains(&c5_base), "got {err}");
+
+            // A write on this handle, and the record index, read the metadata
+            // table as it is now.
+            let mdt = handle.get_or_init_metadata_table().await.unwrap();
+            assert!(
+                !handle
+                    .valid_instant_timestamps(mdt)
+                    .await
+                    .unwrap()
+                    .contains(&c6)
+            );
+            assert!(
+                handle
+                    .valid_metadata_instants()
+                    .await
+                    .unwrap()
+                    .contains(&c6)
+            );
+        }
+
+        /// A metadata base file compacted after the snapshot folds in changes
+        /// the snapshot cannot see, so every read of the handle takes the slice
+        /// from before that compaction.
+        #[tokio::test]
+        async fn a_stale_handle_does_not_read_a_metadata_base_compacted_after_its_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            table_at_c5(dir.path()).await;
+            let handle = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            let at_c5 = planned(&Table::new(dir.path().to_str().unwrap()).await.unwrap()).await;
+            let (partition, c5_base) = at_c5[0].clone();
+
+            let mut writer =
+                Table::new_with_options(dir.path().to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
+                    .await
+                    .unwrap();
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            clean(&writer, &partition, &c5_base).await;
+            writer
+                .file_system_view
+                .storage
+                .delete_file(&format!("{partition}/{c5_base}"))
+                .await
+                .unwrap();
+            // The next write compacts the metadata table, folding the clean in.
+            writer.append([rows("ny", &[("c", 3)])]).await.unwrap();
+            let storage = writer.file_system_view.storage.clone();
+            let files_slices = crate::write::metadata::mdt_partition_latest_slices(
+                storage.as_ref(),
+                FilesPartitionRecord::PARTITION_NAME,
+            )
+            .await
+            .unwrap();
+            assert!(
+                files_slices
+                    .iter()
+                    .all(|(_, base, logs)| base.is_some() && logs.is_empty()),
+                "the files partition must be compacted after the clean: {files_slices:?}"
+            );
+
+            let pruner = PartitionPruner::new(
+                &[],
+                &handle.get_partition_schema().await.unwrap(),
+                handle.hudi_configs.as_ref(),
+            )
+            .unwrap();
+            let records = handle
+                .read_metadata_table_files_partition(&pruner)
+                .await
+                .unwrap();
+            assert_eq!(
+                records[&partition].active_file_names(),
+                vec![c5_base.as_str()],
+                "the public read sees the snapshot's files partition"
+            );
+            assert_eq!(planned(&handle).await, at_c5);
+            let err = handle
+                .read(&ReadOptions::new())
+                .await
+                .expect_err("c5's base file is gone, so the read must fail, not come back short");
+            assert!(err.to_string().contains(&c5_base), "got {err}");
+        }
+
+        /// A metadata table that archived the instants after the slice a stale
+        /// handle would read cannot reproduce the snapshot: its public reads
+        /// fail, and planning lists storage instead.
+        #[tokio::test]
+        async fn a_stale_handle_refuses_a_metadata_table_archived_past_its_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            table_at_c5(dir.path()).await;
+            let handle = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            let at_c5 = planned(&Table::new(dir.path().to_str().unwrap()).await.unwrap()).await;
+            let (partition, c5_base) = at_c5[0].clone();
+
+            let mut writer =
+                Table::new_with_options(dir.path().to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
+                    .await
+                    .unwrap();
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            clean(&writer, &partition, &c5_base).await;
+            writer.append([rows("ny", &[("c", 3)])]).await.unwrap();
+            // Archive the metadata table's initializing instants.
+            let mdt_timeline = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+            for entry in std::fs::read_dir(&mdt_timeline).unwrap() {
+                let path = entry.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if name.starts_with(SOLO_COMMIT_TIMESTAMP) {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+
+            let err = handle
+                .read_metadata_table_files_partition_arrow(&[])
+                .await
+                .expect_err("the metadata table cannot reproduce the snapshot");
+            assert!(
+                matches!(err, CoreError::MetadataTable(_)) && err.to_string().contains("archived"),
+                "got {err}"
+            );
+            assert!(handle.metadata_table_refused());
+            // c5's base is still on storage, which the listing finds.
+            assert_eq!(planned(&handle).await, at_c5);
+        }
+
+        /// Remove every metadata file slice older than the two newest base
+        /// versions of its file group, as the metadata table's cleaner does
+        /// with `KEEP_LATEST_FILE_VERSIONS` and two versions.
+        fn clean_metadata_keeping_two_versions(root: &std::path::Path) {
+            use crate::file_group::base_file::BaseFile;
+            use crate::file_group::log_file::LogFile;
+            use std::str::FromStr;
+            let mdt = root.join(".hoodie/metadata");
+            for entry in std::fs::read_dir(&mdt).unwrap() {
+                let dir = entry.unwrap().path();
+                if !dir.is_dir() || dir.file_name().unwrap().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let mut groups: HashMap<String, Vec<(String, String, bool)>> = HashMap::new();
+                for file in std::fs::read_dir(&dir).unwrap() {
+                    let name = file.unwrap().file_name().to_string_lossy().to_string();
+                    if let Ok(base) = BaseFile::from_str(&name) {
+                        groups.entry(base.file_id).or_default().push((
+                            name,
+                            base.commit_timestamp,
+                            true,
+                        ));
+                    } else if let Ok(log) = LogFile::from_str(&name) {
+                        groups
+                            .entry(log.file_id)
+                            .or_default()
+                            .push((name, log.timestamp, false));
+                    }
+                }
+                for files in groups.values() {
+                    let mut bases: Vec<&String> =
+                        files.iter().filter(|f| f.2).map(|f| &f.1).collect();
+                    bases.sort();
+                    bases.dedup();
+                    if bases.len() < 3 {
+                        continue;
+                    }
+                    let keep_from = bases[bases.len() - 2].clone();
+                    for (name, timestamp, _) in files {
+                        if *timestamp < keep_from {
+                            std::fs::remove_file(dir.join(name)).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+
+        /// A metadata table whose cleaner removed the slice a stale handle
+        /// would read cannot reproduce the snapshot, and the handle lists
+        /// storage instead.
+        #[tokio::test]
+        async fn a_stale_handle_refuses_a_metadata_table_cleaned_past_its_snapshot() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap();
+            table_at_c5(dir.path()).await;
+            let handle = Table::new(path).await.unwrap();
+            let at_c5 = planned(&Table::new(path).await.unwrap()).await;
+
+            let mut writer = Table::new_with_options(path, [(MAX_DELTA_COMMITS, "1")])
+                .await
+                .unwrap();
+            // Each write compacts the metadata table after it commits.
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            writer.append([rows("ny", &[("c", 3)])]).await.unwrap();
+            clean_metadata_keeping_two_versions(dir.path());
+
+            let err = handle
+                .read_metadata_table_files_partition_arrow(&[])
+                .await
+                .expect_err("the metadata table no longer holds the snapshot's slice");
+            assert!(
+                matches!(err, CoreError::MetadataTable(_))
+                    && err.to_string().contains("no longer holds"),
+                "got {err}"
+            );
+            assert_eq!(planned(&handle).await, at_c5);
+            let rows: usize = handle
+                .read(&ReadOptions::new())
+                .await
+                .unwrap()
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum();
+            assert_eq!(rows, 2, "the snapshot's two rows, read by storage listing");
+        }
+
+        /// A metadata table whose cleaner removes the slice a stale handle
+        /// pinned after the pin fails the pinned read, and planning lists
+        /// storage instead.
+        #[tokio::test]
+        async fn a_stale_handle_lists_storage_when_its_pinned_slice_is_cleaned_later() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap();
+            table_at_c5(dir.path()).await;
+            let handle = Table::new(path).await.unwrap();
+            let at_c5 = planned(&Table::new(path).await.unwrap()).await;
+
+            let mut writer = Table::new_with_options(path, [(MAX_DELTA_COMMITS, "1")])
+                .await
+                .unwrap();
+            // Each write compacts the metadata table after it commits.
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            writer.append([rows("ny", &[("c", 3)])]).await.unwrap();
+            assert_eq!(planned(&handle).await, at_c5);
+            let mdt = handle.get_or_init_metadata_table().await.unwrap();
+            assert!(handle.metadata_table_past_snapshot(mdt));
+
+            clean_metadata_keeping_two_versions(dir.path());
+            handle
+                .read_metadata_table_files_partition_arrow(&[])
+                .await
+                .expect_err("the pinned slice is gone");
+            assert_eq!(planned(&handle).await, at_c5);
+            let rows: usize = handle
+                .read(&ReadOptions::new())
+                .await
+                .unwrap()
+                .iter()
+                .map(|batch| batch.num_rows())
+                .sum();
+            assert_eq!(rows, 2, "the snapshot's two rows, read by storage listing");
+        }
+
+        /// A handle opened while a write is in flight keeps a metadata
+        /// compaction that ran before the write's metadata commit completed:
+        /// the compaction could not have folded that commit in.
+        #[tokio::test]
+        async fn a_compaction_before_an_unseen_commit_completed_is_kept() {
+            let dir = tempfile::tempdir().unwrap();
+            table_at_c5(dir.path()).await;
+            let in_flight = crate::write::append::generate_instant_time().await;
+            let mut writer =
+                Table::new_with_options(dir.path().to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
+                    .await
+                    .unwrap();
+            // Compacts the metadata table after the commit completes.
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            put_timeline_file(&writer, &format!("{in_flight}.commit.requested")).await;
+            put_timeline_file(&writer, &format!("{in_flight}.commit.inflight")).await;
+            let partition = planned(&writer).await[0].0.clone();
+            metadata_delta(
+                &writer,
+                &in_flight,
+                &[(
+                    partition,
+                    "unseen-file_0-0-0_0.parquet".to_string(),
+                    1,
+                    false,
+                )],
+            )
+            .await;
+
+            let handle = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            let mdt = handle.get_or_init_metadata_table().await.unwrap();
+            let unpinned = handle.new_metadata_table().await.unwrap();
+            let compactions = |mdt: &Table| -> Vec<String> {
+                mdt.timeline
+                    .completed_commits
+                    .iter()
+                    .filter(|instant| instant.action == Action::Commit)
+                    .map(|instant| instant.timestamp.clone())
+                    .collect()
+            };
+            assert!(
+                !compactions(&unpinned).is_empty(),
+                "the writer must compact"
+            );
+            assert_eq!(compactions(mdt), compactions(&unpinned));
+        }
+
+        /// A handle opened after the same history plans the latest snapshot
+        /// from the metadata table, including after a metadata compaction that
+        /// sorts above every data instant it listed.
+        #[tokio::test]
+        async fn a_handle_opened_after_the_writes_reads_the_latest_metadata() {
+            let dir = tempfile::tempdir().unwrap();
+            table_at_c5(dir.path()).await;
+            let c5 = planned(&Table::new(dir.path().to_str().unwrap()).await.unwrap()).await;
+            let (partition, c5_base) = c5[0].clone();
+            let mut writer =
+                Table::new_with_options(dir.path().to_str().unwrap(), [(MAX_DELTA_COMMITS, "1")])
+                    .await
+                    .unwrap();
+            writer.upsert([rows("sf", &[("a", 2)])]).await.unwrap();
+            clean(&writer, &partition, &c5_base).await;
+            writer.append([rows("ny", &[("c", 3)])]).await.unwrap();
+
+            let handle = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+            let mdt = handle.get_or_init_metadata_table().await.unwrap();
+            assert_eq!(
+                mdt.timeline.completed_commits.len(),
+                handle
+                    .new_metadata_table()
+                    .await
+                    .unwrap()
+                    .timeline
+                    .completed_commits
+                    .len(),
+                "nothing in the metadata table is past this snapshot"
+            );
+            assert_eq!(
+                handle.valid_instant_timestamps(mdt).await.unwrap(),
+                handle.latest_valid_instant_timestamps(mdt).await.unwrap(),
+                "a snapshot that is the latest admits what a write would"
+            );
+            let latest = planned(&handle).await;
+            assert_eq!(latest.len(), 2, "{latest:?}");
+            let file_id = c5_base.split('_').next().unwrap();
+            assert!(
+                latest.iter().any(|(p, base)| *p == partition
+                    && *base != c5_base
+                    && base.starts_with(file_id)),
+                "the file group's c6 slice must be planned: {latest:?}"
+            );
+        }
+
+        /// A data instant pending when the handle opened stays out of the
+        /// valid-instant set after it completes, under a commit action and
+        /// under one the timeline does not load by default.
+        #[tokio::test]
+        async fn a_data_instant_pending_at_open_is_not_admitted_once_it_completes() {
+            for action in ["commit", "clean"] {
+                let dir = tempfile::tempdir().unwrap();
+                let writer = table_at_c5(dir.path()).await;
+                let pending = crate::write::append::generate_instant_time().await;
+                put_timeline_file(&writer, &format!("{pending}.{action}.requested")).await;
+                put_timeline_file(&writer, &format!("{pending}.{action}.inflight")).await;
+
+                let handle = Table::new(dir.path().to_str().unwrap()).await.unwrap();
+                let partition = planned(&writer).await[0].0.clone();
+
+                let unseen = "unseen-file_0-0-0_0.parquet";
+                metadata_delta(
+                    &writer,
+                    &pending,
+                    &[(partition.clone(), unseen.to_string(), 1, false)],
+                )
+                .await;
+                let completion = crate::write::append::generate_instant_time().await;
+                put_timeline_file(&writer, &format!("{pending}_{completion}.{action}")).await;
+
+                let mdt = handle.get_or_init_metadata_table().await.unwrap();
+                let valid = handle.valid_instant_timestamps(mdt).await.unwrap();
+                assert!(
+                    !valid.contains(&pending),
+                    "[{action}] {pending} was pending at open and must stay out"
+                );
+                let partition_pruner = PartitionPruner::new(
+                    &[],
+                    &handle.get_partition_schema().await.unwrap(),
+                    handle.hudi_configs.as_ref(),
+                )
+                .unwrap();
+                let records = mdt
+                    .fetch_files_partition_records(&partition_pruner, &valid)
+                    .await
+                    .unwrap();
+                let listed: Vec<(&str, u64)> =
+                    records[&partition].active_files_with_sizes().collect();
+                assert!(
+                    listed.iter().all(|(name, _)| *name != unseen),
+                    "[{action}] the handle listed {unseen} from an instant it saw pending: {listed:?}"
+                );
+            }
+        }
     }
 }
