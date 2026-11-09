@@ -117,7 +117,7 @@ impl FileSystemView {
         table_schema: &Schema,
         timeline_view: &TimelineView,
         files_partition_records: Option<&HashMap<String, FilesPartitionRecord>>,
-        valid_instants: Option<&std::collections::HashSet<String>>,
+        metadata_table: Option<MetadataListing<'_>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<()> {
         let configured_base_file_format = self.configured_base_file_format()?;
@@ -160,7 +160,7 @@ impl FileSystemView {
                 table_schema,
                 timeline_view.as_of_timestamp(),
                 configured_base_file_format.as_ref(),
-                valid_instants,
+                metadata_table,
             )
             .await;
 
@@ -197,13 +197,14 @@ impl FileSystemView {
         table_schema: &Schema,
         as_of_timestamp: &str,
         configured_base_file_format: Option<&BaseFileFormatValue>,
-        valid_instants: Option<&std::collections::HashSet<String>>,
+        metadata_table: Option<MetadataListing<'_>>,
     ) -> bool {
         use crate::metadata::table::records::MetadataPartitionType;
 
-        // Without the valid-instant set (storage-listed view) the stats logs
-        // cannot be fenced; fall back to footers rather than read unfenced.
-        let Some(valid_instants) = valid_instants else {
+        // Without the metadata table and its valid-instant set (storage-listed
+        // view) the stats logs cannot be fenced; fall back to footers rather
+        // than read unfenced.
+        let Some(metadata_table) = metadata_table else {
             return false;
         };
 
@@ -266,7 +267,12 @@ impl FileSystemView {
             self.storage.clone(),
             self.hudi_configs.clone(),
             &wanted,
-            valid_instants,
+            metadata_table.valid_instants,
+            Some(&metadata_table.table.timeline),
+            usize::from(
+                self.hudi_configs
+                    .get_or_default(crate::config::read::HudiReadConfig::FileSliceReadConcurrency),
+            ),
         )
         .await
         {
@@ -490,9 +496,6 @@ impl FileSystemView {
         metadata_table: Option<MetadataListing<'_>>,
         estimator: Option<&FileStatsEstimator>,
     ) -> Result<Vec<FileSlice>> {
-        let valid_instants = metadata_table
-            .as_ref()
-            .map(|listing| listing.valid_instants);
         let files_partition_records = match metadata_table {
             Some(listing) => Some(
                 listing
@@ -509,7 +512,7 @@ impl FileSystemView {
             table_schema,
             timeline_view,
             files_partition_records.as_ref(),
-            valid_instants,
+            metadata_table,
             estimator,
         )
         .await?;
@@ -1200,6 +1203,82 @@ mod tests {
             .unwrap();
 
         assert!(!file_slices.is_empty());
+    }
+
+    /// The `column_stats` lookup of a filtered plan lists the partition and then
+    /// only GETs: no HEAD before a whole-file read, and no listing of the
+    /// metadata timeline, whose loaded copy on the planner's metadata table
+    /// handle fences the base files instead. The pruned plan matches footer
+    /// pruning over a storage listing.
+    ///
+    /// Only the data table's storage is counted, which is where the lookup
+    /// reads; the metadata table handle reads through its own.
+    #[tokio::test]
+    async fn fs_view_mdt_column_stats_pruning_reads_without_head_or_timeline_listing() {
+        use crate::config::read_options::ReadOptions;
+        use crate::storage::counting::CountingObjectStore;
+
+        fn base_file_names(file_slices: Vec<FileSlice>) -> Vec<String> {
+            let mut names: Vec<String> = file_slices
+                .iter()
+                .filter_map(|fs| fs.base_file.as_ref().map(|b| b.file_name()))
+                .collect();
+            names.sort();
+            names
+        }
+
+        let base_url = SampleTable::V9TxnsSimpleMeta.url_to_cow();
+        let options = ReadOptions::new()
+            .with_filters([("txn_ts", ">=", "1700800000000")])
+            .unwrap();
+
+        let footer_table =
+            Table::new_with_options(base_url.path(), [("hoodie.metadata.enable", "false")])
+                .await
+                .unwrap();
+        let expected = base_file_names(footer_table.get_file_slices(&options).await.unwrap());
+        let unfiltered = base_file_names(
+            footer_table
+                .get_file_slices(&ReadOptions::new())
+                .await
+                .unwrap(),
+        );
+        assert!(
+            !expected.is_empty() && expected.len() < unfiltered.len(),
+            "the filter must prune some files but not all: {expected:?} of {unfiltered:?}"
+        );
+
+        let mut table = Table::new(base_url.path()).await.unwrap();
+        assert!(table.is_metadata_table_enabled());
+        // Warm the per-table caches (metadata table handle, footer-sampled
+        // estimator), so the requests counted below are the column_stats lookup.
+        table.get_file_slices(&ReadOptions::new()).await.unwrap();
+        let storage = table.file_system_view.storage.clone();
+        let (store, counts) = CountingObjectStore::new(storage.object_store.clone());
+        table.file_system_view.storage = Storage::new_with_object_store(
+            storage.base_url.as_ref().clone(),
+            store,
+            storage.hudi_configs.clone(),
+        );
+
+        let actual = base_file_names(table.get_file_slices(&options).await.unwrap());
+        assert_eq!(actual, expected);
+
+        let listed = counts.listed_prefixes();
+        assert!(
+            listed
+                .iter()
+                .any(|prefix| prefix.ends_with(".hoodie/metadata/column_stats")),
+            "the column_stats partition must be listed: {listed:?}"
+        );
+        assert!(
+            !listed
+                .iter()
+                .any(|prefix| prefix.contains(".hoodie/metadata/.hoodie")),
+            "the column_stats lookup must not list the metadata timeline: {listed:?}"
+        );
+        assert_eq!(counts.heads(), 0, "no HEAD before a whole-file read");
+        assert!(counts.gets() > 0);
     }
 
     #[tokio::test]

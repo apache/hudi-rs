@@ -25,8 +25,8 @@
 //! cannot tell them apart.
 
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -43,6 +43,8 @@ pub(crate) struct RequestCounts {
     gets: AtomicUsize,
     /// Metadata-only lookups.
     heads: AtomicUsize,
+    /// Prefixes listed with a delimiter, in request order.
+    listed_prefixes: Mutex<Vec<String>>,
 }
 
 impl RequestCounts {
@@ -52,6 +54,13 @@ impl RequestCounts {
 
     pub(crate) fn heads(&self) -> usize {
         self.heads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn listed_prefixes(&self) -> Vec<String> {
+        self.listed_prefixes
+            .lock()
+            .map(|prefixes| prefixes.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -124,6 +133,9 @@ impl ObjectStore for CountingObjectStore {
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        if let Ok(mut prefixes) = self.counts.listed_prefixes.lock() {
+            prefixes.push(prefix.map(Path::to_string).unwrap_or_default());
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 

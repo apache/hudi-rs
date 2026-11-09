@@ -19,7 +19,7 @@
 use crate::config::HudiConfigs;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{GetResult, ObjectMeta, ObjectStore, ObjectStoreExt};
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -299,6 +299,16 @@ impl StorageReader {
             .get(&object_meta.location)
             .await
             .map_err(|e| Error::other(format!("object-store get failed: {e}")))?;
+        Self::from_get_result(object_store, get_result).await
+    }
+
+    /// Read the entire file of a GET already issued into one buffer, for a
+    /// caller that has no [`ObjectMeta`] and needs none.
+    pub(crate) async fn from_get_result(
+        object_store: Arc<dyn ObjectStore>,
+        get_result: GetResult,
+    ) -> Result<Self> {
+        let location = get_result.meta.location.clone();
         let bytes = get_result
             .bytes()
             .await
@@ -306,7 +316,7 @@ impl StorageReader {
         let file_len = bytes.len() as u64;
         Ok(Self {
             object_store,
-            location: object_meta.location,
+            location,
             file_len,
             pos: 0,
             whole: Some(bytes),

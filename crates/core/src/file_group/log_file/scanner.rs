@@ -142,6 +142,8 @@ pub struct LogFileScanner {
     storage: Arc<Storage>,
     /// Keys to narrow HFile log blocks to; see [`LogFileReader::with_key_predicate`].
     key_predicate: Option<KeyPredicate>,
+    /// How many log files to read at once. One by default.
+    read_concurrency: usize,
 }
 
 impl LogFileScanner {
@@ -150,6 +152,7 @@ impl LogFileScanner {
             hudi_configs,
             storage,
             key_predicate: None,
+            read_concurrency: 1,
         }
     }
 
@@ -159,30 +162,38 @@ impl LogFileScanner {
         self
     }
 
+    /// Read up to `read_concurrency` log files at once. Each file is still read
+    /// whole, and blocks come back in path order whatever the read order.
+    pub(crate) fn with_read_concurrency(mut self, read_concurrency: usize) -> Self {
+        self.read_concurrency = read_concurrency;
+        self
+    }
+
     /// Read all blocks from multiple log files and collect rollback targets.
     async fn collect_blocks(
         &self,
         relative_paths: Vec<String>,
         instant_range: &InstantRange,
     ) -> Result<CollectedBlocks> {
-        let mut all_blocks: Vec<Vec<LogBlock>> = Vec::with_capacity(relative_paths.len());
+        let all_blocks: Vec<Vec<LogBlock>> = crate::util::concurrency::bounded_in_order(
+            &relative_paths,
+            self.read_concurrency,
+            |path| async move {
+                let mut reader =
+                    LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), path)
+                        .await?
+                        .with_key_predicate(self.key_predicate.clone());
+                reader.read_all_blocks(instant_range).await
+            },
+        )
+        .await?;
+
+        // Collect rollback targets from command blocks
         let mut rollback_targets: HashSet<String> = HashSet::new();
-
-        for path in relative_paths {
-            let mut reader =
-                LogFileReader::new(self.hudi_configs.clone(), self.storage.clone(), &path)
-                    .await?
-                    .with_key_predicate(self.key_predicate.clone());
-            let blocks = reader.read_all_blocks(instant_range).await?;
-
-            // Collect rollback targets from command blocks
-            for block in &blocks {
-                if block.is_rollback_block() {
-                    rollback_targets.insert(block.target_instant_time()?.to_string());
-                }
+        for block in all_blocks.iter().flatten() {
+            if block.is_rollback_block() {
+                rollback_targets.insert(block.target_instant_time()?.to_string());
             }
-
-            all_blocks.push(blocks);
         }
 
         Ok(CollectedBlocks {

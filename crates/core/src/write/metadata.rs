@@ -1036,6 +1036,8 @@ async fn compute_partition_stats_records(
         table.hudi_configs.clone(),
         &wanted,
         &valid_instants,
+        None,
+        1,
     )
     .await?;
 
@@ -1128,6 +1130,84 @@ pub(crate) async fn mdt_partition_latest_slices(
     storage: &Storage,
     partition: &str,
 ) -> Result<Vec<(String, Option<String>, Vec<String>)>> {
+    mdt_partition_latest_slices_fenced(storage, partition, None).await
+}
+
+/// MDT instants a base HFile may be admitted on: completed on the active MDT
+/// timeline, or below its earliest instant, which archival only moves past
+/// completed ones.
+struct CommittedMdtInstants {
+    completed: std::collections::HashSet<String>,
+    earliest_active: Option<String>,
+}
+
+impl CommittedMdtInstants {
+    /// From the metadata table's loaded timeline, which holds both halves.
+    fn from_timeline(mdt_timeline: &crate::timeline::Timeline) -> Self {
+        Self {
+            completed: mdt_timeline
+                .completed_commits
+                .iter()
+                .map(|instant| instant.timestamp.clone())
+                .collect(),
+            earliest_active: mdt_timeline.earliest_active_instant.clone(),
+        }
+    }
+
+    /// By listing the MDT timeline, for a caller without a metadata table handle.
+    async fn list(storage: &Storage) -> Result<Self> {
+        use std::str::FromStr;
+        let mdt_timeline_dir = format!("{METADATA_BASE}/.hoodie/timeline");
+        let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut earliest_active: Option<String> = None;
+        match storage.list_files(Some(&mdt_timeline_dir)).await {
+            Ok(files) => {
+                for file in files {
+                    let name = file.name;
+                    if let Ok(instant) = Instant::from_str(&name)
+                        && crate::timeline::DEFAULT_LOADING_ACTIONS.contains(&instant.action)
+                        && earliest_active
+                            .as_ref()
+                            .is_none_or(|earliest| instant.timestamp < *earliest)
+                    {
+                        earliest_active = Some(instant.timestamp);
+                    }
+                    if !name.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        || name.ends_with(".requested")
+                        || name.ends_with(".inflight")
+                    {
+                        continue;
+                    }
+                    completed.insert(name.chars().take_while(char::is_ascii_digit).collect());
+                }
+            }
+            Err(crate::storage::error::StorageError::ObjectStoreError(
+                object_store::Error::NotFound { .. },
+            )) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Self {
+            completed,
+            earliest_active,
+        })
+    }
+
+    fn is_committed(&self, timestamp: &str) -> bool {
+        self.completed.contains(timestamp)
+            || self
+                .earliest_active
+                .as_deref()
+                .is_some_and(|earliest| timestamp < earliest)
+    }
+}
+
+/// [`mdt_partition_latest_slices`], fencing bases with `mdt_timeline` when
+/// given and by listing the MDT timeline otherwise.
+async fn mdt_partition_latest_slices_fenced(
+    storage: &Storage,
+    partition: &str,
+    mdt_timeline: Option<&crate::timeline::Timeline>,
+) -> Result<Vec<(String, Option<String>, Vec<String>)>> {
     use std::str::FromStr;
     let dir = format!("{METADATA_BASE}/{partition}");
     let listed = match storage.list_files(Some(&dir)).await {
@@ -1140,46 +1220,11 @@ pub(crate) async fn mdt_partition_latest_slices(
     // Admit only bases whose instant is committed on the MDT timeline: a crash
     // between writing a compaction HFile and completing its .commit must not
     // let the orphan base shadow the committed slice (and silently drop the
-    // still-live pre-compaction logs). Committed means completed on the active
-    // timeline or below its earliest commit instant, which archival only moves
-    // past completed ones. Log blocks are fenced separately by the callers via
-    // valid_metadata_instants.
-    let mdt_timeline_dir = format!("{METADATA_BASE}/.hoodie/timeline");
-    let mut completed_mdt_instants: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut earliest_active: Option<String> = None;
-    match storage.list_files(Some(&mdt_timeline_dir)).await {
-        Ok(files) => {
-            for file in files {
-                let name = file.name;
-                if let Ok(instant) = Instant::from_str(&name)
-                    && crate::timeline::DEFAULT_LOADING_ACTIONS.contains(&instant.action)
-                    && earliest_active
-                        .as_ref()
-                        .is_none_or(|earliest| instant.timestamp < *earliest)
-                {
-                    earliest_active = Some(instant.timestamp);
-                }
-                if !name.chars().next().is_some_and(|c| c.is_ascii_digit())
-                    || name.ends_with(".requested")
-                    || name.ends_with(".inflight")
-                {
-                    continue;
-                }
-                completed_mdt_instants
-                    .insert(name.chars().take_while(char::is_ascii_digit).collect());
-            }
-        }
-        Err(crate::storage::error::StorageError::ObjectStoreError(
-            object_store::Error::NotFound { .. },
-        )) => {}
-        Err(error) => return Err(error.into()),
-    }
-    let is_committed = |timestamp: &String| {
-        completed_mdt_instants.contains(timestamp)
-            || earliest_active
-                .as_ref()
-                .is_some_and(|earliest| timestamp < earliest)
+    // still-live pre-compaction logs). Log blocks are fenced separately by the
+    // callers via valid_metadata_instants.
+    let committed = match mdt_timeline {
+        Some(mdt_timeline) => CommittedMdtInstants::from_timeline(mdt_timeline),
+        None => CommittedMdtInstants::list(storage).await?,
     };
 
     // Two passes: log-to-slice association requires the base files to be in
@@ -1190,7 +1235,7 @@ pub(crate) async fn mdt_partition_latest_slices(
         let name = file.name;
         if name.ends_with(".hfile") && !name.starts_with('.') {
             let base = crate::file_group::base_file::BaseFile::from_str(&name)?;
-            if !is_committed(&base.commit_timestamp) {
+            if !committed.is_committed(&base.commit_timestamp) {
                 continue;
             }
             bases.push(base);
@@ -1252,11 +1297,16 @@ pub(crate) async fn mdt_partition_latest_slices(
     Ok(out)
 }
 
+/// `mdt_timeline` is the metadata table's loaded timeline when the caller holds
+/// the handle; without it, base files are fenced by listing the MDT timeline.
+/// Up to `log_read_concurrency` log files are fetched at once.
 pub(crate) async fn load_column_stats_records(
     storage: std::sync::Arc<Storage>,
     hudi_configs: std::sync::Arc<crate::config::HudiConfigs>,
     wanted: &HashMap<String, (String, String)>,
     valid_instants: &std::collections::HashSet<String>,
+    mdt_timeline: Option<&crate::timeline::Timeline>,
+    log_read_concurrency: usize,
 ) -> Result<HashMap<String, ColumnStatsMetadata>> {
     if wanted.is_empty() {
         return Ok(HashMap::new());
@@ -1264,7 +1314,9 @@ pub(crate) async fn load_column_stats_records(
     let partition = MetadataPartitionType::ColumnStats.partition_name();
     let mut base_paths = Vec::new();
     let mut log_paths = Vec::new();
-    for (_, base, logs) in mdt_partition_latest_slices(storage.as_ref(), partition).await? {
+    for (_, base, logs) in
+        mdt_partition_latest_slices_fenced(storage.as_ref(), partition, mdt_timeline).await?
+    {
         base_paths.extend(base);
         log_paths.extend(logs);
     }
@@ -1272,34 +1324,47 @@ pub(crate) async fn load_column_stats_records(
     let mut sorted_keys: Vec<&str> = wanted.keys().map(String::as_str).collect();
     sorted_keys.sort_unstable();
 
-    let mut merged: HashMap<String, ColumnStatsMetadata> = HashMap::new();
-    for base in base_paths {
-        let mut reader = HFileReader::open(storage.as_ref(), &base)
-            .await
-            .map_err(|e| crate::error::CoreError::HFile(format!("failed to open {base}: {e:?}")))?;
-        let schema = reader
-            .get_avro_schema()
-            .map_err(|e| crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}")))?
-            .cloned();
-        let records = reader
-            .lookup_records(&sorted_keys)
-            .map_err(|e| crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}")))?;
-        for (_, record) in records {
-            let Some(record) = record else { continue };
-            apply_column_stats_record(&mut merged, wanted, &record, schema.as_ref())?;
+    // Bases are read whole, so one at a time: they overlap the log fetch, not
+    // each other. Every base merges before any log block, in slice order.
+    let read_bases = async {
+        let mut merged: HashMap<String, ColumnStatsMetadata> = HashMap::new();
+        for base in &base_paths {
+            let mut reader = HFileReader::open(storage.as_ref(), base)
+                .await
+                .map_err(|e| {
+                    crate::error::CoreError::HFile(format!("failed to open {base}: {e:?}"))
+                })?;
+            let schema = reader
+                .get_avro_schema()
+                .map_err(|e| {
+                    crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}"))
+                })?
+                .cloned();
+            let records = reader.lookup_records(&sorted_keys).map_err(|e| {
+                crate::error::CoreError::HFile(format!("failed to read {base}: {e:?}"))
+            })?;
+            for (_, record) in records {
+                let Some(record) = record else { continue };
+                apply_column_stats_record(&mut merged, wanted, &record, schema.as_ref())?;
+            }
         }
-    }
-    if !log_paths.is_empty() {
+        Ok(merged)
+    };
+    let read_logs = async {
+        if log_paths.is_empty() {
+            return Ok(Vec::new());
+        }
         // Only log blocks from instants in the caller's valid set are trusted
         // (Java getValidInstantTimestamps); orphan MDT commits are skipped.
-        let scanner = LogFileScanner::new(hudi_configs, storage);
+        let scanner = LogFileScanner::new(hudi_configs.clone(), storage.clone())
+            .with_read_concurrency(log_read_concurrency);
         let range = InstantRange::exact_match(valid_instants.iter().cloned(), "UTC");
-        for HFileRecordGroup { schema, records } in
-            scanner.scan_hfile_records(log_paths, &range).await?
-        {
-            for record in &records {
-                apply_column_stats_record(&mut merged, wanted, record, schema.as_deref())?;
-            }
+        scanner.scan_hfile_records(log_paths, &range).await
+    };
+    let (mut merged, log_groups) = futures::future::try_join(read_bases, read_logs).await?;
+    for HFileRecordGroup { schema, records } in log_groups {
+        for record in &records {
+            apply_column_stats_record(&mut merged, wanted, record, schema.as_deref())?;
         }
     }
     Ok(merged)
@@ -1744,6 +1809,231 @@ mod tests {
             "committed base must stay active, got {base:?}"
         );
         assert_eq!(logs.len(), 1);
+    }
+
+    /// Fencing bases with the metadata table's loaded timeline admits the same
+    /// slices as listing the MDT timeline, and the column_stats records read
+    /// with it, files fetched concurrently, equal those read by listing and
+    /// fetching one file at a time. Both fixtures hold two column_stats file
+    /// groups, each a compacted base plus logs.
+    #[tokio::test]
+    async fn test_load_column_stats_records_same_across_fence_source_and_read_concurrency() {
+        use crate::config::read_options::ReadOptions;
+        use crate::table::Table;
+        use hudi_test::SampleTable;
+
+        for sample in [
+            SampleTable::V9TxnsSimpleMeta,
+            SampleTable::V9TxnsNonpartMeta,
+        ] {
+            let table = Table::new(&sample.path_to_cow()).await.unwrap();
+            let mdt = table.get_or_init_metadata_table().await.unwrap();
+            let storage = table.file_system_view.storage.clone();
+            let partition = MetadataPartitionType::ColumnStats.partition_name();
+
+            let listed = mdt_partition_latest_slices(storage.as_ref(), partition)
+                .await
+                .unwrap();
+            let fenced = mdt_partition_latest_slices_fenced(
+                storage.as_ref(),
+                partition,
+                Some(&mdt.timeline),
+            )
+            .await
+            .unwrap();
+            assert_eq!(fenced, listed, "{sample:?}");
+            assert_eq!(listed.len(), 2, "{sample:?}: {listed:?}");
+            assert!(
+                listed
+                    .iter()
+                    .all(|(_, base, logs)| base.is_some() && !logs.is_empty()),
+                "{sample:?}: {listed:?}"
+            );
+
+            let schema = table.get_schema().await.unwrap();
+            let mut wanted: HashMap<String, (String, String)> = HashMap::new();
+            for file_slice in table.get_file_slices(&ReadOptions::new()).await.unwrap() {
+                let file_name = file_slice.base_file.as_ref().unwrap().file_name();
+                for field in schema.fields() {
+                    wanted.insert(
+                        column_stats_index_key(
+                            &file_slice.partition_path,
+                            &file_name,
+                            field.name(),
+                        ),
+                        (file_name.clone(), field.name().clone()),
+                    );
+                }
+            }
+            let valid_instants = table.valid_metadata_instants().await.unwrap();
+            let expected = load_column_stats_records(
+                storage.clone(),
+                table.hudi_configs.clone(),
+                &wanted,
+                &valid_instants,
+                None,
+                1,
+            )
+            .await
+            .unwrap();
+            let actual = load_column_stats_records(
+                storage.clone(),
+                table.hudi_configs.clone(),
+                &wanted,
+                &valid_instants,
+                Some(&mdt.timeline),
+                4,
+            )
+            .await
+            .unwrap();
+            assert!(!expected.is_empty(), "{sample:?}");
+            assert_eq!(actual, expected, "{sample:?}");
+        }
+    }
+
+    /// Keys with records in a base and in several logs merge in slice order,
+    /// whatever order the files are fetched in: a tombstone wins over the
+    /// records before it and yields to the ones after it, and non-tight ranges
+    /// union.
+    #[tokio::test]
+    async fn test_load_column_stats_records_merges_in_slice_order() {
+        fn stats(range: Option<(i64, i64)>, tight: bool) -> ColumnStatsMetadata {
+            ColumnStatsMetadata {
+                file_name: "f.parquet".to_string(),
+                column_name: "c".to_string(),
+                min_value: range.map(|(min, _)| ColumnStatValue::Long(min)),
+                max_value: range.map(|(_, max)| ColumnStatValue::Long(max)),
+                value_count: 1,
+                null_count: 0,
+                total_size: 0,
+                total_uncompressed_size: 0,
+                is_deleted: range.is_none(),
+                is_tight_bound: tight,
+                decoded_value_type_ordinal: None,
+            }
+        }
+        fn hfile(records: &[(&str, ColumnStatsMetadata)]) -> Vec<u8> {
+            let entries: Vec<(String, Vec<u8>)> = records
+                .iter()
+                .map(|(key, payload)| {
+                    (
+                        key.to_string(),
+                        encode_column_stats(payload, StatsIndexVersion::V2).unwrap(),
+                    )
+                })
+                .collect();
+            let schema = hoodie_metadata_schema_json().unwrap().to_string();
+            HFileWriter::write(
+                &entries,
+                BTreeMap::from([("schema".to_string(), schema.into_bytes())]),
+            )
+            .unwrap()
+        }
+        fn log(instant: &str, records: &[(&str, ColumnStatsMetadata)]) -> Vec<u8> {
+            let schema = hoodie_metadata_schema_json().unwrap().to_string();
+            LogFileWriter::write_log_block(
+                BlockType::HfileData,
+                HashMap::from([
+                    (BlockMetadataKey::InstantTime, instant.to_string()),
+                    (BlockMetadataKey::Schema, schema),
+                ]),
+                &hfile(records),
+            )
+        }
+
+        let (t10, t20, t30) = (
+            "00000000000000010",
+            "00000000000000020",
+            "00000000000000030",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let partition_dir = dir.path().join(".hoodie/metadata/column_stats");
+        std::fs::create_dir_all(&partition_dir).unwrap();
+        let files = [
+            // A base plus two logs.
+            (
+                format!("col-stats-0000-0_0-0-0_{t10}.hfile"),
+                hfile(&[
+                    ("key0", stats(Some((1, 5)), false)),
+                    ("key1", stats(Some((1, 5)), false)),
+                ]),
+            ),
+            (
+                format!(".col-stats-0000-0_{t20}.log.1_0-0-0"),
+                log(
+                    t20,
+                    &[
+                        ("key0", stats(Some((8, 9)), false)),
+                        ("key1", stats(None, false)),
+                    ],
+                ),
+            ),
+            (
+                format!(".col-stats-0000-0_{t30}.log.1_0-0-0"),
+                log(
+                    t30,
+                    &[
+                        ("key0", stats(Some((0, 2)), false)),
+                        ("key1", stats(Some((7, 8)), false)),
+                    ],
+                ),
+            ),
+            // Logs only.
+            (
+                format!(".col-stats-0001-0_{t20}.log.1_0-0-0"),
+                log(t20, &[("key2", stats(Some((1, 2)), true))]),
+            ),
+            (
+                format!(".col-stats-0001-0_{t30}.log.1_0-0-0"),
+                log(t30, &[("key2", stats(None, false))]),
+            ),
+        ];
+        for (name, bytes) in &files {
+            std::fs::write(partition_dir.join(name), bytes).unwrap();
+        }
+        let timeline_dir = dir.path().join(".hoodie/metadata/.hoodie/timeline");
+        std::fs::create_dir_all(&timeline_dir).unwrap();
+        for instant in [t10, t20, t30] {
+            std::fs::write(
+                timeline_dir.join(format!("{instant}_{instant}.deltacommit")),
+                b"{}",
+            )
+            .unwrap();
+        }
+        let storage =
+            Storage::new_with_base_url(url::Url::from_directory_path(dir.path()).unwrap()).unwrap();
+        let wanted: HashMap<String, (String, String)> = ["key0", "key1", "key2"]
+            .into_iter()
+            .map(|key| (key.to_string(), (String::new(), String::new())))
+            .collect();
+        let valid_instants: std::collections::HashSet<String> =
+            [t10, t20, t30].into_iter().map(str::to_string).collect();
+
+        let configs = std::sync::Arc::new(crate::config::HudiConfigs::empty());
+        for concurrency in [1, 4] {
+            let merged = load_column_stats_records(
+                storage.clone(),
+                configs.clone(),
+                &wanted,
+                &valid_instants,
+                None,
+                concurrency,
+            )
+            .await
+            .unwrap();
+            let range = |key: &str| {
+                let stats = &merged[key];
+                (
+                    stats.is_deleted,
+                    stats.min_value.clone(),
+                    stats.max_value.clone(),
+                )
+            };
+            let long = |v: i64| Some(ColumnStatValue::Long(v));
+            assert_eq!(range("key0"), (false, long(0), long(9)), "{concurrency}");
+            assert_eq!(range("key1"), (false, long(7), long(8)), "{concurrency}");
+            assert!(range("key2").0, "{concurrency}: the later tombstone wins");
+        }
     }
 
     #[tokio::test]
