@@ -111,6 +111,9 @@ pub mod util;
 pub mod write;
 
 pub use index::{HoodieKey, SimpleIndex};
+/// The `object_store` crate this one is built against, for implementing a store
+/// to pass to [`table::builder::TableBuilder::with_object_store`].
+pub use object_store;
 pub use write::{UpsertOptions, WriteResult};
 
 use error::Result;

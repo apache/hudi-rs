@@ -98,6 +98,9 @@ pub struct Storage {
     /// counters. The `object_store` inside could not carry them: it is shared
     /// even wider, so its counts would be everyone's.
     pub(crate) read_volume: Arc<ReadVolume>,
+    /// Whether `object_store` was supplied by the caller rather than built from
+    /// `options`, in which case `options` say nothing about the store.
+    pub(crate) object_store_injected: bool,
 }
 
 /// Read-volume counters for one [`Storage`]'s lifetime.
@@ -243,6 +246,7 @@ impl Storage {
         Ok(Self::from_parts(
             base_url,
             object_store,
+            false,
             options,
             hudi_configs,
         ))
@@ -253,30 +257,37 @@ impl Storage {
     ///
     /// The store holds the resolved credentials and the connection pool, so
     /// deriving every `Storage` of a table from one builds them once per table.
-    /// It is reused only when `options` are equal and the base path has the same
-    /// store root; otherwise a new store is built from `options`.
+    /// It is reused when the base path has the same store root and either the
+    /// store was injected or `options` are equal; otherwise a new store is built
+    /// from `options`.
     pub(crate) fn derive(
         &self,
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
         let base_url = Self::base_url_of(&hudi_configs)?;
-        let same_store = self.options == options
-            && store_root(&self.base_url).is_some_and(|root| store_root(&base_url) == Some(root));
-        let object_store = if same_store {
-            self.object_store.clone()
+        let same_store = if self.object_store_injected {
+            injected_store_root(&self.base_url) == injected_store_root(&base_url)
         } else {
-            Self::build_object_store(&base_url, &options)?
+            self.options == options
+                && store_root(&self.base_url)
+                    .is_some_and(|root| store_root(&base_url) == Some(root))
+        };
+        let (object_store, injected) = if same_store {
+            (self.object_store.clone(), self.object_store_injected)
+        } else {
+            (Self::build_object_store(&base_url, &options)?, false)
         };
         Ok(Self::from_parts(
             base_url,
             object_store,
+            injected,
             options,
             hudi_configs,
         ))
     }
 
-    fn base_url_of(hudi_configs: &HudiConfigs) -> Result<Url> {
+    pub(crate) fn base_url_of(hudi_configs: &HudiConfigs) -> Result<Url> {
         match hudi_configs
             .try_get(HudiTableConfig::BasePath)
             .map_err(|e| Creation(format!("{e}")))?
@@ -304,6 +315,7 @@ impl Storage {
     fn from_parts(
         base_url: Url,
         object_store: Arc<dyn ObjectStore>,
+        object_store_injected: bool,
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Arc<Storage> {
@@ -313,6 +325,7 @@ impl Storage {
             options,
             hudi_configs,
             read_volume: Arc::new(ReadVolume::default()),
+            object_store_injected,
         })
     }
 
@@ -322,14 +335,14 @@ impl Storage {
         self.read_volume.clone()
     }
 
-    /// Build storage over a caller-supplied object store.
+    /// Build storage over a caller-supplied object store, which [`Self::derive`]
+    /// then reuses for every base path under the same store root.
     ///
-    /// Test-only, so a test can wrap the real store and observe the requests a
-    /// reader makes. Note that a wrapper takes the trait's default `get_ranges`,
-    /// which coalesces, where `LocalFileSystem` overrides it and does not: the
-    /// counts a test sees are therefore the ones an object store would serve, not
-    /// the ones the local filesystem would.
-    #[cfg(test)]
+    /// Tests use it to wrap the real store and observe the requests a reader
+    /// makes. Note that a wrapper takes the trait's default `get_ranges`, which
+    /// coalesces, where `LocalFileSystem` overrides it and does not: the counts a
+    /// test sees are therefore the ones an object store would serve, not the ones
+    /// the local filesystem would.
     pub(crate) fn new_with_object_store(
         base_url: Url,
         object_store: Arc<dyn ObjectStore>,
@@ -338,6 +351,7 @@ impl Storage {
         Self::from_parts(
             base_url,
             object_store,
+            true,
             Arc::new(HashMap::new()),
             hudi_configs,
         )
@@ -555,6 +569,13 @@ fn store_root(url: &Url) -> Option<String> {
     Some(format!("{authority}/{}", bucket.as_ref()))
 }
 
+/// [`store_root`] for a `Storage` over an injected store, falling back to the
+/// scheme and authority for a URL `object_store` does not recognise: the caller
+/// chose the scheme, and nothing is built from it.
+fn injected_store_root(url: &Url) -> String {
+    store_root(url).unwrap_or_else(|| url[..Position::BeforePath].to_string())
+}
+
 /// Get relative paths of leaf directories under a given directory.
 ///
 /// **Example**
@@ -696,6 +717,46 @@ mod tests {
                 table.base_url
             );
         }
+    }
+
+    #[test]
+    fn derive_reuses_an_injected_store_under_the_same_root_whatever_the_options() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let table = Storage::new_with_object_store(
+            Url::parse("s3://bucket-a/warehouse/t1").unwrap(),
+            store.clone(),
+            configs_at("s3://bucket-a/warehouse/t1"),
+        );
+        let before = object_stores_built();
+
+        let metadata_table = table
+            .derive(
+                options(&[("aws_region", "us-west-2")]),
+                configs_at("s3://bucket-a/warehouse/t1/.hoodie/metadata"),
+            )
+            .unwrap();
+        let from_metadata_table = metadata_table
+            .derive(
+                options(&[("aws_region", "eu-west-1")]),
+                configs_at("s3://bucket-a/warehouse/t1/.hoodie/metadata"),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&store, &metadata_table.object_store));
+        assert!(
+            Arc::ptr_eq(&store, &from_metadata_table.object_store),
+            "a storage derived from a reused injected store reuses it too"
+        );
+        assert_eq!(object_stores_built(), before);
+
+        let other_bucket = table
+            .derive(
+                options(&[("aws_region", "us-west-2")]),
+                configs_at("s3://bucket-b/t1"),
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&store, &other_bucket.object_store));
+        assert!(!other_bucket.object_store_injected);
+        assert_eq!(object_stores_built(), before + 1);
     }
 
     #[tokio::test]

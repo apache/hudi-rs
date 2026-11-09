@@ -970,7 +970,9 @@ impl Table {
     ///
     /// `read_options.hudi_options` override table-level Hudi configs
     /// (last-writer-wins). `extra_storage_overrides` override table-level
-    /// storage options (cloud credentials, endpoints, etc).
+    /// storage options (cloud credentials, endpoints, etc). On a table opened
+    /// with [`TableBuilder::with_object_store`] they do not change where I/O
+    /// goes: the reader still uses the injected store.
     ///
     /// When `read_options` is `Some`, timestamps are resolved into the
     /// `StartTimestamp` / `EndTimestamp` that [`FileGroupReader`] needs for

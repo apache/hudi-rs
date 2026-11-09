@@ -19,6 +19,7 @@
 
 //! [`TableBuilder`] opens a [`Table`] with options.
 
+use object_store::ObjectStore;
 use paste::paste;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -48,6 +49,8 @@ pub struct TableBuilder {
     /// A `Storage` of the table this one belongs to, whose object store the new
     /// table reuses when it resolves the same storage options.
     shared_storage: Option<Arc<Storage>>,
+    /// A caller-supplied store every read of the table goes through.
+    object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 /// Resolver for options including Hudi options, storage options, and generic options.
@@ -115,7 +118,34 @@ impl TableBuilder {
         TableBuilder {
             option_resolver,
             shared_storage: None,
+            object_store: None,
         }
+    }
+
+    /// Do all of the table's I/O through `store` instead of a store built from
+    /// the storage options.
+    ///
+    /// This is for a caller that already has its own I/O layer, such as a file
+    /// cache or its own credentials. Reads (`hoodie.properties`, the timeline,
+    /// listings, the metadata table, base and log files) and writes (upserts,
+    /// deletes, rollbacks, archival, metadata table updates and compaction, a
+    /// background one included) all go through `store`. Storage options and
+    /// per-reader storage overrides then do not change where I/O goes.
+    ///
+    /// The base URI may use any scheme, including one `object_store` does not
+    /// recognise. For each object, `store` receives the object URL's path as
+    /// `ObjPath::from_url_path(url.path())` gives it, that is the full URL path
+    /// without its leading `/`: `a/b/.hoodie/hoodie.properties` for a table at
+    /// `s3://bucket/a/b`, and `container/t/...` for a path-style URL such as
+    /// `https://acct.blob.core.windows.net/container/t`. Opening the table also
+    /// probes `etc/hudi/conf/hudi-defaults.conf` (or `hudi-defaults.conf` under
+    /// `HUDI_CONF_DIR`) through `store`, and ignores any error from that read.
+    ///
+    /// Only this Rust API exposes injection: the DataFusion provider, the
+    /// Python and C++ bindings and the C ABI do not.
+    pub fn with_object_store(mut self, store: Arc<dyn ObjectStore>) -> Self {
+        self.object_store = Some(store);
+        self
     }
 
     /// Build the table's storage from `storage`, so a table that belongs to
@@ -135,10 +165,25 @@ impl TableBuilder {
     /// Fails, among other cases, when `.hoodie/hoodie.properties` cannot be read, or the table
     /// configs are invalid or unsupported (for example a table version other than 6, 8, or 9).
     pub async fn build(&mut self) -> Result<Table> {
+        let shared_storage = match &self.object_store {
+            Some(store) => {
+                let configs = HudiConfigs::new([(
+                    HudiTableConfig::BasePath,
+                    self.option_resolver.base_uri.as_str(),
+                )]);
+                let base_url = Storage::base_url_of(&configs)?;
+                Some(Storage::new_with_object_store(
+                    base_url,
+                    store.clone(),
+                    Arc::new(configs),
+                ))
+            }
+            None => self.shared_storage.clone(),
+        };
         let option_resolver = &mut self.option_resolver;
 
         let storage = option_resolver
-            .resolve_options_with_storage(self.shared_storage.as_deref())
+            .resolve_options_with_storage(shared_storage.as_deref())
             .await?;
 
         // A read config is dropped from the table's own configs only when it
@@ -392,7 +437,128 @@ mod tests {
         TableBuilder {
             option_resolver,
             shared_storage: None,
+            object_store: None,
         }
+    }
+
+    /// Slices are read concurrently, so rows are compared in key order.
+    fn sorted_by_record_key(
+        batches: Vec<arrow::array::RecordBatch>,
+    ) -> Result<arrow::array::RecordBatch> {
+        use arrow::compute::{concat_batches, sort_to_indices, take_record_batch};
+        let batch = concat_batches(&batches[0].schema(), &batches)?;
+        let keys = batch.column_by_name("_hoodie_record_key").unwrap();
+        Ok(take_record_batch(
+            &batch,
+            &sort_to_indices(keys, None, None)?,
+        )?)
+    }
+
+    /// The store serves the table under whatever scheme the caller gives it,
+    /// including one `object_store` cannot build a store for.
+    #[tokio::test]
+    async fn test_with_object_store_any_scheme_reads_through_the_store() -> Result<()> {
+        use crate::table::ReadOptions;
+        use hudi_test::QuickstartTripsTable;
+        use object_store::local::LocalFileSystem;
+
+        let fixture = QuickstartTripsTable::V8Trips8I3U1D.url_to_mor_avro();
+        let expected = sorted_by_record_key(
+            Table::new(fixture.as_str())
+                .await?
+                .read(&ReadOptions::new())
+                .await?,
+        )?;
+        for scheme in ["testfs", "s3"] {
+            let base_uri = format!("{scheme}://host{}", fixture.path());
+            let table = TableBuilder::from_base_uri(&base_uri)
+                .with_object_store(Arc::new(LocalFileSystem::new()))
+                .build()
+                .await?;
+            assert!(table.is_metadata_table_enabled());
+            let actual = sorted_by_record_key(table.read(&ReadOptions::new()).await?)?;
+            assert!(
+                table.cached_metadata_table.initialized(),
+                "{base_uri}: the plan must have opened the metadata table"
+            );
+            assert_eq!(actual, expected, "{base_uri}");
+        }
+        Ok(())
+    }
+
+    /// Every read of a table opened through `with_object_store`, the metadata
+    /// table's included, goes through the given store, and no other store is
+    /// built. The storage option makes the derived options differ from the
+    /// injected `Storage`'s empty ones, so reuse must come from the store being
+    /// injected, not from equal options.
+    ///
+    /// The store counter is thread-local, which holds on the current-thread
+    /// runtime `#[tokio::test]` uses.
+    #[tokio::test]
+    async fn with_object_store_serves_every_read_and_builds_no_other_store() -> Result<()> {
+        use crate::storage::counting::CountingObjectStore;
+        use crate::storage::object_stores_built;
+        use crate::table::ReadOptions;
+        use hudi_test::QuickstartTripsTable;
+        use object_store::local::LocalFileSystem;
+
+        let base_uri = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let expected_table = Table::new(&base_uri).await?;
+        let expected = sorted_by_record_key(expected_table.read(&ReadOptions::new()).await?)?;
+
+        let (store, counts) = CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+        let before = object_stores_built();
+        let table = TableBuilder::from_base_uri(&base_uri)
+            .with_storage_option("aws_region", "us-west-2")
+            .with_object_store(store.clone())
+            .build()
+            .await?;
+        let after_open = (counts.gets(), counts.heads());
+        assert!(after_open.0 > 0, "hoodie.properties and the timeline");
+        assert!(counts.lists() > 0, "the timeline listing");
+
+        assert!(table.is_metadata_table_enabled());
+        let slices = table.get_file_slices(&ReadOptions::new()).await?;
+        assert!(!slices.is_empty());
+        assert!(
+            table.cached_metadata_table.initialized(),
+            "the plan must have opened the metadata table, not fallen back to listing"
+        );
+        let actual = sorted_by_record_key(table.read(&ReadOptions::new()).await?)?;
+        assert_eq!(actual, expected);
+
+        let gets_before_mdt = counts.gets();
+        let files = table.read_metadata_table_files_partition_arrow(&[]).await?;
+        assert!(files.num_rows() > 0);
+        assert!(counts.gets() > gets_before_mdt, "metadata table reads");
+        assert!(counts.heads() > after_open.1, "base and log file opens");
+
+        let injected = Arc::as_ptr(&store) as *const ();
+        let mdt = table
+            .cached_metadata_table
+            .get()
+            .expect("initialized above");
+        for storage in [
+            &table.storage,
+            &table.timeline.storage,
+            &table.file_system_view.storage,
+            &mdt.storage,
+            &mdt.timeline.storage,
+            &mdt.file_system_view.storage,
+        ] {
+            assert_eq!(
+                Arc::as_ptr(&storage.object_store) as *const (),
+                injected,
+                "{} must read through the injected store",
+                storage.base_url
+            );
+        }
+        assert_eq!(
+            object_stores_built(),
+            before,
+            "a table opened with an injected store builds no store of its own"
+        );
+        Ok(())
     }
 
     #[test]

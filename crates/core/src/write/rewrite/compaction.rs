@@ -31,6 +31,7 @@ use crate::file_group::base_file::BaseFile;
 use crate::file_group::file_slice::FileSlice;
 use crate::file_group::log_file::LogFile;
 use crate::metadata::compaction::{CompactionOperation, CompactionPlan, CompactionStrategy};
+use crate::table::builder::TableBuilder;
 use crate::write::markers::Marker;
 
 /// Result of a compaction.
@@ -210,8 +211,17 @@ pub(crate) async fn maybe_compact_inline(table: &mut Table) {
         .chain(table.storage_options())
         .collect();
     let task_base_path = base_path.clone();
+    // Options cannot carry an injected store, so the task derives from it.
+    let injected = table
+        .storage
+        .object_store_injected
+        .then(|| table.storage.clone());
     let handle = tokio::spawn(async move {
-        let mut table = Table::new_with_options(&task_base_path, options).await?;
+        let mut builder = TableBuilder::from_base_uri(&task_base_path).with_options(options);
+        if let Some(storage) = injected {
+            builder = builder.with_shared_storage(storage);
+        }
+        let mut table = builder.build().await?;
         compact_table(&mut table).await
     });
     let previous = async_compactions()
@@ -1158,6 +1168,51 @@ mod tests {
         assert_eq!(
             data_only(&snapshot(&table).await),
             vec![("a".into(), "sf".into(), 2, 11)]
+        );
+    }
+
+    /// On the current-thread runtime the spawned compaction runs only once the
+    /// test awaits it, on the test's thread, so the store counts taken around
+    /// that await are the compaction's alone and the thread-local build
+    /// counter sees the task's stores too.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_async_compaction_with_injected_store_uses_only_that_store() {
+        use crate::storage::counting::CountingObjectStore;
+        use crate::storage::object_stores_built;
+        use object_store::local::LocalFileSystem;
+
+        let dir = tempfile::tempdir().unwrap();
+        mor_table(dir.path(), &[]).await;
+        let (store, counts) = CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+        let before = object_stores_built();
+        let mut table = TableBuilder::from_base_uri(dir.path().to_str().unwrap())
+            .with_hudi_options([
+                ("hoodie.datasource.compaction.async.enable", "true"),
+                ("hoodie.compact.inline.max.delta.commits", "2"),
+            ])
+            .with_object_store(store)
+            .build()
+            .await
+            .unwrap();
+        table.append([batch(&[("a", "sf", 1, 10)])]).await.unwrap();
+        table.upsert([batch(&[("a", "sf", 2, 11)])]).await.unwrap();
+
+        let (gets, puts) = (counts.gets(), counts.puts());
+        let result = await_async_compaction(&table)
+            .await
+            .unwrap()
+            .expect("a compaction was started");
+        assert_eq!((result.num_file_groups, result.num_log_files), (1, 1));
+        assert!(counts.gets() > gets, "the compaction reads the log file");
+        assert!(
+            counts.puts() > puts,
+            "the compaction writes its plan, base file and commit"
+        );
+        assert_eq!(completed_commits(dir.path()).len(), 1);
+        assert_eq!(
+            object_stores_built(),
+            before,
+            "a table with an injected store builds no store of its own"
         );
     }
 }
