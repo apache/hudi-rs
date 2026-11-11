@@ -211,7 +211,11 @@ pub(crate) async fn maybe_compact_inline(table: &mut Table) {
         .collect();
     let task_base_path = base_path.clone();
     let handle = tokio::spawn(async move {
-        let mut table = Table::new_with_options(&task_base_path, options).await?;
+        // `options` are this table's resolved configs, so skip the conflict check against
+        // `hoodie.properties`; a persisted change since opening must not fail the compaction.
+        let mut builder = crate::table::builder::TableBuilder::from_base_uri(&task_base_path)
+            .with_options(options);
+        let mut table = builder.build_with_resolved_options().await?;
         compact_table(&mut table).await
     });
     let previous = async_compactions()
