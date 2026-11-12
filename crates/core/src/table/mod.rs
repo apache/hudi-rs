@@ -1460,9 +1460,12 @@ impl Table {
     /// merge; version 1 collects it and yields the slice as a single batch.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # #[tokio::main]
+    /// # async fn main() -> hudi_core::error::Result<()> {
+    /// # let table = hudi_core::table::Table::new("/tmp/hudi/trips").await?;
     /// use futures::StreamExt;
-    /// use hudi::table::ReadOptions;
+    /// use hudi_core::table::ReadOptions;
     ///
     /// let options = ReadOptions::new()
     ///     .with_filters([("city", "=", "san_francisco")])?
@@ -1471,6 +1474,8 @@ impl Table {
     /// while let Some(result) = stream.next().await {
     ///     println!("Read {} rows", result?.num_rows());
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn read_stream(
         &self,

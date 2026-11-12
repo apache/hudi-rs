@@ -135,6 +135,14 @@ test-demo-ci: ## Test integration runner exit statuses without Docker
 test-rust: ## Run tests on Rust
 	$(info --- Run Rust tests ---)
 	./build-wrapper.sh cargo test --no-fail-fast --all-targets --all-features --workspace
+	$(MAKE) test-rust-doc
+
+# hudi-cpp's lib is named `hudi` like its `hudi` dependency, so its doctest fails with E0464,
+# and it has no doctests.
+.PHONY: test-rust-doc
+test-rust-doc: ## Run Rust doctests
+	$(info --- Run Rust doctests ---)
+	./build-wrapper.sh cargo test --no-fail-fast --doc --all-features --workspace --exclude hudi-cpp
 
 .PHONY: test-python
 test-python: ## Run tests on Python

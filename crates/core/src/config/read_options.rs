@@ -43,8 +43,9 @@ use crate::expr::filter::{Filter, from_str_tuples};
 ///
 /// # Example
 ///
-/// ```ignore
-/// use hudi::table::{ReadOptions, QueryType};
+/// ```no_run
+/// # fn main() -> hudi_core::error::Result<()> {
+/// use hudi_core::table::{QueryType, ReadOptions};
 ///
 /// let options = ReadOptions::new()
 ///     .with_filters([("city", "=", "san_francisco")])?
@@ -63,6 +64,8 @@ use crate::expr::filter::{Filter, from_str_tuples};
 /// // Read-optimized snapshot (skip log files)
 /// let options = ReadOptions::new()
 ///     .with_hudi_option("hoodie.read.use.read_optimized.mode", "true");
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug, Default)]
 pub struct ReadOptions {

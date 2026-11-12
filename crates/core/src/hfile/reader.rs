@@ -235,11 +235,22 @@ impl HFileReader {
     /// * `relative_path` - The relative path to the HFile
     ///
     /// # Example
-    /// ```ignore
-    /// let reader = HFileReader::open(&storage, "files/data.hfile").await?;
+    /// ```no_run
+    /// # use hudi_core::hfile::HFileReader;
+    /// # use std::{collections::HashMap, sync::Arc};
+    /// # use hudi_core::config::HudiConfigs;
+    /// # use hudi_core::storage::Storage;
+    /// # #[tokio::main]
+    /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let base_path = "file:///tmp/hudi/trips/.hoodie/metadata";
+    /// # let configs = HudiConfigs::new([("hoodie.base.path", base_path)]);
+    /// # let storage = Storage::new(Arc::new(HashMap::new()), Arc::new(configs))?;
+    /// let mut reader = HFileReader::open(&storage, "files/data.hfile").await?;
     /// for record in reader.iter()? {
     ///     println!("{:?}", record?);
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn open(storage: &Storage, relative_path: &str) -> Result<Self> {
         let bytes = storage.get_file_data(relative_path).await.map_err(|e| {
@@ -1441,11 +1452,16 @@ impl HFileReader {
     /// stored and merged with log file records.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use hudi_core::hfile::HFileReader;
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let mut reader = HFileReader::new(std::fs::read("data.hfile")?)?;
     /// let records = reader.collect_records()?;
     /// for record in records {
     ///     println!("Key: {}", record.key_as_str().unwrap_or("<binary>"));
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub fn collect_records(&mut self) -> Result<Vec<HFileRecord>> {
         let mut records = Vec::with_capacity(self.trailer.entry_count as usize);

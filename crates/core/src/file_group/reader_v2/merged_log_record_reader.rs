@@ -76,7 +76,11 @@ pub struct ScanStats {
 /// Mirrors Java's `HoodieMergedLogRecordReader<T>`.
 ///
 /// ## Usage (matching Java):
-/// ```ignore
+///
+/// The type is not reachable outside the crate (its module is `pub(crate)`), so this sketch
+/// cannot run as a doctest.
+///
+/// ```text
 /// let reader = HoodieMergedLogRecordReader::new_builder()
 ///     .with_reader_context(reader_context)
 ///     .with_storage(storage)

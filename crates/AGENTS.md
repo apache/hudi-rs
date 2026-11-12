@@ -51,7 +51,10 @@ impl TableBuilder {
 ```
 
 - **Public items must have doc comments** (examples for non-trivial APIs; note panics, errors,
-  safety).
+  safety). Examples run as doctests in CI. Write one that needs a real table as `no_run` with
+  hidden (`# `) setup lines so it still compiles; avoid `ignore`, which is not compiled at all.
+  A sketch on an item not reachable outside the crate (for example in a `pub(crate)` module)
+  goes in a `text` block.
 
 ## Testing
 

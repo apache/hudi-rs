@@ -78,6 +78,9 @@ jobs:
           cache-all-crates: false
       - name: Rust unit tests with coverage report
         run: make coverage-xml
+      # Tarpaulin runs lib, bin and integration test targets only, not doctests.
+      - name: Rust doctests
+        run: make test-rust-doc
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:

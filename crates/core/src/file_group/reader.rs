@@ -736,16 +736,27 @@ impl FileGroupReader {
     /// A stream of record batches. The stream owns all necessary data and is `'static`.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use hudi_core::table::Table;
+    /// # #[tokio::main]
+    /// # async fn main() -> hudi_core::error::Result<()> {
+    /// # let table = Table::new("/tmp/hudi/trips").await?;
+    /// # let reader = table
+    /// #     .create_file_group_reader_with_options(None, std::iter::empty::<(&str, &str)>())
+    /// #     .await?;
+    /// # let file_slice = table.get_file_slices(&ReadOptions::new()).await?.remove(0);
     /// use futures::StreamExt;
+    /// use hudi_core::table::ReadOptions;
     ///
-    /// let options = ReadOptions::new().with_batch_size(4096);
+    /// let options = ReadOptions::new().with_batch_size(4096)?;
     /// let mut stream = reader.read_file_slice_stream(&file_slice, &options).await?;
     ///
     /// while let Some(result) = stream.next().await {
     ///     let batch = result?;
     ///     // Process batch...
     /// }
+    /// # Ok(())
+    /// # }
     /// ```
     pub async fn read_file_slice_stream(
         &self,
