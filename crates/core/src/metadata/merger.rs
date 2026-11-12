@@ -43,7 +43,14 @@ use std::collections::HashMap;
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # use hudi_core::hfile::{HFileReader, HFileRecord};
+/// # use hudi_core::metadata::merger::FilesPartitionMerger;
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// # let mut hfile = HFileReader::new(std::fs::read("files/data.hfile")?)?;
+/// # let schema = hfile.get_avro_schema()?.expect("HFile has a schema").clone();
+/// # let base_records = hfile.collect_records()?;
+/// # let log_records: Vec<HFileRecord> = Vec::new();
 /// let merger = FilesPartitionMerger::new(schema);
 /// let merged = merger.merge(&base_records, &log_records)?;
 ///
@@ -51,6 +58,8 @@ use std::collections::HashMap;
 /// let chennai_files = merged.get("city=chennai")
 ///     .map(|r| r.active_file_names())
 ///     .unwrap_or_default();
+/// # Ok(())
+/// # }
 /// ```
 pub struct FilesPartitionMerger {
     schema: AvroSchema,

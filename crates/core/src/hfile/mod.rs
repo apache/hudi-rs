@@ -25,8 +25,9 @@
 //! See [Hudi's HFile format specification](https://github.com/apache/hudi/blob/master/hudi-io/hfile_format.md).
 //!
 //! # Example
-//! ```ignore
-//! use hudi_core::hfile::{HFileReader, Utf8Key, SeekResult};
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use hudi_core::hfile::HFileReader;
 //!
 //! let bytes = std::fs::read("data.hfile")?;
 //! let mut reader = HFileReader::new(bytes)?;
@@ -36,6 +37,8 @@
 //!     let kv = result?;
 //!     println!("{}: {:?}", kv.key(), kv.value());
 //! }
+//! # Ok(())
+//! # }
 //! ```
 
 mod block;
