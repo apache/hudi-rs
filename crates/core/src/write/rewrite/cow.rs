@@ -694,10 +694,14 @@ impl MergePlan {
         };
         let merged = restamp_file_name(&merged, &self.out_name)?;
         let num_rows = merged.num_rows();
+        let batches = [merged];
         let bytes =
-            crate::write::append::write_parquet_bytes_with_props(ctx.props, ctx.bloom, &[merged])?;
+            crate::write::append::write_parquet_bytes_with_props(ctx.props, ctx.bloom, &batches)?;
         let ranges = if ctx.collect_ranges {
-            Some(crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?)
+            Some(crate::metadata::table::column_stats::column_ranges_from_parquet_bytes_with_batches(
+                &bytes,
+                &batches,
+            )?)
         } else {
             None
         };
