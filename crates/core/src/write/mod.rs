@@ -369,9 +369,10 @@ pub(crate) fn parquet_file_task(
             let bytes =
                 crate::write::append::write_parquet_bytes_with_props(props, bloom, &prepared)?;
             let ranges = if collect_ranges {
-                Some(
-                    crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(&bytes)?,
-                )
+                Some(crate::metadata::table::column_stats::column_ranges_from_parquet_bytes_with_batches(
+                    &bytes,
+                    &prepared,
+                )?)
             } else {
                 None
             };
@@ -401,11 +402,10 @@ pub(crate) fn log_file_task(
             let parquet =
                 crate::write::append::write_parquet_bytes_with_props(props, None, &prepared)?;
             let ranges = if collect_ranges {
-                Some(
-                    crate::metadata::table::column_stats::column_ranges_from_parquet_bytes(
-                        &parquet,
-                    )?,
-                )
+                Some(crate::metadata::table::column_stats::column_ranges_from_parquet_bytes_with_batches(
+                    &parquet,
+                    &prepared,
+                )?)
             } else {
                 None
             };

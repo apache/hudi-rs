@@ -18,8 +18,9 @@
  */
 //! Extract column-range metadata from Parquet footers for MDT writes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use arrow_array::{Array, Float32Array, Float64Array, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -54,21 +55,92 @@ pub struct ColumnRangeStats {
 /// Read file-level column ranges from in-memory Parquet bytes (Java `ParquetUtils`).
 ///
 /// Covers every top-level column of a type any index version supports; the
-/// metadata writer narrows that to [`columns_to_index`] for the table.
+/// metadata writer narrows that to [`columns_to_index`] for the table. Parquet
+/// omits NaN values from float min/max statistics, so batches are read to avoid
+/// publishing incomplete ranges for float columns containing NaN.
 pub fn column_ranges_from_parquet_bytes(bytes: &[u8]) -> Result<Vec<ColumnRangeStats>> {
     let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
         .map_err(|e| CoreError::Write(format!("Failed to open Parquet for column stats: {e}")))?;
     let schema = builder.schema().clone();
     let metadata = builder.metadata().clone();
+    let mut reader = builder
+        .build()
+        .map_err(|e| CoreError::Write(format!("Failed to read Parquet for column stats: {e}")))?;
+    let mut nan_columns = HashSet::new();
+    for batch in &mut reader {
+        let batch = batch.map_err(|e| {
+            CoreError::Write(format!("Failed to read Parquet for column stats: {e}"))
+        })?;
+        add_nan_columns(&batch, &mut nan_columns)?;
+    }
     Ok(column_ranges_from_parquet_metadata(
         metadata.as_ref(),
         schema.as_ref(),
+        &nan_columns,
     ))
+}
+
+/// Extract footer ranges using the original batches to detect NaNs without
+/// decoding the newly written Parquet file.
+pub(crate) fn column_ranges_from_parquet_bytes_with_batches(
+    bytes: &[u8],
+    batches: &[RecordBatch],
+) -> Result<Vec<ColumnRangeStats>> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+        .map_err(|e| CoreError::Write(format!("Failed to open Parquet for column stats: {e}")))?;
+    let schema = builder.schema().clone();
+    let metadata = builder.metadata().clone();
+    let mut nan_columns = HashSet::new();
+    for batch in batches {
+        add_nan_columns(batch, &mut nan_columns)?;
+    }
+    Ok(column_ranges_from_parquet_metadata(
+        metadata.as_ref(),
+        schema.as_ref(),
+        &nan_columns,
+    ))
+}
+
+fn add_nan_columns(batch: &RecordBatch, nan_columns: &mut HashSet<String>) -> Result<()> {
+    for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
+        let has_nan = match field.data_type() {
+            DataType::Float32 => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .ok_or_else(|| {
+                        CoreError::Write(format!(
+                            "Float32 column '{}' has a non-Float32 array",
+                            field.name()
+                        ))
+                    })?;
+                (0..values.len()).any(|row| values.is_valid(row) && values.value(row).is_nan())
+            }
+            DataType::Float64 => {
+                let values = array
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .ok_or_else(|| {
+                        CoreError::Write(format!(
+                            "Float64 column '{}' has a non-Float64 array",
+                            field.name()
+                        ))
+                    })?;
+                (0..values.len()).any(|row| values.is_valid(row) && values.value(row).is_nan())
+            }
+            _ => false,
+        };
+        if has_nan {
+            nan_columns.insert(field.name().clone());
+        }
+    }
+    Ok(())
 }
 
 fn column_ranges_from_parquet_metadata(
     metadata: &parquet::file::metadata::ParquetMetaData,
     schema: &Schema,
+    nan_columns: &HashSet<String>,
 ) -> Vec<ColumnRangeStats> {
     let type_by_name: HashMap<&str, &DataType> = schema
         .fields()
@@ -144,15 +216,18 @@ fn column_ranges_from_parquet_metadata(
 
     let mut out: Vec<ColumnRangeStats> = by_col
         .into_iter()
-        .map(|(column_name, acc)| ColumnRangeStats {
-            column_name,
-            range_known: !acc.range_incomplete,
-            min_value: (!acc.range_incomplete).then_some(acc.min).flatten(),
-            max_value: (!acc.range_incomplete).then_some(acc.max).flatten(),
-            value_count: acc.value_count,
-            null_count: acc.null_count,
-            total_size: acc.total_size,
-            total_uncompressed_size: acc.total_uncompressed_size,
+        .map(|(column_name, acc)| {
+            let range_incomplete = acc.range_incomplete || nan_columns.contains(&column_name);
+            ColumnRangeStats {
+                column_name,
+                range_known: !range_incomplete,
+                min_value: (!range_incomplete).then_some(acc.min).flatten(),
+                max_value: (!range_incomplete).then_some(acc.max).flatten(),
+                value_count: acc.value_count,
+                null_count: acc.null_count,
+                total_size: acc.total_size,
+                total_uncompressed_size: acc.total_uncompressed_size,
+            }
         })
         .collect();
     out.sort_by(|a, b| a.column_name.cmp(&b.column_name));
@@ -1054,5 +1129,57 @@ mod tests {
         );
         let bool_range = by_name["b"];
         assert_eq!(bool_range.min_value, Some(ColumnStatValue::Boolean(false)));
+    }
+
+    #[test]
+    fn test_column_ranges_from_parquet_nan_values_are_not_prunable() {
+        use arrow_array::{ArrayRef, Float32Array, Float64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("f32", DataType::Float32, false),
+            Field::new("f64", DataType::Float64, false),
+            Field::new("finite", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Float32Array::from(vec![1.0, f32::NAN, 10.0])) as ArrayRef,
+                Arc::new(Float64Array::from(vec![1.0, f64::NAN, 10.0])),
+                Arc::new(Float64Array::from(vec![2.0, 3.0, 4.0])),
+            ],
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        {
+            let mut writer =
+                parquet::arrow::ArrowWriter::try_new(&mut bytes, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let assert_nan_ranges = |ranges: &[ColumnRangeStats]| {
+            let by_name: std::collections::HashMap<&str, &ColumnRangeStats> =
+                ranges.iter().map(|r| (r.column_name.as_str(), r)).collect();
+
+            for name in ["f32", "f64"] {
+                let range = by_name[name];
+                assert!(!range.range_known, "{name}");
+                assert!(range.min_value.is_none(), "{name}");
+                assert!(range.max_value.is_none(), "{name}");
+                assert!(
+                    column_stats_for_file("file.parquet", &[(*range).clone()], false).is_empty()
+                );
+            }
+            let finite_range = by_name["finite"];
+            assert!(finite_range.range_known);
+            assert_eq!(finite_range.min_value, Some(ColumnStatValue::Double(2.0)));
+            assert_eq!(finite_range.max_value, Some(ColumnStatValue::Double(4.0)));
+        };
+        assert_nan_ranges(&column_ranges_from_parquet_bytes(&bytes).unwrap());
+        assert_nan_ranges(
+            &column_ranges_from_parquet_bytes_with_batches(&bytes, std::slice::from_ref(&batch))
+                .unwrap(),
+        );
     }
 }
