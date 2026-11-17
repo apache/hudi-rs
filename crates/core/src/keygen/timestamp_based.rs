@@ -509,7 +509,9 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
         let field = MetaField::PartitionPath.as_ref().to_string();
 
         match filter.operator {
-            ExprOperator::Eq | ExprOperator::Ne => {
+            // Many timestamps share one partition, so excluding a timestamp cannot exclude it.
+            ExprOperator::Ne | ExprOperator::NotIn => Ok(vec![]),
+            ExprOperator::Eq => {
                 let dt = self.parse_timestamp(&filter.values[0])?;
                 let path = self.format_partition_path(&dt);
                 Ok(vec![Filter {
@@ -518,7 +520,7 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
                     values: vec![path],
                 }])
             }
-            ExprOperator::In | ExprOperator::NotIn => {
+            ExprOperator::In => {
                 let paths: Result<Vec<String>> = filter
                     .values
                     .iter()
@@ -909,7 +911,7 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].values[0], "2024/01/25");
 
-        // Not-equal: now supported
+        // Negative predicates must be evaluated against the original timestamps.
         let keygen =
             TimestampBasedKeyGenerator::from_configs(&create_test_configs_date_string()).unwrap();
         let filter = Filter {
@@ -918,12 +920,7 @@ mod tests {
             values: vec!["2023-04-01T12:01:00.123Z".to_string()],
         };
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].operator, ExprOperator::Ne);
-        assert_eq!(
-            transformed[0].values[0],
-            "year=2023/month=04/day=01/hour=12"
-        );
+        assert!(transformed.is_empty());
 
         // Range operators: Gt/Gte → Gte, Lt/Lte → Lte (safe widening)
         let keygen =
@@ -1008,8 +1005,7 @@ mod tests {
         )
         .unwrap();
         let transformed = keygen.transform_filter(&filter).unwrap();
-        assert_eq!(transformed.len(), 1);
-        assert_eq!(transformed[0].operator, ExprOperator::NotIn);
+        assert!(transformed.is_empty());
     }
 
     #[test]

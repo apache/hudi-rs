@@ -307,7 +307,7 @@ mod tests {
     use crate::expr::ExprOperator;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow_array::Date32Array;
+    use arrow_array::{BooleanArray, Date32Array, Int64Array, RecordBatch};
     use std::str::FromStr;
 
     fn create_test_schema() -> Schema {
@@ -702,6 +702,66 @@ mod tests {
         assert_eq!(transformed.len(), 1);
         assert_eq!(transformed[0].field, user_filter.field);
         assert_eq!(transformed[0].values[0], user_filter.values[0]);
+    }
+
+    #[test]
+    fn test_timestamp_negative_filters_keep_matching_rows() {
+        // Excluding midnight must not hide the noon record in the same partition.
+        let batch = RecordBatch::try_from_iter([(
+            "ts",
+            Arc::new(Int64Array::from(vec![
+                1706140800, 1706184000, 1706227200, 1706270400,
+            ])) as ArrayRef,
+        )])
+        .unwrap();
+        let partition_schema = Schema::new(vec![Field::new(
+            MetaField::PartitionPath.as_ref(),
+            DataType::Utf8,
+            false,
+        )]);
+        let configs = HudiConfigs::new([
+            ("hoodie.table.partition.fields", "ts"),
+            (
+                "hoodie.table.keygenerator.class",
+                "org.apache.hudi.keygen.TimestampBasedKeyGenerator",
+            ),
+            ("hoodie.keygen.timebased.timestamp.type", "UNIX_TIMESTAMP"),
+            ("hoodie.keygen.timebased.output.dateformat", "yyyy/MM/dd"),
+        ]);
+        let paths = ["2024/01/25", "2024/01/26"];
+        for (operator, excluded, expected) in [
+            (
+                ExprOperator::Ne,
+                vec!["1706140800"],
+                vec![false, true, true, true],
+            ),
+            (
+                ExprOperator::NotIn,
+                vec!["1706140800", "1706227200"],
+                vec![false, true, false, true],
+            ),
+        ] {
+            let filter = Filter::new(
+                "ts".to_string(),
+                operator,
+                excluded.into_iter().map(str::to_string).collect(),
+            )
+            .unwrap();
+            let filters = std::slice::from_ref(&filter);
+            let pruner = PartitionPruner::new(filters, &partition_schema, &configs).unwrap();
+            for path in paths {
+                assert!(pruner.should_include(path), "{operator} must retain {path}");
+            }
+            assert_eq!(
+                crate::expr::filter::filters_to_row_mask(filters, &batch).unwrap(),
+                BooleanArray::from(expected),
+            );
+            let bound = Filter::try_from(("ts", ">=", "1706227200")).unwrap();
+            let bounded =
+                PartitionPruner::new(&[filter, bound], &partition_schema, &configs).unwrap();
+            assert!(!bounded.should_include(paths[0]));
+            assert!(bounded.should_include(paths[1]));
+        }
     }
 
     #[test]

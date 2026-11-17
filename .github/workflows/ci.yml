@@ -44,8 +44,10 @@ on:
       - 'LICENSE'
       - 'NOTICE'
 
+# A pull request keeps only its latest run. A push gets a group per commit, so every commit landed
+# on main or a release branch keeps its own result instead of showing as cancelled.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || 'latest' }}
   cancel-in-progress: true
 
 jobs:

@@ -1117,6 +1117,36 @@ mod v9_tables {
         }
 
         #[tokio::test]
+        async fn test_timebasedkeygen_unixtimestamp_cow_snapshot_with_negative_filters()
+        -> Result<()> {
+            let base_url = SampleTable::V9TimebasedkeygenUnixtimestamp.url_to_cow();
+            let hudi_table = open_table(base_url.path()).await?;
+            let all_rows = read_txn_rows_from_snapshot(&hudi_table).await?;
+
+            // TXN-001 shares the 2024/01/15 partition with TXN-002, and TXN-005 shares
+            // 2024/01/17 with TXN-006.
+            for (op, value, excluded) in [
+                ("!=", "1705311000", vec!["TXN-001"]),
+                (
+                    "NOT IN",
+                    "1705311000,1705485600",
+                    vec!["TXN-001", "TXN-005"],
+                ),
+            ] {
+                let records = hudi_table
+                    .read(&ReadOptions::new().with_filters([("ts_epoch", op, value)])?)
+                    .await?;
+                let expected: Vec<_> = all_rows
+                    .iter()
+                    .filter(|(txn_id, _, _)| !excluded.contains(&txn_id.as_str()))
+                    .cloned()
+                    .collect();
+                assert_eq!(txn_rows(&records), expected, "ts_epoch {op} {value}");
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn test_txns_simple_overwrite_cow_snapshot() -> Result<()> {
             let base_url = SampleTable::V9TxnsSimpleOverwrite.url_to_cow();
             let hudi_table = open_table(base_url.path()).await?;
