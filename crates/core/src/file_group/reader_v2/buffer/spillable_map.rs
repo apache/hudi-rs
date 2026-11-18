@@ -474,8 +474,16 @@ pub struct SpillableRecordMap {
     /// [`CoreError::MemoryLimitExceeded`] (see [`Self::enforce_peak_cap`]).
     max_peak_in_memory_size: Option<u64>,
     /// Parent dir for the lazily-created per-read spill subdirectory.
+    #[cfg_attr(
+        not(feature = "spill-rocksdb"),
+        expect(dead_code, reason = "only the `spill-rocksdb` disk tier reads it")
+    )]
     spill_path: PathBuf,
     /// Spill backend (always RocksDB once constructed).
+    #[cfg_attr(
+        not(feature = "spill-rocksdb"),
+        expect(dead_code, reason = "only the `spill-rocksdb` disk tier reads it")
+    )]
     diskmap_type: DiskMapType,
     /// True once any entry has spilled to disk. Surfaced
     /// to `HoodieReadStats.merge_map_spilled`.
@@ -578,6 +586,7 @@ impl SpillableRecordMap {
     ///   consumed, so this returns 0). Callers wanting a whole-reader figure must
     ///   add those bounded, separately-documented overheads.
     #[must_use]
+    #[cfg(test)]
     pub fn current_in_memory_bytes(&self) -> u64 {
         self.true_retained_bytes()
     }
@@ -804,6 +813,7 @@ impl SpillableRecordMap {
     /// Note: compaction runs end-of-scan (after all inserts, before drain), so
     /// the resulting payload-size shift does not affect any spill decision — the
     /// size estimate no longer drives routing at that point.
+    #[cfg(test)]
     pub fn in_memory_mut(&mut self) -> &mut MergeMap {
         &mut self.in_memory
     }
@@ -821,6 +831,7 @@ impl SpillableRecordMap {
     }
 
     /// Current count of distinct pinned source batches (diagnostic).
+    #[cfg(test)]
     pub fn pinned_batch_count(&self) -> usize {
         self.pinned.by_ptr.len()
     }
@@ -1207,6 +1218,7 @@ impl Iterator for SpillDrainIter {
 /// Rows packed into one spilled Arrow batch (multi-row batching). Amortizes the
 /// per-record RocksDB op + IPC framing/decode over many rows — turning the spill
 /// from N single-row blobs into N/`SPILL_BATCH_ROWS` multi-row blobs.
+#[cfg(feature = "spill-rocksdb")]
 const SPILL_BATCH_ROWS: usize = 1024;
 /// Decoded-batch LRU capacity. A batch-sequential drain (and clustered probes)
 /// then pays one RocksDB get + one decode per batch, shared across its rows.
@@ -1216,14 +1228,18 @@ const SPILL_BATCH_ROWS: usize = 1024;
 /// is a fixed overhead *on top of* `hoodie.memory.merge.max.size` and is not
 /// counted against that budget, so for very wide schemas it is a bounded but
 /// non-trivial RAM spike during drain.
+#[cfg(feature = "spill-rocksdb")]
 const SPILL_BATCH_CACHE: usize = 8;
 /// Batch blob tag: body-only (decode against the cached schema).
+#[cfg(feature = "spill-rocksdb")]
 const SPILL_BATCH_TAG_BODY: u8 = 0x01;
 /// Batch blob tag: self-describing IPC stream (fallback when body-only can't
 /// encode, e.g. dictionary columns).
+#[cfg(feature = "spill-rocksdb")]
 const SPILL_BATCH_TAG_FULL: u8 = 0x02;
 
 /// Location of a flushed record: a row inside a spilled batch, or a delete tombstone.
+#[cfg(feature = "spill-rocksdb")]
 enum DiskLoc {
     Data {
         batch_id: u64,
@@ -1242,6 +1258,7 @@ enum DiskLoc {
 
 /// Per-key index entry for a flushed (on-disk) record. The ordering value is held
 /// here (not in the batch) so a row can be reconstructed without re-extracting it.
+#[cfg(feature = "spill-rocksdb")]
 struct DiskEntry {
     ordering_value: Option<OrderingValue>,
     loc: DiskLoc,
@@ -1576,6 +1593,7 @@ mod rocksdb_disk_tier {
 
         /// The on-disk directory this tier owns. Exposed so a test can assert
         /// the RAII cleanup actually removes it.
+        #[cfg(test)]
         pub fn dir_path(&self) -> &Path {
             self.dir.path()
         }
@@ -1591,6 +1609,10 @@ mod rocksdb_disk_tier {
         }
 
         /// True if there are no spilled entries.
+        #[expect(
+            dead_code,
+            reason = "Java's `RocksDbDiskMap.isEmpty`; `SpillableRecordMap::is_empty` sums `len` over both tiers instead"
+        )]
         pub fn is_empty(&self) -> bool {
             self.len == 0
         }
@@ -1768,6 +1790,7 @@ mod tests {
 
     /// A single-column (key-only) record — a NARROW schema distinct from the
     /// 2-column `record()` fixture. Stands in for a partial-update log record.
+    #[cfg(feature = "spill-rocksdb")]
     fn narrow_record(key: &str) -> BufferedRecord {
         let s = Arc::new(Schema::new(vec![Field::new("key", DataType::Utf8, false)]));
         let batch =
@@ -2508,6 +2531,7 @@ mod tests {
 
     /// A config with a huge soft budget (spill never triggered by the budget) but
     /// an explicit HARD peak cap — isolates the [`CONFIG_MAX_PEAK_MEMORY`] path.
+    #[cfg(feature = "spill-rocksdb")]
     fn capped_config(max_peak: u64) -> SpillConfig {
         SpillConfig {
             max_in_memory_size: u64::MAX,

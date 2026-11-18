@@ -89,7 +89,6 @@ impl Action {
 }
 
 /// The [State] of an [Instant] represents the status of the action performed on the table.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum State {
     Requested,
@@ -128,7 +127,6 @@ impl AsRef<str> for State {
 /// `{requestedTimestamp}_{completionTimestamp}.{action}` instead of `{timestamp}.{action}`.
 /// The `timestamp` field stores the requested timestamp, and `completion_timestamp` stores
 /// the completion timestamp for v8+ completed instants.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Instant {
     /// The timestamp when the action was requested (used for ordering and identification).

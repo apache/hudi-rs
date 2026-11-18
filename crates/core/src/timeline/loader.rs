@@ -55,7 +55,6 @@ pub(crate) fn lsm_history_dir(hudi_configs: &HudiConfigs) -> String {
     format!("{HUDI_METADATA_DIR}/{timeline_path}/{history_path}")
 }
 
-#[allow(dead_code)]
 impl TimelineLoader {
     /// Create a new Layout One Active loader
     pub fn new_layout_one_active(hudi_configs: Arc<HudiConfigs>, storage: Arc<Storage>) -> Self {
@@ -94,6 +93,7 @@ impl TimelineLoader {
     }
 
     /// Returns the storage for this loader.
+    #[cfg(test)]
     fn storage(&self) -> &Arc<Storage> {
         &self.storage
     }

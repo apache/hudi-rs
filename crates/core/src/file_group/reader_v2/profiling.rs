@@ -17,7 +17,7 @@
  * under the License.
  */
 
-#![allow(dead_code, unused_macros, unused_imports)]
+#![allow(unused_macros, unused_imports)]
 
 //! Stage-timing profiling primitives for the file-group reader (perf harness).
 //!

@@ -130,9 +130,12 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
     arrow::compute::take(values.as_ref(), &indices, None).map_err(CoreError::ArrowError)
 }
 
-#[allow(dead_code)]
 pub struct Decoder {
     batch_size: usize,
+    #[expect(
+        dead_code,
+        reason = "`LogFileReader` hands its table configs to every decoder, but no block format reads one yet"
+    )]
     hudi_configs: Arc<HudiConfigs>,
     /// Predicate to push into a parquet log block, when the caller has decided
     /// it is safe to evaluate before the merge. See

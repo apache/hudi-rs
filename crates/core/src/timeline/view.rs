@@ -48,7 +48,10 @@ pub struct TimelineView {
     as_of_timestamp: String,
 
     /// The start timestamp when the view is used for incremental queries.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "`TimelineView::new` is public API and takes it; incremental windows are bounded in `Table::resolve_incremental_window` instead"
+    )]
     start_timestamp: Option<String>,
 
     /// File groups to exclude from the query result.

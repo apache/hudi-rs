@@ -260,7 +260,7 @@ impl<'b> OrderingAccessor<'b> {
 /// - `get_record_keys` — mirrors `RecordContext.getRecordKey(T, Schema)`
 /// - `get_ordering_values` — mirrors `RecordContext.getOrderingValue(T, Schema, List<String>)`
 /// - `batch_to_buffered_records` — combines key + ordering extraction
-/// - `delete_batch_to_keys` — extracts record keys from delete batches
+/// - `delete_batch_to_keys_with_ordering` — extracts record keys and ordering values from delete batches
 /// - `is_delete_record` — mirrors `RecordContext.isDeleteRecord(T, DeleteContext)`
 ///
 /// ## Associated functions (engine-level, no config needed):
@@ -294,11 +294,24 @@ pub struct RecordContext {
     /// When false, computes key from configured record key columns.
     /// Carried from the table config for parity; key extraction keys off the record
     /// key fields directly.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Java picks key extraction by it; this crate keys off the record key fields, so only the tests read it"
+        )
+    )]
     pub populate_meta_fields: bool,
 
     /// Partition path for constructing delete rows.
     /// Mirrors Java's `RecordContext.partitionPath`.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Java's `RecordContext.partitionPath`; only the tests read it here"
+        )
+    )]
     pub partition_path: String,
 
     /// Whether a SINGLE-field virtual key must be encoded as `<field>:<value>`
@@ -932,43 +945,13 @@ impl RecordContext {
         Ok(records)
     }
 
-    /// Extract the record keys from a delete RecordBatch.
-    ///
-    /// Delete batches have schema: (recordKey, partitionPath, orderingVal).
-    /// This key-only variant extracts just the record keys and is a Java-parity
-    /// leftover: production code uses
-    /// [`Self::delete_batch_to_keys_with_ordering`], which also decodes each
-    /// delete's ordering value so an EVENT_TIME delete carrying a lower
-    /// ordering value does not remove the row.
-    #[allow(dead_code)]
-    pub fn delete_batch_to_keys(&self, batch: &RecordBatch) -> Result<Vec<String>> {
-        if batch.num_rows() == 0 {
-            return Ok(Vec::new());
-        }
-
-        // Delete batch schema: recordKey (col 0), partitionPath (col 1), orderingVal (col 2)
-        let key_array = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| {
-                CoreError::ReadFileSliceError(
-                    "Delete batch column 0 is not a StringArray".to_string(),
-                )
-            })?;
-
-        Ok((0..key_array.len())
-            .map(|i| key_array.value(i).to_string())
-            .collect())
-    }
-
-    /// Like [`delete_batch_to_keys`] but also extracts each delete record's
-    /// ordering value from the delete batch (col 2).
+    /// Extract each delete record's key and ordering value from a delete
+    /// RecordBatch, whose schema is (recordKey, partitionPath, orderingVal).
     ///
     /// Required for `EVENT_TIME_ORDERING`: a delete only supersedes an existing
     /// record when its ordering value is `>=` the existing record's, so a delete
     /// carrying a *lower* ordering value must NOT remove the row. Dropping the
-    /// ordering value here (as the key-only [`delete_batch_to_keys`] does) makes
+    /// ordering value here makes
     /// every delete unconditionally win — correct for `COMMIT_TIME_ORDERING`
     /// (delete always wins) but wrong for `EVENT_TIME_ORDERING`.
     ///
@@ -1189,7 +1172,13 @@ impl RecordContext {
     /// schema registry. In Arrow, we extract the schema directly from the
     /// record's payload batch (returns `None` for delete tombstones).
     /// Java-parity helper; the merge already holds the schema it needs.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Java's `getSchemaFromBufferRecord`; the merge already holds the schema, so only the tests call it"
+        )
+    )]
     pub fn get_schema_from_buffer_record(record: &BufferedRecord) -> Option<SchemaRef> {
         record.get_record().map(|batch| batch.schema())
     }

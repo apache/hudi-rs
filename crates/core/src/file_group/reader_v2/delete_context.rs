@@ -143,27 +143,6 @@ impl DeleteContext {
         self
     }
 
-    /// Convenience: create from reader schema only (no properties).
-    ///
-    /// Used when properties are not available (e.g., in tests or simple paths).
-    /// Parity with Java's `DeleteContext.fromReaderSchema`; this crate builds the
-    /// context from configs.
-    #[allow(dead_code)]
-    pub fn from_reader_schema(schema: SchemaRef) -> Self {
-        let has_built_in_delete_field = schema.column_with_name("_hoodie_is_deleted").is_some();
-
-        let hoodie_operation_pos = schema
-            .column_with_name("_hoodie_operation")
-            .map(|(idx, _)| idx);
-
-        Self {
-            custom_delete_marker: None,
-            has_built_in_delete_field,
-            hoodie_operation_pos,
-            reader_schema: schema,
-        }
-    }
-
     /// Extract the custom delete marker key-value from the table properties.
     ///
     /// Mirrors Java's `DeleteContext.getCustomDeleteMarkerKeyValue(Properties)` where

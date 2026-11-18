@@ -43,8 +43,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Default)]
 pub struct ScanStats {
     pub total_time_taken_to_read_and_merge_blocks_us: u64,
-    /// Parity with Java's scan result; the reader reports its own counters.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `numMergedRecordsInLog`; `into_parts` carries it, but no caller reads it yet"
+    )]
     pub num_merged_records_in_log: u64,
     pub total_log_files: u64,
     pub total_log_blocks: u64,
@@ -125,7 +127,10 @@ impl HoodieMergedLogRecordReader {
     ///
     /// Java-parity entry point. `scan_log_files` drives the reader through
     /// `build()`, which scans eagerly, so nothing calls this directly.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's lazy `scan()` for a reader built with `force_full_scan(false)`; `build()` scans eagerly and nothing builds a lazy reader yet"
+    )]
     pub async fn scan(&mut self) -> Result<()> {
         self.scan_with_skip(false).await
     }
@@ -210,12 +215,9 @@ impl HoodieMergedLogRecordReader {
     }
 }
 
-/// Java-parity accessors over the scan result.
-///
-/// `into_parts` hands the caller the whole stats struct, so nothing in this
-/// crate reaches for them one at a time; they exist so a port of Java's call
-/// sites reads the same.
-#[allow(dead_code)]
+/// Accessors over the scan result, read by the tests; `into_parts` hands
+/// callers the whole `ScanStats`.
+#[cfg(test)]
 impl HoodieMergedLogRecordReader {
     pub fn get_num_merged_records_in_log(&self) -> u64 {
         self.num_merged_records_in_log
@@ -226,31 +228,11 @@ impl HoodieMergedLogRecordReader {
     }
 
     pub fn get_total_log_files(&self) -> u64 {
-        self.base.get_total_log_files()
-    }
-
-    pub fn get_total_log_records(&self) -> u64 {
-        self.base.get_total_log_records()
+        self.base.total_log_files
     }
 
     pub fn get_total_log_blocks(&self) -> u64 {
-        self.base.get_total_log_blocks()
-    }
-
-    pub fn get_total_corrupt_blocks(&self) -> u64 {
-        self.base.get_total_corrupt_blocks()
-    }
-
-    pub fn get_total_rollbacks(&self) -> u64 {
-        self.base.get_total_rollbacks()
-    }
-
-    pub fn get_valid_block_instants(&self) -> &[String] {
-        self.base.get_valid_block_instants()
-    }
-
-    pub fn get_progress(&self) -> f32 {
-        self.base.get_progress()
+        self.base.total_log_blocks
     }
 }
 
@@ -326,7 +308,10 @@ impl Builder {
 
     /// Mirrors Java's `withInstantRange(Option<InstantRange>)`.
     /// Builder parity with Java; the range travels through `ReaderContext` here.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `Builder.withInstantRange`; callers pass the range through `ReaderContext`, which `build()` falls back to"
+    )]
     pub fn with_instant_range(mut self, range: Option<InstantRange>) -> Self {
         self.instant_range = range;
         self.instant_range_explicitly_set = true;

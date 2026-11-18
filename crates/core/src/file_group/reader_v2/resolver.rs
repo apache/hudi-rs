@@ -43,7 +43,6 @@ use std::collections::HashMap;
 /// hands to `resolve_from_configs`, so the gate that admits a slice and the
 /// reader that opens it cannot disagree about its format. `None` for a caller
 /// with no base file — a log-only slice resolves no base file format.
-#[allow(dead_code)]
 pub(crate) fn resolve_reader_context(
     hudi_configs: &HudiConfigs,
     has_log_files: bool,
@@ -117,17 +116,14 @@ pub(crate) fn resolve_reader_context(
 /// How a v9 table states its merge semantics. Not modelled as a
 /// [`HudiTableConfig`] yet — this crate does not otherwise read it — so it is
 /// looked up by name.
-#[allow(dead_code)]
 const RECORD_MERGE_MODE: &str = "hoodie.record.merge.mode";
 
 /// Prefix identifying a per-read config.
-#[allow(dead_code)]
 const READ_CONFIG_PREFIX: &str = "hoodie.read.";
 
 /// Prefixes identifying configs that steer this crate's own behavior. They are
 /// neither something the table declares about itself nor a per-read override,
 /// so they reach the reader through neither map.
-#[allow(dead_code)]
 const CRATE_CONFIG_PREFIXES: [&str; 2] = ["hoodie.internal.", "hoodie.plan."];
 
 /// Per-read configs Hudi does *not* spell `hoodie.read.*`.
@@ -141,7 +137,6 @@ const CRATE_CONFIG_PREFIXES: [&str; 2] = ["hoodie.internal.", "hoodie.plan."];
 ///
 /// Listed by reference to the constants that consume them so a rename cannot
 /// leave this behind.
-#[allow(dead_code)]
 const READER_CONFIG_KEYS: [&str; 5] = [
     spillable_map::CONFIG_MERGE_MAX_SIZE,
     spillable_map::CONFIG_MAX_PEAK_MEMORY,
@@ -156,7 +151,6 @@ const READER_CONFIG_KEYS: [&str; 5] = [
 /// Anything belonging to neither is dropped rather than swept into the table
 /// properties: a reader has no way to tell a swept-in crate config from
 /// something the table actually declared.
-#[allow(dead_code)]
 fn partition_configs(
     hudi_configs: &HudiConfigs,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
@@ -182,7 +176,6 @@ fn partition_configs(
 /// Mirrors the bounds file group reader version 1 applies, so a version 2 read
 /// sees the same log blocks: exclusive at the start, inclusive at the pinned
 /// commit.
-#[allow(dead_code)]
 fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
     let timezone: String = hudi_configs
         .get_or_default(HudiTableConfig::TimelineTimezone)
@@ -209,7 +202,6 @@ fn resolve_instant_range(hudi_configs: &HudiConfigs) -> Result<InstantRange> {
 /// default when a value fails to parse: a typo would silently merge by key and
 /// return rows that look ordinary, which is exactly what this setting exists to
 /// change.
-#[allow(dead_code)]
 fn resolve_use_record_position(hudi_configs: &HudiConfigs) -> Result<bool> {
     Ok(hudi_configs
         .try_get(HudiReadConfig::MergeUseRecordPositions)?

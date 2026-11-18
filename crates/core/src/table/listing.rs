@@ -37,7 +37,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct FileLister {
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,

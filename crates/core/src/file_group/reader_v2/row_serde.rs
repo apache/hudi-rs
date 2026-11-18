@@ -133,13 +133,13 @@ pub fn from_binary_body(bytes: &[u8], schema: SchemaRef) -> Result<RecordBatch> 
 
 /// Seal the binary record to ensure data referenced in memory does not change.
 ///
-/// Mirrors Java's `RecordContext.seal(T)`.
-///
-/// For Spark: calls `UnsafeRow.copy()` to make the row self-contained.
-/// For Arrow: no-op -- IPC bytes are already self-contained (owned `Vec<u8>`).
-/// Mirrors Java's `RecordContext.seal`, a no-op for Arrow — IPC bytes are already
-/// self-contained. Kept so the ported call graph stays recognisable.
-#[allow(dead_code)]
+/// Mirrors Java's `RecordContext.seal(T)`. For Spark it calls
+/// `UnsafeRow.copy()` to make the row self-contained; for Arrow it is a no-op,
+/// since IPC bytes are already self-contained (owned `Vec<u8>`).
+#[expect(
+    dead_code,
+    reason = "Java's `RecordContext.seal`, which copies an engine row before it is buffered; Arrow IPC bytes are already owned, so the merge has nothing to seal"
+)]
 pub fn seal(bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
@@ -194,9 +194,7 @@ mod tests {
         let bytes = to_binary_row(&schema, &batch);
         assert!(!bytes.is_empty());
 
-        let sealed = seal(bytes);
-
-        let restored = from_binary(&sealed).unwrap();
+        let restored = from_binary(&bytes).unwrap();
         assert_eq!(restored.num_rows(), 1);
         assert_eq!(restored.schema(), schema);
         assert_eq!(

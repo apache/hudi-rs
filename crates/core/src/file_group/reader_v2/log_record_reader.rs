@@ -302,7 +302,13 @@ pub struct Pass2Result {
     pub current_instant_log_blocks: VecDeque<LogBlock>,
     /// Dedup guard — instants whose blocks are enqueued.
     /// Recorded for parity with Java's scan result; nothing reads it back here.
-    #[allow(dead_code)]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Java keeps this dedup guard local to the scan; only the tests read the set back"
+        )
+    )]
     pub instant_times_included: HashSet<String>,
     /// Which instant times actually contributed blocks (ordered output).
     pub valid_block_instants: Vec<String>,
@@ -447,7 +453,10 @@ pub struct BaseHoodieLogRecordReader {
     /// Carried for parity. Nothing reads it, so it is inert — the completion gate
     /// below is what actually decides whether an inflight instant is admitted,
     /// and `ReaderParameters` never sets this true.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `allowInflightInstants` escape hatch for the completed/inflight check; `ReaderParameters` never sets it to true"
+    )]
     pub allow_inflight_instants: bool,
     /// Inputs for the Gate-3 completed/inflight check. `Some` only for
     /// table version < 8 (v1 timeline layout); `None` for v8+ and when no timeline is available,
@@ -600,54 +609,75 @@ impl BaseHoodieLogRecordReader {
     ///
     /// Point-wise record lookups are only enabled when scanner is NOT in
     /// full-scan mode.
-    /// Java-parity accessors over the scan result; the reader reads the fields it
-    /// owns directly.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `shouldLookupRecords`, which tells the log reader to enable point lookups; this reader has no point-lookup path yet"
+    )]
     pub fn should_lookup_records(&self) -> bool {
         !self.force_full_scan
     }
 
     // ── Getters (mirrors Java's getter methods on BaseHoodieLogRecordReader) ──
 
-    /// Java-parity accessors over the scan stats.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getProgress()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getProgress` (Lombok `@Getter` on `progress`); no caller here reports scan progress yet"
+    )]
     pub fn get_progress(&self) -> f32 {
         self.progress
     }
 
-    /// Java-parity accessors over the scan stats; the loader copies the struct's
-    /// fields into `HoodieReadStats` directly.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getTotalLogFiles()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getTotalLogFiles`; the loader copies the stats fields into `HoodieReadStats` directly"
+    )]
     pub fn get_total_log_files(&self) -> u64 {
         self.total_log_files
     }
 
-    /// Java-parity accessors; see `get_total_log_files`.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getTotalLogRecords()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getTotalLogRecords`; the loader copies the stats fields into `HoodieReadStats` directly"
+    )]
     pub fn get_total_log_records(&self) -> u64 {
         self.total_log_records
     }
 
-    /// See `get_total_log_files`.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getTotalLogBlocks()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getTotalLogBlocks`; the loader copies the stats fields into `HoodieReadStats` directly"
+    )]
     pub fn get_total_log_blocks(&self) -> u64 {
         self.total_log_blocks
     }
 
-    /// See `get_total_log_files`.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getTotalRollbacks()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getTotalRollbacks`; the loader copies the stats fields into `HoodieReadStats` directly"
+    )]
     pub fn get_total_rollbacks(&self) -> u64 {
         self.total_rollbacks
     }
 
-    /// See `get_total_log_files`.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getTotalCorruptBlocks()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getTotalCorruptBlocks`; the loader copies the stats fields into `HoodieReadStats` directly"
+    )]
     pub fn get_total_corrupt_blocks(&self) -> u64 {
         self.total_corrupt_blocks
     }
 
-    /// See `get_total_log_files`.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getValidBlockInstants()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `getValidBlockInstants` (Lombok `@Getter`), which `LogScanningRecordBufferLoader` calls; here `HoodieMergedLogRecordReader::into_parts` moves the list out to the loader instead"
+    )]
     pub fn get_valid_block_instants(&self) -> &[String] {
         &self.valid_block_instants
     }

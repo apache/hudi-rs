@@ -17,8 +17,6 @@
  * under the License.
  */
 
-#![allow(dead_code)]
-
 //! Normalize legacy 2-level `array<map>` parquet encodings so
 //! parquet-rs's parquet→arrow schema builder accepts them.
 //!

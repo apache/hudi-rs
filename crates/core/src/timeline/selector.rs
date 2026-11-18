@@ -26,7 +26,6 @@ use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct InstantRange {
     timezone: String,
@@ -210,7 +209,6 @@ impl InstantRange {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineSelector {
     timezone: String,
@@ -237,7 +235,6 @@ pub struct TimelineSelector {
     timeline_layout_version: isize,
 }
 
-#[allow(dead_code)]
 impl TimelineSelector {
     fn get_timezone_from_configs(hudi_configs: &HudiConfigs) -> String {
         hudi_configs

@@ -232,7 +232,7 @@ impl FileGroupMergeStream {
     /// `RecordBatchIterator` and calls [`Self::new_eager`]. Mainly for
     /// tests + the back-compat path.
     /// Used by the test harness to build an iterator over a fixed record set.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn new_eager_from_vec(
         batches: Vec<RecordBatch>,
         output_schema: SchemaRef,
@@ -280,24 +280,6 @@ impl FileGroupMergeStream {
         if let Ok(mut s) = self.stream_stats.lock() {
             s.final_merge_us = s.final_merge_us.saturating_add(merge_us);
             s.output_build_us = s.output_build_us.saturating_add(build_us);
-        }
-    }
-
-    /// The merge buffer's CURRENT tracked in-memory footprint, in bytes.
-    /// Delegates to the buffer's
-    /// [`current_in_memory_bytes`](HoodieFileGroupRecordBuffer::current_in_memory_bytes)
-    /// on the merge path; returns 0 for the Eager (no-merge) source, which holds
-    /// no merge map. Used by the FFI reader-memory accessor so a host memory
-    /// manager (velox's `MemoryPool`) can reserve against hudi-rs's live native
-    /// footprint. Cheap (an `AtomicU64`/counter read on the buffer), safe to call
-    /// between chunk pulls.
-    #[must_use]
-    /// Reported by the memory harness; the merge path reads the map's own counter.
-    #[allow(dead_code)]
-    pub fn current_in_memory_bytes(&self) -> u64 {
-        match &self.source {
-            MergeSource::Buffered { buffer, .. } => buffer.current_in_memory_bytes(),
-            MergeSource::Eager { .. } => 0,
         }
     }
 
@@ -353,7 +335,7 @@ impl FileGroupMergeStream {
     /// gets the schema from the table — but it is the invariant the projection
     /// tests pin, so it is stated here rather than reached for through the
     /// private field.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn schema(&self) -> SchemaRef {
         self.output_schema.clone()
     }

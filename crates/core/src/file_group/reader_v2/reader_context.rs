@@ -315,13 +315,6 @@ impl ReaderContext {
         &self.record_context.ordering_field_names
     }
 
-    /// Convenience accessor for the partition path stored on record_context.
-    /// Parity accessor; the merge reads `record_context.partition_path`.
-    #[allow(dead_code)]
-    pub fn partition_path(&self) -> &str {
-        &self.record_context.partition_path
-    }
-
     /// Get the timeline timezone from table config, defaulting to "utc".
     pub fn timezone(&self) -> String {
         self.table_config
@@ -341,7 +334,7 @@ impl ReaderContext {
     /// Create an empty reader context, for callers that fill the fields in
     /// themselves and for tests.
     /// Builds a context field-by-field for the test harness and for tests.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             table_path: String::new(),
@@ -424,7 +417,6 @@ mod tests {
 /// The resolver works in this type and converts to the string form
 /// [`ReaderContext::merge_mode`] carries, which matches the merge modes the
 /// Hudi Java reader names.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MergeMode {
     /// Latest commit wins.

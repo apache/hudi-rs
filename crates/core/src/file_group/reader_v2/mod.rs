@@ -26,9 +26,11 @@
 //! `file_group::reader::FileGroupReader` reaches all of this through
 //! `adapter` (see its `read_via_v2` / `stream_via_v2`).
 //!
-//! Some surface exists only for Java parity or is reached only by the test
-//! harness; it carries targeted `#[allow(dead_code)]` allows rather than a
-//! module-wide blanket, so an item that is mistakenly dead still warns.
+//! Some surface exists only for Java parity or is reached only by the `harness`
+//! test module. Each such item carries its own `#[expect(dead_code, reason = ..)]`
+//! (or is `#[cfg(test)]` when only tests use it) rather than a module-wide
+//! allow, so an item that is mistakenly dead still warns, and one that gains a
+//! caller fails the build until the claim is removed.
 
 /// Far-future instant standing in for "no upper bound on the timeline": every
 /// real instant sorts before it, so a read watermarked here sees the whole
@@ -36,7 +38,6 @@
 ///
 /// Comparison is lexicographic on purpose — instant times are zero-padded
 /// fixed-width strings.
-#[allow(dead_code)]
 pub(crate) const MAX_INSTANT_TIME: &str = "99991231235959999";
 
 pub(crate) mod adapter;

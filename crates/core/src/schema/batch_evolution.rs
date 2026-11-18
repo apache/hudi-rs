@@ -17,8 +17,6 @@
  * under the License.
  */
 
-#![allow(dead_code)]
-
 //! Batch-level schema-evolution projector.
 //!
 //! Equivalent of Java's record rewrite (`HoodieAvroUtils.rewriteRecordWithNewSchema`,
