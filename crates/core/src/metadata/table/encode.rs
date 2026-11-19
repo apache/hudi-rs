@@ -463,18 +463,288 @@ fn parse_uuid_file_id(file_id: &str) -> Option<(uuid::Uuid, i32)> {
 /// `writer_schema` is the schema of the container the bytes were read from
 /// (mixed-writer tables have differing HoodieMetadataRecord schemas per
 /// container); falls back to our vendored schema when unknown.
+///
+/// When that writer schema has the same record-index binary layout as the
+/// vendored `HoodieMetadata.avsc` (Java `HoodieRecordIndexInfo` field order
+/// and types), entries are read straight from the Avro bytes. Otherwise, and
+/// if the direct read fails, the generic `from_avro_datum` decoder is used.
 pub fn decode_record_index_entry(
     key: &str,
     bytes: &[u8],
     writer_schema: Option<&Schema>,
 ) -> Result<Option<RecordIndexEntry>> {
+    let schema = match writer_schema {
+        Some(s) => s,
+        None if bytes.is_empty() => return Ok(None),
+        None => metadata_schema()?,
+    };
+    decode_record_index_entry_with_layout(
+        key,
+        bytes,
+        schema,
+        record_index_writer_layout_matches(schema),
+    )
+}
+
+/// Decode using a layout-check result already computed for this container.
+pub(crate) fn decode_record_index_entry_with_layout(
+    key: &str,
+    bytes: &[u8],
+    schema: &Schema,
+    layout_matches: bool,
+) -> Result<Option<RecordIndexEntry>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    let schema = match writer_schema {
-        Some(s) => s,
-        None => metadata_schema()?,
+    if layout_matches && let Ok(entry) = decode_record_index_entry_direct(key, bytes) {
+        return Ok(entry);
+    }
+    decode_record_index_entry_generic(key, bytes, schema)
+}
+
+/// Whether `schema` has the same record-index layout as the vendored
+/// `HoodieMetadata.avsc`.
+///
+/// Field names and order are taken from the vendored schema. Typed top-level
+/// fields use `Schema` equality, which in apache-avro compares field types in
+/// order and ignores names, doc and default; names are compared separately.
+/// The other index payloads only need a null-leading union: a null branch is
+/// one byte regardless of the other branch, and record-index records leave
+/// those payloads null. `recordIndexMetadata` compares each
+/// `HoodieRecordIndexInfo` field name and type, because `Schema` equality
+/// would accept a swap of `fileIdHighBits` and `fileIdLowBits`.
+pub(crate) fn record_index_writer_layout_matches(schema: &Schema) -> bool {
+    let Ok(vendored) = metadata_schema() else {
+        return false;
     };
+    if std::ptr::eq(schema, vendored) {
+        return true;
+    }
+    let (Schema::Record(got), Schema::Record(want)) = (schema, vendored) else {
+        return false;
+    };
+    if got.fields.len() != want.fields.len() {
+        return false;
+    }
+    got.fields.iter().zip(&want.fields).all(|(got, want)| {
+        if got.name != want.name {
+            return false;
+        }
+        match got.name.as_str() {
+            "filesystemMetadata"
+            | "BloomFilterMetadata"
+            | "ColumnStatsMetadata"
+            | "SecondaryIndexMetadata" => is_null_leading_union(&got.schema),
+            "recordIndexMetadata" => record_index_info_layout_matches(&got.schema, &want.schema),
+            _ => got.schema == want.schema,
+        }
+    })
+}
+
+fn is_null_leading_union(schema: &Schema) -> bool {
+    match schema {
+        Schema::Union(u) => {
+            let variants = u.variants();
+            !variants.is_empty() && matches!(variants[0], Schema::Null)
+        }
+        _ => false,
+    }
+}
+
+fn record_index_info_layout_matches(got: &Schema, want: &Schema) -> bool {
+    let (Some(got_fields), Some(want_fields)) = (
+        hoodie_record_index_info_fields(got),
+        hoodie_record_index_info_fields(want),
+    ) else {
+        return false;
+    };
+    got_fields.len() == want_fields.len()
+        && got_fields
+            .iter()
+            .zip(want_fields)
+            .all(|(got, want)| got.name == want.name && got.schema == want.schema)
+}
+
+fn hoodie_record_index_info_fields(schema: &Schema) -> Option<&[apache_avro::schema::RecordField]> {
+    let Schema::Union(u) = schema else {
+        return None;
+    };
+    let variants = u.variants();
+    if variants.len() != 2 || !matches!(variants[0], Schema::Null) {
+        return None;
+    }
+    match &variants[1] {
+        Schema::Record(record) => Some(record.fields.as_slice()),
+        _ => None,
+    }
+}
+
+/// Inverse of [`put_long`].
+fn get_long(src: &mut &[u8]) -> Result<i64> {
+    let mut zigzag: u64 = 0;
+    let mut shift = 0;
+    loop {
+        let Some((&byte, rest)) = src.split_first() else {
+            return Err(CoreError::MetadataTable(
+                "truncated Avro varint in record_index payload".to_string(),
+            ));
+        };
+        *src = rest;
+        zigzag |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(((zigzag >> 1) as i64) ^ -((zigzag & 1) as i64));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return Err(CoreError::MetadataTable(
+                "Avro varint in record_index payload exceeds a long".to_string(),
+            ));
+        }
+    }
+}
+
+fn get_int(src: &mut &[u8]) -> Result<i32> {
+    let value = get_long(src)?;
+    i32::try_from(value).map_err(|_| {
+        CoreError::MetadataTable(format!(
+            "Avro int in record_index payload is out of range: {value}"
+        ))
+    })
+}
+
+fn get_string(src: &mut &[u8]) -> Result<String> {
+    let len = get_long(src)?;
+    let len = usize::try_from(len).map_err(|_| {
+        CoreError::MetadataTable(format!(
+            "Avro string length in record_index payload is negative: {len}"
+        ))
+    })?;
+    if src.len() < len {
+        return Err(CoreError::MetadataTable(
+            "truncated Avro string in record_index payload".to_string(),
+        ));
+    }
+    let (head, rest) = src.split_at(len);
+    *src = rest;
+    String::from_utf8(head.to_vec()).map_err(|e| {
+        CoreError::MetadataTable(format!("record_index Avro string is not valid UTF-8: {e}"))
+    })
+}
+
+/// Read a `[null, T]` union: branch 0 is `None`, branch 1 is `T`.
+fn get_nullable<T>(
+    src: &mut &[u8],
+    read: impl FnOnce(&mut &[u8]) -> Result<T>,
+) -> Result<Option<T>> {
+    match get_int(src)? {
+        0 => Ok(None),
+        1 => read(src).map(Some),
+        branch => Err(CoreError::MetadataTable(format!(
+            "record_index union branch {branch} is not [null, value]"
+        ))),
+    }
+}
+
+fn skip_nullable_string(src: &mut &[u8]) -> Result<()> {
+    get_nullable(src, |s| get_string(s).map(|_| ())).map(|_| ())
+}
+
+fn skip_nullable_long(src: &mut &[u8]) -> Result<()> {
+    get_nullable(src, |s| get_long(s).map(|_| ())).map(|_| ())
+}
+
+fn expect_null_union(src: &mut &[u8], name: &str) -> Result<()> {
+    match get_int(src)? {
+        0 => Ok(()),
+        branch => Err(CoreError::MetadataTable(format!(
+            "direct record_index decode expected {name} to be null, got union branch {branch}"
+        ))),
+    }
+}
+
+fn resolve_file_id(
+    file_id: String,
+    file_id_encoding: i32,
+    file_id_high: Option<i64>,
+    file_id_low: Option<i64>,
+    file_index: Option<i32>,
+) -> String {
+    if file_id.is_empty()
+        && file_id_encoding == 0
+        && let (Some(high), Some(low), Some(idx)) = (file_id_high, file_id_low, file_index)
+    {
+        let uuid = uuid_from_u64_pair(high as u64, low as u64);
+        if idx >= 0 {
+            format!("{uuid}-{idx}")
+        } else {
+            uuid
+        }
+    } else {
+        file_id
+    }
+}
+
+/// Decode against the vendored record-index layout, without resolving a schema.
+fn decode_record_index_entry_direct(key: &str, bytes: &[u8]) -> Result<Option<RecordIndexEntry>> {
+    let mut src = bytes;
+    // Five `_hoodie_*` meta fields prepended by `prepend_meta_fields`.
+    for _ in 0..5 {
+        skip_nullable_string(&mut src)?;
+    }
+    let _avro_key = get_string(&mut src)?;
+    let _typ = get_int(&mut src)?;
+    expect_null_union(&mut src, "filesystemMetadata")?;
+    expect_null_union(&mut src, "BloomFilterMetadata")?;
+    expect_null_union(&mut src, "ColumnStatsMetadata")?;
+    let entry = match get_int(&mut src)? {
+        0 => {
+            expect_null_union(&mut src, "SecondaryIndexMetadata")?;
+            None
+        }
+        1 => {
+            let partition_path = get_nullable(&mut src, get_string)?.unwrap_or_default();
+            let file_id_high = get_nullable(&mut src, get_long)?;
+            let file_id_low = get_nullable(&mut src, get_long)?;
+            let file_index = get_nullable(&mut src, get_int)?;
+            let file_id = get_nullable(&mut src, get_string)?.unwrap_or_default();
+            let instant_time_millis = get_nullable(&mut src, get_long)?.unwrap_or(0);
+            let file_id_encoding = get_int(&mut src)?;
+            skip_nullable_long(&mut src)?; // position is unused on lookup
+            expect_null_union(&mut src, "SecondaryIndexMetadata")?;
+            Some(RecordIndexEntry {
+                record_key: key.to_string(),
+                partition_path,
+                file_id: resolve_file_id(
+                    file_id,
+                    file_id_encoding,
+                    file_id_high,
+                    file_id_low,
+                    file_index,
+                ),
+                instant_time_millis,
+                is_deleted: false,
+            })
+        }
+        branch => {
+            return Err(CoreError::MetadataTable(format!(
+                "recordIndexMetadata union branch {branch} is not [null, HoodieRecordIndexInfo]"
+            )));
+        }
+    };
+    if !src.is_empty() {
+        return Err(CoreError::MetadataTable(format!(
+            "record_index payload has {} unexpected trailing bytes",
+            src.len()
+        )));
+    }
+    Ok(entry)
+}
+
+fn decode_record_index_entry_generic(
+    key: &str,
+    bytes: &[u8],
+    schema: &Schema,
+) -> Result<Option<RecordIndexEntry>> {
     let value = apache_avro::from_avro_datum(schema, &mut &bytes[..], None)?;
     let Value::Record(fields) = value else {
         return Err(CoreError::MetadataTable(
@@ -545,21 +815,16 @@ pub fn decode_record_index_entry(
     if !has_info {
         return Ok(None);
     }
-    if file_id.is_empty()
-        && file_id_encoding == 0
-        && let (Some(high), Some(low), Some(idx)) = (file_id_high, file_id_low, file_index)
-    {
-        let uuid = uuid_from_u64_pair(high as u64, low as u64);
-        file_id = if idx >= 0 {
-            format!("{uuid}-{idx}")
-        } else {
-            uuid
-        };
-    }
     Ok(Some(RecordIndexEntry {
         record_key: key.to_string(),
         partition_path,
-        file_id,
+        file_id: resolve_file_id(
+            file_id,
+            file_id_encoding,
+            file_id_high,
+            file_id_low,
+            file_index,
+        ),
         instant_time_millis,
         is_deleted: false,
     }))
@@ -1153,37 +1418,7 @@ mod tests {
 
     #[test]
     fn encode_record_index_matches_generic_avro_encoding() {
-        let entries = [
-            RecordIndexEntry {
-                record_key: "k".to_string(),
-                partition_path: String::new(),
-                file_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301-0".to_string(),
-                instant_time_millis: 1_700_000_000_123,
-                is_deleted: false,
-            },
-            RecordIndexEntry {
-                record_key: "k".to_string(),
-                partition_path: "city=san_francisco".to_string(),
-                file_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".to_string(),
-                instant_time_millis: 0,
-                is_deleted: false,
-            },
-            RecordIndexEntry {
-                record_key: "k".to_string(),
-                partition_path: format!("city={}", "x".repeat(200)),
-                file_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301-7".to_string(),
-                instant_time_millis: i64::MIN,
-                is_deleted: false,
-            },
-            RecordIndexEntry {
-                record_key: "k".to_string(),
-                partition_path: "p=\u{e9}t\u{e9}".to_string(),
-                file_id: "not-a-uuid-file-id".to_string(),
-                instant_time_millis: -1,
-                is_deleted: false,
-            },
-        ];
-        for entry in &entries {
+        for entry in &sample_record_index_entries() {
             let fast = encode_record_index_entry(entry).unwrap();
             let generic = encode_record_index_entry_generic(entry).unwrap();
             assert_eq!(fast, generic, "entry {entry:?}");
@@ -1286,6 +1521,544 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(decoded.file_id, file_id);
+    }
+
+    fn sample_entry(partition: &str, file_id: &str, instant: i64) -> RecordIndexEntry {
+        RecordIndexEntry {
+            record_key: "k".to_string(),
+            partition_path: partition.to_string(),
+            file_id: file_id.to_string(),
+            instant_time_millis: instant,
+            is_deleted: false,
+        }
+    }
+
+    fn sample_record_index_entries() -> [RecordIndexEntry; 4] {
+        [
+            sample_entry(
+                "",
+                "3f2504e0-4f89-11d3-9a0c-0305e82c3301-0",
+                1_700_000_000_123,
+            ),
+            sample_entry(
+                "city=san_francisco",
+                "3f2504e0-4f89-11d3-9a0c-0305e82c3301",
+                0,
+            ),
+            sample_entry(
+                &format!("city={}", "x".repeat(200)),
+                "3f2504e0-4f89-11d3-9a0c-0305e82c3301-7",
+                i64::MIN,
+            ),
+            sample_entry("p=\u{e9}t\u{e9}", "not-a-uuid-file-id", -1),
+        ]
+    }
+
+    // High/low bits of the RFC 4122 example UUID 3f2504e0-4f89-11d3-9a0c-0305e82c3301.
+    const RFC4122_HIGH: i64 = 0x3f2504e04f8911d3_u64 as i64;
+    const RFC4122_LOW: i64 = 0x9a0c0305e82c3301_u64 as i64;
+    const RFC4122_FILE_ID: &str = "3f2504e0-4f89-11d3-9a0c-0305e82c3301-0";
+    fn present(value: Value) -> Value {
+        Value::Union(1, Box::new(value))
+    }
+
+    fn rli_info(
+        partition: Value,
+        file_index: Value,
+        file_id: Value,
+        instant: Value,
+        encoding: i32,
+    ) -> Value {
+        present(Value::Record(vec![
+            ("partitionName".to_string(), partition),
+            (
+                "fileIdHighBits".to_string(),
+                present(Value::Long(RFC4122_HIGH)),
+            ),
+            (
+                "fileIdLowBits".to_string(),
+                present(Value::Long(RFC4122_LOW)),
+            ),
+            ("fileIndex".to_string(), file_index),
+            ("fileId".to_string(), file_id),
+            ("instantTime".to_string(), instant),
+            ("fileIdEncoding".to_string(), Value::Int(encoding)),
+            ("position".to_string(), null_union()),
+        ]))
+    }
+
+    fn rli_default() -> Value {
+        rli_info(
+            null_union(),
+            present(Value::Int(0)),
+            null_union(),
+            null_union(),
+            0,
+        )
+    }
+
+    fn encode_rli(
+        schema: &Schema,
+        record_index: Value,
+        secondary: Value,
+        extras: &[(&str, Value)],
+    ) -> Vec<u8> {
+        let mut fields: Vec<(String, Value)> = MetaField::field_names()
+            .into_iter()
+            .map(|name| (name.to_string(), null_union()))
+            .chain([
+                ("key".to_string(), Value::String(String::new())),
+                (
+                    "type".to_string(),
+                    Value::Int(MetadataRecordType::RecordIndex as i32),
+                ),
+                ("filesystemMetadata".to_string(), null_union()),
+                ("BloomFilterMetadata".to_string(), null_union()),
+                ("ColumnStatsMetadata".to_string(), null_union()),
+                ("recordIndexMetadata".to_string(), record_index),
+                ("SecondaryIndexMetadata".to_string(), secondary),
+            ])
+            .collect();
+        fields.extend(extras.iter().map(|(n, v)| (n.to_string(), v.clone())));
+        apache_avro::to_avro_datum(schema, Value::Record(fields)).unwrap()
+    }
+
+    fn encode_record_index_payload(record_index: Value, secondary: Value) -> Vec<u8> {
+        encode_rli(metadata_schema().unwrap(), record_index, secondary, &[])
+    }
+
+    fn parse_mutated_metadata_schema(mutate: impl FnOnce(&mut serde_json::Value)) -> Schema {
+        let mut json: serde_json::Value =
+            serde_json::from_str(hoodie_metadata_schema_json().unwrap()).unwrap();
+        mutate(&mut json);
+        Schema::parse_str(&json.to_string()).unwrap()
+    }
+
+    fn json_fields(json: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+        json.get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap()
+    }
+
+    fn json_named<'a>(
+        fields: &'a mut [serde_json::Value],
+        name: &str,
+    ) -> &'a mut serde_json::Value {
+        fields.iter_mut().find(|f| f["name"] == name).unwrap()
+    }
+
+    fn json_union_record_fields<'a>(
+        field: &'a mut serde_json::Value,
+        record_name: &str,
+    ) -> &'a mut Vec<serde_json::Value> {
+        field
+            .get_mut("type")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["name"] == record_name)
+            .unwrap()
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap()
+    }
+
+    fn json_rli_info_fields(json: &mut serde_json::Value) -> &mut Vec<serde_json::Value> {
+        json_union_record_fields(
+            json_named(json_fields(json), "recordIndexMetadata"),
+            "HoodieRecordIndexInfo",
+        )
+    }
+
+    fn json_swap_named(fields: &mut [serde_json::Value], left: &str, right: &str) {
+        let i = fields.iter().position(|f| f["name"] == left).unwrap();
+        let j = fields.iter().position(|f| f["name"] == right).unwrap();
+        fields.swap(i, j);
+    }
+
+    fn set_rli_type(json: &mut serde_json::Value, name: &str, ty: serde_json::Value) {
+        json_named(json_rli_info_fields(json), name)["type"] = ty;
+    }
+
+    fn assert_no_panic_and_eq(name: &str, input: &[u8], schema: &Schema) {
+        let public = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_record_index_entry("k", input, Some(schema))
+        }));
+        let generic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decode_record_index_entry_generic("k", input, schema)
+        }));
+        let public = public.unwrap_or_else(|_| panic!("public decode panicked on {name}"));
+        let generic = generic.unwrap_or_else(|_| panic!("generic decode panicked on {name}"));
+        match (public, generic) {
+            (Ok(p), Ok(g)) => assert_eq!(p, g, "{name}"),
+            (Err(_), Err(_)) => {}
+            (p, g) => panic!("{name}: public {p:?} != generic {g:?}"),
+        }
+    }
+
+    fn check_layout(
+        name: &str,
+        mutate: impl FnOnce(&mut serde_json::Value),
+        info: Value,
+        extras: &[(&str, Value)],
+        should_match: bool,
+        extra: Option<fn(&[u8], &Schema)>,
+    ) {
+        let schema = parse_mutated_metadata_schema(mutate);
+        assert_eq!(
+            record_index_writer_layout_matches(&schema),
+            should_match,
+            "{name}"
+        );
+        let bytes = encode_rli(&schema, info, null_union(), extras);
+        assert_no_panic_and_eq(name, &bytes, &schema);
+        if let Some(extra) = extra {
+            extra(&bytes, &schema);
+        }
+    }
+
+    fn patch(mut bytes: Vec<u8>, at: usize, was: u8, to: u8) -> Vec<u8> {
+        assert_eq!(bytes[at], was);
+        bytes[at] = to;
+        bytes
+    }
+
+    fn assert_direct_eq_generic(bytes: &[u8], schema: &Schema) -> RecordIndexEntry {
+        let generic = decode_record_index_entry_generic("k", bytes, schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_record_index_entry_direct("k", bytes)
+                .unwrap()
+                .unwrap(),
+            generic
+        );
+        generic
+    }
+
+    fn decode_direct_and_generic(
+        bytes: &[u8],
+        schema: &Schema,
+    ) -> (RecordIndexEntry, RecordIndexEntry) {
+        (
+            decode_record_index_entry_direct("k", bytes)
+                .unwrap()
+                .unwrap(),
+            decode_record_index_entry_generic("k", bytes, schema)
+                .unwrap()
+                .unwrap(),
+        )
+    }
+
+    /// Expected values come from generic decode, including null and default fields.
+    #[test]
+    fn decode_record_index_direct_matches_generic() {
+        let schema = metadata_schema().unwrap();
+        for entry in &sample_record_index_entries() {
+            let bytes = encode_record_index_entry(entry).unwrap();
+            let generic = assert_direct_eq_generic(&bytes, schema);
+            assert_eq!(
+                decode_record_index_entry("k", &bytes, Some(schema)).unwrap(),
+                Some(generic),
+                "{entry:?}"
+            );
+        }
+
+        let bytes = encode_record_index_payload(rli_default(), null_union());
+        let generic = assert_direct_eq_generic(&bytes, schema);
+        assert_eq!(generic.partition_path, "");
+        assert_eq!(generic.instant_time_millis, 0);
+        assert_eq!(generic.file_id, RFC4122_FILE_ID);
+
+        // encoding=1 must keep fileId empty even when UUID bits are present.
+        let bytes = encode_record_index_payload(
+            rli_info(
+                null_union(),
+                present(Value::Int(0)),
+                null_union(),
+                null_union(),
+                1,
+            ),
+            null_union(),
+        );
+        let generic = assert_direct_eq_generic(&bytes, schema);
+        assert_eq!(generic.file_id, "");
+    }
+
+    /// Empty bytes and a null `recordIndexMetadata` payload are tombstones.
+    #[test]
+    fn decode_record_index_empty_or_null_payload_is_delete() {
+        assert_eq!(decode_record_index_entry("k", &[], None).unwrap(), None);
+        let schema = metadata_schema().unwrap();
+        let bytes = encode_record_index_payload(null_union(), null_union());
+        assert_eq!(
+            decode_record_index_entry("k", &bytes, Some(schema)).unwrap(),
+            None
+        );
+    }
+
+    /// Layout check ignores column-stats union changes and rejects mismatches.
+    /// Expected values come from generic decode against the writer schema.
+    #[test]
+    fn record_index_writer_layout_matches_rli_not_column_stats() {
+        let schema = metadata_schema().unwrap();
+        assert!(record_index_writer_layout_matches(schema));
+        let default_info = rli_info(
+            null_union(),
+            present(Value::Int(0)),
+            null_union(),
+            present(Value::Long(12345)),
+            0,
+        );
+
+        check_layout(
+            "column-stats union only",
+            |json| {
+                json_fields(json)
+                    .iter_mut()
+                    .find(|f| f["name"] == "ColumnStatsMetadata")
+                    .unwrap()
+                    .get_mut("type")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .unwrap()
+                    .push(serde_json::json!({
+                        "type": "record",
+                        "name": "ExtraStatsMarker",
+                        "fields": [{"name": "ignored", "type": "boolean"}]
+                    }));
+            },
+            default_info.clone(),
+            &[],
+            true,
+            Some(|bytes, schema| {
+                assert_eq!(
+                    decode_record_index_entry_direct("k", bytes).unwrap(),
+                    decode_record_index_entry_generic("k", bytes, schema).unwrap()
+                );
+            }),
+        );
+        check_layout(
+            "swap fileIdHighBits and fileIdLowBits",
+            |json| {
+                json_swap_named(
+                    json_rli_info_fields(json),
+                    "fileIdHighBits",
+                    "fileIdLowBits",
+                )
+            },
+            default_info.clone(),
+            &[],
+            false,
+            Some(|bytes, schema| {
+                let (direct, generic) = decode_direct_and_generic(bytes, schema);
+                assert_eq!(generic.file_id, RFC4122_FILE_ID);
+                assert_eq!(direct.file_id, "9a0c0305-e82c-3301-3f25-04e04f8911d3-0");
+            }),
+        );
+        check_layout(
+            "fileIndex is long",
+            |json| set_rli_type(json, "fileIndex", serde_json::json!(["null", "long"])),
+            rli_info(
+                null_union(),
+                present(Value::Long(0)),
+                null_union(),
+                present(Value::Long(12345)),
+                0,
+            ),
+            &[],
+            false,
+            Some(|bytes, schema| {
+                let (direct, generic) = decode_direct_and_generic(bytes, schema);
+                assert_eq!(generic.file_id, "");
+                assert_eq!(direct.file_id, RFC4122_FILE_ID);
+            }),
+        );
+        check_layout(
+            "instantTime is int",
+            |json| set_rli_type(json, "instantTime", serde_json::json!(["null", "int"])),
+            rli_info(
+                null_union(),
+                present(Value::Int(0)),
+                null_union(),
+                present(Value::Int(12345)),
+                0,
+            ),
+            &[],
+            false,
+            Some(|bytes, schema| {
+                let (direct, generic) = decode_direct_and_generic(bytes, schema);
+                assert_eq!(generic.instant_time_millis, 0);
+                assert_eq!(direct.instant_time_millis, 12345);
+            }),
+        );
+        check_layout(
+            "extra field before recordIndexMetadata",
+            |json| {
+                let fields = json_fields(json);
+                let i = fields.iter().position(|f| f["name"] == "type").unwrap();
+                fields.insert(
+                    i + 1,
+                    serde_json::json!({
+                        "name": "extraBeforeRecordIndex",
+                        "type": ["null", "string"],
+                        "default": null
+                    }),
+                );
+            },
+            default_info.clone(),
+            &[("extraBeforeRecordIndex", null_union())],
+            false,
+            None,
+        );
+        check_layout(
+            "extra field at the end of the top level",
+            |json| {
+                json_fields(json).push(serde_json::json!({
+                    "name": "extraAfterSecondary",
+                    "type": ["null", "string"],
+                    "default": null
+                }));
+            },
+            default_info.clone(),
+            &[("extraAfterSecondary", null_union())],
+            false,
+            None,
+        );
+        check_layout(
+            "swap BloomFilterMetadata and ColumnStatsMetadata",
+            |json| {
+                json_swap_named(
+                    json_fields(json),
+                    "BloomFilterMetadata",
+                    "ColumnStatsMetadata",
+                )
+            },
+            default_info,
+            &[],
+            false,
+            None,
+        );
+    }
+
+    /// Public decode must not panic and must match generic decode on prefixes and fixed inputs.
+    #[test]
+    fn decode_record_index_corrupt_bytes_match_generic() {
+        let schema = metadata_schema().unwrap();
+        for (i, entry) in sample_record_index_entries().iter().enumerate() {
+            let bytes = encode_record_index_entry(entry).unwrap();
+            for len in 1..=bytes.len() {
+                assert_no_panic_and_eq(&format!("entry {i} prefix {len}"), &bytes[..len], schema);
+            }
+        }
+
+        let sample0 = encode_record_index_entry(&sample_record_index_entries()[0]).unwrap();
+        let rli_branch_at = 5 + 1 + 1 + 3;
+        let mut trailing = sample0.clone();
+        trailing.push(0);
+        let mut invalid_utf8 = encode_record_index_payload(
+            rli_info(
+                present(Value::String("X".to_string())),
+                present(Value::Int(0)),
+                null_union(),
+                null_union(),
+                0,
+            ),
+            null_union(),
+        );
+        let utf8_at = invalid_utf8.iter().position(|&b| b == b'X').unwrap();
+        invalid_utf8[utf8_at] = 0xff;
+        let mut eleven_byte_varint = vec![0x80; 10];
+        eleven_byte_varint.push(0);
+        let mut overlong_string = vec![0; 5];
+        overlong_string.push(40); // Avro zigzag for length 20
+        let long_index_schema = parse_mutated_metadata_schema(|json| {
+            set_rli_type(json, "fileIndex", serde_json::json!(["null", "long"]));
+        });
+        let fallback_when_direct_fails = encode_record_index_payload(
+            rli_default(),
+            present(Value::Record(vec![(
+                "isDeleted".to_string(),
+                Value::Boolean(false),
+            )])),
+        );
+        assert!(record_index_writer_layout_matches(schema));
+        assert!(decode_record_index_entry_direct("k", &fallback_when_direct_fails).is_err());
+        let generic = decode_record_index_entry_generic("k", &fallback_when_direct_fails, schema)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decode_record_index_entry("k", &fallback_when_direct_fails, Some(schema)).unwrap(),
+            Some(generic)
+        );
+
+        let fixed = [
+            ("trailing byte", trailing),
+            (
+                "illegal union branch",
+                patch(sample0.clone(), rli_branch_at, 2, 14),
+            ),
+            ("invalid utf-8", invalid_utf8),
+            ("11-byte varint", eleven_byte_varint),
+            ("string length past end", overlong_string),
+            (
+                "fileIndex out of i32",
+                encode_rli(
+                    &long_index_schema,
+                    rli_info(
+                        null_union(),
+                        present(Value::Long(1i64 << 31)),
+                        null_union(),
+                        null_union(),
+                        0,
+                    ),
+                    null_union(),
+                    &[],
+                ),
+            ),
+            (
+                "get_nullable illegal branch",
+                patch(
+                    encode_record_index_entry(&sample_record_index_entries()[1]).unwrap(),
+                    rli_branch_at + 1,
+                    2,
+                    4,
+                ),
+            ),
+            (
+                "expect_null_union illegal branch",
+                patch(sample0, 5 + 1 + 1, 0, 14),
+            ),
+            (
+                "direct decode fails after layout check",
+                fallback_when_direct_fails,
+            ),
+        ];
+        for (name, input) in fixed {
+            assert_no_panic_and_eq(name, &input, schema);
+        }
+    }
+
+    /// Spark-compacted record-index HFile: direct decode matches generic decode.
+    #[test]
+    fn decode_record_index_spark_hfile_matches_generic() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../test/data/metadata_multi_block_hfile/record-index-0009-0_10-71-248_20260830075534042.hfile",
+        );
+        let mut reader = crate::hfile::HFileReader::new(std::fs::read(&path).unwrap()).unwrap();
+        let schema = reader
+            .get_avro_schema()
+            .unwrap()
+            .expect("fixture HFile embeds a writer schema")
+            .clone();
+        assert!(record_index_writer_layout_matches(&schema));
+        let records = reader.collect_records().unwrap();
+        assert!(!records.is_empty());
+        for rec in &records {
+            let key = rec.key_as_str().unwrap();
+            let generic = decode_record_index_entry_generic(key, rec.value(), &schema).unwrap();
+            let direct = decode_record_index_entry_direct(key, rec.value()).unwrap();
+            assert_eq!(direct, generic, "key {key}");
+        }
     }
 
     /// V1 (tv8) and V2 (tv9) encodings must both decode back to the same
