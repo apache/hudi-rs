@@ -55,7 +55,7 @@ static LAST_EPOCH_MILLIS: AtomicI64 = AtomicI64::new(0);
 
 /// Append one or more record batches as a single INSERT commit.
 pub async fn append_batches(table: &mut Table, batches: &[RecordBatch]) -> Result<WriteResult> {
-    let batches = &crate::write::normalize_for_write(batches)?;
+    let batches = &crate::write::normalize_for_append(batches)?;
     if table_version(table) < 8 {
         return append_version_6(table, batches).await;
     }
@@ -873,10 +873,12 @@ fn arrow_type_to_avro_type_json_named(dt: &arrow_schema::DataType, path: &str) -
         DataType::Int64 => Ok("\"long\"".to_string()),
         DataType::Float32 => Ok("\"float\"".to_string()),
         DataType::Float64 => Ok("\"double\"".to_string()),
-        DataType::Utf8 | DataType::LargeUtf8 => {
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             Ok("{\"type\":\"string\",\"avro.java.string\":\"String\"}".to_string())
         }
-        DataType::Binary | DataType::LargeBinary => Ok("\"bytes\"".to_string()),
+        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+            Ok("\"bytes\"".to_string())
+        }
         DataType::Date32 => Ok("{\"type\":\"int\",\"logicalType\":\"date\"}".to_string()),
         DataType::Timestamp(unit, tz) => {
             // A timezone-less Arrow timestamp is Spark's TimestampNTZType,
@@ -965,9 +967,8 @@ async fn match_table_schema(table: &Table, batches: &[RecordBatch]) -> Result<Ve
     crate::write::widen_to_table_nullability(batches, &table_schema)
 }
 
-/// The batch is already normalized to the types its commit schema reads back
-/// (see [`crate::write::normalize_for_write`]), so it matches only when its
-/// names and types equal the table's.
+/// The batch's schema matches the table's, allowing string/binary array types
+/// that have the same Avro representation.
 fn ensure_batch_schema_matches(
     table_schema: &arrow_schema::Schema,
     batch_data: &arrow_schema::Schema,
@@ -1040,7 +1041,27 @@ fn schemas_equal_by_fields(a: &arrow_schema::Schema, b: &arrow_schema::Schema) -
     a.fields()
         .iter()
         .zip(b.fields().iter())
-        .all(|(fa, fb)| fa.name() == fb.name() && fa.data_type() == fb.data_type())
+        .all(|(fa, fb)| fa.name() == fb.name() && write_types_match(fa.data_type(), fb.data_type()))
+}
+
+fn write_types_match(a: &arrow_schema::DataType, b: &arrow_schema::DataType) -> bool {
+    use arrow_schema::DataType;
+    if a == b {
+        return true;
+    }
+    let is_string = |dt: &DataType| {
+        matches!(
+            dt,
+            &DataType::Utf8 | &DataType::LargeUtf8 | &DataType::Utf8View
+        )
+    };
+    let is_binary = |dt: &DataType| {
+        matches!(
+            dt,
+            &DataType::Binary | &DataType::LargeBinary | &DataType::BinaryView
+        )
+    };
+    (is_string(a) && is_string(b)) || (is_binary(a) && is_binary(b))
 }
 
 /// `_hoodie_commit_seqno` for `rows` rows numbered from `row_id_offset`, in Java's
@@ -1187,7 +1208,10 @@ mod tests {
             Field::new("f64", DataType::Float64, false),
             Field::new("s", DataType::Utf8, true),
             Field::new("ls", DataType::LargeUtf8, false),
+            Field::new("sv", DataType::Utf8View, false),
             Field::new("bin", DataType::Binary, false),
+            Field::new("lbin", DataType::LargeBinary, false),
+            Field::new("bview", DataType::BinaryView, false),
             Field::new("d", DataType::Date32, false),
             Field::new(
                 "ts_ms",
@@ -1213,7 +1237,7 @@ mod tests {
         let json = arrow_schema_to_avro_json(&schema).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         let fields = value["fields"].as_array().unwrap();
-        assert_eq!(fields.len(), 15);
+        assert_eq!(fields.len(), 18);
         let type_of = |name: &str| -> serde_json::Value {
             fields
                 .iter()
@@ -1226,6 +1250,11 @@ mod tests {
         // Nullable fields become ["null", T] unions.
         assert_eq!(type_of("i16")[0], serde_json::json!("null"));
         assert_eq!(type_of("i64"), serde_json::json!("long"));
+        assert_eq!(type_of("ls")["type"], "string");
+        assert_eq!(type_of("sv")["type"], "string");
+        assert_eq!(type_of("bin"), serde_json::json!("bytes"));
+        assert_eq!(type_of("lbin"), serde_json::json!("bytes"));
+        assert_eq!(type_of("bview"), serde_json::json!("bytes"));
         assert_eq!(type_of("d")["logicalType"], "date");
         // Timezone-less == Spark TimestampNTZType == Avro local-timestamp-*.
         assert_eq!(type_of("ts_ms")["logicalType"], "local-timestamp-millis");
@@ -1233,6 +1262,20 @@ mod tests {
         assert_eq!(type_of("dec")["logicalType"], "decimal");
         assert_eq!(type_of("dec")["precision"], 10);
         assert_eq!(type_of("list")["type"], "array");
+    }
+
+    #[test]
+    fn test_schema_match_accepts_equivalent_string_binary_types() {
+        let canonical = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("b", DataType::Binary, false),
+        ]);
+        let native = Schema::new(vec![
+            Field::new("s", DataType::Utf8View, false),
+            Field::new("b", DataType::LargeBinary, false),
+        ]);
+
+        assert!(schemas_equal_by_fields(&canonical, &native));
     }
 
     #[test]

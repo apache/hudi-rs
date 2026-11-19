@@ -230,6 +230,10 @@ mod tests {
             vec![Some("x".to_string()), None]
         );
         assert_eq!(
+            rendered(Arc::new(StringViewArray::from(vec!["view"]))),
+            some(&["view"])
+        );
+        assert_eq!(
             rendered(Arc::new(BooleanArray::from(vec![true, false]))),
             some(&["true", "false"])
         );

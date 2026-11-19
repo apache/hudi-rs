@@ -1183,10 +1183,9 @@ fn to_batches(data: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
         .collect()
 }
 
-/// Rewrite a batch into types the writer accepts: drop the columns pandas
-/// adds for an unnamed index, and cast view and large string, binary and
-/// list types (Polars exports `Utf8View`, pandas exports `LargeUtf8`) and
-/// dictionaries to their plain forms at any nesting depth.
+/// Rewrite a batch into forms the writer requires: drop pandas' unnamed index
+/// columns, and cast timestamp, list and dictionary types at any nesting depth.
+/// String/binary view and large-offset types are passed through for core to handle.
 ///
 /// Errors are plain strings so the function runs without an interpreter.
 fn normalize_batch(batch: RecordBatch) -> Result<RecordBatch, String> {
@@ -1292,8 +1291,6 @@ fn writable_field(field: &FieldRef) -> Option<FieldRef> {
 
 fn writable_type(dt: &DataType) -> Option<DataType> {
     match dt {
-        DataType::Utf8View | DataType::LargeUtf8 => Some(DataType::Utf8),
-        DataType::BinaryView | DataType::LargeBinary => Some(DataType::Binary),
         DataType::Timestamp(TimeUnit::Nanosecond, tz) => {
             Some(DataType::Timestamp(TimeUnit::Microsecond, tz.clone()))
         }
@@ -1796,8 +1793,9 @@ mod tests {
         normalize_batch, pascal_to_screaming_snake, writable_field, writable_type,
     };
     use arrow::array::{
-        Array, ArrayRef, DictionaryArray, Int8Array, Int64Array, LargeListArray, LargeStringArray,
-        ListArray, StringArray, StructArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+        Array, ArrayRef, BinaryArray, DictionaryArray, Int8Array, Int64Array, LargeBinaryArray,
+        LargeListArray, LargeStringArray, ListArray, StringArray, StructArray,
+        TimestampMicrosecondArray, TimestampNanosecondArray,
     };
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
@@ -1842,9 +1840,9 @@ mod tests {
             panic!("expected list, got {}", children[0].data_type());
         };
         assert_eq!(item.name(), "item");
-        assert_eq!(item.data_type(), &DataType::Utf8);
+        assert_eq!(item.data_type(), &DataType::Utf8View);
         assert_eq!(item.metadata(), &metadata);
-        assert_eq!(children[1].data_type(), &DataType::Utf8);
+        assert_eq!(children[1].data_type(), &DataType::LargeUtf8);
         assert_eq!(children[2].data_type(), &DataType::Int64);
 
         let plain = Arc::new(Field::new(
@@ -1868,8 +1866,10 @@ mod tests {
     fn writable_type_maps_leaf_types() {
         let utc: Option<Arc<str>> = Some("UTC".into());
         for (from, to) in [
-            (DataType::LargeBinary, Some(DataType::Binary)),
-            (DataType::BinaryView, Some(DataType::Binary)),
+            (DataType::LargeUtf8, None),
+            (DataType::Utf8View, None),
+            (DataType::LargeBinary, None),
+            (DataType::BinaryView, None),
             (
                 DataType::Timestamp(TimeUnit::Nanosecond, utc.clone()),
                 Some(DataType::Timestamp(TimeUnit::Microsecond, utc.clone())),
@@ -1980,6 +1980,23 @@ mod tests {
         let input = batch(
             vec![
                 ("id", Arc::new(StringArray::from(vec!["a"]))),
+                (
+                    "view_string",
+                    arrow::compute::cast(&StringArray::from(vec!["view"]), &DataType::Utf8View)
+                        .unwrap(),
+                ),
+                (
+                    "view_binary",
+                    arrow::compute::cast(
+                        &BinaryArray::from(vec![Some(&b"view"[..])]),
+                        &DataType::BinaryView,
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "large_binary",
+                    Arc::new(LargeBinaryArray::from(vec![Some(&b"large"[..])])),
+                ),
                 ("__index_level_0__", Arc::new(Int64Array::from(vec![0]))),
             ],
             false,
@@ -2007,7 +2024,7 @@ mod tests {
             .map(|f| f.name().clone())
             .collect();
         assert_eq!(names, ["id", "ts"]);
-        assert_eq!(output.column(0).data_type(), &DataType::Utf8);
+        assert_eq!(output.column(0).data_type(), &DataType::LargeUtf8);
         let DataType::List(item) = output.column(1).data_type() else {
             panic!("expected list, got {}", output.column(1).data_type());
         };

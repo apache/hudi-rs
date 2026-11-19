@@ -180,10 +180,27 @@ pub(crate) fn normalize_for_write(
     batches.iter().map(normalize_write_batch).collect()
 }
 
+/// Normalize append batches without casting string/binary view and large-offset columns.
+pub(crate) fn normalize_for_append(
+    batches: &[arrow_array::RecordBatch],
+) -> Result<Vec<arrow_array::RecordBatch>> {
+    batches
+        .iter()
+        .map(|batch| normalize_write_batch_with_native_types(batch, true))
+        .collect()
+}
+
 pub(crate) fn normalize_write_batch(
     batch: &arrow_array::RecordBatch,
 ) -> Result<arrow_array::RecordBatch> {
-    use arrow_schema::Field;
+    normalize_write_batch_with_native_types(batch, false)
+}
+
+fn normalize_write_batch_with_native_types(
+    batch: &arrow_array::RecordBatch,
+    preserve_string_binary: bool,
+) -> Result<arrow_array::RecordBatch> {
+    use arrow_schema::{DataType, Field};
     let batch = strip_meta_columns(batch)?;
     let source = batch.schema();
     let read_back = crate::schema::resolver::avro_json_to_arrow_schema(
@@ -199,7 +216,16 @@ pub(crate) fn normalize_write_batch(
         .zip(read_back.fields())
     {
         let target = read_back.data_type();
-        if target == field.data_type() {
+        let native_string_or_binary = preserve_string_binary
+            && matches!(
+                (field.data_type(), target),
+                (DataType::LargeUtf8 | DataType::Utf8View, DataType::Utf8)
+                    | (
+                        DataType::LargeBinary | DataType::BinaryView,
+                        DataType::Binary
+                    )
+            );
+        if target == field.data_type() || native_string_or_binary {
             fields.push(field.clone());
             columns.push(column.clone());
             continue;
@@ -979,6 +1005,88 @@ mod tests {
         assert_eq!(normalize_write_batch(&normalized).unwrap(), normalized);
         let ids = batch.project(&[0]).unwrap();
         assert_eq!(normalize_write_batch(&ids).unwrap(), ids);
+    }
+
+    #[test]
+    fn test_normalize_write_batch_accepts_view_and_large_string_binary_types() {
+        use arrow_array::{
+            Array, BinaryArray, BinaryViewArray, LargeBinaryArray, LargeStringArray, RecordBatch,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8View, false),
+            Field::new("large_string", DataType::LargeUtf8, false),
+            Field::new("binary_view", DataType::BinaryView, false),
+            Field::new("large_binary", DataType::LargeBinary, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringViewArray::from(vec!["key"])),
+                Arc::new(LargeStringArray::from(vec!["text"])),
+                Arc::new(BinaryViewArray::from(vec![b"view".as_slice()])),
+                Arc::new(LargeBinaryArray::from(vec![b"large".as_slice()])),
+            ],
+        )
+        .unwrap();
+
+        let normalized = normalize_write_batch(&batch).unwrap();
+        assert_eq!(normalized.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(normalized.schema().field(1).data_type(), &DataType::Utf8);
+        assert_eq!(normalized.schema().field(2).data_type(), &DataType::Binary);
+        assert_eq!(normalized.schema().field(3).data_type(), &DataType::Binary);
+        assert_eq!(
+            normalized
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .unwrap()
+                .value(0),
+            "key"
+        );
+        assert_eq!(
+            normalized
+                .column(2)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            b"view"
+        );
+    }
+
+    #[test]
+    fn test_normalize_for_append_preserves_native_string_and_binary_arrays() {
+        use arrow_array::{
+            BinaryViewArray, LargeBinaryArray, LargeStringArray, RecordBatch, StringViewArray,
+        };
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("view_string", DataType::Utf8View, false),
+                Field::new("large_string", DataType::LargeUtf8, false),
+                Field::new("view_binary", DataType::BinaryView, false),
+                Field::new("large_binary", DataType::LargeBinary, false),
+            ])),
+            vec![
+                Arc::new(StringViewArray::from(vec!["view"])),
+                Arc::new(LargeStringArray::from(vec!["large"])),
+                Arc::new(BinaryViewArray::from(vec![b"view".as_slice()])),
+                Arc::new(LargeBinaryArray::from(vec![b"large".as_slice()])),
+            ],
+        )
+        .unwrap();
+
+        let normalized = normalize_for_append(&[batch.clone()]).unwrap();
+        let normalized = &normalized[0];
+        assert_eq!(normalized.schema(), batch.schema());
+        for column in 0..batch.num_columns() {
+            assert!(Arc::ptr_eq(batch.column(column), normalized.column(column)));
+        }
     }
 
     /// CPU-bound tasks run on the runtime's workers, not the awaiting thread,
