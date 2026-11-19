@@ -40,6 +40,9 @@ pub trait BufferedRecordConverter: Send + Sync + std::fmt::Debug {
     /// Mirrors Java's `BufferedRecord<T> convert(T record)`.
     /// The engine holds this as an `Option` and never sets it: the conversion it
     /// would do is done by the output converter instead.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `BufferedRecordConverter.convert`; the engine installs no converter yet, and the output converter does this conversion"
+    )]
     fn convert(&self, record: RecordBatch) -> Result<BufferedRecord>;
 }

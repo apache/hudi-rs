@@ -468,6 +468,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     /// record key (mirrors Java's overridden `containsLogRecord`). Only the
     /// in-memory tier is scanned; a spilled position entry is not visible here
     /// (a limitation shared with the key-based `get_log_records`).
+    #[cfg(test)]
     fn contains_log_record(&self, record_key: &str) -> bool {
         if !self.should_use_position {
             return self.inner.contains_log_record(record_key);
@@ -500,6 +501,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         self.inner.merge_map_peak_in_memory_bytes()
     }
 
+    #[cfg(test)]
     fn current_in_memory_bytes(&self) -> u64 {
         self.inner.current_in_memory_bytes()
     }
@@ -512,6 +514,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         self.inner.get_log_records()
     }
 
+    #[cfg(test)]
     fn set_reader_schema(&mut self, schema: SchemaRef) {
         self.inner.set_reader_schema(schema)
     }

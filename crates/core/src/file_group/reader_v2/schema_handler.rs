@@ -123,14 +123,14 @@ impl FileGroupReaderSchemaHandler {
 
     /// Builder parity for the FFI path, which supplies Avro JSON; this crate's
     /// callers supply Arrow schemas.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_data_schema_json(mut self, json: String) -> Self {
         self.data_schema_json = Some(json);
         self
     }
 
     /// Builder parity for the FFI path — see `with_data_schema_json`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_requested_schema_json(mut self, json: String) -> Self {
         self.requested_schema_json = Some(json);
         self
@@ -149,7 +149,7 @@ impl FileGroupReaderSchemaHandler {
     /// Mirrors Java's `FileGroupReaderSchemaHandler.getSchemaForUpdates()`.
     /// Partial-update surface for the FFI path; the merge resolves the update schema
     /// per block instead.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn schema_for_updates(&self) -> Option<&SchemaRef> {
         self.schema_for_updates.as_ref()
     }
@@ -159,7 +159,10 @@ impl FileGroupReaderSchemaHandler {
     /// Mirrors Java's `FileGroupReaderSchemaHandler.setSchemaForUpdates(Schema)`.
     /// Used by streaming buffer loaders for incoming records without metadata.
     /// See `schema_for_updates`.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `setSchemaForUpdates`; the merge resolves the update schema per log block, so nothing sets it"
+    )]
     pub fn set_schema_for_updates(&mut self, schema: SchemaRef) {
         self.schema_for_updates = Some(schema);
     }

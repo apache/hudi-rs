@@ -17,8 +17,6 @@
  * under the License.
  */
 
-#![allow(dead_code)]
-
 //! Port of Java's `HoodieAvroUtils.recordNeedsRewriteForExtendedAvroTypePromotion`
 //! and `needsRewriteToString` (`HoodieAvroUtils.java:1451-1509`),
 //! operating on `apache_avro::Schema`.

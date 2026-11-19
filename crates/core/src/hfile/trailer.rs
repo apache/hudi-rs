@@ -29,19 +29,38 @@ pub const TRAILER_SIZE: usize = 4096;
 
 /// HFile trailer containing file metadata.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct HFileTrailer {
     /// Major version (should be 3 for HFile v3)
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub major_version: u32,
     /// Minor version
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub minor_version: u32,
     /// Offset to file info block
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub file_info_offset: u64,
     /// Offset to load-on-open section
     pub load_on_open_data_offset: u64,
     /// Total uncompressed size of data block index
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub uncompressed_data_index_size: u64,
     /// Total uncompressed bytes in file
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub total_uncompressed_bytes: u64,
     /// Number of entries in data block index
     pub data_index_count: u32,
@@ -52,10 +71,25 @@ pub struct HFileTrailer {
     /// Number of levels in data block index
     pub num_data_index_levels: u32,
     /// Offset to first data block
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub first_data_block_offset: u64,
     /// Offset past the last data block
+    #[expect(
+        dead_code,
+        reason = "decoded with the rest of the HFile v3 trailer; the reader seeks by the index offsets and entry counts only"
+    )]
     pub last_data_block_offset: u64,
     /// Comparator class name (not used by Hudi)
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "decoded with the rest of the HFile v3 trailer; only the tests read it"
+        )
+    )]
     pub comparator_class_name: String,
     /// Compression codec used for blocks
     pub compression_codec: CompressionCodec,

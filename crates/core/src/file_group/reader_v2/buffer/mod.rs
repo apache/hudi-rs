@@ -17,9 +17,7 @@
  * under the License.
  */
 
-// Some items exist only for Java parity or for buffer variants that are not
-// implemented yet, and have no caller.
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
 //! Record buffer hierarchy for the merge-on-read file group reader.
 //!
@@ -68,6 +66,10 @@ pub enum BufferType {
     /// Position-based merge: matches base rows to log records by base-file row position.
     PositionBasedMerge,
     /// Unmerged: skips merge (not yet implemented).
+    #[expect(
+        dead_code,
+        reason = "Java's `BufferType.UNMERGED`; the unmerged buffer is not yet implemented, so nothing constructs it"
+    )]
     Unmerged,
 }
 
@@ -124,6 +126,7 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Check if a record exists in the buffered records.
     ///
     /// Mirrors Java's `containsLogRecord(String)`.
+    #[cfg(test)]
     fn contains_log_record(&self, record_key: &str) -> bool;
 
     /// Returns the number of records in the buffer.
@@ -153,11 +156,11 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
 
     /// The merge map's CURRENT tracked in-memory footprint (bytes) — the live
     /// resident heap right now, not the peak. This is the value a host memory
-    /// manager (e.g. velox's `MemoryPool`) reserves against the hudi-rs reader;
-    /// the FFI reader-memory accessor forwards it. Default 0 for
-    /// buffers without a spillable map. See
+    /// manager (e.g. velox's `MemoryPool`) reserves against the hudi-rs reader.
+    /// Default 0 for buffers without a spillable map. See
     /// [`SpillableRecordMap::current_in_memory_bytes`](super::spillable_map::SpillableRecordMap::current_in_memory_bytes)
     /// for exactly what is and isn't included.
+    #[cfg(test)]
     fn current_in_memory_bytes(&self) -> u64 {
         0
     }
@@ -185,6 +188,7 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// This schema is used as a fallback when no base file is present
     /// and the first record in the buffer is a delete (which has no schema).
     /// Mirrors Java's readerSchema from FileGroupReaderSchemaHandler.
+    #[cfg(test)]
     fn set_reader_schema(&mut self, schema: SchemaRef);
 
     /// Set the lazy base file source for merge iteration.
@@ -201,6 +205,13 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Mirrors Java's `setBaseFileIterator(ClosableIterator<T>)`. Kept as
     /// a default-impl so the 14 existing test sites continue to compile
     /// unchanged.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Java's pull-style merge, where the buffer owns the base file iterator, which only the buffer tests use"
+        )
+    )]
     fn set_base_file_iterator(&mut self, batches: Vec<RecordBatch>) {
         let schema = batches
             .first()
@@ -250,6 +261,13 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Consume the buffer and produce just the merged output `RecordBatch`,
     /// discarding the merge stats. Convenience wrapper that discards stats; not
     /// called by the production read path (which uses merge_and_collect_with_stats).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "convenience over `merge_and_collect_with_stats` for the pull-style merge; only the buffer tests call it"
+        )
+    )]
     fn merge_and_collect(self: Box<Self>) -> Result<RecordBatch> {
         self.merge_and_collect_with_stats().map(|(batch, _)| batch)
     }
@@ -275,6 +293,13 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     ///
     /// Empty input batches are skipped internally (loop pulls next non-empty
     /// batch from the source).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "pulls from the base source set by `set_base_file_iterator`; only the buffer tests call it"
+        )
+    )]
     fn next_merged_base_batch(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>>;
 
     /// Merge one base-file batch against the in-buffer log map.

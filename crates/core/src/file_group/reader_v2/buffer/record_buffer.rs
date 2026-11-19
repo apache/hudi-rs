@@ -172,6 +172,10 @@ impl FileGroupRecordBuffer {
     /// Mirrors Java's `next()`: take and return nextRecord. Named `take_next`
     /// (not `next`) to avoid colliding with the `Iterator::next` contract, since
     /// this type is not an iterator (it pairs with `has_next`).
+    #[expect(
+        dead_code,
+        reason = "Java's `FileGroupRecordBuffer.next`; the key-based and position-based buffers both take `next_record` off the field directly"
+    )]
     pub fn take_next(&mut self) -> Option<BufferedRecord> {
         self.next_record.take()
     }

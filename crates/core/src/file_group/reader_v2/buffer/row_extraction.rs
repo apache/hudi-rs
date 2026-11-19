@@ -23,7 +23,6 @@
 //! conversion) live in [`RecordContext`](crate::file_group::reader_v2::record_context::RecordContext).
 //!
 //! This module holds Arrow batch-level utilities that don't need RecordContext:
-//! - `slice_row` — zero-copy single-row extraction
 //! - `records_to_batch` — reassemble BufferedRecords into a RecordBatch
 //! - `reconcile_batch_to_schema` — handle Avro/Parquet schema differences
 
@@ -34,13 +33,6 @@ use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, SchemaRef};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-/// Slice a single row from a RecordBatch as a new single-row RecordBatch.
-///
-/// This is zero-copy (just adjusts array offsets in Arrow).
-pub fn slice_row(batch: &RecordBatch, row_index: usize) -> RecordBatch {
-    batch.slice(row_index, 1)
-}
 
 /// Reassemble a collection of BufferedRecords back into a single RecordBatch
 /// via the Arrow `interleave` kernel (the drain path).
@@ -556,16 +548,6 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn test_slice_row() {
-        let batch = make_test_batch(3);
-        let row = slice_row(&batch, 1);
-        assert_eq!(row.num_rows(), 1);
-        let ctx = RecordContext::default();
-        let keys = ctx.get_record_keys(&row).unwrap();
-        assert_eq!(keys, vec!["key_1"]);
-    }
-
     /// Extract `(key, value)` tuples from a make_test_batch-shaped batch, in row
     /// order, for full-data assertions.
     fn extract_kv(batch: &RecordBatch) -> Vec<(String, i64)> {
@@ -643,7 +625,7 @@ mod tests {
     fn test_records_to_batch_mixed_payloads_and_deletes() {
         let src_a = Arc::new(make_test_batch(3)); // key_0,key_1,key_2
         let schema = src_a.schema();
-        let owned = slice_row(&make_test_batch(10), 7); // key_7 / value 7
+        let owned = make_test_batch(10).slice(7, 1); // key_7 / value 7
         let records = vec![
             BufferedRecord::new_batch_ref("key_2".into(), src_a.clone(), 2, None),
             BufferedRecord::new_delete("gone".into(), None),

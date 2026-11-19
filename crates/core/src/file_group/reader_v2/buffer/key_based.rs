@@ -1673,6 +1673,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         Ok(())
     }
 
+    #[cfg(test)]
     fn contains_log_record(&self, record_key: &str) -> bool {
         // A spill-backend (RocksDB) error is treated as "not present" for this
         // boolean predicate; the authoritative get/remove on the merge path
@@ -1700,6 +1701,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         self.base.records.peak_in_memory_size()
     }
 
+    #[cfg(test)]
     fn current_in_memory_bytes(&self) -> u64 {
         self.base.records.current_in_memory_bytes()
     }
@@ -1720,6 +1722,7 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
         self.base.records.in_memory()
     }
 
+    #[cfg(test)]
     fn set_reader_schema(&mut self, schema: SchemaRef) {
         self.base.reader_schema = Some(schema.clone());
         // Phase 2: Enrich DeleteContext with the reader schema.
@@ -4072,6 +4075,7 @@ mod tests {
     /// blocks, then a base file) through the buffer and return the sorted merged
     /// output. `reader_config` lets the caller set `hoodie.memory.merge.max.size`
     /// to force spilling. Also returns whether the merge map spilled.
+    #[cfg(feature = "spill-rocksdb")]
     fn run_churn_merge(reader_config: &[(&str, &str)]) -> (Vec<(String, i32, i64)>, bool) {
         let mut buffer =
             build_key_based_buffer_with_reader_config("COMMIT_TIME_ORDERING", reader_config);

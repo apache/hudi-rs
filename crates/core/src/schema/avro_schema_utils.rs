@@ -17,8 +17,6 @@
  * under the License.
  */
 
-#![allow(dead_code)]
-
 //! Mirrors Java's `org.apache.hudi.avro.AvroSchemaUtils`.
 //!
 //! Provides schema comparison utilities for checking projection equivalence

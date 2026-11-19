@@ -62,5 +62,12 @@ Naming: `test_<function>_<scenario>_<expected>`. Shared fixtures in `crates/test
 
 Run `make format-rust check-rust` before submitting to match CI.
 
+- **Dead code**: no `#[allow(dead_code)]`, and never module-wide. An item kept without a production
+  caller carries `#[expect(dead_code, reason = "...")]` saying why it stays (its Java counterpart,
+  or what will call it). A test-only item is `#[cfg(test)]`, or carries
+  `#[cfg_attr(not(test), expect(...))]` where `#[cfg(test)]` does not fit, such as a struct field.
+  CI checks the lib with and without default features, and the lib test build with all features
+  only, so an item used only with `spill-rocksdb` is caught by
+  `cargo clippy -p hudi-core --lib --no-default-features -- -D warnings`.
 - **Inline format args** (Rust 1.94.1+): `format!("{x}")`, not `format!("{}", x)` — expressions
   like `path.display()` still require positional args.

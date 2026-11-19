@@ -36,13 +36,20 @@ use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 /// All three are named even while only one is in use, so that an entry added
 /// later picks its comparison target rather than inventing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ComparedWith {
     /// Hudi's own reader.
     Jvm,
     /// File group reader version 1, the reader this one is replacing.
+    #[expect(
+        dead_code,
+        reason = "named so a gap entry added later picks its comparison target; only `Jvm` is in use"
+    )]
     VersionOne,
     /// Both.
+    #[expect(
+        dead_code,
+        reason = "named so a gap entry added later picks its comparison target; only `Jvm` is in use"
+    )]
     Both,
 }
 

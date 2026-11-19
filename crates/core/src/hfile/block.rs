@@ -44,13 +44,24 @@ pub const BLOCK_HEADER_SIZE: usize = HEADER_SIZE_NO_CHECKSUM + SIZEOF_BYTE + 2 *
 
 /// Parsed block header information.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct BlockHeader {
     pub block_type: HFileBlockType,
     pub on_disk_size_without_header: usize,
     pub uncompressed_size_without_header: usize,
+    #[expect(
+        dead_code,
+        reason = "part of the HFile v3 block header; the reader walks blocks by offset from the block index"
+    )]
     pub prev_block_offset: i64,
+    #[expect(
+        dead_code,
+        reason = "part of the HFile v3 block header; block checksums are not verified yet"
+    )]
     pub checksum_type: u8,
+    #[expect(
+        dead_code,
+        reason = "part of the HFile v3 block header; block checksums are not verified yet"
+    )]
     pub bytes_per_checksum: usize,
     pub on_disk_data_size_with_header: usize,
 }
@@ -225,7 +236,6 @@ impl DataBlock {
     }
 
     /// Iterate over all key-value pairs in the block.
-    #[allow(dead_code)]
     pub fn iter(&self) -> DataBlockIterator<'_> {
         DataBlockIterator {
             block: self,
@@ -234,7 +244,10 @@ impl DataBlock {
     }
 
     /// Returns the raw data.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `HFileBlock.getByteBuff` (Lombok `@Getter` on `byteBuff`); the reader walks entries through `iter` instead"
+    )]
     pub fn data(&self) -> &[u8] {
         &self.data
     }

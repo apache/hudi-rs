@@ -86,7 +86,10 @@ pub struct HoodieFileGroupReader {
     reader_parameters: ReaderParameters,
 
     /// The current iterator mode.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's iterator mode picks the record converter; this engine emits engine records only, so nothing branches on it yet"
+    )]
     iterator_mode: IteratorMode,
 
     // ── Schema (mirrors Java's readerContext.getSchemaHandler()) ───────
@@ -397,8 +400,8 @@ impl HoodieFileGroupReader {
 
     /// Java-parity surface reached only by the test harness, which drives the engine
     /// the way an FFI caller would; `FileGroupReader` goes through `adapter`.
-    #[allow(dead_code)]
     /// Create a builder for configuring the reader.
+    #[cfg(test)]
     pub fn builder() -> HoodieFileGroupReaderBuilder {
         HoodieFileGroupReaderBuilder::default()
     }
@@ -1163,16 +1166,20 @@ impl HoodieFileGroupReader {
 
     /// Set the output converter.
     /// Mirrors Java: `this.outputConverter = readerContext.getSchemaHandler().getOutputConverter()`.
-    /// Set by the FFI/harness path before `open`; the adapter path installs neither.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java assigns `outputConverter` once in the `HoodieFileGroupReader` constructor, as `new` does here; nothing overrides it afterwards"
+    )]
     pub fn set_output_converter(&mut self, converter: Box<dyn OutputConverter>) {
         self.output_converter = Some(converter);
     }
 
     /// Set the buffered record converter.
     /// Mirrors Java: `this.bufferedRecordConverter = BufferedRecordConverter.createConverter(...)`.
-    /// Set by the FFI/harness path — see `set_output_converter`.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "Java's `HoodieFileGroupReader` constructor sets `bufferedRecordConverter` through `BufferedRecordConverter.createConverter`; no caller installs one here yet"
+    )]
     pub fn set_buffered_record_converter(&mut self, converter: Box<dyn BufferedRecordConverter>) {
         self.buffered_record_converter = Some(converter);
     }
@@ -1184,7 +1191,6 @@ impl HoodieFileGroupReader {
     /// Returns the read statistics collected during the read.
     /// Java-parity accessors; the adapter reads the stats it needs off the returned
     /// value.
-    #[allow(dead_code)]
     /// The stats this read accumulated.
     ///
     /// Complete after [`Self::read`], which folds the merge-phase counters back
@@ -1207,8 +1213,11 @@ impl HoodieFileGroupReader {
     }
 
     /// Returns the valid block instants from log scanning.
-    /// See `read_stats`.
-    #[allow(dead_code)]
+    /// Mirrors Java's `getValidBlockInstants()`.
+    #[expect(
+        dead_code,
+        reason = "Java's `HoodieFileGroupReader.getValidBlockInstants` (Lombok `@Getter`), which log compaction reads; this crate has no log compaction yet"
+    )]
     pub fn valid_block_instants(&self) -> &[String] {
         &self.valid_block_instants
     }
@@ -1224,7 +1233,6 @@ impl HoodieFileGroupReader {
 /// engine directly through [`adapter`](super::adapter). Kept because the
 /// harness is what drives the engine the way an FFI caller would, so it is the
 /// only exercise of this construction path.
-#[allow(dead_code)]
 ///
 /// Mirrors Java's `HoodieFileGroupReader.Builder<T>`.
 #[derive(Default)]
@@ -1250,7 +1258,13 @@ pub struct HoodieFileGroupReaderBuilder {
 }
 
 /// Reached only from the test harness — see the builder's own note.
-#[allow(dead_code)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "only the `harness` test module builds the engine this way; `FileGroupReader` goes through `adapter`"
+    )
+)]
 impl HoodieFileGroupReaderBuilder {
     pub fn with_reader_context(mut self, ctx: Arc<ReaderContext>) -> Self {
         self.reader_context = Some(ctx);
@@ -1274,6 +1288,10 @@ impl HoodieFileGroupReaderBuilder {
 
     /// Set the data schema (full table schema).
     /// Mirrors Java's `Builder.withDataSchema(Schema dataSchema)`.
+    #[expect(
+        dead_code,
+        reason = "Java's `HoodieFileGroupReader.Builder.withDataSchema`; `harness` passes schemas on the reader context's schema handler instead"
+    )]
     pub fn with_data_schema(mut self, schema: SchemaRef) -> Self {
         self.data_schema = Some(schema);
         self
@@ -1281,6 +1299,10 @@ impl HoodieFileGroupReaderBuilder {
 
     /// Set the requested schema (column projection).
     /// Mirrors Java's `Builder.withRequestedSchema(Schema requestedSchema)`.
+    #[expect(
+        dead_code,
+        reason = "Java's `HoodieFileGroupReader.Builder.withRequestedSchema`; `harness` passes schemas on the reader context's schema handler instead"
+    )]
     pub fn with_requested_schema(mut self, schema: SchemaRef) -> Self {
         self.requested_schema = Some(schema);
         self

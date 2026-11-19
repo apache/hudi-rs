@@ -55,7 +55,6 @@ use std::sync::Arc;
 
 /// A [Timeline] contains transaction logs of all actions performed on the table at different [Instant]s of time.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct Timeline {
     hudi_configs: Arc<HudiConfigs>,
     pub(crate) storage: Arc<Storage>,
