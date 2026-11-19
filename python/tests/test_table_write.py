@@ -81,6 +81,36 @@ class StreamOnly:
         return self._table.__arrow_c_stream__(requested_schema)
 
 
+def test_append_accepts_large_string_and_binary_columns(tmp_path):
+    data = pa.table(
+        {
+            "id": pa.array(["k1", "k2"], type=pa.large_string()),
+            "label": pa.array(["one", "two"], type=pa.large_string()),
+            "payload": pa.array([b"one", b"two"], type=pa.large_binary()),
+        }
+    )
+    table = HudiTable.create(str(tmp_path / "large-types"), record_key="id")
+
+    table.append(data)
+    table.append(
+        pa.table(
+            {
+                "id": pa.array(["k3", "k4"], type=pa.large_string()),
+                "label": pa.array(["three", "four"], type=pa.large_string()),
+                "payload": pa.array([b"three", b"four"], type=pa.large_binary()),
+            }
+        )
+    )
+
+    written = pa.Table.from_batches(table.read()).select(["id", "label", "payload"])
+    assert sorted(written.to_pylist(), key=lambda row: row["id"]) == [
+        {"id": "k1", "label": "one", "payload": b"one"},
+        {"id": "k2", "label": "two", "payload": b"two"},
+        {"id": "k3", "label": "three", "payload": b"three"},
+        {"id": "k4", "label": "four", "payload": b"four"},
+    ]
+
+
 class ArrayOnly:
     """Exposes only the Arrow PyCapsule array interface for one record batch."""
 

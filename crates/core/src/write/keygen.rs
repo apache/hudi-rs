@@ -18,7 +18,7 @@
  */
 //! Derive Hoodie record keys and hive-style partition paths from write batches.
 
-use arrow::array::{Array, StringArray};
+use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
 use arrow::record_batch::RecordBatch;
 
 use crate::Result;
@@ -233,6 +233,12 @@ fn array_value_as_string(array: &dyn Array, row: usize) -> Result<String> {
     if let Some(strings) = array.as_any().downcast_ref::<StringArray>() {
         return Ok(strings.value(row).to_string());
     }
+    if let Some(strings) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return Ok(strings.value(row).to_string());
+    }
+    if let Some(strings) = array.as_any().downcast_ref::<StringViewArray>() {
+        return Ok(strings.value(row).to_string());
+    }
     use arrow::array::{Int32Array, Int64Array};
     if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
         return Ok(values.value(row).to_string());
@@ -241,7 +247,7 @@ fn array_value_as_string(array: &dyn Array, row: usize) -> Result<String> {
         return Ok(values.value(row).to_string());
     }
     Err(CoreError::Unsupported(
-        "partition field types currently support Utf8, Int32, and Int64".to_string(),
+        "partition field types currently support Arrow strings, Int32, and Int64".to_string(),
     ))
 }
 
@@ -257,7 +263,7 @@ pub fn relative_data_path(partition_path: &str, file_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, Int64Array, StringArray};
+    use arrow::array::{Int32Array, Int64Array, LargeStringArray, StringArray, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
@@ -289,6 +295,37 @@ mod tests {
         );
         let err = hoodie_keys_for_batch(&cfg, &b, None).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("null"), "{err}");
+    }
+
+    #[test]
+    fn test_partition_path_accepts_large_and_view_strings() {
+        let cases = [
+            (
+                DataType::LargeUtf8,
+                Arc::new(LargeStringArray::from(vec!["large"])) as arrow::array::ArrayRef,
+                "large",
+            ),
+            (
+                DataType::Utf8View,
+                Arc::new(StringViewArray::from(vec!["view"])) as arrow::array::ArrayRef,
+                "view",
+            ),
+        ];
+        for (data_type, column, expected) in cases {
+            let cfg = configs(&[
+                ("hoodie.table.recordkey.fields", "id"),
+                ("hoodie.table.partition.fields", "p"),
+            ]);
+            let b = batch(
+                vec![
+                    Field::new("id", DataType::Utf8, false),
+                    Field::new("p", data_type, false),
+                ],
+                vec![Arc::new(StringArray::from(vec!["k"])), column],
+            );
+            let keys = hoodie_keys_for_batch(&cfg, &b, None).unwrap();
+            assert_eq!(keys[0].partition_path, expected);
+        }
     }
 
     #[test]
