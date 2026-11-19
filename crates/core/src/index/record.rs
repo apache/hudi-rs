@@ -30,7 +30,9 @@ use crate::file_group::base_file::reader::{KeyMatcher, KeyPredicate};
 use crate::file_group::log_file::scanner::{HFileRecordGroup, LogFileScanner};
 use crate::hfile::{HFileReader, HFileRecord};
 use crate::index::{HoodieIndex, HoodieKey, RecordLocation};
-use crate::metadata::table::encode::decode_record_index_entry;
+use crate::metadata::table::encode::{
+    decode_record_index_entry_with_layout, metadata_schema, record_index_writer_layout_matches,
+};
 use crate::metadata::table::records::MetadataPartitionType;
 use crate::storage::Storage;
 use crate::storage::reader::{HFILE_WHOLE_READ_WITH_KEYS_MAX_SIZE, hfile_whole_read_max_size};
@@ -271,6 +273,14 @@ fn apply_hfile_records(
     schema: Option<&AvroSchema>,
     matcher: &KeyMatcher<'_>,
 ) -> Result<()> {
+    let vendored;
+    let (schema, layout_matches) = match schema {
+        Some(s) => (s, record_index_writer_layout_matches(s)),
+        None => {
+            vendored = metadata_schema()?;
+            (vendored, true)
+        }
+    };
     for record in records {
         let key = record
             .key_as_str()
@@ -278,7 +288,7 @@ fn apply_hfile_records(
         if !matcher.admits(key) {
             continue;
         }
-        match decode_record_index_entry(key, record.value(), schema)? {
+        match decode_record_index_entry_with_layout(key, record.value(), schema, layout_matches)? {
             Some(entry) => {
                 merged.insert(
                     key.to_string(),
@@ -341,7 +351,10 @@ pub(crate) async fn record_index_has_file_groups(table: &Table) -> bool {
 mod tests {
     use super::*;
     use crate::hfile::HFileReader;
-    use crate::metadata::table::encode::decode_record_index_entry;
+    use crate::metadata::table::encode::{
+        decode_record_index_entry, decode_record_index_entry_with_layout,
+        record_index_writer_layout_matches,
+    };
 
     /// A missing shard also shrinks the modulus, so the keys it misroutes are
     /// mostly ones that live in intact shards, not ones in the missing shard.
@@ -500,5 +513,82 @@ mod tests {
             .await
             .unwrap();
         assert!(n.is_empty());
+    }
+
+    /// Expected locations come from generic decode against the same schema.
+    #[test]
+    fn test_apply_hfile_records_matches_generic_when_layout_differs() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(
+            "../test/data/metadata_multi_block_hfile/record-index-0009-0_10-71-248_20260830075534042.hfile",
+        );
+        let mut reader = HFileReader::new(std::fs::read(&path).unwrap()).unwrap();
+        let schema = reader.get_avro_schema().unwrap().unwrap().clone();
+        let records = reader.collect_records().unwrap();
+        let swapped = swap_rli_high_low(&schema);
+        assert!(record_index_writer_layout_matches(&schema));
+        assert!(!record_index_writer_layout_matches(&swapped));
+
+        let admit_all = [String::new()];
+        let matcher = KeyMatcher::Prefixes(&admit_all);
+        for writer in [&schema, &swapped] {
+            let mut merged = HashMap::new();
+            apply_hfile_records(&mut merged, &records, Some(writer), &matcher).unwrap();
+            let mut n = 0usize;
+            for record in &records {
+                let key = record.key_as_str().unwrap();
+                let expected =
+                    decode_record_index_entry_with_layout(key, record.value(), writer, false)
+                        .unwrap();
+                match (merged.get(key), expected) {
+                    (Some(got), Some(e)) => {
+                        n += 1;
+                        assert_eq!(
+                            (&got.file_id, &got.partition_path, got.instant_time_millis),
+                            (&e.file_id, &e.partition_path, e.instant_time_millis),
+                            "{key}"
+                        );
+                    }
+                    (None, None) => {}
+                    (None, Some(_)) => panic!("{key}: apply missed a record"),
+                    (Some(_), None) => panic!("{key}: apply kept a delete"),
+                }
+            }
+            assert_eq!(merged.len(), n);
+        }
+        assert!(records.iter().any(|r| {
+            let k = r.key_as_str().unwrap();
+            decode_record_index_entry_with_layout(k, r.value(), &swapped, false).unwrap()
+                != decode_record_index_entry(k, r.value(), Some(&schema)).unwrap()
+        }));
+    }
+
+    fn swap_rli_high_low(schema: &AvroSchema) -> AvroSchema {
+        let mut json = serde_json::to_value(schema).unwrap();
+        let fields = json
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|f| f["name"] == "recordIndexMetadata")
+            .unwrap()
+            .get_mut("type")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|t| t["name"] == "HoodieRecordIndexInfo")
+            .unwrap()
+            .get_mut("fields")
+            .and_then(serde_json::Value::as_array_mut)
+            .unwrap();
+        let i = fields
+            .iter()
+            .position(|f| f["name"] == "fileIdHighBits")
+            .unwrap();
+        let j = fields
+            .iter()
+            .position(|f| f["name"] == "fileIdLowBits")
+            .unwrap();
+        fields.swap(i, j);
+        AvroSchema::parse_str(&json.to_string()).unwrap()
     }
 }
