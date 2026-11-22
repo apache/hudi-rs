@@ -355,6 +355,7 @@ pub(super) enum GroupOp {
         incoming: RecordBatch,
         partial_columns: Option<Vec<String>>,
         evict_keys: std::sync::Arc<HashSet<String>>,
+        evict_marker_keys: std::sync::Arc<HashSet<String>>,
         /// Whether incoming rows merge with stored ones by ordering value
         /// rather than by commit time.
         by_event_time: bool,
@@ -363,6 +364,7 @@ pub(super) enum GroupOp {
     DeleteKeys {
         exact: std::sync::Arc<HashSet<(String, String)>>,
         keys_only: std::sync::Arc<HashSet<String>>,
+        marker_keys: std::sync::Arc<HashSet<String>>,
     },
     /// Remove rows matching the filter.
     DeleteWhere { filter: Filter },
@@ -498,6 +500,7 @@ impl MergePlan {
                 incoming,
                 partial_columns,
                 evict_keys,
+                evict_marker_keys,
                 by_event_time,
             } => {
                 let incoming = if old.num_rows() > 0 {
@@ -517,6 +520,10 @@ impl MergePlan {
                     old
                 } else {
                     let old_keys = keys(&old, key_field)?;
+                    marker_deletes = old_keys
+                        .iter()
+                        .filter(|key| evict_marker_keys.contains(*key))
+                        .count();
                     let survivors: Vec<u32> = old_keys
                         .iter()
                         .enumerate()
@@ -615,7 +622,11 @@ impl MergePlan {
                 inserted = incoming.num_rows() - matched;
                 (merged, matched)
             }
-            GroupOp::DeleteKeys { exact, keys_only } => {
+            GroupOp::DeleteKeys {
+                exact,
+                keys_only,
+                marker_keys,
+            } => {
                 let old_keys = keys(&old, key_field)?;
                 let old_partitions = string_values(&old, MetaField::PartitionPath.as_ref())?;
                 let mut selected = Vec::with_capacity(old.num_rows());
@@ -625,6 +636,9 @@ impl MergePlan {
                     let doomed = keys_only.contains(key)
                         || exact.contains(&(key.clone(), partition.clone()));
                     if doomed {
+                        if marker_keys.contains(key) {
+                            marker_deletes += 1;
+                        }
                         if ctx.collect_rli_deletes {
                             rli_deletes.push((key.clone(), partition.clone()));
                         }

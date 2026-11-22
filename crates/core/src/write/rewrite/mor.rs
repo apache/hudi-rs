@@ -124,6 +124,7 @@ pub(super) async fn mor_upsert_batches(
     let mut insert_indices_by_partition: HashMap<String, Vec<u32>> = HashMap::new();
     let mut updates = 0;
     let mut inserts = 0;
+    let mut moved_delete_counts: HashMap<(String, String), usize> = HashMap::new();
     // Update-partition-path (global index): a key whose incoming partition
     // differs from its located one moves — tombstoned in the old group via a
     // delete log block, inserted into its new partition.
@@ -195,6 +196,9 @@ pub(super) async fn mor_upsert_batches(
                 };
                 if delete_markers[index] {
                     index_deletes.push(doomed.clone());
+                    *moved_delete_counts
+                        .entry((location.partition_path.clone(), location.file_id.clone()))
+                        .or_default() += 1;
                 } else {
                     insert_indices_by_partition
                         .entry(incoming_partition)
@@ -227,12 +231,14 @@ pub(super) async fn mor_upsert_batches(
         &ordering_fields,
     )
     .await?;
+    let mut winning_in_place_delete_keys = HashSet::new();
     for (key, location) in in_place_deletes
         .into_values()
         .flatten()
         .filter(|key| !stale_deletes.contains(key))
         .filter_map(|key| locations.get(&key).map(|location| (key, location)))
     {
+        winning_in_place_delete_keys.insert(key.clone());
         index_deletes.push(HoodieKey {
             record_key: key,
             partition_path: location.partition_path.clone(),
@@ -321,6 +327,7 @@ pub(super) async fn mor_upsert_batches(
     let mut stats = Vec::new();
     let mut written_paths = Vec::<String>::new();
     let mut files_mdt = Vec::new();
+    let delete_count = index_deletes.len();
     let mut rli_entries: Vec<RecordIndexEntry> = index_deletes
         .into_iter()
         .map(|key| RecordIndexEntry {
@@ -357,7 +364,12 @@ pub(super) async fn mor_upsert_batches(
             base_file: Some(String::new()),
             log_files: Some(vec![log_name]),
             num_writes: Some(moved.len() as i64),
-            num_deletes: Some(moved.len() as i64),
+            num_deletes: Some(
+                moved_delete_counts
+                    .get(&(partition_path.clone(), file_id.clone()))
+                    .copied()
+                    .unwrap_or(0) as i64,
+            ),
             total_write_bytes: Some(size),
             file_size_in_bytes: Some(size),
             total_log_records: Some(moved.len() as i64),
@@ -464,6 +476,7 @@ pub(super) async fn mor_upsert_batches(
         base_basename: String,
         base_instant: String,
         update_count: usize,
+        delete_count: usize,
         prepared: Vec<RecordBatch>,
     }
     let mut log_plans: Vec<LogTaskPlan> = Vec::new();
@@ -486,6 +499,12 @@ pub(super) async fn mor_upsert_batches(
         crate::write::ensure_partition_metadata(storage.as_ref(), &partition_path, &instant)
             .await?;
         let update_batch = take_batch(&incoming, &update_rows)?;
+        let delete_count = update_rows
+            .iter()
+            .filter(|row| {
+                winning_in_place_delete_keys.contains(&tagged_keys[**row as usize].record_key)
+            })
+            .count();
         // Java's append handle stamps log records with the file group id.
         let prepared =
             prepare_batches_for_write(&table.hudi_configs, &[update_batch], &instant, &file_id)?;
@@ -497,6 +516,7 @@ pub(super) async fn mor_upsert_batches(
             base_basename,
             base_instant,
             update_count: update_rows.len(),
+            delete_count,
             prepared,
         });
     }
@@ -548,6 +568,7 @@ pub(super) async fn mor_upsert_batches(
                     num_writes: Some(total),
                     num_update_writes: Some(plan.update_count as i64),
                     num_inserts: Some(0),
+                    num_deletes: Some(plan.delete_count as i64),
                     total_write_bytes: Some(output.size),
                     file_size_in_bytes: Some(output.size),
                     total_log_records: Some(total),
@@ -599,7 +620,7 @@ pub(super) async fn mor_upsert_batches(
         num_writes: incoming.num_rows(),
         num_updates: updates,
         num_inserts: inserts,
-        num_deletes: 0,
+        num_deletes: delete_count,
     })
 }
 
