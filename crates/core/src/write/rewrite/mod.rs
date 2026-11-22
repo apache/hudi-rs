@@ -319,6 +319,7 @@ pub async fn upsert_batches(
         _ => (incoming, incoming_hoodie_keys.clone()),
     };
     let mut moved_deletes = Vec::new();
+    let mut moved_marker_keys_by_group: HashMap<String, HashSet<String>> = HashMap::new();
     for (index, (hoodie_key, route_key)) in incoming_hoodie_keys.iter().zip(&route_keys).enumerate()
     {
         // A location whose file group has no live slice is a stale index
@@ -339,6 +340,10 @@ pub async fn upsert_batches(
         {
             if let Some(location) = located {
                 evictions_by_group
+                    .entry(location.file_id.clone())
+                    .or_default()
+                    .insert(hoodie_key.record_key.clone());
+                moved_marker_keys_by_group
                     .entry(location.file_id.clone())
                     .or_default()
                     .insert(hoodie_key.record_key.clone());
@@ -409,6 +414,11 @@ pub async fn upsert_batches(
                 incoming: take_batch(&incoming, &rows)?,
                 partial_columns: options.update_columns.clone(),
                 evict_keys,
+                evict_marker_keys: std::sync::Arc::new(
+                    moved_marker_keys_by_group
+                        .remove(&file_id)
+                        .unwrap_or_default(),
+                ),
                 by_event_time: !ordering_fields.is_empty(),
             },
         });
@@ -432,6 +442,11 @@ pub async fn upsert_batches(
             op: GroupOp::DeleteKeys {
                 exact: std::sync::Arc::new(HashSet::new()),
                 keys_only: std::sync::Arc::new(evicted),
+                marker_keys: std::sync::Arc::new(
+                    moved_marker_keys_by_group
+                        .remove(&file_id)
+                        .unwrap_or_default(),
+                ),
             },
         });
     }
@@ -703,6 +718,7 @@ pub async fn delete_keys(table: &mut Table, delete_keys: &[HoodieKey]) -> Result
         |_| GroupOp::DeleteKeys {
             exact: requested_exact.clone(),
             keys_only: requested_keys_only.clone(),
+            marker_keys: std::sync::Arc::new(HashSet::new()),
         },
     )
     .await?;

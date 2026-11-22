@@ -3573,11 +3573,23 @@ async fn test_upsert_hoodie_is_deleted_removes_row_and_index_entry() {
             ])])
             .await
             .unwrap();
-        if table_type == TableTypeValue::CopyOnWrite {
-            // `a`'s winning marker counts as a delete, as Java's merge handle
-            // counts it.
-            assert_eq!(result.num_deletes, 1);
-        }
+        // `a` is deleted in place and `c` is deleted when it moves partitions.
+        assert_eq!(result.num_deletes, 2, "{table_type:?}");
+        let instant = table.timeline.completed_commits.last().unwrap().clone();
+        let json = table
+            .timeline
+            .get_instant_metadata_in_json(&instant)
+            .await
+            .unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let stat_num_deletes = metadata["partitionToWriteStats"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|stats| stats.as_array().unwrap())
+            .map(|stat| stat["numDeletes"].as_i64().unwrap_or(0))
+            .sum::<i64>();
+        assert_eq!(stat_num_deletes, 2, "{table_type:?}");
 
         let batches = table.read(&ReadOptions::new()).await.unwrap();
         assert_eq!(
@@ -3642,7 +3654,8 @@ async fn test_update_setting_hoodie_is_deleted_removes_row_and_index_entry() {
             vec![Arc::new(BooleanArray::from(vec![true]))],
         )
         .unwrap();
-        table.update("id = 'a'", set_deleted).await.unwrap();
+        let result = table.update("id = 'a'", set_deleted).await.unwrap();
+        assert_eq!(result.num_deletes, 1, "{table_type:?}");
 
         let batches = table.read(&ReadOptions::new()).await.unwrap();
         assert_eq!(
