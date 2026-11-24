@@ -43,6 +43,51 @@ use std::collections::HashMap;
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
+/// Schema metadata key set on batches decoded from a partial-update
+/// (`IS_PARTIAL`) data block.
+///
+/// The merge has to treat such a record as partial even when it carries every
+/// column a projected read asks for, and only the block header says it is one.
+pub(crate) const PARTIAL_UPDATE_SCHEMA_KEY: &str = "hudi.partial_update";
+
+/// Whether a data block's header marks it a partial update. Java reads the
+/// header as `Boolean.parseBoolean(getOrDefault(IS_PARTIAL, "false"))`.
+fn is_partial_update_block(header: &HashMap<BlockMetadataKey, String>) -> bool {
+    header
+        .get(&BlockMetadataKey::IsPartial)
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Mark every data batch of a partial-update block with
+/// [`PARTIAL_UPDATE_SCHEMA_KEY`]; a full block's batches are returned as is.
+fn mark_partial_update(
+    mut batches: RecordBatches,
+    header: &HashMap<BlockMetadataKey, String>,
+) -> Result<RecordBatches> {
+    if !is_partial_update_block(header) {
+        return Ok(batches);
+    }
+    let mut marked: Option<(Arc<Schema>, Arc<Schema>)> = None;
+    for batch in batches.data_batches.iter_mut() {
+        let schema = batch.schema();
+        let target = match &marked {
+            Some((from, to)) if Arc::ptr_eq(from, &schema) => to.clone(),
+            _ => {
+                let mut metadata = schema.metadata().clone();
+                metadata.insert(PARTIAL_UPDATE_SCHEMA_KEY.to_string(), "true".to_string());
+                let to = Arc::new(Schema::new_with_metadata(schema.fields().clone(), metadata));
+                marked = Some((schema.clone(), to.clone()));
+                to
+            }
+        };
+        *batch = batch
+            .clone()
+            .with_schema(target)
+            .map_err(CoreError::ArrowError)?;
+    }
+    Ok(batches)
+}
+
 /// Turn the wrapped ordering values into a plain column.
 ///
 /// Hudi writes `orderingVal` as a union of per-type wrapper records, so a decode
@@ -277,9 +322,11 @@ impl Decoder {
         match block_type {
             BlockType::AvroData => self
                 .decode_avro_record_content(reader, header)
+                .and_then(|batches| mark_partial_update(batches, header))
                 .map(LogBlockContent::Records),
             BlockType::ParquetData => self
                 .decode_parquet_record_content(reader)
+                .and_then(|batches| mark_partial_update(batches, header))
                 .map(LogBlockContent::Records),
             BlockType::Delete => self
                 .decode_delete_record_content(reader, header)
@@ -335,9 +382,7 @@ impl Decoder {
         // that emits `IS_PARTIAL=false` on a full block would otherwise have it
         // decoded writer-only, skipping the reader-schema resolution and
         // reintroducing the int-to-long mismatch at merge time on an evolved table.
-        let is_partial = header
-            .get(&BlockMetadataKey::IsPartial)
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+        let is_partial = is_partial_update_block(header);
         if is_partial {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
@@ -1194,6 +1239,40 @@ mod tests {
             &DataType::Int64,
             "the promoted column must arrive promoted"
         );
+        Ok(())
+    }
+
+    /// Only a block whose header says `IS_PARTIAL=true` has its batches marked
+    /// partial, so the merge can tell a partial record from a full one that
+    /// carries the same columns.
+    #[test]
+    fn test_mark_partial_update_marks_only_partial_blocks() -> Result<()> {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)])),
+            vec![Arc::new(arrow_array::Int32Array::from(vec![1, 2]))],
+        )?;
+        let marked_value = |header: HashMap<BlockMetadataKey, String>| -> Result<Option<String>> {
+            let batches = mark_partial_update(
+                RecordBatches::new_with_data_batches(vec![batch.clone(), batch.clone()]),
+                &header,
+            )?;
+            let values: Vec<Option<String>> = batches
+                .data_batches
+                .iter()
+                .map(|b| b.schema().metadata().get(PARTIAL_UPDATE_SCHEMA_KEY).cloned())
+                .collect();
+            assert!(values.windows(2).all(|w| w[0] == w[1]));
+            Ok(values[0].clone())
+        };
+        assert_eq!(
+            marked_value(HashMap::from([(BlockMetadataKey::IsPartial, "TRUE".to_string())]))?,
+            Some("true".to_string())
+        );
+        assert_eq!(
+            marked_value(HashMap::from([(BlockMetadataKey::IsPartial, "false".to_string())]))?,
+            None
+        );
+        assert_eq!(marked_value(HashMap::new())?, None);
         Ok(())
     }
 

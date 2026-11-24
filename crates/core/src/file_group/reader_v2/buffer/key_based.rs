@@ -37,6 +37,7 @@
 //! - `hasNextBaseRecord` → `has_next_base_record`
 
 use crate::Result;
+use crate::file_group::log_file::content::PARTIAL_UPDATE_SCHEMA_KEY;
 use crate::file_group::log_file::log_block::{LogBlock, LogBlockContent};
 use crate::file_group::reader_v2::buffer::record_buffer::FileGroupRecordBuffer;
 use crate::file_group::reader_v2::buffer::record_positions::base_row_position_array;
@@ -1232,9 +1233,13 @@ fn field_is_integer(schema: &apache_avro::Schema) -> bool {
 /// "the record is missing at least one of the reader schema's fields" (it may
 /// still carry extra meta columns the reader projection pruned).
 ///
-/// A non-partial log block is resolved up to the reader schema at decode time, so
-/// only `IS_PARTIAL` blocks (decoded writer-only) reach the merge with a narrow
-/// schema — making this field-set check equivalent to the block's IS_PARTIAL flag.
+/// A record decoded from an `IS_PARTIAL` block is partial whatever columns it
+/// carries: the decoder marks it with [`PARTIAL_UPDATE_SCHEMA_KEY`], because under
+/// a projected read it can hold every requested column and still need the fold
+/// that takes the columns it omits from the record it merges with. Full blocks
+/// are resolved up to the reader schema at decode time, so the field-set check
+/// below only catches records without that mark, such as a fold's result that
+/// still lacks a column.
 ///
 /// Detected by field SET, not field count. An `IS_PARTIAL` block carries Hudi
 /// meta columns (`_hoodie_record_key`, `_hoodie_commit_time`, …) alongside the
@@ -1247,10 +1252,14 @@ fn field_is_integer(schema: &apache_avro::Schema) -> bool {
 /// simply "any target field absent from the record"; for full records every
 /// target field is present, so it returns false after a bounded name scan.
 fn schema_is_partial(record_schema: &Schema, target_schema: &Schema) -> bool {
-    target_schema
-        .fields()
-        .iter()
-        .any(|f| record_schema.index_of(f.name()).is_err())
+    record_schema
+        .metadata()
+        .get(PARTIAL_UPDATE_SCHEMA_KEY)
+        .is_some_and(|v| v == "true")
+        || target_schema
+            .fields()
+            .iter()
+            .any(|f| record_schema.index_of(f.name()).is_err())
 }
 
 /// Overlay a partial-update record's present columns onto a prior row, producing
