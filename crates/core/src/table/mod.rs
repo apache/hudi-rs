@@ -4034,9 +4034,10 @@ mod tests {
         let v2 = ReadOptions::new()
             .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
 
-        let positions = Table::new(&QuickstartTripsTable::MorLayoutDuplicateKeys.path_to_mor_avro())
-            .await
-            .unwrap();
+        let positions =
+            Table::new(&QuickstartTripsTable::MorLayoutDuplicateKeys.path_to_mor_avro())
+                .await
+                .unwrap();
         let by_position = v2
             .clone()
             .with_hudi_option(HudiReadConfig::MergeUseRecordPositions.as_ref(), "true");
@@ -4076,7 +4077,7 @@ mod tests {
             .iter()
             .map(|b| b.num_rows())
             .sum();
-        let count_only = v2.clone().with_projection(Vec::new());
+        let count_only = v2.clone().with_projection(Vec::<String>::new());
         let eager_rows: usize = trips
             .read(&count_only)
             .await

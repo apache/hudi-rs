@@ -1259,17 +1259,28 @@ mod tests {
             let values: Vec<Option<String>> = batches
                 .data_batches
                 .iter()
-                .map(|b| b.schema().metadata().get(PARTIAL_UPDATE_SCHEMA_KEY).cloned())
+                .map(|b| {
+                    b.schema()
+                        .metadata()
+                        .get(PARTIAL_UPDATE_SCHEMA_KEY)
+                        .cloned()
+                })
                 .collect();
             assert!(values.windows(2).all(|w| w[0] == w[1]));
             Ok(values[0].clone())
         };
         assert_eq!(
-            marked_value(HashMap::from([(BlockMetadataKey::IsPartial, "TRUE".to_string())]))?,
+            marked_value(HashMap::from([(
+                BlockMetadataKey::IsPartial,
+                "TRUE".to_string()
+            )]))?,
             Some("true".to_string())
         );
         assert_eq!(
-            marked_value(HashMap::from([(BlockMetadataKey::IsPartial, "false".to_string())]))?,
+            marked_value(HashMap::from([(
+                BlockMetadataKey::IsPartial,
+                "false".to_string()
+            )]))?,
             None
         );
         assert_eq!(marked_value(HashMap::new())?, None);
