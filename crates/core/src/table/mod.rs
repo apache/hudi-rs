@@ -3959,6 +3959,139 @@ mod tests {
         }
     }
 
+    /// Reads `table` projected to `projection`, eagerly and streamed, and checks
+    /// both return what `full` (the unprojected read with `options`) holds for
+    /// those columns.
+    async fn assert_projection_matches_full_read(
+        table: &Table,
+        options: &ReadOptions,
+        full: &[RecordBatch],
+        projection: &[String],
+        label: &str,
+    ) {
+        let expected = sorted_rows(full, projection);
+        let options = options.clone().with_projection(projection.to_vec());
+        let eager = table.read(&options).await.unwrap();
+        assert_eq!(
+            sorted_rows(&eager, projection),
+            expected,
+            "{label} eager {projection:?}"
+        );
+        let streamed = collect_stream(table, &options).await;
+        assert_eq!(
+            sorted_rows(&streamed, projection),
+            expected,
+            "{label} streamed {projection:?}"
+        );
+    }
+
+    /// A record from a partial-update block stays partial when it happens to
+    /// carry every projected column. `k1`'s second update holds only `ts` and `b`
+    /// and loses on ordering to its first, which holds `ts` and `a`; the fold
+    /// must still take `b` from the loser, so a read projected to `b` sees
+    /// `b-low`, not the base file's `b-init`. `k2` folds the other way round.
+    #[tokio::test]
+    async fn test_v2_projected_read_folds_a_partial_update_covering_the_projection() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::QuickstartTripsTable;
+
+        let table = Table::new(&QuickstartTripsTable::MorPartialUpdateEventTime.path_to_mor_avro())
+            .await
+            .unwrap();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
+        let full = table.read(&options).await.unwrap();
+        let key = MetaField::RecordKey.as_ref().to_string();
+        assert_eq!(
+            sorted_rows(&full, &[key.clone(), "a".to_string(), "b".to_string()]),
+            vec!["k1|a-high|b-low", "k2|a-low|b-high"]
+        );
+        for projection in [
+            vec!["b".to_string()],
+            vec![key.clone(), "b".to_string()],
+            vec![key.clone(), "a".to_string()],
+            vec![key.clone(), "a".to_string(), "b".to_string()],
+        ] {
+            assert_projection_matches_full_read(
+                &table,
+                &options,
+                &full,
+                &projection,
+                "partial update",
+            )
+            .await;
+        }
+    }
+
+    /// A projection over a slice merged by record position, over a table whose
+    /// record key is a composite of data columns with no meta fields, and an
+    /// empty projection (a row count) all return what the full read returns.
+    #[tokio::test]
+    async fn test_v2_projected_read_matches_the_full_read_for_other_merge_shapes() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::{QuickstartTripsTable, SampleTable};
+
+        let v2 = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
+
+        let positions = Table::new(&QuickstartTripsTable::MorLayoutDuplicateKeys.path_to_mor_avro())
+            .await
+            .unwrap();
+        let by_position = v2
+            .clone()
+            .with_hudi_option(HudiReadConfig::MergeUseRecordPositions.as_ref(), "true");
+        let full = positions.read(&by_position).await.unwrap();
+        let projection = vec![columns_the_merge_does_not_need(&positions).await[0].clone()];
+        assert_projection_matches_full_read(
+            &positions,
+            &by_position,
+            &full,
+            &projection,
+            "record positions",
+        )
+        .await;
+
+        let virtual_key = Table::new(&SampleTable::V9TxnsComplexNometa.path_to_mor_avro())
+            .await
+            .unwrap();
+        let full = virtual_key.read(&v2).await.unwrap();
+        let candidates = columns_the_merge_does_not_need(&virtual_key).await;
+        assert!(!candidates.is_empty());
+        assert_projection_matches_full_read(
+            &virtual_key,
+            &v2,
+            &full,
+            &candidates[..1],
+            "composite key without meta fields",
+        )
+        .await;
+
+        let trips = Table::new(&QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro())
+            .await
+            .unwrap();
+        let full_rows: usize = trips
+            .read(&v2)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        let count_only = v2.clone().with_projection(Vec::new());
+        let eager_rows: usize = trips
+            .read(&count_only)
+            .await
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        let streamed_rows: usize = collect_stream(&trips, &count_only)
+            .await
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!((eager_rows, streamed_rows), (full_rows, full_rows));
+    }
+
     /// The projection reaches the base file: a projected merge-on-read read
     /// fetches fewer bytes than the full read of the same slices.
     #[tokio::test]
