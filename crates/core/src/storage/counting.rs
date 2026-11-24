@@ -47,6 +47,8 @@ pub(crate) struct RequestCounts {
     lists: AtomicUsize,
     /// Whole-object and multipart writes.
     puts: AtomicUsize,
+    /// Bytes returned by reads.
+    bytes_read: AtomicUsize,
 }
 
 impl RequestCounts {
@@ -64,6 +66,10 @@ impl RequestCounts {
 
     pub(crate) fn puts(&self) -> usize {
         self.puts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bytes_read(&self) -> usize {
+        self.bytes_read.load(Ordering::Relaxed)
     }
 }
 
@@ -123,7 +129,13 @@ impl ObjectStore for CountingObjectStore {
         } else {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
         }
-        self.inner.get_opts(location, options).await
+        let head = options.head;
+        let result = self.inner.get_opts(location, options).await?;
+        if !head {
+            let read = (result.range.end - result.range.start) as usize;
+            self.counts.bytes_read.fetch_add(read, Ordering::Relaxed);
+        }
+        Ok(result)
     }
 
     fn delete_stream(

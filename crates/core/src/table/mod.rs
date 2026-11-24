@@ -3832,4 +3832,201 @@ mod tests {
         let file_slices = table.get_file_slices(&ReadOptions::new()).await.unwrap();
         assert!(!file_slices.is_empty());
     }
+
+    /// The rows of `batches` restricted to `columns`, each rendered as one
+    /// string and sorted, so two reads compare regardless of batch boundaries
+    /// and row order.
+    fn sorted_rows(batches: &[RecordBatch], columns: &[String]) -> Vec<String> {
+        use arrow::util::display::array_value_to_string;
+        let mut rows = Vec::new();
+        for batch in batches {
+            let arrays: Vec<_> = columns
+                .iter()
+                .map(|c| {
+                    batch
+                        .column_by_name(c)
+                        .unwrap_or_else(|| panic!("column '{c}' missing from the read"))
+                        .clone()
+                })
+                .collect();
+            for i in 0..batch.num_rows() {
+                let row: Vec<String> = arrays
+                    .iter()
+                    .map(|a| array_value_to_string(a, i).unwrap())
+                    .collect();
+                rows.push(row.join("|"));
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// The table's columns a merge does not need on its own: not a meta field,
+    /// a record key or an ordering field. Projecting to these is what makes the
+    /// merge-on-read reader add its own columns back.
+    async fn columns_the_merge_does_not_need(table: &Table) -> Vec<String> {
+        let keys: Vec<String> = table
+            .hudi_configs
+            .try_get(HudiTableConfig::RecordKeyFields)
+            .unwrap()
+            .map(Into::into)
+            .unwrap_or_default();
+        let ordering: Vec<String> = table
+            .hudi_configs
+            .try_get(HudiTableConfig::OrderingFields)
+            .unwrap()
+            .map(Into::into)
+            .unwrap_or_default();
+        table
+            .get_schema()
+            .await
+            .unwrap()
+            .fields()
+            .iter()
+            .map(|f| f.name().to_string())
+            .filter(|n| !n.starts_with("_hoodie_") && !keys.contains(n) && !ordering.contains(n))
+            .collect()
+    }
+
+    async fn collect_stream(table: &Table, options: &ReadOptions) -> Vec<RecordBatch> {
+        use futures::StreamExt;
+        let mut stream = table.read_stream(options).await.unwrap();
+        let mut batches = Vec::new();
+        while let Some(batch) = stream.next().await {
+            batches.push(batch.unwrap());
+        }
+        batches
+    }
+
+    /// A projected merge-on-read read returns exactly what the full read
+    /// returns for the same columns, eagerly and streamed, though the reader
+    /// now reads only the projection plus the columns the merge needs. Covers
+    /// event-time and commit-time ordering, a delete block, and a column added
+    /// after the base file was written.
+    #[tokio::test]
+    async fn test_v2_projected_read_matches_the_full_read() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::QuickstartTripsTable;
+
+        for fixture in [
+            QuickstartTripsTable::V8Trips8I3U1D,
+            QuickstartTripsTable::V9Mor8I4UCommitTime,
+            QuickstartTripsTable::V9MorNonpart3Commits,
+            QuickstartTripsTable::MorEvoAddCol,
+        ] {
+            let table = Table::new(&fixture.path_to_mor_avro()).await.unwrap();
+            let full_options = ReadOptions::new()
+                .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
+            let full = table.read(&full_options).await.unwrap();
+
+            let candidates = columns_the_merge_does_not_need(&table).await;
+            assert!(
+                !candidates.is_empty(),
+                "{fixture:?} has no column to project"
+            );
+            let mut reversed = candidates.clone();
+            reversed.reverse();
+            for projection in [vec![candidates[0].clone()], reversed] {
+                let expected = sorted_rows(&full, &projection);
+                let options = full_options.clone().with_projection(projection.clone());
+
+                let eager = table.read(&options).await.unwrap();
+                assert_eq!(
+                    sorted_rows(&eager, &projection),
+                    expected,
+                    "{fixture:?} eager {projection:?}"
+                );
+
+                let streamed = collect_stream(&table, &options).await;
+                assert_eq!(
+                    sorted_rows(&streamed, &projection),
+                    expected,
+                    "{fixture:?} streamed {projection:?}"
+                );
+                for batch in eager.iter().chain(streamed.iter()) {
+                    let names: Vec<String> = batch
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|f| f.name().to_string())
+                        .collect();
+                    assert_eq!(
+                        names, projection,
+                        "{fixture:?} keeps the projection's order"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The projection reaches the base file: a projected merge-on-read read
+    /// fetches fewer bytes than the full read of the same slices.
+    #[tokio::test]
+    async fn test_v2_projected_read_fetches_fewer_bytes() {
+        use crate::config::read::HudiReadConfig;
+        use crate::storage::counting::CountingObjectStore;
+        use crate::table::builder::TableBuilder;
+        use hudi_test::QuickstartTripsTable;
+        use object_store::local::LocalFileSystem;
+
+        let (store, counts) = CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+        let table =
+            TableBuilder::from_base_uri(&QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro())
+                .with_object_store(store)
+                .build()
+                .await
+                .unwrap();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
+        let projection = vec![columns_the_merge_does_not_need(&table).await[0].clone()];
+
+        // Warm up anything a first read caches (schema, metadata table), so the
+        // two measured reads differ only in the columns they decode.
+        collect_stream(&table, &options).await;
+
+        let before = counts.bytes_read();
+        let full = collect_stream(&table, &options).await;
+        let full_bytes = counts.bytes_read() - before;
+
+        let before = counts.bytes_read();
+        let projected =
+            collect_stream(&table, &options.clone().with_projection(projection.clone())).await;
+        let projected_bytes = counts.bytes_read() - before;
+
+        assert_eq!(
+            sorted_rows(&projected, &projection),
+            sorted_rows(&full, &projection)
+        );
+        assert!(
+            projected_bytes < full_bytes,
+            "a projected read must fetch fewer bytes: projected {projected_bytes}, full {full_bytes}"
+        );
+    }
+
+    /// An incremental read narrows rows by `_hoodie_commit_time` after the
+    /// merge, so a projection without that column still gets it from the
+    /// reader and returns what the full incremental read returns.
+    #[tokio::test]
+    async fn test_v2_projected_incremental_read_matches_the_full_read() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::QuickstartTripsTable;
+
+        let table = Table::new(&QuickstartTripsTable::V9MorCompactedIncremental.path_to_mor_avro())
+            .await
+            .unwrap();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2")
+            .with_query_type(QueryType::Incremental)
+            .with_start_timestamp("20260807223527000")
+            .with_end_timestamp("20260807223532000");
+        let full = table.read(&options).await.unwrap();
+        let projection = vec![columns_the_merge_does_not_need(&table).await[0].clone()];
+        let projected = table
+            .read(&options.clone().with_projection(projection.clone()))
+            .await
+            .unwrap();
+        let expected = sorted_rows(&full, &projection);
+        assert!(!expected.is_empty(), "the window must admit some rows");
+        assert_eq!(sorted_rows(&projected, &projection), expected);
+    }
 }
