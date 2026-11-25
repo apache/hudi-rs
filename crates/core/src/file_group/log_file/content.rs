@@ -144,6 +144,13 @@ pub struct Decoder {
     /// Schema an Avro block is resolved up to, as Avro JSON. See
     /// [`Decoder::with_reader_schema`].
     reader_schema_json: Option<String>,
+    /// Columns a full Avro block is decoded to when no reader schema is set.
+    /// See [`Decoder::with_projection`].
+    projection: Option<Arc<Vec<String>>>,
+    /// The last writer schema narrowed to `projection`, and the result: `None`
+    /// when narrowing would drop nothing or could not produce a valid schema.
+    /// One entry, like `registered`.
+    narrowed: std::cell::RefCell<Option<(String, Option<Arc<str>>)>>,
     /// Whether an HFile block's records are decoded into Arrow batches rather
     /// than handed back as key-value pairs. See
     /// [`Decoder::with_hfile_as_records`].
@@ -245,6 +252,16 @@ impl Decoder {
         self
     }
 
+    /// Decode a full Avro data block to only these columns (matched by name,
+    /// ignoring ASCII case) when no reader schema is set: the block's own
+    /// schema, narrowed to them, becomes the reader schema, so Avro resolution
+    /// skips the other fields instead of building arrays for them. A partial
+    /// block and an HFile block are still decoded whole.
+    pub fn with_projection(mut self, projection: Option<Arc<Vec<String>>>) -> Self {
+        self.projection = projection;
+        self
+    }
+
     pub fn new(hudi_configs: Arc<HudiConfigs>) -> Self {
         Self {
             batch_size: 1024,
@@ -252,6 +269,8 @@ impl Decoder {
             row_filter: None,
             repair_table_schema: None,
             reader_schema_json: None,
+            projection: None,
+            narrowed: std::cell::RefCell::new(None),
             hfile_as_records: false,
             key_predicate: None,
             registered: std::cell::RefCell::new(None),
@@ -325,6 +344,7 @@ impl Decoder {
         &self,
         writer_schema_json: &str,
         header: &HashMap<BlockMetadataKey, String>,
+        narrow: bool,
     ) -> Result<AvroBlockDecoder> {
         // A partial-update block carries only the columns that were written, and
         // the merge needs to know which those are. Resolving it up to the table
@@ -341,6 +361,12 @@ impl Decoder {
         if is_partial {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
+        let narrowed = match (&self.reader_schema_json, &self.projection) {
+            (None, Some(columns)) if narrow && !is_partial => {
+                self.narrowed_for(writer_schema_json, columns)
+            }
+            _ => None,
+        };
         let reader_schema_json = if is_partial {
             None
         } else {
@@ -367,7 +393,9 @@ impl Decoder {
                     (Some(required_json), None)
                 }
             }
-            None => (None, None),
+            // The writer's own schema with fields left out: the types are the
+            // writer's, so there is no promotion to check for.
+            None => (narrowed.as_deref(), None),
         };
 
         // Registered once per writer schema rather than once per block. Compared,
@@ -396,6 +424,20 @@ impl Decoder {
         Ok(decoder)
     }
 
+    /// `writer_schema_json` narrowed to `columns`, computed once per writer
+    /// schema.
+    fn narrowed_for(&self, writer_schema_json: &str, columns: &[String]) -> Option<Arc<str>> {
+        let mut slot = self.narrowed.borrow_mut();
+        if let Some((json, narrowed)) = slot.as_ref()
+            && json == writer_schema_json
+        {
+            return narrowed.clone();
+        }
+        let narrowed = narrow_avro_record(writer_schema_json, columns).map(Arc::from);
+        *slot = Some((writer_schema_json.to_string(), narrowed.clone()));
+        narrowed
+    }
+
     /// An HFile block, in whichever shape the caller asked for.
     ///
     /// The records are Avro-encoded values under HFile keys, so decoding them to
@@ -418,7 +460,7 @@ impl Decoder {
                     .to_string(),
             )
         })?;
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header, false)?;
         let mut decoded: Vec<arrow_array::RecordBatch> = Vec::new();
         for record in &records {
             if let Some(batch) = decoder.decode(&record.value)? {
@@ -485,7 +527,7 @@ impl Decoder {
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header)?;
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header, true)?;
         let mut batches =
             RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
 
@@ -694,9 +736,281 @@ impl Decoder {
     }
 }
 
+/// `writer_schema_json`, a top-level Avro record, with its fields narrowed to
+/// `columns` (matched ignoring ASCII case), or `None` when that would keep every
+/// field or does not give a schema that parses. The kept fields keep the
+/// writer's order and types. A named type that a kept field refers to but a
+/// dropped field defines is moved to its first use, so the narrowed schema still
+/// defines every name it uses.
+fn narrow_avro_record(writer_schema_json: &str, columns: &[String]) -> Option<String> {
+    use serde_json::Value;
+    let mut schema: Value = serde_json::from_str(writer_schema_json).ok()?;
+    let top_namespace = avro_namespace(&schema, None);
+    let top_name = schema
+        .get("name")
+        .and_then(|n| n.as_str())
+        .map(|n| avro_fullname(n, top_namespace.as_deref()));
+    let fields = schema.get_mut("fields")?.as_array_mut()?;
+    let (mut kept, dropped): (Vec<Value>, Vec<Value>) = fields.drain(..).partition(|f| {
+        f.get("name")
+            .and_then(|n| n.as_str())
+            .is_some_and(|n| columns.iter().any(|c| c.eq_ignore_ascii_case(n)))
+    });
+    if dropped.is_empty() {
+        return None;
+    }
+    let mut definitions = HashMap::new();
+    for field in &dropped {
+        if let Some(t) = field.get("type") {
+            collect_avro_definitions(t, top_namespace.as_deref(), &mut definitions);
+        }
+    }
+    let mut defined: std::collections::HashSet<String> = top_name.into_iter().collect();
+    for field in kept.iter_mut() {
+        if let Some(t) = field.get_mut("type") {
+            hoist_avro_definitions(t, top_namespace.as_deref(), &definitions, &mut defined);
+        }
+    }
+    *fields = kept;
+    let narrowed = schema.to_string();
+    apache_avro::Schema::parse_str(&narrowed).ok()?;
+    Some(narrowed)
+}
+
+const AVRO_PRIMITIVES: [&str; 8] = [
+    "null", "boolean", "int", "long", "float", "double", "bytes", "string",
+];
+
+/// The namespace a named type declares, or the one it inherits.
+fn avro_namespace(node: &serde_json::Value, enclosing: Option<&str>) -> Option<String> {
+    if let Some(ns) = node.get("namespace").and_then(|n| n.as_str()) {
+        return (!ns.is_empty()).then(|| ns.to_string());
+    }
+    if let Some((ns, _)) = node
+        .get("name")
+        .and_then(|n| n.as_str())
+        .and_then(|n| n.rsplit_once('.'))
+    {
+        return Some(ns.to_string());
+    }
+    enclosing.map(str::to_string)
+}
+
+fn avro_fullname(name: &str, namespace: Option<&str>) -> String {
+    match namespace {
+        Some(ns) if !name.contains('.') => format!("{ns}.{name}"),
+        _ => name.to_string(),
+    }
+}
+
+fn is_named_avro_type(node: &serde_json::Value) -> bool {
+    matches!(
+        node.get("type").and_then(|t| t.as_str()),
+        Some("record" | "error" | "enum" | "fixed")
+    ) && node.get("name").is_some_and(|n| n.is_string())
+}
+
+/// Every named type `node` defines, by full name, each with its namespace made
+/// explicit so it can be moved to another place in the schema.
+fn collect_avro_definitions(
+    node: &serde_json::Value,
+    enclosing: Option<&str>,
+    out: &mut HashMap<String, serde_json::Value>,
+) {
+    match node {
+        serde_json::Value::Array(branches) => {
+            for b in branches {
+                collect_avro_definitions(b, enclosing, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let namespace = avro_namespace(node, enclosing);
+            if is_named_avro_type(node) {
+                let name = map["name"].as_str().unwrap_or_default();
+                let mut definition = node.clone();
+                if let (Some(ns), Some(obj)) = (&namespace, definition.as_object_mut()) {
+                    obj.entry("namespace")
+                        .or_insert_with(|| serde_json::Value::String(ns.clone()));
+                }
+                out.insert(avro_fullname(name, namespace.as_deref()), definition);
+            }
+            for key in ["type", "items", "values"] {
+                if let Some(child) = map.get(key).filter(|c| !c.is_string() || key != "type") {
+                    collect_avro_definitions(child, namespace.as_deref(), out);
+                }
+            }
+            if let Some(fields) = map.get("fields").and_then(|f| f.as_array()) {
+                for f in fields {
+                    if let Some(t) = f.get("type") {
+                        collect_avro_definitions(t, namespace.as_deref(), out);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Replace each reference in `node` to a name that is not yet defined, and that
+/// a dropped field defined, with that definition.
+fn hoist_avro_definitions(
+    node: &mut serde_json::Value,
+    enclosing: Option<&str>,
+    definitions: &HashMap<String, serde_json::Value>,
+    defined: &mut std::collections::HashSet<String>,
+) {
+    if let serde_json::Value::String(name) = node {
+        if AVRO_PRIMITIVES.contains(&name.as_str()) {
+            return;
+        }
+        let fullname = avro_fullname(name, enclosing);
+        if defined.contains(&fullname) {
+            return;
+        }
+        if let Some(definition) = definitions.get(&fullname) {
+            *node = definition.clone();
+        } else {
+            return;
+        }
+    }
+    match node {
+        serde_json::Value::Array(branches) => {
+            for b in branches {
+                hoist_avro_definitions(b, enclosing, definitions, defined);
+            }
+        }
+        serde_json::Value::Object(_) => {
+            let namespace = avro_namespace(node, enclosing);
+            if is_named_avro_type(node) {
+                let name = node["name"].as_str().unwrap_or_default().to_string();
+                defined.insert(avro_fullname(&name, namespace.as_deref()));
+            }
+            let map = node.as_object_mut().expect("matched an object");
+            for key in ["type", "items", "values"] {
+                if let Some(child) = map.get_mut(key) {
+                    if key == "type"
+                        && child.as_str().is_some_and(|t| {
+                            matches!(t, "record" | "error" | "enum" | "fixed" | "array" | "map")
+                        })
+                    {
+                        continue;
+                    }
+                    hoist_avro_definitions(child, namespace.as_deref(), definitions, defined);
+                }
+            }
+            if let Some(fields) = map.get_mut("fields").and_then(|f| f.as_array_mut()) {
+                for f in fields {
+                    if let Some(t) = f.get_mut("type") {
+                        hoist_avro_definitions(t, namespace.as_deref(), definitions, defined);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn narrow_avro_record_keeps_only_the_named_fields_in_writer_order() {
+        let writer = r#"{"type":"record","name":"r","fields":[
+            {"name":"a","type":"int"},
+            {"name":"b","type":["null","string"],"default":null},
+            {"name":"c","type":"long"}]}"#;
+        let narrowed = narrow_avro_record(writer, &["C".to_string(), "a".to_string()]).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&narrowed).unwrap();
+        let names: Vec<&str> = parsed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["a", "c"]);
+        let all = ["a", "b", "c"].map(String::from);
+        assert!(narrow_avro_record(writer, &all).is_none());
+        assert!(narrow_avro_record("not json", &all).is_none());
+    }
+
+    /// A named type defined by a dropped field and used by a kept one moves to
+    /// the kept field, so the narrowed schema parses; nested and namespaced
+    /// references move too.
+    #[test]
+    fn narrow_avro_record_keeps_named_types_a_kept_field_uses() {
+        let writer = r#"{"type":"record","name":"r","namespace":"ns","fields":[
+            {"name":"a","type":{"type":"record","name":"Inner","fields":[
+                {"name":"x","type":"int"},
+                {"name":"e","type":{"type":"enum","name":"Kind","symbols":["A","B"]}}]}},
+            {"name":"f","type":{"type":"fixed","name":"other.Fix","size":4}},
+            {"name":"b","type":["null","Inner"],"default":null},
+            {"name":"c","type":{"type":"array","items":"Kind"}},
+            {"name":"d","type":["null","other.Fix"],"default":null},
+            {"name":"g","type":"long"}]}"#;
+        assert!(apache_avro::Schema::parse_str(writer).is_ok());
+        let columns = ["b", "c", "d"].map(String::from);
+        let narrowed = narrow_avro_record(writer, &columns).expect("narrowed");
+        let parsed = apache_avro::Schema::parse_str(&narrowed).expect("the narrowed schema parses");
+        let apache_avro::Schema::Record(record) = parsed else {
+            panic!("a record")
+        };
+        let names: Vec<&str> = record.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["b", "c", "d"]);
+    }
+
+    /// A block decoded with narrowing returns the kept columns exactly as the
+    /// full decode does, with nested named types moved by the narrowing.
+    #[test]
+    fn narrowed_decode_matches_the_full_decode_on_the_kept_columns() -> Result<()> {
+        let schema_str = r#"{"type":"record","name":"r","fields":[
+            {"name":"a","type":{"type":"record","name":"Inner","fields":[{"name":"x","type":"int"}]}},
+            {"name":"id","type":"long"},
+            {"name":"b","type":["null","Inner"],"default":null},
+            {"name":"name","type":["null","string"],"default":null}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(schema_str)?;
+        let inner = |x: i32| AvroValue::Record(vec![("x".to_string(), AvroValue::Int(x))]);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        buf.extend_from_slice(&3u32.to_be_bytes());
+        for i in 0..3i64 {
+            let mut record = AvroRecord::new(&writer_schema).unwrap();
+            record.put("a", inner(i as i32));
+            record.put("id", i);
+            record.put("b", AvroValue::Union(1, Box::new(inner(10 + i as i32))));
+            record.put(
+                "name",
+                if i == 1 {
+                    AvroValue::Union(0, Box::new(AvroValue::Null))
+                } else {
+                    AvroValue::Union(1, Box::new(AvroValue::String(format!("n{i}"))))
+                },
+            );
+            let body = to_avro_datum(&writer_schema, record)?;
+            buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            buf.extend_from_slice(&body);
+        }
+        let header = HashMap::from([(BlockMetadataKey::Schema, schema_str.to_string())]);
+        let full = Decoder::new(Arc::new(HudiConfigs::empty()))
+            .decode_avro_record_content(buf.as_slice(), &header)?;
+        let columns = Arc::new(["id", "b", "name"].map(String::from).to_vec());
+        let narrow = Decoder::new(Arc::new(HudiConfigs::empty())).with_projection(Some(columns));
+        let narrowed = narrow.decode_avro_record_content(buf.as_slice(), &header)?;
+        let full = &full.data_batches[0];
+        let narrowed = &narrowed.data_batches[0];
+        assert_eq!(narrowed.num_columns(), 3);
+        for name in ["id", "b", "name"] {
+            assert_eq!(
+                narrowed.column_by_name(name).unwrap().to_data(),
+                full.column_by_name(name).unwrap().to_data(),
+                "{name}"
+            );
+        }
+        // A second block with the same writer schema reuses the narrowing.
+        let again = narrow.decode_avro_record_content(buf.as_slice(), &header)?;
+        assert_eq!(again.data_batches[0].num_columns(), 3);
+        Ok(())
+    }
     use crate::file_group::log_file::log_block::LogBlockVersion;
     use apache_avro::to_avro_datum;
     use apache_avro::types::Record as AvroRecord;

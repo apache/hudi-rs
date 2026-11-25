@@ -896,6 +896,38 @@ impl BaseHoodieLogRecordReader {
                 .reader_schema_json
                 .clone(),
         )
+        .with_projection(self.log_projection())
+    }
+
+    /// The columns a full Avro log block is decoded to when there is no reader
+    /// schema: the merge schema, plus the fields that can mark a record deleted,
+    /// which a log record may carry outside it. `None` decodes every column.
+    fn log_projection(&self) -> Option<Arc<Vec<String>>> {
+        let required = self
+            .reader_context
+            .schema_handler
+            .required_schema
+            .as_ref()?;
+        let mut columns: Vec<String> = required.fields().iter().map(|f| f.name().clone()).collect();
+        let mut keep = |name: &str| {
+            if !columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                columns.push(name.to_string());
+            }
+        };
+        keep("_hoodie_is_deleted");
+        keep("_hoodie_operation");
+        for key in [
+            "hoodie.payload.delete.field",
+            "hoodie.record.merge.property.hoodie.payload.delete.field",
+        ] {
+            if let Some(field) = self.reader_context.table_config.get(key) {
+                keep(field);
+            }
+            if let Some(field) = self.reader_context.hoodie_reader_config.get(key) {
+                keep(field);
+            }
+        }
+        Some(Arc::new(columns))
     }
 
     /// Merge `range` of the queued blocks, oldest first.
