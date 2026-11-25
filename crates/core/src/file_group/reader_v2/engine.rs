@@ -294,13 +294,22 @@ impl HoodieFileGroupReader {
             reader_context.schema_handler.clone()
         };
 
+        // `_hoodie_commit_time` matters only to a read whose window starts
+        // somewhere (an incremental read): its caller narrows rows by the column
+        // after the merge. The resolver always sets a range, and a snapshot
+        // read's (an end bound at most) excludes nothing the slice holds, so
+        // reading the column for it decodes a string per row for nothing.
+        let has_instant_range = reader_context
+            .instant_range
+            .as_ref()
+            .is_some_and(crate::timeline::selector::InstantRange::is_bounded_below);
+
         // Mirrors Java FileGroupReaderSchemaHandler constructor line 105:
         // this.requiredSchema = prepareRequiredSchema(this.deleteContext);
         //
         // Uses record_key_fields() (all key fields) instead of record_key_field()
         // (single) to support composite record keys in virtual-key mode.
         // Mirrors Java's getMandatoryFieldsForMerging() lines 250-258.
-        let has_instant_range = reader_context.instant_range.is_some();
         schema_handler.prepare_required_schema(
             input_split.has_log_files(),
             &reader_context.record_key_fields(),
@@ -3186,6 +3195,95 @@ mod tests {
         assert!(
             reader.reader_context.repair_risk_columns.is_empty(),
             "unset must leave the guard disarmed, not populated by accident"
+        );
+    }
+
+    /// A merging read adds `_hoodie_commit_time` to what it reads only when its
+    /// range starts somewhere, as an incremental read's does. A snapshot's
+    /// range, an end bound at most, leaves the column out when the output does
+    /// not ask for it.
+    #[tokio::test]
+    async fn commit_time_is_read_only_for_a_range_bounded_below() {
+        use crate::file_group::base_file::parquet::ParquetBaseFileReader;
+        use arrow_schema::Schema;
+        use hudi_test::QuickstartTripsTable;
+
+        const BASE_COMMIT: &str = "20260408053032350";
+        const LOG_COMMIT: &str = "20260408053037787";
+        const BASE: &str =
+            "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+        const LOG: &str =
+            "city=sf/.fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73";
+
+        let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+        let (_, storage) =
+            crate::file_group::reader_v2::harness::create_configs_and_storage(&table_path)
+                .await
+                .unwrap();
+        let data_schema: SchemaRef = Arc::new(
+            ParquetBaseFileReader::new(storage.clone())
+                .get_schema(BASE)
+                .await
+                .unwrap(),
+        );
+        let requested: SchemaRef = Arc::new(Schema::new(
+            ["id", "name", "age"]
+                .iter()
+                .map(|n| data_schema.field_with_name(n).unwrap().clone())
+                .collect::<Vec<_>>(),
+        ));
+
+        let reads_commit_time = |range: Option<InstantRange>| {
+            let mut reader_context = ReaderContext::empty();
+            reader_context.latest_commit_time =
+                crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
+            reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+            reader_context.instant_range = range;
+            reader_context.table_config.insert(
+                HudiTableConfig::OrderingFields.as_ref().to_string(),
+                "ts".to_string(),
+            );
+            reader_context.rebuild_record_context("city=sf".to_string());
+            reader_context.has_log_files = true;
+            let reader = HoodieFileGroupReader::new(
+                Arc::new(reader_context),
+                storage.clone(),
+                InputSplit::new(
+                    Some(BASE.to_string()),
+                    Some(BASE_COMMIT.to_string()),
+                    vec![LOG.to_string()],
+                    "city=sf".to_string(),
+                ),
+                ReaderParameters::default(),
+                Some(data_schema.clone()),
+                Some(requested.clone()),
+            )
+            .unwrap();
+            reader
+                .schema_handler
+                .required_schema
+                .as_ref()
+                .expect("a merging read with a requested schema has a required schema")
+                .column_with_name("_hoodie_commit_time")
+                .is_some()
+        };
+
+        assert!(!reads_commit_time(None), "no range");
+        assert!(
+            !reads_commit_time(Some(InstantRange::up_to(LOG_COMMIT, "UTC"))),
+            "a snapshot's end-only range"
+        );
+        assert!(
+            reads_commit_time(Some(InstantRange::within_open_closed(
+                BASE_COMMIT,
+                LOG_COMMIT,
+                "UTC"
+            ))),
+            "an incremental read's range, which has a start bound"
+        );
+        assert!(
+            reads_commit_time(Some(InstantRange::exact_match([LOG_COMMIT], "UTC"))),
+            "a range that admits by membership"
         );
     }
 }

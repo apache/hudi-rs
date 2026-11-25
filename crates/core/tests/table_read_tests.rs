@@ -3230,6 +3230,39 @@ mod incremental_over_a_compacted_base_file {
         assert_eq!(read_window("2").await?, read_window("1").await?);
         Ok(())
     }
+
+    /// An incremental read still reads `_hoodie_commit_time` when the caller
+    /// projects it away: `d` is left out only by the row-level commit time
+    /// filter, which needs the column, and the column is not handed back.
+    #[tokio::test]
+    async fn a_projection_without_commit_time_still_drops_d() -> Result<()> {
+        let base_url = QuickstartTripsTable::V9MorCompactedIncremental.url_to_mor_avro();
+        let table = Table::new(base_url.path()).await?;
+        let records = table
+            .read(
+                &ReadOptions::new()
+                    .with_query_type(QueryType::Incremental)
+                    .with_start_timestamp(C1_INSERT_ALL_COMPLETED)
+                    .with_end_timestamp(AFTER_C_BEFORE_D)
+                    .with_projection(["uuid", "rider", "fare"])
+                    .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2"),
+            )
+            .await?;
+        let schema = &records[0].schema();
+        let merged = concat_batches(schema, &records)?;
+        let columns: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(columns, vec!["uuid", "rider", "fare"]);
+        let mut rows = QuickstartTripsTable::uuid_rider_and_fare(&merged);
+        rows.sort_by(|l, r| l.0.cmp(&r.0));
+        assert_eq!(
+            rows,
+            read_window("2").await?,
+            "the projected read keeps the same rows as the full one"
+        );
+        let ids: Vec<&str> = rows.iter().map(|(uuid, _, _)| uuid.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        Ok(())
+    }
 }
 
 /// Incremental reads over a merge-on-read table whose delta commits only append.
