@@ -387,7 +387,9 @@ struct PinnedBatch {
 #[derive(Debug, Default)]
 struct PinnedBatches {
     /// `Arc::as_ptr as usize` → pin record.
-    by_ptr: HashMap<usize, PinnedBatch>,
+    /// Hashed with the merge map's hasher: a probe per log record is a hot
+    /// loop, not a place for SipHash.
+    by_ptr: HashMap<usize, PinnedBatch, MergeHasher>,
     /// Running sum of the DISTINCT batches' `batch_bytes` — the true retained
     /// heap of all pinned source batches.
     total_bytes: u64,
@@ -713,6 +715,25 @@ impl SpillableRecordMap {
     where
         F: FnOnce(Option<&BufferedRecord>) -> Result<Option<BufferedRecord>>,
     {
+        self.merge_in_place_with(std::borrow::Cow::Borrowed(key), f)
+    }
+
+    /// [`Self::merge_in_place`] for a caller that already owns the key, so a
+    /// vacant slot takes that string instead of allocating a copy. Ingestion
+    /// owns one key per log record, which makes this the common path.
+    pub fn merge_in_place_owned<F>(&mut self, key: String, f: F) -> Result<bool>
+    where
+        F: FnOnce(Option<&BufferedRecord>) -> Result<Option<BufferedRecord>>,
+    {
+        self.merge_in_place_with(std::borrow::Cow::Owned(key), f)
+    }
+
+    fn merge_in_place_with<F>(&mut self, key: std::borrow::Cow<'_, str>, f: F) -> Result<bool>
+    where
+        F: FnOnce(Option<&BufferedRecord>) -> Result<Option<BufferedRecord>>,
+    {
+        let key_cow = key;
+        let key: &str = &key_cow;
         if self.disk.is_none() {
             if let Some(slot) = self.in_memory.get_mut(key) {
                 if let Some(new) = f(Some(&*slot))? {
@@ -741,7 +762,7 @@ impl SpillableRecordMap {
             }
             // Vacant: no existing record. The get_mut borrow has ended.
             if let Some(new) = f(None)? {
-                self.insert(key.to_string(), new)?;
+                self.insert(key_cow.into_owned(), new)?;
             }
             return Ok(false);
         }
@@ -749,7 +770,7 @@ impl SpillableRecordMap {
         let existing = self.get(key)?;
         let had = existing.is_some();
         if let Some(new) = f(existing.as_ref())? {
-            self.insert(key.to_string(), new)?;
+            self.insert(key_cow.into_owned(), new)?;
         }
         Ok(had)
     }

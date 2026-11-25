@@ -180,6 +180,16 @@ impl BufferedRecord {
     pub fn get_record(&self) -> Option<RecordBatch> {
         self.payload.get_record()
     }
+
+    /// The schema of the record's data, without slicing the record out of its
+    /// batch. `None` for a delete.
+    pub fn schema(&self) -> Option<arrow_schema::SchemaRef> {
+        match &self.payload {
+            RecordPayload::BatchRef { batch, .. } => Some(batch.schema()),
+            RecordPayload::Owned(batch) => Some(batch.schema()),
+            RecordPayload::Delete => None,
+        }
+    }
 }
 
 /// Comparable ordering value for merge conflict resolution.
@@ -574,6 +584,25 @@ mod tests {
         assert!(!Long(0).is_same_class(&String("0".to_string())));
         assert!(!Long(0).is_same_class(&Composite(vec![Long(0)])));
         assert!(!String("x".to_string()).is_same_class(&Composite(vec![])));
+    }
+
+    /// The schema answers without slicing, and says the same as the slice would.
+    #[test]
+    fn schema_matches_the_sliced_records_schema() {
+        let schema = schema();
+        let b = Arc::new(batch(&["a", "b"], &[1, 2]));
+        let by_ref = BufferedRecord::new_batch_ref("b".to_string(), b.clone(), 1, None);
+        assert_eq!(
+            by_ref.schema().unwrap(),
+            by_ref.get_record().unwrap().schema()
+        );
+        let owned = BufferedRecord::new_data("a".to_string(), b.slice(0, 1), None);
+        assert_eq!(owned.schema().unwrap(), schema);
+        assert!(
+            BufferedRecord::new_delete("a".to_string(), None)
+                .schema()
+                .is_none()
+        );
     }
 
     /// `BatchRef::get_record` slices the addressed row — full data must match the
