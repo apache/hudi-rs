@@ -4137,6 +4137,170 @@ mod tests {
         );
     }
 
+    /// Row groups in a local parquet file, read straight from its footer.
+    fn local_row_groups(table: &Table, relative_path: &str) -> usize {
+        use parquet::file::reader::{FileReader, SerializedFileReader};
+        let file = std::fs::File::open(local_path(table, relative_path)).unwrap();
+        SerializedFileReader::new(file)
+            .unwrap()
+            .metadata()
+            .num_row_groups()
+    }
+
+    fn local_path(table: &Table, relative_path: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(table.base_url().path()).join(relative_path)
+    }
+
+    async fn drain(
+        stream: futures::stream::BoxStream<'static, Result<RecordBatch>>,
+    ) -> Vec<RecordBatch> {
+        use futures::TryStreamExt;
+        stream.try_collect().await.unwrap()
+    }
+
+    /// What one slice read sent to its base file, read with and without the
+    /// base file's size.
+    struct BaseFileRequests {
+        /// `(heads, gets)` with the size given.
+        with_size: (usize, usize),
+        /// `(heads, gets)` with the size looked up.
+        without_size: (usize, usize),
+        row_groups: usize,
+        sized_rows: Vec<String>,
+        looked_up_rows: Vec<String>,
+    }
+
+    /// Reads one slice of the wanted shape twice, with and without its base
+    /// file's size, counting the requests each read sends to the base file.
+    async fn base_file_requests(
+        fixture_path: &str,
+        options: ReadOptions,
+        want_logs: bool,
+    ) -> BaseFileRequests {
+        use crate::storage::counting::CountingObjectStore;
+        use crate::table::builder::TableBuilder;
+        use object_store::local::LocalFileSystem;
+
+        let (store, counts) = CountingObjectStore::new(Arc::new(LocalFileSystem::new()));
+        let table = TableBuilder::from_base_uri(fixture_path)
+            .with_object_store(store)
+            .build()
+            .await
+            .unwrap();
+        let slice = table
+            .get_file_slices(&options)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.base_file.is_some() && s.has_log_file() == want_logs)
+            .expect("the fixture has a slice of the wanted shape");
+        let path = slice.base_file_relative_path().unwrap().unwrap();
+        let logs: Vec<String> = slice
+            .log_files
+            .iter()
+            .map(|l| slice.log_file_relative_path(l).unwrap())
+            .collect();
+        let size = std::fs::metadata(local_path(&table, &path)).unwrap().len();
+        let projection = columns_the_merge_does_not_need(&table).await[..1].to_vec();
+        let options = options.with_projection(projection.clone());
+        let reader = table
+            .create_file_group_reader_with_options(Some(&options), Vec::<(String, String)>::new())
+            .await
+            .unwrap();
+
+        let before = counts.requests_to(&path);
+        let sized = drain(
+            reader
+                .read_file_slice_from_paths_stream_with_base_file_size(
+                    &path,
+                    Some(size),
+                    logs.clone(),
+                    &options,
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let after = counts.requests_to(&path);
+        let with_size = (after.0 - before.0, after.1 - before.1);
+
+        let before = counts.requests_to(&path);
+        let looked_up = drain(
+            reader
+                .read_file_slice_from_paths_stream(&path, logs, &options)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let after = counts.requests_to(&path);
+        let without_size = (after.0 - before.0, after.1 - before.1);
+
+        BaseFileRequests {
+            with_size,
+            without_size,
+            row_groups: local_row_groups(&table, &path),
+            sized_rows: sorted_rows(&sized, &projection),
+            looked_up_rows: sorted_rows(&looked_up, &projection),
+        }
+    }
+
+    /// A copy-on-write slice read opens its base file once: no size lookup when
+    /// the size is given, and one footer fetch, so the only other reads are the
+    /// projected column's chunks.
+    #[tokio::test]
+    async fn test_base_file_stream_fetches_the_footer_once() {
+        let fixture = hudi_test::SampleTable::V8Nonpartitioned.path_to_cow();
+        let BaseFileRequests {
+            with_size,
+            without_size,
+            row_groups,
+            sized_rows,
+            looked_up_rows,
+        } = base_file_requests(&fixture, ReadOptions::new(), false).await;
+        assert_eq!(with_size.0, 0, "a known size needs no metadata lookup");
+        assert_eq!(
+            without_size.0, 1,
+            "an unknown size costs one metadata lookup"
+        );
+        assert!(
+            with_size.1 <= 2 + row_groups,
+            "one footer fetch (two requests) plus one per row group, got {} gets for {row_groups} row groups",
+            with_size.1
+        );
+        assert_eq!(with_size.1, without_size.1);
+        assert_eq!(sized_rows, looked_up_rows);
+    }
+
+    /// A merging slice read opens its base file once too, through the
+    /// merge-on-read reader.
+    #[tokio::test]
+    async fn test_merging_stream_fetches_the_base_file_footer_once() {
+        use crate::config::read::HudiReadConfig;
+        use hudi_test::QuickstartTripsTable;
+
+        let fixture = QuickstartTripsTable::V8Trips8I3U1D.path_to_mor_avro();
+        let options = ReadOptions::new()
+            .with_hudi_option(HudiReadConfig::FileGroupReaderVersion.as_ref(), "2");
+        let BaseFileRequests {
+            with_size,
+            without_size,
+            row_groups,
+            sized_rows,
+            looked_up_rows,
+        } = base_file_requests(&fixture, options, true).await;
+        assert_eq!(with_size.0, 0, "a known size needs no metadata lookup");
+        assert_eq!(
+            without_size.0, 1,
+            "an unknown size costs one metadata lookup"
+        );
+        assert!(
+            with_size.1 <= 2 + row_groups * 2,
+            "one footer fetch (two requests) plus the merge's column chunks, got {} gets for {row_groups} row groups",
+            with_size.1
+        );
+        assert_eq!(sized_rows, looked_up_rows);
+    }
+
     /// An incremental read narrows rows by `_hoodie_commit_time` after the
     /// merge, so a projection without that column still gets it from the
     /// reader and returns what the full incremental read returns.

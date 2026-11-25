@@ -520,6 +520,7 @@ impl FileGroupReader {
             self.hudi_configs.clone(),
             self.storage.clone(),
             base_file_path,
+            None,
             log_file_paths,
             partition_path,
             pushdown,
@@ -897,6 +898,31 @@ impl FileGroupReader {
             .await
     }
 
+    /// [`Self::read_file_slice_from_paths_stream`] for a caller that already
+    /// knows the base file's size, as a planner holding the file listing does.
+    ///
+    /// Opening a base file of unknown size costs a metadata request before the
+    /// footer can be fetched; with the size it costs none.
+    pub async fn read_file_slice_from_paths_stream_with_base_file_size<I, S>(
+        &self,
+        base_file_path: &str,
+        base_file_size: Option<u64>,
+        log_file_paths: I,
+        options: &ReadOptions,
+    ) -> Result<BoxStream<'static, Result<RecordBatch>>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.read_file_slice_from_paths_stream_inner(
+            base_file_path,
+            log_file_paths,
+            options,
+            base_file_size,
+        )
+        .await
+    }
+
     async fn read_file_slice_from_paths_stream_inner<I, S>(
         &self,
         base_file_path: &str,
@@ -930,7 +956,12 @@ impl FileGroupReader {
         // file group reader, so anything reaching here has log files to merge.
         if self.serve_with_version_two(base_file_path, false)? {
             return self
-                .stream_via_v2(base_file_path, log_file_paths, &options)
+                .stream_via_v2(
+                    base_file_path,
+                    known_base_file_size,
+                    log_file_paths,
+                    &options,
+                )
                 .await;
         }
 
@@ -952,6 +983,7 @@ impl FileGroupReader {
     async fn stream_via_v2(
         &self,
         base_file_path: &str,
+        known_base_file_size: Option<u64>,
         log_file_paths: Vec<String>,
         options: &ReadOptions,
     ) -> Result<BoxStream<'static, Result<RecordBatch>>> {
@@ -976,6 +1008,7 @@ impl FileGroupReader {
             self.hudi_configs.clone(),
             self.storage.clone(),
             base_file_path,
+            known_base_file_size,
             log_file_paths,
             partition_path,
             pushdown,
@@ -1023,40 +1056,14 @@ impl FileGroupReader {
 
         let final_projection = options.projection.clone();
         let read_projection = self.read_projection(options)?;
-        // The base file's own columns, needed only when this read has to be
-        // reconciled to the table's schema — see `stream_target_schema`. Reading
-        // the footer costs one request; the eager merge-on-read path already pays
-        // the same one for the same reason.
-        let base_file_schema = match (&self.data_schema_override, relative_path.is_empty()) {
-            (Some(_), false) => Some(
-                self.reader_for_path(relative_path)?
-                    .read_stream(relative_path, BaseFileReadOptions::default())
-                    .await
-                    .map_err(|e| {
-                        ReadFileSliceError(format!(
-                            "Failed to read base file schema '{relative_path}': {e:?}"
-                        ))
-                    })?
-                    .schema()
-                    .clone(),
-            ),
-            _ => None,
-        };
-
-        if let Some(ref cols) = read_projection {
-            // A column the table has but this base file does not cannot be
-            // selected from it — the parquet reader rejects an unknown column
-            // outright. It is null-filled by the reconciliation below instead.
-            let selectable: Vec<String> = match &base_file_schema {
-                Some(schema) => cols
-                    .iter()
-                    .filter(|name| schema.index_of(name).is_ok())
-                    .cloned()
-                    .collect(),
-                None => cols.clone(),
-            };
-            read_options = read_options.with_projection(selectable);
-        }
+        let hudi_configs = self.hudi_configs.clone();
+        let path = relative_path.to_string();
+        let filters = Arc::new(options.filters.clone());
+        let final_projection = Arc::new(final_projection);
+        // Validate once on first batch so typoed filter columns surface as errors
+        // rather than silent no-ops in `filters_to_row_mask`.
+        let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = self.reader_for_path(&path)?;
 
         // What each batch must look like once read: the table's types for the
         // columns this read selected. Without this the streaming path returns the
@@ -1065,24 +1072,54 @@ impl FileGroupReader {
         // `Table::read_stream` gives i32, and a caller that declared the table's
         // schema up front (the DataFusion scan does) is handed batches that do
         // not match it.
-        let target_schema = self
-            .stream_target_schema(base_file_schema.as_ref(), &read_projection)
-            .map(Arc::new);
-
-        let hudi_configs = self.hudi_configs.clone();
-        let path = relative_path.to_string();
-        let filters = Arc::new(options.filters.clone());
-        let final_projection = Arc::new(final_projection);
-        let target_schema = Arc::new(target_schema);
-        // Validate once on first batch so typoed filter columns surface as errors
-        // rather than silent no-ops in `filters_to_row_mask`.
-        let validated = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let reader = self.reader_for_path(&path)?;
-        let base_stream = reader
-            .read_stream(&path, read_options)
-            .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
-            .await?;
+        //
+        // Reconciling needs the base file's own columns, which only its footer
+        // can say. The projection is therefore chosen from inside the open, so
+        // the footer that answers the schema also serves the read.
+        let target_slot: Arc<std::sync::Mutex<Option<Arc<arrow_schema::Schema>>>> = Arc::default();
+        let base_stream = if self.data_schema_override.is_some() && !relative_path.is_empty() {
+            let slot = target_slot.clone();
+            let read_projection = read_projection.clone();
+            let open_options = read_options.clone();
+            reader
+                .read_stream_with_schema(
+                    &path,
+                    open_options,
+                    Box::new(move |schemas| {
+                        let base_file_schema = &schemas.stream;
+                        if let Some(cols) = &read_projection {
+                            // A column the table has but this base file does not
+                            // cannot be selected from it — the parquet reader
+                            // rejects an unknown column outright. It is
+                            // null-filled by the reconciliation below instead.
+                            let selectable: Vec<String> = cols
+                                .iter()
+                                .filter(|name| base_file_schema.index_of(name).is_ok())
+                                .cloned()
+                                .collect();
+                            read_options = read_options.with_projection(selectable);
+                        }
+                        *slot.lock().unwrap_or_else(|p| p.into_inner()) = self
+                            .stream_target_schema(Some(base_file_schema), &read_projection)
+                            .map(Arc::new);
+                        Ok(read_options)
+                    }),
+                )
+                .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
+                .await?
+        } else {
+            if let Some(cols) = &read_projection {
+                read_options = read_options.with_projection(cols.clone());
+            }
+            *target_slot.lock().unwrap_or_else(|p| p.into_inner()) = self
+                .stream_target_schema(None, &read_projection)
+                .map(Arc::new);
+            reader
+                .read_stream(&path, read_options)
+                .map_err(|e| ReadFileSliceError(format!("Failed to read path {path}: {e:?}")))
+                .await?
+        };
+        let target_schema = Arc::new(target_slot.lock().unwrap_or_else(|p| p.into_inner()).take());
 
         // Apply: reconcile to the table's schema → commit time → structured
         // filters → final projection. Reconciliation comes first so a filter and

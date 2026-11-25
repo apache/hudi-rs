@@ -899,96 +899,6 @@ impl HoodieFileGroupReader {
         //      promotions (float→double string-mediated so it is value-exact).
         // Step 3 is applied PER ROW-GROUP, so every base batch the merge
         // interleaves is already in `required_schema`.
-        let file_schema = self
-            .base_file_reader()?
-            .read_schema(&path)
-            .await
-            .map_err(|e| {
-                CoreError::ReadFileSliceError(format!(
-                    "Failed to read base file footer schema '{path}': {e:?}"
-                ))
-            })?;
-        // Intersection by *case-insensitive* name (Java/Spark resolve field names
-        // case-insensitively). Project under the FILE's actual name+type so the
-        // parquet reader finds the column; `project_batch_to_schema` (also
-        // case-insensitive) then evolves each batch to `required_schema`. A
-        // required column absent from the footer is skipped here and null-filled
-        // downstream; an ambiguous footer case-collision errors loudly.
-        let mut present: Vec<arrow_schema::FieldRef> =
-            Vec::with_capacity(required_schema.fields().len());
-        for rf in required_schema.fields() {
-            if let Some(idx) = crate::schema::batch_evolution::index_of_ci(&file_schema, rf.name())?
-            {
-                present.push(file_schema.fields()[idx].clone());
-            }
-        }
-        let present_len = present.len();
-        let intersection: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(present));
-        log::debug!(
-            "[base-file-evolution] path={} file_cols={} required_cols={} intersect_cols={}",
-            path,
-            file_schema.fields().len(),
-            required_schema.fields().len(),
-            present_len
-        );
-
-        // Parquet evaluates a pushed predicate against the file's PHYSICAL values,
-        // before `project_batch_to_schema` runs. Sound only while a physical value
-        // means what its physical type says, which the apache/hudi#18132 repair
-        // breaks: the file labels a tz-aware column micros while the stored i64 is
-        // MILLIS, so a millis-semantics literal reads those rows as 1970 and the
-        // filter drops rows that match. The post-scan filter cannot restore them.
-        //
-        // Two gates, cheapest first. `repair_risk_columns` was decided ONCE per scan
-        // from the table schema and the predicate's own referenced columns, and is
-        // empty unless the predicate touches a tz-aware millis column — so the
-        // common scan never reaches the footer comparison below and never loses
-        // pushdown. The footer schema itself is already fetched unconditionally
-        // above, so gate 1 buys predicate scoping and the per-file name walk, not
-        // avoided IO.
-        //
-        // The table side is `table_schema`, NOT `required_schema`: a filter column
-        // absent from the projection is still decoded and still misread, because a
-        // `RowFilter` builder derives its own `ProjectionMask` from the parquet
-        // schema rather than from `intersection`.
-        let repair_conflict =
-            if pushdown_is_safe && !self.reader_context.repair_risk_columns.is_empty() {
-                let table_side = self
-                    .schema_handler
-                    .table_schema
-                    .as_ref()
-                    .unwrap_or(&required_schema);
-                crate::schema::batch_evolution::reinterpreted_columns(
-                    &file_schema,
-                    table_side,
-                    &self.reader_context.repair_risk_columns,
-                )?
-            } else {
-                Vec::new()
-            };
-
-        // ONE verdict, both consumers, withdrawn in one block. That is the same
-        // property the merge-safety gate is bound once for, one layer in: an edit
-        // to the condition cannot leave the row-group selector behind, and pruning
-        // is the one that must not be left behind — it drops rows before anything
-        // downstream can see them.
-        if !repair_conflict.is_empty() {
-            let volume = self.storage.read_volume();
-            // Counted for every withdrawal; `row_group_selector_suppressed` can
-            // only speak for a selector the caller actually installed.
-            volume.record_pushdown_suppressed_by_repair();
-            if row_group_selector.is_some() {
-                volume.record_selector_suppressed();
-            }
-            log::debug!(
-                "base file '{path}' needs a value-reinterpreting logical-type repair \
-                 on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
-                 row-group pruning (post-merge filter still runs)"
-            );
-            row_filter = None;
-            row_group_selector = None;
-        }
-
         let base_read_schema: SchemaRef = if use_position {
             let mut fields: Vec<arrow_schema::FieldRef> =
                 required_schema.fields().iter().cloned().collect();
@@ -1009,29 +919,152 @@ impl HoodieFileGroupReader {
             return Ok(BaseSource::empty(base_read_schema));
         }
 
+        // Everything below the footer decides is chosen inside the open, so the
+        // footer that answers the file's schema also serves the stream: one
+        // footer fetch per base file rather than two.
+        let table_side = self
+            .schema_handler
+            .table_schema
+            .clone()
+            .unwrap_or_else(|| required_schema.clone());
+        let repair_risk_columns = self.reader_context.repair_risk_columns.clone();
+        let volume = self.storage.read_volume();
+        let choose_path = path.clone();
+        // The open speaks storage errors; a schema decision that fails here is
+        // kept whole and returned as itself once the open gives up.
+        let choose_error: Arc<std::sync::Mutex<Option<CoreError>>> = Arc::default();
+        let choose_error_slot = choose_error.clone();
+        let fail = move |e: CoreError| {
+            let message = e.to_string();
+            *choose_error_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+            crate::storage::error::StorageError::InvalidColumn(message)
+        };
+        let choose =
+            move |schemas: &crate::file_group::base_file::reader::FooterSchemas|
+                  -> crate::storage::error::Result<BaseFileReadOptions> {
+                // The footer's parquet schema, as `read_schema` gives it: the
+                // timestamp-repair check below was written against that, not
+                // against an embedded Arrow schema.
+                let file_schema = &schemas.file;
+                // Schema-evolution intersection (Java parity:
+                // HoodieParquetFileFormatHelper.buildImplicitSchemaChangeInfo):
+                //   1. diff footer schema vs required by name;
+                //   2. ask parquet only for the INTERSECTION (in the file's own types);
+                //   3. project to required per batch: null-fill added columns, cast
+                //      promotions (float→double string-mediated so it is value-exact).
+                // Step 3 is applied PER ROW-GROUP, so every base batch the merge
+                // interleaves is already in `required_schema`.
+                //
+                // Intersection by *case-insensitive* name (Java/Spark resolve field
+                // names case-insensitively). Project under the FILE's actual name+type
+                // so the parquet reader finds the column; `project_batch_to_schema`
+                // (also case-insensitive) then evolves each batch to
+                // `required_schema`. A required column absent from the footer is
+                // skipped here and null-filled downstream; an ambiguous footer
+                // case-collision errors loudly.
+                let mut present: Vec<arrow_schema::FieldRef> =
+                    Vec::with_capacity(required_schema.fields().len());
+                for rf in required_schema.fields() {
+                    let idx = crate::schema::batch_evolution::index_of_ci(file_schema, rf.name())
+                        .map_err(&fail)?;
+                    if let Some(idx) = idx {
+                        present.push(file_schema.fields()[idx].clone());
+                    }
+                }
+                log::debug!(
+                    "[base-file-evolution] path={} file_cols={} required_cols={} intersect_cols={}",
+                    choose_path,
+                    file_schema.fields().len(),
+                    required_schema.fields().len(),
+                    present.len()
+                );
+
+                // Parquet evaluates a pushed predicate against the file's PHYSICAL
+                // values, before `project_batch_to_schema` runs. Sound only while a
+                // physical value means what its physical type says, which the
+                // apache/hudi#18132 repair breaks: the file labels a tz-aware column
+                // micros while the stored i64 is MILLIS, so a millis-semantics literal
+                // reads those rows as 1970 and the filter drops rows that match. The
+                // post-scan filter cannot restore them.
+                //
+                // `repair_risk_columns` was decided ONCE per scan from the table
+                // schema and the predicate's own referenced columns, and is empty
+                // unless the predicate touches a tz-aware millis column — so the
+                // common scan never reaches the footer comparison and never loses
+                // pushdown.
+                //
+                // The table side is `table_schema`, NOT `required_schema`: a filter
+                // column absent from the projection is still decoded and still
+                // misread, because a `RowFilter` builder derives its own
+                // `ProjectionMask` from the parquet schema rather than from the
+                // intersection.
+                let repair_conflict = if pushdown_is_safe && !repair_risk_columns.is_empty() {
+                    crate::schema::batch_evolution::reinterpreted_columns(
+                        file_schema,
+                        &table_side,
+                        &repair_risk_columns,
+                    )
+                    .map_err(&fail)?
+                } else {
+                    Vec::new()
+                };
+
+                // ONE verdict, both consumers, withdrawn in one block: an edit to the
+                // condition cannot leave the row-group selector behind, and pruning
+                // is the one that must not be left behind — it drops rows before
+                // anything downstream can see them.
+                if !repair_conflict.is_empty() {
+                    // Counted for every withdrawal; `row_group_selector_suppressed`
+                    // can only speak for a selector the caller actually installed.
+                    volume.record_pushdown_suppressed_by_repair();
+                    if row_group_selector.is_some() {
+                        volume.record_selector_suppressed();
+                    }
+                    log::debug!(
+                        "base file '{choose_path}' needs a value-reinterpreting logical-type \
+                     repair on {repair_conflict:?} — skipping parquet RowFilter \
+                     pushdown and row-group pruning (post-merge filter still runs)"
+                    );
+                    row_filter = None;
+                    row_group_selector = None;
+                }
+
+                // The gated RowFilter and row-group selector are both threaded
+                // through the intersection read. Only the SELECTOR skips IO: a
+                // RowFilter decides per row once the predicate columns are decoded.
+                // The filter builder resolves predicate columns by name and returns
+                // None when any referenced column is absent — safe even for
+                // evolved/added cols.
+                Ok(
+                    base_read_options(row_filter, row_group_selector, key_predicate, use_position)
+                        .with_projection(present.iter().map(|f| f.name())),
+                )
+            };
+
         // Open the base file as a stream. The whole file never lives in memory;
-        // one batch does. The gated RowFilter and row-group selector are both
-        // threaded through the intersection read. Only the SELECTOR skips IO: a
-        // RowFilter decides per row once the predicate columns are decoded. The
-        // filter builder resolves predicate columns by name and returns None when
-        // any referenced column is absent — safe even for evolved/added cols.
+        // one batch does.
+        let mut open_options = BaseFileReadOptions::new();
+        if use_position {
+            open_options = open_options.with_row_index_column(ROW_INDEX_TEMPORARY_COLUMN_NAME);
+        }
+        if let Some(size) = self.input_split.base_file_size {
+            open_options = open_options.with_known_file_size(size);
+        }
         let base_stream = self
             .base_file_reader()?
-            .read_stream(
-                &path,
-                base_read_options(
-                    row_filter.clone(),
-                    row_group_selector.clone(),
-                    key_predicate.clone(),
-                    use_position,
-                )
-                .with_projection(intersection.fields().iter().map(|f| f.name())),
-            )
+            .read_stream_with_schema(&path, open_options, Box::new(choose))
             .await
             .map_err(|e| {
-                CoreError::ReadFileSliceError(format!(
-                    "Failed to open base file stream '{path}': {e:?}"
-                ))
+                match choose_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                {
+                    Some(schema_error) => schema_error,
+                    None => CoreError::ReadFileSliceError(format!(
+                        "Failed to open base file stream '{path}': {e:?}"
+                    )),
+                }
             })?;
 
         let evolve_to = base_read_schema.clone();

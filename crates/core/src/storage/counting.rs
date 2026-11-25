@@ -49,11 +49,23 @@ pub(crate) struct RequestCounts {
     puts: AtomicUsize,
     /// Bytes returned by reads.
     bytes_read: AtomicUsize,
+    /// Metadata lookups and reads per object, keyed by its path.
+    by_path: std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>,
 }
 
 impl RequestCounts {
     pub(crate) fn gets(&self) -> usize {
         self.gets.load(Ordering::Relaxed)
+    }
+
+    /// Metadata lookups and reads made against the one object whose path ends
+    /// with `suffix`, as `(heads, gets)`.
+    pub(crate) fn requests_to(&self, suffix: &str) -> (usize, usize) {
+        let by_path = self.by_path.lock().unwrap_or_else(|p| p.into_inner());
+        by_path
+            .iter()
+            .filter(|(path, _)| path.ends_with(suffix))
+            .fold((0, 0), |(h, g), (_, (ph, pg))| (h + ph, g + pg))
     }
 
     pub(crate) fn heads(&self) -> usize {
@@ -128,6 +140,19 @@ impl ObjectStore for CountingObjectStore {
             self.counts.heads.fetch_add(1, Ordering::Relaxed);
         } else {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
+        }
+        {
+            let mut by_path = self
+                .counts
+                .by_path
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let entry = by_path.entry(location.to_string()).or_default();
+            if options.head {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
         }
         let head = options.head;
         let result = self.inner.get_opts(location, options).await?;

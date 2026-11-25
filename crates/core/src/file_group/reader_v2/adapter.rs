@@ -56,6 +56,7 @@ pub(crate) async fn read_file_slice(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
+    base_file_size: Option<u64>,
     log_file_paths: Vec<String>,
     partition_path: String,
     pushdown: Option<FilterPushdown>,
@@ -67,6 +68,7 @@ pub(crate) async fn read_file_slice(
         hudi_configs,
         storage,
         base_file_path,
+        base_file_size,
         log_file_paths,
         partition_path,
         pushdown,
@@ -88,6 +90,7 @@ pub(crate) async fn read_file_slice_stream(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
+    base_file_size: Option<u64>,
     log_file_paths: Vec<String>,
     partition_path: String,
     pushdown: Option<FilterPushdown>,
@@ -99,6 +102,7 @@ pub(crate) async fn read_file_slice_stream(
         hudi_configs,
         storage,
         base_file_path,
+        base_file_size,
         log_file_paths,
         partition_path,
         pushdown,
@@ -117,6 +121,7 @@ fn build_reader(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
+    base_file_size: Option<u64>,
     log_file_paths: Vec<String>,
     partition_path: String,
     pushdown: Option<FilterPushdown>,
@@ -155,7 +160,8 @@ fn build_reader(
         base_file_commit_time,
         log_file_paths,
         partition_path,
-    );
+    )
+    .with_base_file_size(base_file_size);
 
     // Defaults chosen to match what the existing reader returns: deletes are
     // applied but never emitted, output keeps merge order, and only completed
