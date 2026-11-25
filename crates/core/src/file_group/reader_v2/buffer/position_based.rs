@@ -1231,6 +1231,24 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
             .merge_one_base_batch_kernel(base, target_schema, base_match)
     }
 
+    /// The vectorized merge matches base rows by position alone, so it needs no
+    /// record key from the base file. A key field that is also an ordering
+    /// field is still needed: event-time ordering compares the base row's value.
+    fn base_columns_unneeded(&mut self, merge_schema: &SchemaRef) -> Result<Vec<String>> {
+        if self.should_use_position && self.build_position_merge_index(merge_schema)? {
+            let ordering = &self.inner.record_context.ordering_field_names;
+            return Ok(self
+                .inner
+                .record_context
+                .record_key_fields
+                .iter()
+                .filter(|k| !ordering.iter().any(|o| o.eq_ignore_ascii_case(k)))
+                .cloned()
+                .collect());
+        }
+        Ok(Vec::new())
+    }
+
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
         if self.vectorized.is_some() {
             return self.drain_position_merge(target_schema);
@@ -1965,8 +1983,14 @@ mod tests {
         merge_ten_rows(buffer, blocks).0
     }
 
-    /// Each case where the vectorized merge does not apply falls back on its own
-    /// and returns what the key merge returns.
+    /// Whether `buffer` still needs the record key from the base file.
+    fn reads_key(buffer: &mut dyn HoodieFileGroupRecordBuffer) -> bool {
+        buffer.base_columns_unneeded(&schema()).unwrap().is_empty()
+    }
+
+    /// Each case where the vectorized merge does not apply falls back on its own,
+    /// returns what the key merge returns, and reads the record key from the
+    /// base file again. The vectorized case, for contrast, does without it.
     #[test]
     fn vectorized_merge_falls_back_where_it_does_not_apply() {
         let expected: Vec<(String, i32, i64)> = (0..10)
@@ -1984,11 +2008,13 @@ mod tests {
         // Vectorized: positions match the base instant.
         let vectorized = build_buffer();
         assert!(vectorized.vectorized.is_some());
-        let (out, vectorized) = merge_ten_rows(vectorized, fallback_blocks(BASE_INSTANT, false));
+        let (out, mut vectorized) =
+            merge_ten_rows(vectorized, fallback_blocks(BASE_INSTANT, false));
         let reference = key_merged(commit, &[], fallback_blocks(BASE_INSTANT, false));
         assert_eq!(out, expected);
         assert_eq!(out, reference);
         assert!(vectorized.vectorized.is_some());
+        assert!(!reads_key(&mut vectorized));
 
         // No record positions in the block: the empty bitmap falls back to
         // the key merge.
@@ -1997,42 +2023,47 @@ mod tests {
         no_positions.process_data_block(&mut update).unwrap();
         assert!(no_positions.vectorized.is_none());
         assert_eq!(no_positions.get_buffer_type(), BufferType::KeyBasedMerge);
+        assert!(reads_key(&mut no_positions));
 
         // Positions computed against another base file.
         let other = "19990101000000000";
-        let (out, mismatched) = merge_ten_rows(build_buffer(), fallback_blocks(other, false));
+        let (out, mut mismatched) = merge_ten_rows(build_buffer(), fallback_blocks(other, false));
         let reference = key_merged(commit, &[], fallback_blocks(other, false));
         assert!(mismatched.vectorized.is_none());
         assert_eq!(mismatched.get_buffer_type(), BufferType::KeyBasedMerge);
         assert_eq!(out, expected);
         assert_eq!(out, reference);
+        assert!(reads_key(&mut mismatched));
 
         // A partial-update block: still merged by position, through the map.
         let blocks = fallback_blocks(BASE_INSTANT, true);
-        let (out, partial) = merge_ten_rows(build_buffer(), blocks);
+        let (out, mut partial) = merge_ten_rows(build_buffer(), blocks);
         let reference = key_merged(commit, &[], fallback_blocks(BASE_INSTANT, true));
         assert!(partial.vectorized.is_none());
         assert_eq!(partial.get_buffer_type(), BufferType::PositionBasedMerge);
         assert_eq!(out, reference);
+        assert!(reads_key(&mut partial));
 
         // Event-time ordering takes the vectorized merge too, and matches the key
-        // merge.
+        // merge without reading the record key.
         let event = "EVENT_TIME_ORDERING";
         let ordering = [("hoodie.table.ordering.fields", "ts")];
         let event_buffer = build_buffer_with(event, &ordering, &[]);
         assert!(event_buffer.vectorized.is_some());
         let blocks = fallback_blocks(BASE_INSTANT, false);
-        let (out, _) = merge_ten_rows(event_buffer, blocks);
+        let (out, mut event_buffer) = merge_ten_rows(event_buffer, blocks);
         let reference = key_merged(event, &ordering, fallback_blocks(BASE_INSTANT, false));
         assert_eq!(out, reference);
+        assert!(!reads_key(&mut event_buffer));
 
         // Event-time ordering with positions from another base file falls back.
         let blocks = fallback_blocks(other, false);
-        let (out, event_fallback) =
+        let (out, mut event_fallback) =
             merge_ten_rows(build_buffer_with(event, &ordering, &[]), blocks);
         let reference = key_merged(event, &ordering, fallback_blocks(other, false));
         assert!(event_fallback.vectorized.is_none());
         assert_eq!(out, reference);
+        assert!(reads_key(&mut event_fallback));
 
         // A custom merger decides from whole rows, so it stays on the row path.
         let custom = build_buffer_with(
@@ -2050,6 +2081,23 @@ mod tests {
             &[],
         );
         assert!(custom.vectorized.is_none());
+
+        // `hoodie.merge.use.record.positions=false` builds a key-based buffer,
+        // which needs every merge column from the base file.
+        let mut key_buffer = build_buffer().inner;
+        assert!(reads_key(&mut key_buffer));
+    }
+
+    /// A record key field that is also the ordering field stays read from the
+    /// base file: event-time ordering compares the base row's value.
+    #[test]
+    fn a_key_field_used_for_ordering_is_never_skipped() {
+        let ordering = [("hoodie.table.ordering.fields", "_hoodie_record_key")];
+        let mut buffer = build_buffer_with("EVENT_TIME_ORDERING", &ordering, &[]);
+        assert!(buffer.vectorized.is_some());
+        let mut update = data_block_with_positions(&[("k2", 200, 9)], &[2], BASE_INSTANT);
+        buffer.process_data_block(&mut update).unwrap();
+        assert!(buffer.base_columns_unneeded(&schema()).unwrap().is_empty());
     }
 
     /// An update whose base row the base read never produces is emitted once
