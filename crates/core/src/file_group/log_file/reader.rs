@@ -46,6 +46,34 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
+/// Bytes of log-block content a scan may keep from its header walk, shared by
+/// every log file the scan walks, concurrently or not. A walk keeps a block's
+/// content only when it can reserve the block's whole length here; the rest is
+/// deferred and fetched later.
+#[derive(Debug)]
+pub struct ResidentBudget(std::sync::atomic::AtomicU64);
+
+impl ResidentBudget {
+    pub fn new(bytes: u64) -> Self {
+        Self(std::sync::atomic::AtomicU64::new(bytes))
+    }
+
+    /// Take `bytes` from the budget if that many are left.
+    pub fn try_reserve(&self, bytes: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        self.0
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(bytes)
+            })
+            .is_ok()
+    }
+
+    /// Bytes not reserved yet.
+    pub fn remaining(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 pub struct LogFileReader {
     hudi_configs: Arc<HudiConfigs>,
     reader: StorageReader,
@@ -118,25 +146,28 @@ impl LogFileReader {
         })
     }
 
-    /// Walk every block reading only its header, recording where the content
-    /// sits so an admitted block can read it later.
-    ///
-    /// `instant_range` is not applied here — the caller decides what to admit
-    /// from the headers, which is the point of not decoding yet.
     /// Walk with no residency bound.
     ///
     /// For callers that are measuring or exercising the walk itself rather than a
-    /// scan. Production goes through [`Self::read_all_blocks_metadata_only`] with a
-    /// budget shared across every log file, which is what keeps peak residency at
+    /// scan. A scan goes through [`Self::read_all_blocks_metadata_only`] with one
+    /// [`ResidentBudget`] that every log file's walk reserves from, concurrent
+    /// walks included, which is what keeps the content kept from the walk within
     /// one window.
     pub async fn read_all_blocks_metadata_only_unbounded(&mut self) -> Result<Vec<LogBlock>> {
-        let mut budget = u64::MAX;
-        self.read_all_blocks_metadata_only(&mut budget).await
+        self.read_all_blocks_metadata_only(&ResidentBudget::new(u64::MAX))
+            .await
     }
 
+    /// Walk every block reading only its header, recording where the content
+    /// sits so an admitted block can read it later. A block whose content the
+    /// fetch window already holds keeps it when `resident_budget` can reserve
+    /// its length.
+    ///
+    /// No instant range is applied here: the caller decides what to admit from
+    /// the headers, which is the point of not decoding yet.
     pub async fn read_all_blocks_metadata_only(
         &mut self,
-        resident_budget: &mut u64,
+        resident_budget: &ResidentBudget,
     ) -> Result<Vec<LogBlock>> {
         let fetcher = self.reader.block_fetcher();
         let mut blocks = Vec::new();
@@ -459,7 +490,7 @@ impl LogFileReader {
     async fn read_next_block_metadata_only(
         &mut self,
         fetcher: &LogBlockFetcher,
-        resident_budget: &mut u64,
+        resident_budget: &ResidentBudget,
     ) -> Result<Option<LogBlock>> {
         let magic_pos = self.reader.position();
         if !self.read_magic().await? {
@@ -516,26 +547,25 @@ impl LogFileReader {
         let after_content = content_position
             .checked_add(content_length)
             .ok_or_else(|| CoreError::LogFormatError("Content length overflow".to_string()))?;
-        let affordable = *resident_budget >= content_length;
-        let resident_content =
-            if affordable && self.reader.has_resident(content_position, after_content) {
-                self.reader.seek_to(content_position);
-                let window_slice = self
-                    .reader
-                    .read_bytes(content_length)
-                    .await
-                    .map_err(CoreError::ReadLogFileError)?;
-                *resident_budget -= content_length;
-                // Copied, not sliced. `Bytes` slices share their allocation, so keeping
-                // a slice would pin the whole fetch window: one retained block would
-                // hold `hoodie.memory.dfs.buffer.max.size` rather than its own content,
-                // and a scan accumulates blocks from every log file before the gates
-                // run. Copying makes residency the block's own length, which the budget
-                // above then bounds.
-                Some(bytes::Bytes::copy_from_slice(&window_slice))
-            } else {
-                None
-            };
+        let resident_content = if self.reader.has_resident(content_position, after_content)
+            && resident_budget.try_reserve(content_length)
+        {
+            self.reader.seek_to(content_position);
+            let window_slice = self
+                .reader
+                .read_bytes(content_length)
+                .await
+                .map_err(CoreError::ReadLogFileError)?;
+            // Copied, not sliced. `Bytes` slices share their allocation, so keeping
+            // a slice would pin the whole fetch window: one retained block would
+            // hold `hoodie.memory.dfs.buffer.max.size` rather than its own content,
+            // and a scan accumulates blocks from every log file before the gates
+            // run. Copying makes residency the block's own length, which the budget
+            // above then bounds.
+            Some(bytes::Bytes::copy_from_slice(&window_slice))
+        } else {
+            None
+        };
         self.reader.seek_to(after_content);
         let footer = self
             .read_block_metadata(BlockMetadataType::Footer, &format_version)
@@ -664,13 +694,13 @@ mod tests {
                 Storage::new(Arc::new(std::collections::HashMap::new()), configs.clone())?;
             let mut reader =
                 LogFileReader::new_streaming(configs.clone(), storage, &file_name).await?;
-            let mut left = budget;
-            let blocks = reader.read_all_blocks_metadata_only(&mut left).await?;
+            let left = ResidentBudget::new(budget);
+            let blocks = reader.read_all_blocks_metadata_only(&left).await?;
             let kept: u64 = blocks
                 .iter()
                 .filter_map(|b| b.resident_content.as_ref().map(|c| c.len() as u64))
                 .sum();
-            Ok((blocks.len(), kept, budget - left))
+            Ok((blocks.len(), kept, budget - left.remaining()))
         };
 
         // Generous: the file is far inside one window, so every block is kept.

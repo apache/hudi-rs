@@ -42,7 +42,7 @@
 
 use crate::Result;
 use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType, LogBlock};
-use crate::file_group::log_file::reader::LogFileReader;
+use crate::file_group::log_file::reader::{LogFileReader, ResidentBudget};
 use crate::file_group::reader_v2::buffer::HoodieFileGroupRecordBuffer;
 use crate::file_group::reader_v2::profiling::{profile_add, profile_once};
 use crate::file_group::reader_v2::reader_context::{CompletionGateInputs, ReaderContext};
@@ -50,6 +50,13 @@ use crate::storage::Storage;
 use crate::timeline::selector::InstantRange;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+
+use futures::{StreamExt, TryStreamExt};
+
+/// Log files of one slice walked at once. Each walk holds at most one fetch
+/// window while it runs, so this bounds the walk's transient memory to this
+/// many windows; content kept past the walk is bounded by one shared budget.
+const LOG_FILE_WALK_CONCURRENCY: usize = 4;
 
 // =========================================================================
 // Pass 1 result
@@ -505,36 +512,59 @@ impl BaseHoodieLogRecordReader {
         // One window's worth of content may be kept from the walk across the whole
         // scan, not per file. Blocks the walk was already holding bytes for cost no
         // second request, but keeping them is memory, and Pass 3's budget bounds
-        // only the deferred remainder. Sharing one budget across every log file is
-        // what keeps peak residency at one window, which is the bound the
-        // headers-only walk exists to buy.
-        let mut resident_budget =
-            crate::storage::reader::stream_window_size(&hudi_configs).unwrap_or(0);
+        // only the deferred remainder. Every walk reserves from this one budget,
+        // including the concurrent ones below, which is what keeps the content
+        // kept from the walk at one window, the bound the headers-only walk exists
+        // to buy.
+        let resident_budget = Arc::new(ResidentBudget::new(
+            crate::storage::reader::stream_window_size(&hudi_configs).unwrap_or(0),
+        ));
         profile_once!(self.log_block_read_us, {
-            for path in &self.log_file_paths.clone() {
-                // Walk headers only, out of a bounded fetch window. Passes 1 and 2
-                // read nothing but a block's header, so the gates below decide what
-                // is admitted before any content is fetched or decoded, and Pass 3
-                // reads each admitted block's own content. A block the gates discard
-                // therefore costs no bytes and cannot fail the read by being
-                // undecodable. No instant range is applied here: the gates decide,
-                // rather than filtering twice with different rules.
-                let mut reader =
-                    LogFileReader::new_streaming(hudi_configs.clone(), self.storage.clone(), path)
+            // Walk headers only, out of a bounded fetch window. Passes 1 and 2
+            // read nothing but a block's header, so the gates below decide what is
+            // admitted before any content is fetched or decoded, and Pass 3 reads
+            // each admitted block's own content. A block the gates discard
+            // therefore costs no bytes and cannot fail the read by being
+            // undecodable. No instant range is applied here: the gates decide,
+            // rather than filtering twice with different rules.
+            //
+            // The files are walked concurrently, up to LOG_FILE_WALK_CONCURRENCY at
+            // a time, so a slice's log GETs overlap instead of queueing;
+            // `buffered` returns the walks in file order whatever order they
+            // finish in, so the gates see the blocks in log order. Each walk
+            // holds one fetch window while it runs, so the transient memory is up
+            // to that many windows; what is kept past the walk stays within the
+            // one shared budget.
+            let paths = self.log_file_paths.clone();
+            let storage = self.storage.clone();
+            let walks = paths.into_iter().map(|path: String| {
+                let hudi_configs = hudi_configs.clone();
+                let storage = storage.clone();
+                let resident_budget = resident_budget.clone();
+                async move {
+                    let mut reader =
+                        LogFileReader::new_streaming(hudi_configs, storage, &path).await?;
+                    let blocks = reader
+                        .read_all_blocks_metadata_only(&resident_budget)
                         .await?;
-                let blocks = reader
-                    .read_all_blocks_metadata_only(&mut resident_budget)
-                    .await?;
+                    // A file inside one fetch window costs a single request whose
+                    // blocking read can complete before this task is ever
+                    // suspended, and Pass 3 then decodes resident bytes with no
+                    // I/O at all, so nothing in the scan is guaranteed to reach
+                    // the scheduler. On a single-worker runtime that starves every
+                    // task sharing it for the whole scan; one explicit yield per
+                    // file keeps the walk cooperative whatever the I/O timing.
+                    tokio::task::yield_now().await;
+                    Ok::<_, crate::error::CoreError>(blocks)
+                }
+            });
+            let walked: Vec<Vec<LogBlock>> = futures::stream::iter(walks)
+                .buffered(LOG_FILE_WALK_CONCURRENCY)
+                .try_collect()
+                .await?;
+            for blocks in walked {
                 self.total_log_files += 1;
                 all_blocks.extend(blocks);
-                // A file inside one fetch window costs a single request whose
-                // blocking read can complete before this task is ever suspended,
-                // and Pass 3 then decodes resident bytes with no I/O at all — so
-                // nothing in the scan is guaranteed to reach the scheduler. On a
-                // single-worker runtime that starves every task sharing it for
-                // the whole scan; one explicit yield per file keeps the walk
-                // cooperative whatever the I/O timing.
-                tokio::task::yield_now().await;
             }
         });
 
@@ -1193,7 +1223,12 @@ mod tests {
         // regime in which the prefetch has anything to do. With a budget the walk
         // keeps both blocks' bytes, `plan_content_windows` returns nothing, and
         // this test would pass without ever calling `fetch_window`.
-        let blocks = reader.read_all_blocks_metadata_only(&mut 0).await.unwrap();
+        let blocks = reader
+            .read_all_blocks_metadata_only(
+                &crate::file_group::log_file::reader::ResidentBudget::new(0),
+            )
+            .await
+            .unwrap();
         let admitted = blocks
             .iter()
             .filter(|b| {
@@ -2430,6 +2465,81 @@ mod tests {
             merge_upsert_us: 0,
             merge_insert_us: 0,
         }
+    }
+
+    /// Log files walked concurrently are gated in file order whatever order
+    /// their walks finish in. The first file holds a data block whose content
+    /// is not decodable; the second holds the rollback of its instant. The
+    /// first file's reads are delayed so the second walk finishes first. The
+    /// rollback must still apply to the first file's block, which is then never
+    /// decoded; applied out of order, the scan would decode it and fail.
+    #[tokio::test]
+    async fn concurrent_walks_apply_a_later_files_rollback_in_order() {
+        use crate::file_group::log_file::writer::write_log_block;
+        use crate::storage::counting::CountingObjectStore;
+        use object_store::{ObjectStoreExt, PutPayload};
+
+        let data_instant = "20250101000001000";
+        let rollback_instant = "20250101000002000";
+        let first = ".fg-0_20250101000000000.log.1_0-1-1";
+        let second = ".fg-0_20250101000000000.log.2_0-1-1";
+        let data = write_log_block(
+            BlockType::AvroData,
+            HashMap::from([
+                (BlockMetadataKey::InstantTime, data_instant.to_string()),
+                (
+                    BlockMetadataKey::Schema,
+                    r#"{"type":"record","name":"r","fields":[{"name":"a","type":"int"}]}"#
+                        .to_string(),
+                ),
+            ]),
+            b"not an avro block",
+        );
+        let rollback = write_log_block(
+            BlockType::Command,
+            HashMap::from([
+                (BlockMetadataKey::InstantTime, rollback_instant.to_string()),
+                (
+                    BlockMetadataKey::TargetInstantTime,
+                    data_instant.to_string(),
+                ),
+                (
+                    BlockMetadataKey::CommandBlockType,
+                    (CommandBlock::Rollback as u32).to_string(),
+                ),
+            ]),
+            b"",
+        );
+        let memory = object_store::memory::InMemory::new();
+        for (name, bytes) in [(first, data), (second, rollback)] {
+            memory
+                .put(
+                    &object_store::path::Path::from(format!("table/{name}")),
+                    PutPayload::from(bytes),
+                )
+                .await
+                .unwrap();
+        }
+        let (store, _) = CountingObjectStore::new(Arc::new(memory));
+        store.delay_reads(first, std::time::Duration::from_millis(300));
+
+        let mut reader = reader_with(false, None);
+        reader.storage = Storage::new_with_object_store(
+            url::Url::parse("memory:///table/").unwrap(),
+            store,
+            Arc::new(crate::config::HudiConfigs::empty()),
+        );
+        reader.log_file_paths = vec![first.to_string(), second.to_string()];
+        reader.scan_internal(false).await.unwrap();
+        assert_eq!(reader.total_log_files, 2);
+        assert_eq!(reader.total_rollbacks, 1);
+        assert!(
+            !reader
+                .valid_block_instants
+                .iter()
+                .any(|i| i == data_instant),
+            "the rolled-back instant is not merged"
+        );
     }
 
     fn a_row_filter_builder() -> crate::storage::RowFilterBuilder {
