@@ -38,6 +38,25 @@
 //! keys in the existing `String`-keyed spillable map; the map holds a single key
 //! domain at any instant — positions before fallback, record keys after.
 //!
+//! ## Vectorized position-based merge
+//!
+//! Under commit-time or event-time ordering, with no partial-update rule and no
+//! delete marker other than `_hoodie_is_deleted`, a log record at a position
+//! either replaces the base row there whole or leaves it, and a delete either
+//! removes it or is obsolete. While that holds, log blocks are kept as they
+//! arrive instead of being turned into records one by one. When the base is
+//! read, they are folded in log order into one sorted position list: under
+//! commit-time ordering a later block wins, under event-time ordering the fold
+//! follows the event-time merger's rules on each record's ordering value. Each
+//! base batch is then merged by finding that list's positions among the batch's
+//! row positions. Under event-time ordering the base row's ordering value is
+//! read only at those matched rows and compared with the log record's. The rows
+//! the log wins are masked out and the log rows that replace them are gathered
+//! in one call. The record map is never touched. Anything outside
+//! those conditions (a partial block, a block without usable positions, a
+//! caller using the row-at-a-time path) replays the kept blocks into the map
+//! and continues the ordinary way.
+//!
 //! ## Fallback to key-based
 //!
 //! When a log block has no valid positions (missing / mismatched base-file
@@ -49,20 +68,24 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::RecordBatch;
+use arrow_array::{Array, BooleanArray, RecordBatch};
+use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::SchemaRef;
 
 use crate::Result;
 use crate::error::CoreError;
+use crate::file_group::log_file::content::PARTIAL_UPDATE_SCHEMA_KEY;
 use crate::file_group::log_file::log_block::{LogBlock, LogBlockContent};
 use crate::file_group::reader_v2::buffer::key_based::{BaseMatch, KeyBasedFileGroupRecordBuffer};
 use crate::file_group::reader_v2::buffer::record_positions::{
     base_row_position_array, decode_record_positions,
 };
-use crate::file_group::reader_v2::buffer::row_extraction::records_to_batch;
+use crate::file_group::reader_v2::buffer::row_extraction::{
+    reconcile_batch_to_schema, records_to_batch,
+};
 use crate::file_group::reader_v2::buffer::spillable_map::{SpillConfig, SpillableRecordMap};
 use crate::file_group::reader_v2::buffer::{BufferType, HoodieFileGroupRecordBuffer};
-use crate::file_group::reader_v2::buffered_record::{BufferedRecord, DeleteRecord};
+use crate::file_group::reader_v2::buffered_record::{BufferedRecord, DeleteRecord, OrderingValue};
 use crate::file_group::reader_v2::merge_iterator::DEFAULT_BATCH_SIZE;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::update_processor::UpdateStats;
@@ -92,6 +115,61 @@ pub struct PositionBasedFileGroupRecordBuffer {
     /// Position-only deletes retained across a fallback (see
     /// [`needs_hybrid_strategy`](Self::needs_hybrid_strategy)).
     hybrid_deletes: HashMap<u64, BufferedRecord>,
+    /// The vectorized merge's state while it applies (see the module docs);
+    /// `None` once the buffer merges through the record map.
+    vectorized: Option<VectorizedPositionMerge>,
+}
+
+/// Log blocks kept for the vectorized merge, and the position list built from them.
+#[derive(Debug)]
+struct VectorizedPositionMerge {
+    blocks: Vec<PositionMergeBlock>,
+    index: Option<PositionMergeIndex>,
+    /// Bytes of log batches kept so far.
+    bytes: usize,
+    /// The merge map's in-memory budget. The kept blocks can't spill, so past
+    /// this they are handed to the record map, which can.
+    budget: u64,
+}
+
+/// One log block as it arrived, with its validated record positions.
+#[derive(Debug)]
+enum PositionMergeBlock {
+    Data {
+        positions: Vec<u64>,
+        batches: Vec<RecordBatch>,
+    },
+    Delete {
+        positions: Vec<u64>,
+        batches: Vec<(RecordBatch, String)>,
+    },
+}
+
+/// What the newest log record at a position does to the base row there.
+#[derive(Clone, Copy, Debug)]
+enum PositionMergeSlot {
+    /// Replace it with row `row` of `PositionMergeIndex::data[batch]`.
+    Update { batch: u32, row: u32 },
+    /// Remove it.
+    Delete,
+}
+
+/// The kept log blocks folded into one list, sorted by position.
+#[derive(Debug)]
+struct PositionMergeIndex {
+    entries: Vec<(u64, PositionMergeSlot)>,
+    /// Whether entry `i` met its base row; an update that never did is emitted
+    /// on its own when the base is exhausted, as the record map would.
+    consumed: Vec<bool>,
+    /// The log data batches, reconciled to the merge schema.
+    data: Vec<RecordBatch>,
+    /// Under event-time ordering, each entry's ordering value (aligned with
+    /// `entries`); empty under commit-time ordering, which never compares.
+    orderings: Vec<Option<OrderingValue>>,
+    /// The next entry the drain of unmatched updates looks at.
+    drain_from: usize,
+    /// Counts for the read's update statistics, as the record map keeps them.
+    stats: UpdateStats,
 }
 
 impl PositionBasedFileGroupRecordBuffer {
@@ -105,13 +183,28 @@ impl PositionBasedFileGroupRecordBuffer {
         emit_delete: bool,
         base_file_instant_time: String,
     ) -> Result<Self> {
-        let inner = KeyBasedFileGroupRecordBuffer::new(reader_context, merge_mode, emit_delete)?;
+        let mut inner =
+            KeyBasedFileGroupRecordBuffer::new(reader_context, merge_mode, emit_delete)?;
+        inner.position_filter = Some(roaring::RoaringTreemap::new());
+        let vectorized = if vectorized_merge_applies(&inner, emit_delete) {
+            let budget = SpillConfig::from_config(&inner.reader_context.hoodie_reader_config)?
+                .max_in_memory_size;
+            Some(VectorizedPositionMerge {
+                blocks: Vec::new(),
+                index: None,
+                bytes: 0,
+                budget,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             inner,
             base_file_instant_time,
             should_use_position: true,
             needs_hybrid_strategy: false,
             hybrid_deletes: HashMap::new(),
+            vectorized,
         })
     }
 
@@ -120,6 +213,412 @@ impl PositionBasedFileGroupRecordBuffer {
     /// fallback, record keys after), so the string domains do not collide.
     fn position_key(position: u64) -> String {
         position.to_string()
+    }
+
+    /// Record that `position` has a buffered log record, so the merge kernel
+    /// looks base rows at that position up in the merge map.
+    fn note_position(&mut self, position: u64) {
+        if let Some(filter) = self.inner.position_filter.as_mut() {
+            filter.insert(position);
+        }
+    }
+
+    /// [`Self::note_position`] for a map key handed in from outside the
+    /// block loops. While the buffer merges by position every key is a
+    /// decimal position. A key that does not parse can't be skipped safely,
+    /// so the filter is dropped and every base row is looked up.
+    fn note_position_key(&mut self, key: &str) {
+        if !self.should_use_position {
+            return;
+        }
+        match key.parse::<u64>() {
+            Ok(position) => self.note_position(position),
+            Err(_) => self.inner.position_filter = None,
+        }
+    }
+
+    /// Buffer a data block's records in the record map, keyed by position.
+    fn ingest_data_records(&mut self, positions: &[u64], batches: Vec<RecordBatch>) -> Result<()> {
+        let mut pos_idx = 0usize;
+        for batch in batches {
+            let batch = Arc::new(batch);
+            // `record_context` and `base.delete_context` are disjoint fields of
+            // `inner`, so these two immutable borrows coexist; the owned
+            // `records` Vec ends both borrows before the `&mut` calls below.
+            let records = self
+                .inner
+                .record_context
+                .batch_to_buffered_records(&batch, self.inner.base.delete_context.as_ref())?;
+            // Index-zip: `positions[pos_idx]` is the base-file position of the
+            // `pos_idx`-th record in file order. `decode_record_positions`
+            // returns the Roaring64 bitmap ascending, so this pairing is only
+            // correct because the Hudi writer emits records within a block in
+            // ascending base-position order, the same invariant Java's
+            // `PositionBasedFileGroupRecordBuffer` relies on with
+            // `recordPositions.get(recordIndex++)`. The caller checked that the
+            // counts agree.
+            for (_record_key, record) in records {
+                let position = positions[pos_idx];
+                pos_idx += 1;
+                self.note_position(position);
+                self.inner
+                    .process_next_data_record(record, &Self::position_key(position))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Buffer a delete block's records in the record map, keyed by position.
+    fn ingest_delete_records(
+        &mut self,
+        positions: &[u64],
+        batches: Vec<(RecordBatch, String)>,
+    ) -> Result<()> {
+        let mut pos_idx = 0usize;
+        for (batch, _inst) in batches {
+            let delete_entries = self
+                .inner
+                .record_context
+                .delete_batch_to_keys_with_ordering(&batch)?;
+            // Same ascending-order index-zip invariant as for data records.
+            for (record_key, ordering_value) in delete_entries {
+                let position = positions[pos_idx];
+                pos_idx += 1;
+                // Java sets the record key on the delete so a later fallback
+                // can re-key it; `DeleteRecord` carries it, and
+                // `process_next_deleted_record` keys the map by position.
+                let delete_record = DeleteRecord {
+                    record_key,
+                    ordering_value,
+                };
+                self.note_position(position);
+                self.inner
+                    .process_next_deleted_record(delete_record, &Self::position_key(position))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep a block for the vectorized merge, or buffer it in the record map when
+    /// the vectorized merge no longer applies. Past the merge map's budget the
+    /// kept blocks move to the record map, which can spill.
+    fn keep_or_ingest(&mut self, block: PositionMergeBlock, bytes: usize) -> Result<()> {
+        if let Some(vectorized) = self.vectorized.as_mut() {
+            vectorized.bytes += bytes;
+            vectorized.blocks.push(block);
+            if vectorized.bytes as u64 > vectorized.budget {
+                self.leave_position_merge()?;
+            }
+            return Ok(());
+        }
+        match block {
+            PositionMergeBlock::Data { positions, batches } => {
+                self.ingest_data_records(&positions, batches)
+            }
+            PositionMergeBlock::Delete { positions, batches } => {
+                self.ingest_delete_records(&positions, batches)
+            }
+        }
+    }
+
+    /// Leave the vectorized merge: buffer the kept blocks in the record map, in the
+    /// order they arrived, and merge through it from here on. Only valid while
+    /// the blocks are still kept: once they are folded into the position list
+    /// (the first base batch, or the drain, folds them), there are no blocks
+    /// left to replay and leaving is an error.
+    fn leave_position_merge(&mut self) -> Result<()> {
+        let Some(vectorized) = self.vectorized.take() else {
+            return Ok(());
+        };
+        if vectorized.index.is_some() {
+            return Err(CoreError::ReadFileSliceError(
+                "internal: the vectorized position-based merge was left after its position list was built"
+                    .to_string(),
+            ));
+        }
+        for block in vectorized.blocks {
+            match block {
+                PositionMergeBlock::Data { positions, batches } => {
+                    self.ingest_data_records(&positions, batches)?
+                }
+                PositionMergeBlock::Delete { positions, batches } => {
+                    self.ingest_delete_records(&positions, batches)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Fold the kept blocks into the sorted position list, the first time the
+    /// base is merged. Returns `false`, after leaving the vectorized merge, when a
+    /// data block can't take the vectorized merge: one that lacks a column of the
+    /// merge schema is partial in all but name.
+    fn build_position_merge_index(&mut self, target_schema: &SchemaRef) -> Result<bool> {
+        let Some(vectorized) = self.vectorized.as_ref() else {
+            return Ok(false);
+        };
+        if vectorized.index.is_some() {
+            return Ok(true);
+        }
+        let complete = vectorized.blocks.iter().all(|block| match block {
+            PositionMergeBlock::Data { batches, .. } => batches.iter().all(|b| {
+                let schema = b.schema();
+                target_schema
+                    .fields()
+                    .iter()
+                    .all(|f| schema.column_with_name(f.name()).is_some())
+            }),
+            PositionMergeBlock::Delete { .. } => true,
+        });
+        if !complete {
+            self.leave_position_merge()?;
+            return Ok(false);
+        }
+        let vectorized = self.vectorized.as_mut().expect("checked above");
+        let total: usize = vectorized
+            .blocks
+            .iter()
+            .map(|b| match b {
+                PositionMergeBlock::Data { positions, .. }
+                | PositionMergeBlock::Delete { positions, .. } => positions.len(),
+            })
+            .sum();
+        let event_time = self.inner.base.record_merge_mode == "EVENT_TIME_ORDERING";
+        let record_context = &self.inner.record_context;
+        let mut slots: HashMap<u64, (PositionMergeSlot, Option<OrderingValue>)> =
+            HashMap::with_capacity(total);
+        let mut data: Vec<RecordBatch> = Vec::new();
+        for block in &vectorized.blocks {
+            match block {
+                PositionMergeBlock::Data { positions, batches } => {
+                    let mut pos_idx = 0usize;
+                    for batch in batches {
+                        let deleted = built_in_delete_mask(batch);
+                        let orderings = if event_time {
+                            Some(record_context.ordering_accessor(batch)?)
+                        } else {
+                            None
+                        };
+                        let batch_idx = data.len() as u32;
+                        data.push(reconcile_batch_to_schema(batch, target_schema)?);
+                        for row in 0..batch.num_rows() {
+                            let slot = match &deleted {
+                                Some(mask) if mask.is_valid(row) && mask.value(row) => {
+                                    PositionMergeSlot::Delete
+                                }
+                                _ => PositionMergeSlot::Update {
+                                    batch: batch_idx,
+                                    row: row as u32,
+                                },
+                            };
+                            let ordering = orderings.as_ref().and_then(|o| o.value_at(row));
+                            fold_slot(
+                                &mut slots,
+                                positions[pos_idx],
+                                slot,
+                                ordering,
+                                event_time,
+                                LogSource::DataBlock,
+                            );
+                            pos_idx += 1;
+                        }
+                    }
+                }
+                PositionMergeBlock::Delete { positions, batches } => {
+                    if event_time {
+                        let mut pos_idx = 0usize;
+                        for (batch, _) in batches {
+                            for (_, ordering) in
+                                record_context.delete_batch_to_keys_with_ordering(batch)?
+                            {
+                                fold_slot(
+                                    &mut slots,
+                                    positions[pos_idx],
+                                    PositionMergeSlot::Delete,
+                                    ordering,
+                                    true,
+                                    LogSource::DeleteBlock,
+                                );
+                                pos_idx += 1;
+                            }
+                        }
+                    } else {
+                        for &position in positions {
+                            slots.insert(position, (PositionMergeSlot::Delete, None));
+                        }
+                    }
+                }
+            }
+        }
+        let mut folded: Vec<(u64, (PositionMergeSlot, Option<OrderingValue>))> =
+            slots.into_iter().collect();
+        folded.sort_unstable_by_key(|(position, _)| *position);
+        let mut entries: Vec<(u64, PositionMergeSlot)> = Vec::with_capacity(folded.len());
+        let mut orderings: Vec<Option<OrderingValue>> = if event_time {
+            Vec::with_capacity(folded.len())
+        } else {
+            Vec::new()
+        };
+        for (position, (slot, ordering)) in folded {
+            entries.push((position, slot));
+            if event_time {
+                orderings.push(ordering);
+            }
+        }
+        let consumed = vec![false; entries.len()];
+        vectorized.blocks.clear();
+        vectorized.index = Some(PositionMergeIndex {
+            entries,
+            consumed,
+            data,
+            orderings,
+            drain_from: 0,
+            stats: UpdateStats::default(),
+        });
+        Ok(true)
+    }
+
+    /// Merge one base batch by position: mask out the rows the position list
+    /// names and append the log rows that replace them.
+    fn vectorized_position_merge(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+    ) -> Result<Option<RecordBatch>> {
+        let num_rows = base.num_rows();
+        if num_rows == 0 {
+            return Ok(None);
+        }
+        let positions = base_row_position_array(base)?;
+        let base_orderings = if self.inner.base.record_merge_mode == "EVENT_TIME_ORDERING" {
+            Some(self.inner.record_context.ordering_accessor(base)?)
+        } else {
+            None
+        };
+        let index = self
+            .vectorized
+            .as_mut()
+            .and_then(|d| d.index.as_mut())
+            .expect("the vectorized index is built before the base is merged");
+        let values = positions.values();
+        let ascending = positions.null_count() == 0 && values.windows(2).all(|w| w[0] <= w[1]);
+        let (lo, hi) = match (
+            arrow::compute::min(positions),
+            arrow::compute::max(positions),
+        ) {
+            (Some(lo), Some(hi)) => (lo.max(0) as u64, hi.max(0) as u64),
+            _ => (0, 0),
+        };
+        let mut keep: Option<BooleanBufferBuilder> = None;
+        let mut picks: Vec<(usize, usize)> = Vec::new();
+        let start = index.entries.partition_point(|(p, _)| *p < lo);
+        for i in start..index.entries.len() {
+            let (position, slot) = index.entries[i];
+            if position > hi {
+                break;
+            }
+            let wanted = position as i64;
+            let row = if ascending {
+                values.binary_search(&wanted).ok()
+            } else {
+                (0..num_rows).find(|&r| positions.is_valid(r) && values[r] == wanted)
+            };
+            let Some(row) = row else {
+                continue;
+            };
+            if let Some(base_orderings) = &base_orderings
+                && !log_beats_base(slot, &index.orderings[i], &base_orderings.value_at(row))
+            {
+                // The base row is newer: it stays, and the log record is spent
+                // (the record map would have removed it on this match).
+                index.consumed[i] = true;
+                index.stats.num_updates += 1;
+                continue;
+            }
+            let mask = keep.get_or_insert_with(|| {
+                let mut b = BooleanBufferBuilder::new(num_rows);
+                b.append_n(num_rows, true);
+                b
+            });
+            mask.set_bit(row, false);
+            index.consumed[i] = true;
+            match slot {
+                PositionMergeSlot::Update { batch, row } => {
+                    index.stats.num_updates += 1;
+                    picks.push((batch as usize, row as usize));
+                }
+                PositionMergeSlot::Delete => index.stats.num_deletes += 1,
+            }
+        }
+        let Some(mut keep) = keep else {
+            return Ok(Some(if base.schema() == *target_schema {
+                base.clone()
+            } else {
+                reconcile_batch_to_schema(base, target_schema)?
+            }));
+        };
+        let mask = BooleanArray::new(keep.finish(), None);
+        let kept = arrow::compute::filter_record_batch(base, &mask).map_err(|e| {
+            CoreError::ReadFileSliceError(format!(
+                "vectorized position-based merge: filter failed: {e}"
+            ))
+        })?;
+        let kept = reconcile_batch_to_schema(&kept, target_schema)?;
+        if picks.is_empty() {
+            return Ok(Some(kept));
+        }
+        let updates = gather(&index.data, &picks)?;
+        arrow::compute::concat_batches(target_schema, [&kept, &updates])
+            .map(Some)
+            .map_err(|e| {
+                CoreError::ReadFileSliceError(format!(
+                    "vectorized position-based merge: concat failed: {e}"
+                ))
+            })
+    }
+
+    /// The updates whose base row the base read never produced, once the base
+    /// is exhausted, at most [`DEFAULT_BATCH_SIZE`] rows per call. The record
+    /// map emits such records as log-only inserts in chunks of the same size.
+    fn drain_position_merge(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        if self.vectorized.as_ref().is_some_and(|d| d.index.is_none()) {
+            self.build_position_merge_index(target_schema)?;
+        }
+        let Some(index) = self.vectorized.as_mut().and_then(|d| d.index.as_mut()) else {
+            return self.inner.drain_log_only_inserts(target_schema);
+        };
+        let mut picks: Vec<(usize, usize)> = Vec::new();
+        while index.drain_from < index.entries.len() && picks.len() < DEFAULT_BATCH_SIZE {
+            let i = index.drain_from;
+            index.drain_from += 1;
+            if let (_, PositionMergeSlot::Update { batch, row }) = index.entries[i]
+                && !index.consumed[i]
+            {
+                picks.push((batch as usize, row as usize));
+            }
+        }
+        index.stats.num_inserts += picks.len() as u64;
+        if picks.is_empty() {
+            return Ok(None);
+        }
+        gather(&index.data, &picks).map(Some)
+    }
+
+    /// Log records kept for the vectorized merge.
+    fn position_merge_record_count(&self) -> usize {
+        match &self.vectorized {
+            Some(VectorizedPositionMerge {
+                index: Some(index), ..
+            }) => index.entries.len(),
+            Some(VectorizedPositionMerge { blocks, .. }) => blocks
+                .iter()
+                .map(|b| match b {
+                    PositionMergeBlock::Data { positions, .. }
+                    | PositionMergeBlock::Delete { positions, .. } => positions.len(),
+                })
+                .sum(),
+            None => 0,
+        }
     }
 
     /// Extract the block's record positions, validating the base-file instant.
@@ -169,6 +668,7 @@ impl PositionBasedFileGroupRecordBuffer {
             return Ok(());
         }
         self.should_use_position = false;
+        self.inner.position_filter = None;
 
         // Rebuild the (possibly-spilled) position-keyed map as a record-key-keyed
         // map. `drain_iter` yields values; the position keys are dropped.
@@ -325,6 +825,160 @@ impl PositionBasedFileGroupRecordBuffer {
     }
 }
 
+/// Whether the vectorized merge can apply to this buffer at all: commit-time or
+/// event-time ordering (a log record wins or loses whole, decided from ordering
+/// values alone), no partial-update rule, deletes marked only by delete blocks
+/// or `_hoodie_is_deleted`, and no emitted deletes. Every other merge mode,
+/// including a custom merger or payload that needs the full rows, merges row by
+/// row through the record map.
+fn vectorized_merge_applies(inner: &KeyBasedFileGroupRecordBuffer, emit_delete: bool) -> bool {
+    let delete_markers_ok =
+        inner.base.delete_context.as_ref().is_none_or(|ctx| {
+            ctx.custom_delete_marker.is_none() && ctx.hoodie_operation_pos.is_none()
+        });
+    !emit_delete
+        && matches!(
+            inner.base.record_merge_mode.as_str(),
+            "COMMIT_TIME_ORDERING" | "EVENT_TIME_ORDERING"
+        )
+        && !inner.has_partial_update_rules()
+        && delete_markers_ok
+}
+
+/// Rows of a log data batch whose `_hoodie_is_deleted` is true, if it has
+/// that column as a boolean.
+fn built_in_delete_mask(batch: &RecordBatch) -> Option<BooleanArray> {
+    batch
+        .column_by_name("_hoodie_is_deleted")
+        .and_then(|c| c.as_any().downcast_ref::<BooleanArray>().cloned())
+}
+
+/// The kind of log block a record came from. The record map folds a data
+/// block's records, including rows whose `_hoodie_is_deleted` is true, through
+/// `delta_merge`, and a delete block's records through `delta_merge_delete`, so
+/// the fold has to know which one it is replaying.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LogSource {
+    DataBlock,
+    DeleteBlock,
+}
+
+/// Fold one log record into the position list. Under commit-time ordering a
+/// later record replaces an earlier one at the same position. Under event-time
+/// ordering the fold mirrors `EventTimeRecordMerger`: a record from a data
+/// block (a deleted row included) replaces the earlier entry when
+/// `should_keep_newer_record` would keep it, and a record from a delete block
+/// replaces it unless `delta_merge_delete` would keep the earlier entry.
+fn fold_slot(
+    slots: &mut HashMap<u64, (PositionMergeSlot, Option<OrderingValue>)>,
+    position: u64,
+    slot: PositionMergeSlot,
+    ordering: Option<OrderingValue>,
+    event_time: bool,
+    source: LogSource,
+) {
+    match slots.entry(position) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert((slot, ordering));
+        }
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let (old_slot, old_ordering) = e.get();
+            if !event_time || newer_log_wins(*old_slot, old_ordering, slot, &ordering, source) {
+                e.insert((slot, ordering));
+            }
+        }
+    }
+}
+
+/// Whether a newer log record replaces an older one at the same position under
+/// event-time ordering.
+fn newer_log_wins(
+    old_slot: PositionMergeSlot,
+    old_ordering: &Option<OrderingValue>,
+    new_slot: PositionMergeSlot,
+    new_ordering: &Option<OrderingValue>,
+    source: LogSource,
+) -> bool {
+    let old_is_commit_time_delete =
+        matches!(old_slot, PositionMergeSlot::Delete) && is_default_ordering(old_ordering);
+    match source {
+        // `delta_merge_delete`: an earlier commit-time-ordering delete stays; the
+        // earlier record survives only when the delete has a non-default ordering
+        // value of the same class that it strictly exceeds.
+        LogSource::DeleteBlock => {
+            if old_is_commit_time_delete {
+                return false;
+            }
+            is_default_ordering(new_ordering)
+                || !matches!((new_ordering, old_ordering),
+                    (Some(d), Some(o)) if d.is_same_class(o) && o > d)
+        }
+        // `should_keep_newer_record`: a commit-time-ordering delete on either side
+        // keeps the newer record; otherwise the newer wins on `>=` or a
+        // cross-class pair.
+        LogSource::DataBlock => {
+            let new_is_commit_time_delete =
+                matches!(new_slot, PositionMergeSlot::Delete) && is_default_ordering(new_ordering);
+            if new_is_commit_time_delete || old_is_commit_time_delete {
+                return true;
+            }
+            match (new_ordering, old_ordering) {
+                (Some(n), Some(o)) => !n.is_same_class(o) || n >= o,
+                _ => true,
+            }
+        }
+    }
+}
+
+/// Whether the folded log record at a position beats the base row there under
+/// event-time ordering. Mirrors `pick_winner`: a data record wins on `>=`, a
+/// cross-class pair or a missing ordering value; a delete applies unless it has
+/// a non-default ordering value of the base's class that the base strictly
+/// exceeds.
+fn log_beats_base(
+    slot: PositionMergeSlot,
+    log_ordering: &Option<OrderingValue>,
+    base_ordering: &Option<OrderingValue>,
+) -> bool {
+    match slot {
+        PositionMergeSlot::Delete => !matches!((log_ordering, base_ordering),
+            (Some(d), Some(b)) if !d.is_default() && d.is_same_class(b) && b > d),
+        PositionMergeSlot::Update { .. } => match (log_ordering, base_ordering) {
+            (Some(l), Some(b)) => !l.is_same_class(b) || l >= b,
+            _ => true,
+        },
+    }
+}
+
+/// `None` or the null-coerced default: the natural-order ordering value.
+fn is_default_ordering(ordering: &Option<OrderingValue>) -> bool {
+    ordering.as_ref().is_none_or(|o| o.is_default())
+}
+
+/// Gather rows `(batch, row)` of `data` into one batch, in that order.
+fn gather(data: &[RecordBatch], picks: &[(usize, usize)]) -> Result<RecordBatch> {
+    let refs: Vec<&RecordBatch> = data.iter().collect();
+    arrow_select::interleave::interleave_record_batch(&refs, picks).map_err(|e| {
+        CoreError::ReadFileSliceError(format!(
+            "vectorized position-based merge: gather failed: {e}"
+        ))
+    })
+}
+
+/// The error for a block whose record count differs from its position count.
+fn record_count_mismatch(kind: &str, rows: usize, positions: usize) -> CoreError {
+    if rows > positions {
+        CoreError::LogBlockError(format!(
+            "position-based merge: {kind} block has more records than positions \
+             ({positions} positions for {rows} records)"
+        ))
+    } else {
+        CoreError::LogBlockError(format!(
+            "position-based merge: {kind} block record count {rows} != position count {positions}"
+        ))
+    }
+}
+
 /// Read the base row's physical position from the row-index column.
 fn position_at(base_batch: &RecordBatch, row_idx: usize) -> Result<u64> {
     let arr = base_row_position_array(base_batch)?;
@@ -352,53 +1006,35 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         let positions = match self.extract_positions(block)? {
             Some(p) => p,
             None => {
+                self.leave_position_merge()?;
                 self.fallback_to_key_based()?;
                 return self.inner.process_data_block(block);
             }
         };
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
-            let mut pos_idx = 0usize;
-            for batch in record_batches.data_batches {
-                let batch = Arc::new(batch);
-                // `record_context` and `base.delete_context` are disjoint fields
-                // of `inner`, so these two immutable borrows coexist; the owned
-                // `records` Vec ends both borrows before the `&mut` calls below.
-                let records = self
-                    .inner
-                    .record_context
-                    .batch_to_buffered_records(&batch, self.inner.base.delete_context.as_ref())?;
-                // Index-zip: `positions[pos_idx]` is the base-file position of
-                // the `pos_idx`-th record in file order. `decode_record_positions`
-                // returns the Roaring64 bitmap ASCENDING, so this pairing is only
-                // correct because the Hudi writer emits records within a block in
-                // ascending base-position order — the same invariant Java's
-                // `PositionBasedFileGroupRecordBuffer` relies on with
-                // `recordPositions.get(recordIndex++)`.
-                for (_record_key, record) in records {
-                    let position = *positions.get(pos_idx).ok_or_else(|| {
-                        CoreError::LogBlockError(format!(
-                            "position-based merge: data block has more records than positions \
-                             ({} positions for record index {pos_idx})",
-                            positions.len(),
-                        ))
-                    })?;
-                    pos_idx += 1;
-                    self.inner
-                        .process_next_data_record(record, &Self::position_key(position))?;
-                }
+            let batches = record_batches.data_batches;
+            let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if rows != positions.len() {
+                return Err(record_count_mismatch("data", rows, positions.len()));
             }
-            if pos_idx != positions.len() {
-                return Err(CoreError::LogBlockError(format!(
-                    "position-based merge: data block record count {pos_idx} != position count {}",
-                    positions.len(),
-                )));
+            let partial = batches.iter().any(|b| {
+                b.schema()
+                    .metadata()
+                    .contains_key(PARTIAL_UPDATE_SCHEMA_KEY)
+            });
+            if partial {
+                self.leave_position_merge()?;
             }
+            let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
+            self.keep_or_ingest(PositionMergeBlock::Data { positions, batches }, bytes)?;
         }
         Ok(())
     }
 
     fn process_next_data_record(&mut self, record: BufferedRecord, key: &str) -> Result<()> {
+        self.leave_position_merge()?;
+        self.note_position_key(key);
         self.inner.process_next_data_record(record, key)
     }
 
@@ -409,48 +1045,20 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         let positions = match self.extract_positions(block)? {
             Some(p) => p,
             None => {
+                self.leave_position_merge()?;
                 self.fallback_to_key_based()?;
                 return self.inner.process_delete_block(block);
             }
         };
 
         if let LogBlockContent::Records(record_batches) = std::mem::take(&mut block.content) {
-            let mut pos_idx = 0usize;
-            for (batch, _inst) in record_batches.delete_batches {
-                let delete_entries = self
-                    .inner
-                    .record_context
-                    .delete_batch_to_keys_with_ordering(&batch)?;
-                // Same ascending-order index-zip invariant as in
-                // `process_data_block` above.
-                for (record_key, ordering_value) in delete_entries {
-                    let position = *positions.get(pos_idx).ok_or_else(|| {
-                        CoreError::LogBlockError(format!(
-                            "position-based merge: delete block has more records than positions \
-                             ({} positions for record index {pos_idx})",
-                            positions.len(),
-                        ))
-                    })?;
-                    pos_idx += 1;
-                    // Java sets the record key on the delete so a later fallback
-                    // can re-key it; `DeleteRecord` carries it, and
-                    // `process_next_deleted_record` keys the map by position.
-                    let delete_record = DeleteRecord {
-                        record_key,
-                        ordering_value,
-                    };
-                    self.inner.process_next_deleted_record(
-                        delete_record,
-                        &Self::position_key(position),
-                    )?;
-                }
+            let batches = record_batches.delete_batches;
+            let rows: usize = batches.iter().map(|(b, _)| b.num_rows()).sum();
+            if rows != positions.len() {
+                return Err(record_count_mismatch("delete", rows, positions.len()));
             }
-            if pos_idx != positions.len() {
-                return Err(CoreError::LogBlockError(format!(
-                    "position-based merge: delete block record count {pos_idx} != position count {}",
-                    positions.len(),
-                )));
-            }
+            let bytes: usize = batches.iter().map(|(b, _)| b.get_array_memory_size()).sum();
+            self.keep_or_ingest(PositionMergeBlock::Delete { positions, batches }, bytes)?;
         }
         Ok(())
     }
@@ -460,6 +1068,8 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         delete_record: DeleteRecord,
         key: &str,
     ) -> Result<()> {
+        self.leave_position_merge()?;
+        self.note_position_key(key);
         self.inner.process_next_deleted_record(delete_record, key)
     }
 
@@ -469,6 +1079,11 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     /// in-memory tier is scanned; a spilled position entry is not visible here
     /// (a limitation shared with the key-based `get_log_records`).
     fn contains_log_record(&self, record_key: &str) -> bool {
+        if self.vectorized.is_some() {
+            // Kept blocks hold records by position; a record key is not indexed
+            // until they reach the record map.
+            return false;
+        }
         if !self.should_use_position {
             return self.inner.contains_log_record(record_key);
         }
@@ -481,11 +1096,11 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn size(&self) -> usize {
-        self.inner.size()
+        self.inner.size() + self.position_merge_record_count()
     }
 
     fn get_total_log_records(&self) -> u64 {
-        self.inner.get_total_log_records()
+        self.inner.get_total_log_records() + self.position_merge_record_count() as u64
     }
 
     fn merge_map_peak_entries(&self) -> u64 {
@@ -505,7 +1120,13 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn update_stats_snapshot(&self) -> UpdateStats {
-        self.inner.update_stats_snapshot()
+        let mut stats = self.inner.update_stats_snapshot();
+        if let Some(index) = self.vectorized.as_ref().and_then(|d| d.index.as_ref()) {
+            stats.num_inserts += index.stats.num_inserts;
+            stats.num_updates += index.stats.num_updates;
+            stats.num_deletes += index.stats.num_deletes;
+        }
+        stats
     }
 
     fn get_log_records(&self) -> &crate::file_group::reader_v2::buffer::MergeMap {
@@ -525,6 +1146,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn has_next(&mut self) -> Result<bool> {
+        self.leave_position_merge()?;
         if self.inner.base.next_record.is_some() {
             return Ok(true);
         }
@@ -536,6 +1158,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn merge_and_collect_with_stats(mut self: Box<Self>) -> Result<(RecordBatch, UpdateStats)> {
+        self.leave_position_merge()?;
         // Output schema selection mirrors the key-based buffer.
         let schema = if let Some(schema) = &self.inner.base.reader_schema {
             schema.clone()
@@ -571,6 +1194,7 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
     }
 
     fn next_merged_base_batch(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        self.leave_position_merge()?;
         if self.needs_hybrid_strategy {
             return self.next_hybrid_base_batch(target_schema);
         }
@@ -599,12 +1223,18 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
                     .to_string(),
             ));
         }
+        if self.should_use_position && self.build_position_merge_index(target_schema)? {
+            return self.vectorized_position_merge(base, target_schema);
+        }
         let base_match = self.base_match();
         self.inner
             .merge_one_base_batch_kernel(base, target_schema, base_match)
     }
 
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
+        if self.vectorized.is_some() {
+            return self.drain_position_merge(target_schema);
+        }
         self.inner.drain_log_only_inserts(target_schema)
     }
 }
@@ -615,6 +1245,7 @@ mod tests {
     use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader_v2::buffer::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME;
+    use crate::file_group::reader_v2::buffer::spillable_map::CONFIG_MERGE_MAX_SIZE;
     use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
     use crate::file_group::record_batches::RecordBatches;
     use arrow_array::{Int32Array, Int64Array, StringArray};
@@ -751,19 +1382,29 @@ mod tests {
         positions: &[u64],
         base_instant_of_positions: &str,
     ) -> LogBlock {
+        let ords: Vec<Option<i64>> = keys.iter().map(|_| None).collect();
+        delete_block_with_positions_ordered(keys, &ords, positions, base_instant_of_positions)
+    }
+
+    /// Like [`delete_block_with_positions`], with each delete's ordering value.
+    fn delete_block_with_positions_ordered(
+        keys: &[&str],
+        ords: &[Option<i64>],
+        positions: &[u64],
+        base_instant_of_positions: &str,
+    ) -> LogBlock {
         let delete_schema = Arc::new(Schema::new(vec![
             Field::new("recordKey", DataType::Utf8, false),
             Field::new("partitionPath", DataType::Utf8, true),
             Field::new("orderingVal", DataType::Int64, true),
         ]));
         let parts: Vec<&str> = keys.iter().map(|_| "").collect();
-        let ords: Vec<Option<i64>> = keys.iter().map(|_| None).collect();
         let batch = RecordBatch::try_new(
             delete_schema,
             vec![
                 Arc::new(StringArray::from(keys.to_vec())),
                 Arc::new(StringArray::from(parts)),
-                Arc::new(Int64Array::from(ords)),
+                Arc::new(Int64Array::from(ords.to_vec())),
             ],
         )
         .unwrap();
@@ -801,16 +1442,38 @@ mod tests {
     fn build_buffer_with_reader_config(
         reader_config: &[(&str, &str)],
     ) -> PositionBasedFileGroupRecordBuffer {
-        let merge_mode = "COMMIT_TIME_ORDERING";
+        build_buffer_with("COMMIT_TIME_ORDERING", &[], reader_config)
+    }
+
+    /// Build a buffer under `merge_mode`, with extra table-config and reader-config
+    /// entries.
+    fn build_buffer_with(
+        merge_mode: &str,
+        table_config: &[(&str, &str)],
+        reader_config: &[(&str, &str)],
+    ) -> PositionBasedFileGroupRecordBuffer {
+        build_buffer_for(schema(), merge_mode, table_config, reader_config)
+    }
+
+    /// [`build_buffer_with`] over another table schema.
+    fn build_buffer_for(
+        table_schema: SchemaRef,
+        merge_mode: &str,
+        table_config: &[(&str, &str)],
+        reader_config: &[(&str, &str)],
+    ) -> PositionBasedFileGroupRecordBuffer {
         let mut ctx = ReaderContext::empty();
+        for (k, v) in table_config {
+            ctx.table_config.insert((*k).to_string(), (*v).to_string());
+        }
         for (k, v) in reader_config {
             ctx.hoodie_reader_config
                 .insert((*k).to_string(), (*v).to_string());
         }
         ctx.rebuild_record_context(String::new());
         let mut handler = FileGroupReaderSchemaHandler::new()
-            .with_table_schema(schema())
-            .with_data_schema(schema());
+            .with_table_schema(table_schema.clone())
+            .with_data_schema(table_schema);
         let key_field = ctx.record_key_field().to_string();
         let ordering = ctx.record_context.ordering_field_names.clone();
         handler
@@ -1030,6 +1693,399 @@ mod tests {
                 ("x".into(), 55, 7), // inserted (position 5, beyond base)
             ]
         );
+    }
+
+    /// How a merge test drives the buffer.
+    #[derive(Clone, Copy, Debug)]
+    enum MergeWay {
+        /// The vectorized position-based merge over the kept blocks.
+        Vectorized,
+        /// The record map keyed by position, with the position filter.
+        PositionMap,
+        /// The record map keyed by record key.
+        RecordKey,
+    }
+
+    /// Update and delete blocks across two commits, merged over a base of two
+    /// batches. The vectorized merge must return what both record-map merges do:
+    /// a later block wins at a position, a delete removes the row, and a base
+    /// batch no block touches comes back whole.
+    #[test]
+    fn vectorized_merge_matches_position_and_key_merges() {
+        fn run(way: MergeWay) -> Vec<(String, i32, i64)> {
+            let mut buffer = build_buffer();
+            if matches!(way, MergeWay::RecordKey) {
+                buffer.vectorized = None;
+                buffer.fallback_to_key_based().unwrap();
+            }
+            // Commit 1 updates positions 2 and 7 and deletes position 5.
+            let mut update1 = data_block_with_positions_at_instant(
+                &[("k2", 200, 9), ("k7", 700, 9)],
+                &[2, 7],
+                BASE_INSTANT,
+                "20240101000001000",
+            );
+            buffer.process_data_block(&mut update1).unwrap();
+            let mut delete1 = delete_block_with_positions(&["k5"], &[5], BASE_INSTANT);
+            buffer.process_delete_block(&mut delete1).unwrap();
+            // Commit 2 updates position 7 again, deletes position 2 and
+            // updates position 12, in the second base batch.
+            let mut update2 = data_block_with_positions_at_instant(
+                &[("k7", 777, 9), ("k12", 1200, 9)],
+                &[7, 12],
+                BASE_INSTANT,
+                "20240101000002000",
+            );
+            buffer.process_data_block(&mut update2).unwrap();
+            let mut delete2 = delete_block_with_positions(&["k2"], &[2], BASE_INSTANT);
+            buffer.process_delete_block(&mut delete2).unwrap();
+            match way {
+                MergeWay::Vectorized => assert!(buffer.vectorized.is_some()),
+                MergeWay::PositionMap => {
+                    buffer.leave_position_merge().unwrap();
+                    let filter = buffer.inner.position_filter.as_ref().unwrap();
+                    assert_eq!(filter.iter().collect::<Vec<_>>(), vec![2, 5, 7, 12]);
+                }
+                MergeWay::RecordKey => {
+                    assert_eq!(buffer.get_buffer_type(), BufferType::KeyBasedMerge)
+                }
+            }
+            let keys: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
+            let rows: Vec<(&str, i32, i64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.as_str(), i as i32, 1))
+                .collect();
+            let target = schema();
+            let mut all: Vec<RecordBatch> = Vec::new();
+            for (range, start) in [(0..10, 0u64), (10..15, 10), (15..20, 15)] {
+                let batch = base_batch_at(&rows[range], start);
+                if let Some(out) = buffer.merge_base_batch(&batch, &target).unwrap() {
+                    all.push(out);
+                }
+            }
+            while let Some(b) = buffer.drain_log_only_inserts(&target).unwrap() {
+                all.push(b);
+            }
+            let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
+            let mut out = extract(&merged);
+            out.sort();
+            out
+        }
+        let vectorized = run(MergeWay::Vectorized);
+        assert_eq!(vectorized, run(MergeWay::PositionMap));
+        assert_eq!(vectorized, run(MergeWay::RecordKey));
+        assert_eq!(vectorized.len(), 18, "positions 2 and 5 are deleted");
+        assert!(
+            vectorized.contains(&("k7".to_string(), 777, 9)),
+            "the later update wins"
+        );
+        assert!(vectorized.contains(&("k12".to_string(), 1200, 9)));
+        assert!(!vectorized.iter().any(|(k, _, _)| k == "k2" || k == "k5"));
+    }
+
+    /// Under event-time ordering the vectorized merge returns what the position map
+    /// and the key merge return: base rows that outrank the log stay, ties go to
+    /// the log, a later but lower-ordered log record loses the fold, and a delete
+    /// with a lower non-default ordering value is obsolete while a default one
+    /// always applies.
+    #[test]
+    fn vectorized_merge_event_time_matches_position_and_key_merges() {
+        fn run(way: MergeWay) -> Vec<(String, i32, i64)> {
+            let event = "EVENT_TIME_ORDERING";
+            let ordering = [("hoodie.table.ordering.fields", "ts")];
+            let mut buffer = build_buffer_with(event, &ordering, &[]);
+            if matches!(way, MergeWay::RecordKey) {
+                buffer.vectorized = None;
+                buffer.fallback_to_key_based().unwrap();
+            }
+            // Base rows all carry ts 5.
+            // Commit 1: k1 older (3), k2 tied (5), k3 and k7 newer (9), and an
+            // update past the base (k40).
+            let mut update1 = data_block_with_positions_at_instant(
+                &[
+                    ("k1", 100, 3),
+                    ("k2", 200, 5),
+                    ("k3", 300, 9),
+                    ("k7", 700, 9),
+                    ("k40", 4000, 1),
+                ],
+                &[1, 2, 3, 7, 40],
+                BASE_INSTANT,
+                "20240101000001000",
+            );
+            buffer.process_data_block(&mut update1).unwrap();
+            // k4's delete is older than the base, k6's has no ordering value,
+            // k8's is newer.
+            let mut delete1 = delete_block_with_positions_ordered(
+                &["k4", "k6", "k8"],
+                &[Some(3), None, Some(7)],
+                &[4, 6, 8],
+                BASE_INSTANT,
+            );
+            buffer.process_delete_block(&mut delete1).unwrap();
+            // Commit 2: k7 again but older than commit 1's k7, k12 older than
+            // its base row, k15 newer.
+            let mut update2 = data_block_with_positions_at_instant(
+                &[("k7", 777, 6), ("k12", 1200, 1), ("k15", 1500, 8)],
+                &[7, 12, 15],
+                BASE_INSTANT,
+                "20240101000002000",
+            );
+            buffer.process_data_block(&mut update2).unwrap();
+            // k3's delete is older than commit 1's k3, k9's is newer than base.
+            let mut delete2 = delete_block_with_positions_ordered(
+                &["k3", "k9"],
+                &[Some(8), Some(10)],
+                &[3, 9],
+                BASE_INSTANT,
+            );
+            buffer.process_delete_block(&mut delete2).unwrap();
+            match way {
+                MergeWay::Vectorized => assert!(buffer.vectorized.is_some()),
+                MergeWay::PositionMap => buffer.leave_position_merge().unwrap(),
+                MergeWay::RecordKey => {
+                    assert_eq!(buffer.get_buffer_type(), BufferType::KeyBasedMerge)
+                }
+            }
+            let keys: Vec<String> = (0..20).map(|i| format!("k{i}")).collect();
+            let rows: Vec<(&str, i32, i64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.as_str(), i as i32, 5))
+                .collect();
+            let target = schema();
+            let mut all: Vec<RecordBatch> = Vec::new();
+            for (range, start) in [(0..10, 0u64), (10..15, 10), (15..20, 15)] {
+                let batch = base_batch_at(&rows[range], start);
+                if let Some(out) = buffer.merge_base_batch(&batch, &target).unwrap() {
+                    all.push(out);
+                }
+            }
+            while let Some(b) = buffer.drain_log_only_inserts(&target).unwrap() {
+                all.push(b);
+            }
+            let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
+            let mut out = extract(&merged);
+            out.sort();
+            out
+        }
+        let vectorized = run(MergeWay::Vectorized);
+        assert_eq!(vectorized, run(MergeWay::PositionMap));
+        assert_eq!(vectorized, run(MergeWay::RecordKey));
+        let has = |k: &str, c: i32, t: i64| vectorized.contains(&(k.to_string(), c, t));
+        assert!(has("k1", 1, 5), "an older log record loses to the base row");
+        assert!(has("k2", 200, 5), "a tie goes to the log");
+        assert!(
+            has("k3", 300, 9),
+            "an older delete loses to the newer log update"
+        );
+        assert!(
+            has("k4", 4, 5),
+            "a delete older than the base row is obsolete"
+        );
+        assert!(
+            has("k7", 700, 9),
+            "the higher-ordered log record wins the fold"
+        );
+        assert!(has("k12", 12, 5));
+        assert!(has("k15", 1500, 8));
+        assert!(has("k40", 4000, 1), "an update past the base is emitted");
+        for gone in ["k6", "k8", "k9"] {
+            assert!(
+                !vectorized.iter().any(|(k, _, _)| k == gone),
+                "{gone} is deleted"
+            );
+        }
+    }
+
+    /// A data block that would reach the vectorized merge in each fallback case
+    /// below: it updates position 2 and is followed by a delete of position 5.
+    fn fallback_blocks(base_instant_of_positions: &str, partial: bool) -> (LogBlock, LogBlock) {
+        let mut update = data_block_with_positions_at_instant(
+            &[("k2", 200, 9)],
+            &[2],
+            base_instant_of_positions,
+            "20240101000001000",
+        );
+        if partial && let LogBlockContent::Records(records) = &mut update.content {
+            for batch in records.data_batches.iter_mut() {
+                let mut metadata = batch.schema().metadata().clone();
+                metadata.insert(PARTIAL_UPDATE_SCHEMA_KEY.to_string(), "true".to_string());
+                let schema = Arc::new(batch.schema().as_ref().clone().with_metadata(metadata));
+                *batch = batch.clone().with_schema(schema).unwrap();
+            }
+        }
+        let delete = delete_block_with_positions(&["k5"], &[5], base_instant_of_positions);
+        (update, delete)
+    }
+
+    /// Merge `blocks` into a 10-row base through `buffer`'s batch path and
+    /// return the sorted rows.
+    fn merge_ten_rows(
+        mut buffer: PositionBasedFileGroupRecordBuffer,
+        blocks: (LogBlock, LogBlock),
+    ) -> (Vec<(String, i32, i64)>, PositionBasedFileGroupRecordBuffer) {
+        let (mut update, mut delete) = blocks;
+        buffer.process_data_block(&mut update).unwrap();
+        buffer.process_delete_block(&mut delete).unwrap();
+        let keys: Vec<String> = (0..10).map(|i| format!("k{i}")).collect();
+        let rows: Vec<(&str, i32, i64)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.as_str(), i as i32, 1))
+            .collect();
+        let target = schema();
+        let mut all = Vec::new();
+        if let Some(out) = buffer
+            .merge_base_batch(&base_batch_at(&rows, 0), &target)
+            .unwrap()
+        {
+            all.push(out);
+        }
+        while let Some(b) = buffer.drain_log_only_inserts(&target).unwrap() {
+            all.push(b);
+        }
+        let merged = arrow_select::concat::concat_batches(&target, &all).unwrap();
+        let mut out = extract(&merged);
+        out.sort();
+        (out, buffer)
+    }
+
+    /// The same blocks merged by record key, the reference every fallback must
+    /// match.
+    fn key_merged(
+        merge_mode: &str,
+        table_config: &[(&str, &str)],
+        blocks: (LogBlock, LogBlock),
+    ) -> Vec<(String, i32, i64)> {
+        let mut buffer = build_buffer_with(merge_mode, table_config, &[]);
+        buffer.vectorized = None;
+        buffer.fallback_to_key_based().unwrap();
+        merge_ten_rows(buffer, blocks).0
+    }
+
+    /// Each case where the vectorized merge does not apply falls back on its own
+    /// and returns what the key merge returns.
+    #[test]
+    fn vectorized_merge_falls_back_where_it_does_not_apply() {
+        let expected: Vec<(String, i32, i64)> = (0..10)
+            .filter(|i| *i != 5)
+            .map(|i| {
+                if i == 2 {
+                    ("k2".to_string(), 200, 9)
+                } else {
+                    (format!("k{i}"), i, 1)
+                }
+            })
+            .collect();
+        let commit = "COMMIT_TIME_ORDERING";
+
+        // Vectorized: positions match the base instant.
+        let vectorized = build_buffer();
+        assert!(vectorized.vectorized.is_some());
+        let (out, vectorized) = merge_ten_rows(vectorized, fallback_blocks(BASE_INSTANT, false));
+        let reference = key_merged(commit, &[], fallback_blocks(BASE_INSTANT, false));
+        assert_eq!(out, expected);
+        assert_eq!(out, reference);
+        assert!(vectorized.vectorized.is_some());
+
+        // No record positions in the block: the empty bitmap falls back to
+        // the key merge.
+        let mut no_positions = build_buffer();
+        let mut update = data_block_with_positions(&[("k2", 200, 9)], &[], BASE_INSTANT);
+        no_positions.process_data_block(&mut update).unwrap();
+        assert!(no_positions.vectorized.is_none());
+        assert_eq!(no_positions.get_buffer_type(), BufferType::KeyBasedMerge);
+
+        // Positions computed against another base file.
+        let other = "19990101000000000";
+        let (out, mismatched) = merge_ten_rows(build_buffer(), fallback_blocks(other, false));
+        let reference = key_merged(commit, &[], fallback_blocks(other, false));
+        assert!(mismatched.vectorized.is_none());
+        assert_eq!(mismatched.get_buffer_type(), BufferType::KeyBasedMerge);
+        assert_eq!(out, expected);
+        assert_eq!(out, reference);
+
+        // A partial-update block: still merged by position, through the map.
+        let blocks = fallback_blocks(BASE_INSTANT, true);
+        let (out, partial) = merge_ten_rows(build_buffer(), blocks);
+        let reference = key_merged(commit, &[], fallback_blocks(BASE_INSTANT, true));
+        assert!(partial.vectorized.is_none());
+        assert_eq!(partial.get_buffer_type(), BufferType::PositionBasedMerge);
+        assert_eq!(out, reference);
+
+        // Event-time ordering takes the vectorized merge too, and matches the key
+        // merge.
+        let event = "EVENT_TIME_ORDERING";
+        let ordering = [("hoodie.table.ordering.fields", "ts")];
+        let event_buffer = build_buffer_with(event, &ordering, &[]);
+        assert!(event_buffer.vectorized.is_some());
+        let blocks = fallback_blocks(BASE_INSTANT, false);
+        let (out, _) = merge_ten_rows(event_buffer, blocks);
+        let reference = key_merged(event, &ordering, fallback_blocks(BASE_INSTANT, false));
+        assert_eq!(out, reference);
+
+        // Event-time ordering with positions from another base file falls back.
+        let blocks = fallback_blocks(other, false);
+        let (out, event_fallback) =
+            merge_ten_rows(build_buffer_with(event, &ordering, &[]), blocks);
+        let reference = key_merged(event, &ordering, fallback_blocks(other, false));
+        assert!(event_fallback.vectorized.is_none());
+        assert_eq!(out, reference);
+
+        // A custom merger decides from whole rows, so it stays on the row path.
+        let custom = build_buffer_with(
+            "CUSTOM",
+            &[
+                (
+                    "hoodie.compaction.payload.class",
+                    "org.apache.hudi.metadata.HoodieMetadataPayload",
+                ),
+                (
+                    "hoodie.record.merge.strategy.id",
+                    "00000000-0000-0000-0000-000000000000",
+                ),
+            ],
+            &[],
+        );
+        assert!(custom.vectorized.is_none());
+    }
+
+    /// An update whose base row the base read never produces is emitted once
+    /// the base is exhausted, and a block that would outgrow the merge map's
+    /// budget hands the kept blocks to the map.
+    #[test]
+    fn vectorized_merge_drains_unmatched_updates_and_respects_budget() {
+        let mut buffer = build_buffer();
+        let mut block =
+            data_block_with_positions(&[("k1", 100, 9), ("k40", 4000, 9)], &[1, 40], BASE_INSTANT);
+        buffer.process_data_block(&mut block).unwrap();
+        let target = schema();
+        let base = base_batch_at(&[("k0", 0, 1), ("k1", 1, 1), ("k2", 2, 1)], 0);
+        let merged = buffer.merge_base_batch(&base, &target).unwrap().unwrap();
+        let mut rows = extract(&merged);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("k0".to_string(), 0, 1),
+                ("k1".to_string(), 100, 9),
+                ("k2".to_string(), 2, 1)
+            ]
+        );
+        let drained = buffer.drain_log_only_inserts(&target).unwrap().unwrap();
+        assert_eq!(extract(&drained), vec![("k40".to_string(), 4000, 9)]);
+        assert!(buffer.drain_log_only_inserts(&target).unwrap().is_none());
+
+        let mut tiny = build_buffer_with_reader_config(&[(CONFIG_MERGE_MAX_SIZE, "1")]);
+        let mut block = data_block_with_positions(&[("k1", 100, 9)], &[1], BASE_INSTANT);
+        tiny.process_data_block(&mut block).unwrap();
+        assert!(
+            tiny.vectorized.is_none(),
+            "past the budget the blocks go to the map"
+        );
+        assert_eq!(tiny.size(), 1);
     }
 
     /// Two data blocks from consecutive commits both target the SAME base
@@ -1495,5 +2551,420 @@ mod tests {
             ],
             "every re-keyed update must land when the keys are unique"
         );
+    }
+
+    /// Merge cases over a table with a nullable ordering field and the
+    /// `_hoodie_is_deleted` marker, run through the vectorized merge, the
+    /// position map and the key merge.
+    mod wide {
+        use super::*;
+        use arrow_array::{ArrayRef, BooleanArray};
+
+        /// `(key, counter, ts, _hoodie_is_deleted)`; `ts` is `None` for null.
+        type Row<'a> = (&'a str, i32, Option<i64>, bool);
+
+        /// `_hoodie_record_key`, `counter`, a nullable `ts` of `ts_type` (Int64
+        /// or Int32) and a nullable `_hoodie_is_deleted`.
+        fn wide_schema(ts_type: DataType) -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("_hoodie_record_key", DataType::Utf8, false),
+                Field::new("counter", DataType::Int32, false),
+                Field::new("ts", ts_type, true),
+                Field::new("_hoodie_is_deleted", DataType::Boolean, true),
+            ]))
+        }
+
+        fn ts_array(schema: &SchemaRef, rows: &[Row]) -> ArrayRef {
+            let values = rows.iter().map(|r| r.2);
+            match schema.field_with_name("ts").unwrap().data_type() {
+                DataType::Int32 => {
+                    Arc::new(Int32Array::from_iter(values.map(|v| v.map(|v| v as i32))))
+                }
+                _ => Arc::new(Int64Array::from_iter(values)),
+            }
+        }
+
+        fn wide_batch(schema: &SchemaRef, rows: &[Row]) -> RecordBatch {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(Int32Array::from_iter_values(rows.iter().map(|r| r.1))),
+                    ts_array(schema, rows),
+                    Arc::new(BooleanArray::from_iter(rows.iter().map(|r| Some(r.3)))),
+                ],
+            )
+            .unwrap()
+        }
+
+        /// A base batch whose row-index column holds `positions`.
+        fn wide_base(schema: &SchemaRef, rows: &[Row], positions: &[Option<i64>]) -> RecordBatch {
+            let batch = wide_batch(schema, rows);
+            let mut fields: Vec<Field> =
+                schema.fields().iter().map(|f| f.as_ref().clone()).collect();
+            fields.push(Field::new(
+                ROW_INDEX_TEMPORARY_COLUMN_NAME,
+                DataType::Int64,
+                true,
+            ));
+            let mut columns = batch.columns().to_vec();
+            columns.push(Arc::new(Int64Array::from(positions.to_vec())));
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+        }
+
+        /// A data block of `rows` at `positions`, written at `instant`.
+        fn wide_data_block(
+            schema: &SchemaRef,
+            rows: &[Row],
+            positions: &[u64],
+            instant: &str,
+        ) -> LogBlock {
+            let mut header = HashMap::new();
+            header.insert(BlockMetadataKey::InstantTime, instant.to_string());
+            if !positions.is_empty() {
+                header.insert(
+                    BlockMetadataKey::RecordPositions,
+                    encode_positions(positions),
+                );
+            }
+            header.insert(
+                BlockMetadataKey::BaseFileInstantTimeOfRecordPositions,
+                BASE_INSTANT.to_string(),
+            );
+            LogBlock::new(
+                LogFormatVersion::V1,
+                BlockType::ParquetData,
+                header,
+                LogBlockContent::Records(RecordBatches::new_with_data_batches(vec![wide_batch(
+                    schema, rows,
+                )])),
+                HashMap::new(),
+            )
+        }
+
+        /// `(key, counter, ts)` of every row, sorted, whatever `ts`'s type.
+        fn wide_rows(batch: &RecordBatch) -> Vec<(String, i32, Option<i64>)> {
+            let keys = batch
+                .column_by_name("_hoodie_record_key")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            let counters = batch
+                .column_by_name("counter")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let ts = batch.column_by_name("ts").unwrap();
+            let ts_at = |i: usize| -> Option<i64> {
+                if ts.is_null(i) {
+                    return None;
+                }
+                if let Some(a) = ts.as_any().downcast_ref::<Int32Array>() {
+                    Some(a.value(i) as i64)
+                } else {
+                    Some(ts.as_any().downcast_ref::<Int64Array>().unwrap().value(i))
+                }
+            };
+            let mut out: Vec<(String, i32, Option<i64>)> = (0..batch.num_rows())
+                .map(|i| (keys.value(i).to_string(), counters.value(i), ts_at(i)))
+                .collect();
+            out.sort();
+            out
+        }
+
+        /// One log block of a case: data rows at positions, or a delete block.
+        enum Block<'a> {
+            Data(Vec<Row<'a>>, Vec<u64>, &'a str),
+            Delete(Vec<&'a str>, Vec<Option<i64>>, Vec<u64>),
+        }
+
+        /// Merge `blocks` over `base` (batches with their positions) one way, and
+        /// return the sorted rows and the buffer.
+        fn run(
+            way: MergeWay,
+            schema: &SchemaRef,
+            merge_mode: &str,
+            reader_config: &[(&str, &str)],
+            blocks: &[Block],
+            base: &[(Vec<Row>, Vec<Option<i64>>)],
+        ) -> (
+            Vec<(String, i32, Option<i64>)>,
+            PositionBasedFileGroupRecordBuffer,
+        ) {
+            let ordering = [("hoodie.table.ordering.fields", "ts")];
+            let table_config: &[(&str, &str)] = if merge_mode == "EVENT_TIME_ORDERING" {
+                &ordering
+            } else {
+                &[]
+            };
+            let mut buffer =
+                build_buffer_for(schema.clone(), merge_mode, table_config, reader_config);
+            if matches!(way, MergeWay::RecordKey) {
+                buffer.vectorized = None;
+                buffer.fallback_to_key_based().unwrap();
+            }
+            for block in blocks {
+                match block {
+                    Block::Data(rows, positions, instant) => {
+                        let mut b = wide_data_block(schema, rows, positions, instant);
+                        buffer.process_data_block(&mut b).unwrap();
+                    }
+                    Block::Delete(keys, ords, positions) => {
+                        let mut b = delete_block_with_positions_ordered(
+                            keys,
+                            ords,
+                            positions,
+                            BASE_INSTANT,
+                        );
+                        buffer.process_delete_block(&mut b).unwrap();
+                    }
+                }
+            }
+            if matches!(way, MergeWay::PositionMap) {
+                buffer.leave_position_merge().unwrap();
+            }
+            let mut all = Vec::new();
+            for (rows, positions) in base {
+                let batch = wide_base(schema, rows, positions);
+                if let Some(out) = buffer.merge_base_batch(&batch, schema).unwrap() {
+                    all.push(out);
+                }
+            }
+            while let Some(b) = buffer.drain_log_only_inserts(schema).unwrap() {
+                assert!(b.num_rows() <= DEFAULT_BATCH_SIZE);
+                all.push(b);
+            }
+            let merged = arrow_select::concat::concat_batches(schema, &all).unwrap();
+            (wide_rows(&merged), buffer)
+        }
+
+        /// Runs `blocks` all three ways, asserts they agree and that the
+        /// vectorized way kept its index, and returns the rows.
+        fn agree(
+            schema: &SchemaRef,
+            merge_mode: &str,
+            blocks: &[Block],
+            base: &[(Vec<Row>, Vec<Option<i64>>)],
+        ) -> Vec<(String, i32, Option<i64>)> {
+            let (vectorized, buffer) =
+                run(MergeWay::Vectorized, schema, merge_mode, &[], blocks, base);
+            assert!(buffer.vectorized.is_some(), "the vectorized merge applied");
+            let (map, _) = run(MergeWay::PositionMap, schema, merge_mode, &[], blocks, base);
+            let (key, _) = run(MergeWay::RecordKey, schema, merge_mode, &[], blocks, base);
+            assert_eq!(vectorized, key, "vectorized vs key merge");
+            assert_eq!(map, key, "position map vs key merge");
+            vectorized
+        }
+
+        fn base_rows(n: usize, ts: Option<i64>) -> (Vec<Row<'static>>, Vec<Option<i64>>) {
+            let keys: Vec<&'static str> = (0..n)
+                .map(|i| &*Box::leak(format!("k{i}").into_boxed_str()))
+                .collect();
+            let rows = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (*k, i as i32, ts, false))
+                .collect();
+            (rows, (0..n as i64).map(Some).collect())
+        }
+
+        /// A row marked deleted in a data block folds as a data record, not a
+        /// delete-block record. After a delete block with no ordering value (a
+        /// commit-time delete), a later deleted row with a lower ordering than
+        /// the base still loses to the base row, as in the key merge.
+        #[test]
+        fn event_time_deleted_rows_in_data_blocks_fold_like_the_key_merge() {
+            let schema = wide_schema(DataType::Int64);
+            let base = vec![base_rows(8, Some(10))];
+            let blocks = vec![
+                // k3: commit-time delete, then a deleted row older than the base.
+                // k4: commit-time delete, then a deleted row newer than the base.
+                // k5: a deleted row with no ordering value (a commit-time delete).
+                // k6: an update, then an older deleted row.
+                Block::Delete(vec!["k3", "k4"], vec![None, None], vec![3, 4]),
+                Block::Data(
+                    vec![
+                        ("k3", 0, Some(5), true),
+                        ("k4", 0, Some(20), true),
+                        ("k5", 0, None, true),
+                        ("k6", 600, Some(30), false),
+                    ],
+                    vec![3, 4, 5, 6],
+                    "20240101000001000",
+                ),
+                Block::Data(
+                    vec![("k6", 0, Some(25), true)],
+                    vec![6],
+                    "20240101000002000",
+                ),
+                // k7: a deleted row newer than the base, then an older delete block.
+                Block::Data(
+                    vec![("k7", 0, Some(40), true)],
+                    vec![7],
+                    "20240101000003000",
+                ),
+                Block::Delete(vec!["k7"], vec![Some(35)], vec![7]),
+            ];
+            let rows = agree(&schema, "EVENT_TIME_ORDERING", &blocks, &base);
+            let keys: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
+            assert!(
+                keys.contains(&"k3"),
+                "the older deleted row loses to the base"
+            );
+            assert!(!keys.contains(&"k4"));
+            assert!(!keys.contains(&"k5"));
+            assert!(rows.contains(&("k6".to_string(), 600, Some(30))));
+            assert!(!keys.contains(&"k7"));
+        }
+
+        /// Null and Int32 `0` ordering values (both the default ordering value)
+        /// on the base and log sides merge as the key merge does.
+        #[test]
+        fn event_time_null_and_zero_orderings_match_the_key_merge() {
+            for ts_type in [DataType::Int32, DataType::Int64] {
+                let schema = wide_schema(ts_type);
+                let base = vec![(
+                    vec![
+                        ("k0", 0, None, false),
+                        ("k1", 1, Some(0), false),
+                        ("k2", 2, Some(5), false),
+                        ("k3", 3, None, false),
+                        ("k4", 4, Some(0), false),
+                        ("k5", 5, Some(5), false),
+                        ("k6", 6, None, false),
+                    ],
+                    (0..7).map(Some).collect(),
+                )];
+                let blocks = vec![
+                    Block::Data(
+                        vec![
+                            ("k0", 100, Some(1), false),
+                            ("k1", 101, None, false),
+                            ("k2", 102, Some(0), false),
+                            ("k3", 103, None, false),
+                        ],
+                        vec![0, 1, 2, 3],
+                        "20240101000001000",
+                    ),
+                    Block::Delete(vec!["k4", "k5"], vec![Some(0), Some(0)], vec![4, 5]),
+                    Block::Data(vec![("k6", 0, Some(0), true)], vec![6], "20240101000002000"),
+                ];
+                agree(&schema, "EVENT_TIME_ORDERING", &blocks, &base);
+            }
+        }
+
+        /// Base batches whose positions are not ascending are matched row by
+        /// row and merge as the key merge does, and a row whose position is null
+        /// is never matched by position.
+        #[test]
+        fn non_ascending_and_null_base_positions() {
+            let schema = wide_schema(DataType::Int64);
+            let rows: Vec<Row> = vec![
+                ("k3", 3, Some(1), false),
+                ("k1", 1, Some(1), false),
+                ("k2", 2, Some(1), false),
+                ("k0", 0, Some(1), false),
+            ];
+            let base = vec![(rows.clone(), vec![Some(3), Some(1), Some(2), Some(0)])];
+            let blocks = vec![
+                Block::Data(
+                    vec![("k1", 100, Some(9), false), ("k3", 300, Some(9), false)],
+                    vec![1, 3],
+                    "20240101000001000",
+                ),
+                Block::Delete(vec!["k2"], vec![None], vec![2]),
+            ];
+            for mode in ["COMMIT_TIME_ORDERING", "EVENT_TIME_ORDERING"] {
+                let out = agree(&schema, mode, &blocks, &base);
+                assert_eq!(
+                    out,
+                    vec![
+                        ("k0".to_string(), 0, Some(1)),
+                        ("k1".to_string(), 100, Some(9)),
+                        ("k3".to_string(), 300, Some(9)),
+                    ]
+                );
+            }
+
+            let null_base = vec![(rows, vec![Some(3), None, Some(2), Some(0)])];
+            let (out, _) = run(
+                MergeWay::Vectorized,
+                &schema,
+                "COMMIT_TIME_ORDERING",
+                &[],
+                &blocks,
+                &null_base,
+            );
+            assert!(
+                out.contains(&("k1".to_string(), 1, Some(1))),
+                "a null position is not matched"
+            );
+            assert!(
+                out.contains(&("k1".to_string(), 100, Some(9))),
+                "its update is drained as a log-only record"
+            );
+        }
+
+        /// A read whose kept blocks outgrow the budget and then meets a block
+        /// without positions ends on the key merge with the key merge's rows.
+        #[test]
+        fn budget_handoff_then_a_block_without_positions() {
+            let schema = wide_schema(DataType::Int64);
+            let base = vec![base_rows(6, Some(1))];
+            let blocks = vec![
+                Block::Data(
+                    vec![("k1", 100, Some(9), false), ("k2", 200, Some(9), false)],
+                    vec![1, 2],
+                    "20240101000001000",
+                ),
+                Block::Delete(vec!["k3"], vec![None], vec![3]),
+                Block::Data(
+                    vec![("k4", 400, Some(9), false)],
+                    vec![],
+                    "20240101000002000",
+                ),
+            ];
+            for mode in ["COMMIT_TIME_ORDERING", "EVENT_TIME_ORDERING"] {
+                let tiny = [(CONFIG_MERGE_MAX_SIZE, "1")];
+                let (out, buffer) = run(MergeWay::Vectorized, &schema, mode, &tiny, &blocks, &base);
+                assert!(buffer.vectorized.is_none());
+                assert_eq!(buffer.get_buffer_type(), BufferType::KeyBasedMerge);
+                let (key, _) = run(MergeWay::RecordKey, &schema, mode, &[], &blocks, &base);
+                assert_eq!(out, key);
+                assert!(out.contains(&("k4".to_string(), 400, Some(9))));
+                assert!(!out.iter().any(|r| r.0 == "k3"));
+            }
+        }
+
+        /// Unmatched updates past one batch's worth drain in chunks of at most
+        /// `DEFAULT_BATCH_SIZE` rows (checked in [`run`]) and all come back.
+        #[test]
+        fn drain_larger_than_a_batch_is_chunked() {
+            let schema = wide_schema(DataType::Int64);
+            let n = DEFAULT_BATCH_SIZE * 2 + 7;
+            let keys: Vec<String> = (0..n).map(|i| format!("u{i:06}")).collect();
+            let rows: Vec<Row> = keys
+                .iter()
+                .map(|k| (k.as_str(), 1, Some(1), false))
+                .collect();
+            let positions: Vec<u64> = (0..n as u64).map(|i| 100 + i).collect();
+            let blocks = vec![Block::Data(rows, positions, "20240101000001000")];
+            let base = vec![base_rows(3, Some(1))];
+            let out = agree(&schema, "COMMIT_TIME_ORDERING", &blocks, &base);
+            assert_eq!(out.len(), n + 3);
+            let mut buffer = build_buffer_for(schema.clone(), "COMMIT_TIME_ORDERING", &[], &[]);
+            let Block::Data(rows, positions, instant) = &blocks[0] else {
+                unreachable!()
+            };
+            let mut block = wide_data_block(&schema, rows, positions, instant);
+            buffer.process_data_block(&mut block).unwrap();
+            let mut chunks = Vec::new();
+            while let Some(b) = buffer.drain_log_only_inserts(&schema).unwrap() {
+                chunks.push(b.num_rows());
+            }
+            assert_eq!(chunks, vec![DEFAULT_BATCH_SIZE, DEFAULT_BATCH_SIZE, 7]);
+        }
     }
 }
