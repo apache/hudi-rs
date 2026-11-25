@@ -60,6 +60,9 @@ impl RequestCounts {
 pub(crate) struct CountingObjectStore {
     inner: Arc<dyn ObjectStore>,
     counts: Arc<RequestCounts>,
+    /// Reads of a path ending in the first part wait the second before they
+    /// start, so a test can make one request finish after a later one.
+    delays: std::sync::Mutex<Vec<(String, std::time::Duration)>>,
 }
 
 impl CountingObjectStore {
@@ -69,9 +72,18 @@ impl CountingObjectStore {
             Arc::new(Self {
                 inner,
                 counts: counts.clone(),
+                delays: std::sync::Mutex::new(Vec::new()),
             }),
             counts,
         )
+    }
+
+    /// Delay every read of a path ending in `suffix` by `delay`.
+    pub(crate) fn delay_reads(&self, suffix: &str, delay: std::time::Duration) {
+        self.delays
+            .lock()
+            .unwrap()
+            .push((suffix.to_string(), delay));
     }
 }
 
@@ -108,6 +120,16 @@ impl ObjectStore for CountingObjectStore {
             self.counts.heads.fetch_add(1, Ordering::Relaxed);
         } else {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
+        }
+        let delay = self
+            .delays
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(suffix, _)| location.as_ref().ends_with(suffix.as_str()))
+            .map(|(_, d)| *d);
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         self.inner.get_opts(location, options).await
     }
