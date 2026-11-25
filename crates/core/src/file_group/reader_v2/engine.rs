@@ -133,6 +133,13 @@ pub struct HoodieFileGroupReader {
     /// read opens the base file.
     skip_base_columns: Vec<String>,
 
+    /// Rows per base batch. `MERGE_CHUNK_ROWS` unless the log scan settled on
+    /// the vectorized position-based merge, whose per-batch work is a filter
+    /// and a gather rather than a lookup per row, so the base is read in the
+    /// caller's batch size (`hoodie.read.stream.batch_size`) as a base-only
+    /// read would be, though never below `MERGE_CHUNK_ROWS`.
+    base_batch_rows: usize,
+
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
@@ -158,6 +165,10 @@ pub struct HoodieFileGroupReader {
 /// larger default upstream would multiply the blocking above with nothing
 /// failing. Measured by `spilled_merge_blocking_duration` (ignored; run with
 /// `--release --ignored --nocapture`).
+///
+/// The vectorized position-based merge is the exception: it merges a base
+/// batch with a filter and a gather, not a lookup per row, so a read that
+/// settles on it uses the caller's batch size instead (`base_batch_rows`).
 const MERGE_CHUNK_ROWS: usize = 1024;
 
 /// Base-file read options carrying an optional pushdown predicate, and the
@@ -444,6 +455,7 @@ impl HoodieFileGroupReader {
             stream_stats: new_stream_stats_handle(),
             valid_block_instants: Vec::new(),
             skip_base_columns: Vec::new(),
+            base_batch_rows: MERGE_CHUNK_ROWS,
             buffered_record_converter: None,
         })
     }
@@ -486,8 +498,9 @@ impl HoodieFileGroupReader {
     ///
     /// [`Self::read`] returns the whole file group as one batch, so peak memory
     /// tracks the base file. This reads the base file one bounded batch at a
-    /// time instead (`MERGE_CHUNK_ROWS` rows), merging and emitting a chunk
-    /// per batch.
+    /// time instead (`MERGE_CHUNK_ROWS` rows, or the caller's batch size under
+    /// the vectorized position-based merge), merging and emitting a chunk per
+    /// batch.
     ///
     /// Demand-driven: nothing is merged until the consumer asks for it, so the
     /// memory this adds over the merge map is one chunk. The previous shape ran
@@ -557,6 +570,17 @@ impl HoodieFileGroupReader {
         self.read_stats.num_inserts = s.num_inserts;
         self.read_stats.num_updates = s.num_updates;
         self.read_stats.num_deletes = s.num_deletes;
+    }
+
+    /// The batch size the caller asked for, or `MERGE_CHUNK_ROWS` when it set
+    /// none (or an unusable one).
+    fn caller_batch_rows(&self) -> usize {
+        self.reader_context
+            .hoodie_reader_config
+            .get(crate::config::read::HudiReadConfig::StreamBatchSize.as_ref())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MERGE_CHUNK_ROWS)
     }
 
     /// Initialize record iterators: read base file + scan/merge log files,
@@ -670,6 +694,9 @@ impl HoodieFileGroupReader {
                         )
                     })?;
                 let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
+                if record_buffer.merges_base_by_position(&merge_schema)? {
+                    self.base_batch_rows = self.caller_batch_rows().max(MERGE_CHUNK_ROWS);
+                }
                 let unfiltered = self.reader_context.row_filter_builder.is_none()
                     && self.reader_context.row_group_selector.is_none()
                     && self.reader_context.key_predicate.is_none();
@@ -1051,6 +1078,7 @@ impl HoodieFileGroupReader {
             .unwrap_or_else(|| required_schema.clone());
         let repair_risk_columns = self.reader_context.repair_risk_columns.clone();
         let skip_columns = self.skip_base_columns.clone();
+        let batch_rows = self.base_batch_rows;
         let volume = self.storage.read_volume();
         let choose_path = path.clone();
         // The open speaks storage errors; a schema decision that fails here is
@@ -1164,6 +1192,7 @@ impl HoodieFileGroupReader {
                 // evolved/added cols.
                 Ok(
                     base_read_options(row_filter, row_group_selector, key_predicate, use_position)
+                        .with_batch_size(batch_rows)
                         .with_projection(present.iter().map(|f| f.name())),
                 )
             };
@@ -2512,7 +2541,9 @@ mod tests {
     /// the pin from the default — but a caller that passed a larger batch size
     /// through here (making `hoodie.read.stream.batch_size` effective on the
     /// merge path, say) would multiply every poll's cost, and this is what says
-    /// so out loud.
+    /// so out loud. The vectorized position-based merge, whose cost per batch is
+    /// a filter and a gather, is the one exception, and the open makes it
+    /// (`base_batch_rows`), not these options.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_merged_chunk_is_bounded_by_the_readers_own_batch_size() {
         // Every argument combination must carry the pin: the position-merge
@@ -2597,9 +2628,10 @@ mod tests {
         reader_context.latest_commit_time =
             crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
         reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
-        // Set on purpose: the knob is documented to size base-file-only slices
-        // and to have NO effect on a merged slice. The chunk assertions in the
-        // test below are what hold that, rather than a one-off measurement.
+        // Set on purpose: the knob sizes base-file-only slices and slices under
+        // the vectorized position-based merge, and has NO effect on a key-based
+        // merge. The chunk assertions in the test below are what hold that,
+        // rather than a one-off measurement.
         reader_context.hoodie_reader_config.insert(
             crate::config::read::HudiReadConfig::StreamBatchSize
                 .as_ref()
@@ -2652,7 +2684,7 @@ mod tests {
     /// synthetic, so nothing matches: every base row survives, the drain has
     /// nothing to emit, and the chunk cadence is exactly what the machine
     /// produced. `hoodie.read.stream.batch_size=8192` is set in the reader
-    /// config on purpose — the knob must have no effect on a merged slice.
+    /// config on purpose — the knob must have no effect on a key-based merge.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_the_chunk_bound_holds_on_a_slice_with_log_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3374,5 +3406,97 @@ mod tests {
             reader.reader_context.repair_risk_columns.is_empty(),
             "unset must leave the guard disarmed, not populated by accident"
         );
+    }
+
+    /// The base of a slice that settles on the vectorized position-based merge
+    /// is read in the caller's batch size, and a key-based merge keeps the
+    /// `MERGE_CHUNK_ROWS` bound, with the same rows either way.
+    #[tokio::test]
+    async fn the_position_merge_reads_the_base_in_the_callers_batch_size() {
+        use crate::file_group::base_file::parquet::ParquetBaseFileReader;
+        use arrow_array::cast::AsArray;
+        use arrow_schema::Schema;
+        use hudi_test::QuickstartTripsTable;
+
+        const BASE: &str =
+            "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+        const LOG: &str =
+            "city=sf/.fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73";
+
+        let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+        let (_, storage) =
+            crate::file_group::reader_v2::harness::create_configs_and_storage(&table_path)
+                .await
+                .unwrap();
+        let data_schema: SchemaRef = Arc::new(
+            ParquetBaseFileReader::new(storage.clone())
+                .get_schema(BASE)
+                .await
+                .unwrap(),
+        );
+        let requested: SchemaRef = Arc::new(Schema::new(
+            ["id", "name", "age"]
+                .iter()
+                .map(|n| data_schema.field_with_name(n).unwrap().clone())
+                .collect::<Vec<_>>(),
+        ));
+
+        for use_record_position in [true, false] {
+            let mut reader_context = ReaderContext::empty();
+            reader_context.latest_commit_time =
+                crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
+            reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+            reader_context.table_config.insert(
+                HudiTableConfig::OrderingFields.as_ref().to_string(),
+                "ts".to_string(),
+            );
+            reader_context.hoodie_reader_config.insert(
+                crate::config::read::HudiReadConfig::StreamBatchSize
+                    .as_ref()
+                    .to_string(),
+                "8192".to_string(),
+            );
+            reader_context.rebuild_record_context("city=sf".to_string());
+            reader_context.has_log_files = true;
+            let mut reader = HoodieFileGroupReader::new(
+                Arc::new(reader_context),
+                storage.clone(),
+                InputSplit::new(
+                    Some(BASE.to_string()),
+                    Some("20260408053032350".to_string()),
+                    vec![LOG.to_string()],
+                    "city=sf".to_string(),
+                ),
+                ReaderParameters {
+                    use_record_position,
+                    ..Default::default()
+                },
+                Some(data_schema.clone()),
+                Some(requested.clone()),
+            )
+            .unwrap();
+            let mut stream = reader.open_stream().await.unwrap();
+            let mut names: Vec<String> = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                let column = batch.column_by_name("name").unwrap().as_string::<i32>();
+                names.extend(column.iter().map(|v| v.unwrap().to_string()));
+            }
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["Alice-V2".to_string(), "Bob".to_string()],
+                "use_record_position={use_record_position}"
+            );
+            let expected = if use_record_position {
+                8192
+            } else {
+                MERGE_CHUNK_ROWS
+            };
+            assert_eq!(
+                reader.base_batch_rows, expected,
+                "use_record_position={use_record_position}"
+            );
+        }
     }
 }

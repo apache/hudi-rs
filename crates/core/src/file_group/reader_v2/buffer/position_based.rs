@@ -1249,6 +1249,10 @@ impl HoodieFileGroupRecordBuffer for PositionBasedFileGroupRecordBuffer {
         Ok(Vec::new())
     }
 
+    fn merges_base_by_position(&mut self, merge_schema: &SchemaRef) -> Result<bool> {
+        Ok(self.should_use_position && self.build_position_merge_index(merge_schema)?)
+    }
+
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>> {
         if self.vectorized.is_some() {
             return self.drain_position_merge(target_schema);
@@ -1985,7 +1989,11 @@ mod tests {
 
     /// Whether `buffer` still needs the record key from the base file.
     fn reads_key(buffer: &mut dyn HoodieFileGroupRecordBuffer) -> bool {
-        buffer.base_columns_unneeded(&schema()).unwrap().is_empty()
+        let reads = buffer.base_columns_unneeded(&schema()).unwrap().is_empty();
+        // Only the merge by position alone does without the key, and that is
+        // the merge whose base batches may be read larger.
+        assert_eq!(buffer.merges_base_by_position(&schema()).unwrap(), !reads);
+        reads
     }
 
     /// Each case where the vectorized merge does not apply falls back on its own,

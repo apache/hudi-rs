@@ -314,4 +314,13 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
         let _ = merge_schema;
         Ok(Vec::new())
     }
+
+    /// Called once the logs are scanned, before the base file is opened:
+    /// whether this buffer merges each base batch by row position as a whole
+    /// (a filter and a gather), so its cost per batch does not grow with a
+    /// lookup per row and the base may be read in larger batches.
+    fn merges_base_by_position(&mut self, merge_schema: &SchemaRef) -> Result<bool> {
+        let _ = merge_schema;
+        Ok(false)
+    }
 }

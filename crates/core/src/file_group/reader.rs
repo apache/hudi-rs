@@ -1004,8 +1004,21 @@ impl FileGroupReader {
         log::debug!("streaming '{base_file_path}' with file group reader version 2");
         let pushdown = self.filter_pushdown(options, &data_schema, !log_file_paths.is_empty());
         let requested_schema = self.v2_requested_schema(options, &data_schema)?;
+        // A batch size set on this read reaches the merge-on-read reader the way
+        // a configured one does, through its reader config.
+        let reader_configs = match options.batch_size()? {
+            Some(rows) => {
+                let mut configs = self.hudi_configs.as_options();
+                configs.insert(
+                    HudiReadConfig::StreamBatchSize.as_ref().to_string(),
+                    rows.to_string(),
+                );
+                Arc::new(HudiConfigs::new(configs))
+            }
+            None => self.hudi_configs.clone(),
+        };
         let merged = crate::file_group::reader_v2::adapter::read_file_slice_stream(
-            self.hudi_configs.clone(),
+            reader_configs,
             self.storage.clone(),
             base_file_path,
             known_base_file_size,
