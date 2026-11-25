@@ -231,6 +231,35 @@ fg_case_test!(
     }
 );
 
+// The same slice as `v9_mor_nonpart_multi_log` read with a projection, which
+// narrows the Avro data block's decode to the merge columns. The merged rows
+// match the full read's.
+fn requested_name() -> SchemaRef {
+    Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]))
+}
+
+fg_case_test!(
+    harness_v9_mor_nonpart_multi_log_projected,
+    FgReaderCase {
+        name: "v9_mor_nonpart_multi_log_projected",
+        fixture: QuickstartTripsTable::V9MorNonpart3Commits,
+        partition: "",
+        base_file: "960a29a0-0f78-401d-85b1-1cbc44b34121-0_0-846-1597_20260409002001492.parquet",
+        log_files: &[
+            ".960a29a0-0f78-401d-85b1-1cbc44b34121-0_20260409002002957.log.1_0-868-1644",
+            ".960a29a0-0f78-401d-85b1-1cbc44b34121-0_20260409002003963.log.1_0-890-1691",
+        ],
+        schema: SchemaSpec::Projection(requested_name()),
+        expect_output_columns: Some(&["name"]),
+        expected: Expected::Rows {
+            sort_key: "name",
+            columns: &["name"],
+            rows: &[&["C"], &["D2"], &["E2"], &["F2"]],
+        },
+        ..Default::default()
+    }
+);
+
 // Non-partitioned, 2 heterogeneous log files: log 1 is a DELETE block
 // (ids 0-2), log 2 an avro data block (updates ids 4-6 to D2/E2/F2).
 // After merge: 4 rows — 7 base - 3 deleted, ids 4-6 updated, id=3 untouched.

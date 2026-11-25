@@ -60,6 +60,11 @@ pub struct AvroBlockDecoder {
     prefix: [u8; 10],
     /// Reused across records so framing costs one copy, not one allocation.
     framed: Vec<u8>,
+    /// Whether `decoder` filled a batch and was flushed, so it must be rebuilt
+    /// before it decodes again. Rebuilt on the next record rather than at the
+    /// flush, so a block that ends exactly on a full batch builds no decoder it
+    /// never uses.
+    spent: bool,
     /// When set, each batch is projected to this schema after decoding. See
     /// [`AvroBlockDecoder::with_rewrite_to`].
     rewrite_to: Option<SchemaRef>,
@@ -168,6 +173,7 @@ impl AvroBlockDecoder {
             batch_size,
             prefix,
             framed: Vec::new(),
+            spent: false,
             rewrite_to: None,
         })
     }
@@ -207,6 +213,17 @@ impl AvroBlockDecoder {
 
     /// Decode one record body, returning a batch once enough rows have accrued.
     pub fn decode(&mut self, body: &[u8]) -> Result<Option<RecordBatch>> {
+        if self.spent {
+            // A flushed union decoder cannot be decoded into again, so the next
+            // batch gets a fresh one. Only reached when a block holds more
+            // records than one batch.
+            self.decoder = Self::build_inner(
+                &self.registered,
+                self.reader_schema_json.as_deref(),
+                self.batch_size,
+            )?;
+            self.spent = false;
+        }
         self.framed.clear();
         self.framed.reserve(self.prefix.len() + body.len());
         self.framed.extend_from_slice(&self.prefix);
@@ -225,15 +242,7 @@ impl AvroBlockDecoder {
 
         if self.decoder.batch_is_full() {
             let batch = self.flush()?;
-            // A flushed union decoder cannot be decoded into again, so the next
-            // batch gets a fresh one. Only reached when a single block holds more
-            // records than one batch, which is the case that fails outright
-            // without this; a block inside one batch never takes this path.
-            self.decoder = Self::build_inner(
-                &self.registered,
-                self.reader_schema_json.as_deref(),
-                self.batch_size,
-            )?;
+            self.spent = true;
             return Ok(batch);
         }
         Ok(None)
