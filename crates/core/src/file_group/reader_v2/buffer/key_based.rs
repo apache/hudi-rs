@@ -544,6 +544,11 @@ impl KeyBasedFileGroupRecordBuffer {
         // (1 byte/row) that arrow would then re-pack into a bitmap.
         let mut keep = BooleanBufferBuilder::new(num_rows);
         let mut replacements: Vec<BufferedRecord> = Vec::new();
+        // Schema pointer -> whether a log record carrying that schema is
+        // partial. The map keeps the `Arc` alive so the address cannot be
+        // freed and reused by a later record's schema within this call, which a
+        // spilled batch decoded with its own schema would otherwise allow.
+        let mut partial_by_schema: HashMap<usize, (SchemaRef, bool)> = HashMap::new();
         // Tracks whether any base row is actually dropped; drives the all-keep
         // short-circuit below.
         let mut any_dropped = false;
@@ -632,7 +637,16 @@ impl KeyBasedFileGroupRecordBuffer {
                             // tables — and a losing delete tombstone, which has no
                             // columns to fill from — emit the base row unchanged
                             // (the common all-keep fast path).
-                            let filled = match log_rec.get_record() {
+                            //
+                            // Only those two fix-ups look inside the losing record;
+                            // slicing it out of its batch otherwise costs an
+                            // allocation per row for nothing.
+                            let loser = if ignore_defaults || unavailable_value.is_some() {
+                                log_rec.get_record()
+                            } else {
+                                None
+                            };
+                            let filled = match loser {
                                 Some(loser) if ignore_defaults => {
                                     let base_rec = BufferedRecord::new_data(
                                         key.to_string(),
@@ -692,9 +706,34 @@ impl KeyBasedFileGroupRecordBuffer {
                             // column it omits. Detected by the record's narrow schema.
                             // Falls through to FILL_UNAVAILABLE (below) for full-schema
                             // records carrying the toasted/unavailable sentinel.
-                            let log_batch = log_rec.get_record();
-                            let rec = match log_batch {
-                                Some(lb) if schema_is_partial(&lb.schema(), target_schema) => {
+                            //
+                            // Partiality is a property of the record's source batch,
+                            // shared by every record from that block, so it is read
+                            // off the batch's schema and remembered per schema rather
+                            // than derived from a one-row slice per record.
+                            let is_partial = match log_rec.schema() {
+                                Some(schema) => {
+                                    let ptr = Arc::as_ptr(&schema) as usize;
+                                    partial_by_schema
+                                        .entry(ptr)
+                                        .or_insert_with(|| {
+                                            let partial = schema_is_partial(&schema, target_schema);
+                                            (schema, partial)
+                                        })
+                                        .1
+                                }
+                                None => false,
+                            };
+                            // Only a partial record is read as a row here; slicing a
+                            // full one out of its block batch would cost one `Arc`
+                            // clone per column for every winning log record.
+                            let partial_row = if is_partial {
+                                log_rec.get_record()
+                            } else {
+                                None
+                            };
+                            let rec = match partial_row {
+                                Some(lb) => {
                                     let merged = overlay_partial_over_prior(
                                         &lb,
                                         &base.slice(idx, 1),
@@ -799,6 +838,125 @@ impl KeyBasedFileGroupRecordBuffer {
                     "concat_batches failed in merge_one_base_batch_kernel: {e}"
                 ))
             })
+    }
+
+    /// One log record into the merge map. `inc_is_partial` says whether the
+    /// record's batch lacks columns the reader schema has, which the caller
+    /// decides once per batch rather than per record.
+    fn process_data_record(
+        &mut self,
+        record: BufferedRecord,
+        key: String,
+        inc_is_partial: bool,
+    ) -> Result<()> {
+        self.base.total_log_records += 1;
+
+        // Two mutually-exclusive log-vs-log fix-ups can rewrite the incoming record
+        // before the merge — a record is either a narrow KEEP_VALUES record or a
+        // full-schema FILL_UNAVAILABLE one, so partial is checked first and toasted
+        // is the `else`:
+        //
+        // Partial-update (IS_PARTIAL / KEEP_VALUES): the incoming record carries only
+        // a subset of columns; fold it together with the prior buffered record for
+        // this key, producing the UNION of their columns. The result stays narrower
+        // than the reader schema until a base row or later update supplies the rest,
+        // so base-vs-log can still fill the gaps. With no prior data record it stays
+        // narrow and is padded at the base/drain step.
+        if inc_is_partial {
+            // Mirrors Java `DefaultSparkRecordMerger.partialMerge`, which folds in BOTH
+            // directions: the ordering WINNER supplies every column it carries and the
+            // loser only the columns the winner omits. The union takes the winner's
+            // ordering value, so a later update is compared against the winner's
+            // position on the timeline rather than the loser's.
+            //
+            // Single-probe merge (perf): the fold runs inside `merge_in_place`, which
+            // probes `key` once and overwrites the slot in place rather than
+            // get(probe+clone) → merge → insert(probe+clone+probe). A2 semantics
+            // preserved: the merged payload is stored in-memory (IPC serialization
+            // deferred to spill only).
+            let merger = &self.base.buffered_record_merger;
+            let commit_time_ordering = self.base.record_merge_mode == "COMMIT_TIME_ORDERING";
+            self.base.records.merge_in_place_owned(key, |existing| {
+                // Folding needs columns on both sides. With no prior, or a prior that
+                // is a delete tombstone, the ordering comparison alone decides.
+                let Some((prior, prior_batch, ib)) = existing
+                    .and_then(|prior| Some((prior, prior.get_record()?, record.get_record()?)))
+                else {
+                    return merger.delta_merge(&record, existing);
+                };
+                let union = union_schema(&ib.schema(), &prior_batch.schema());
+                let new_wins = commit_time_ordering || should_keep_newer_record(prior, &record);
+                let (winner, loser, ordering_value) = if new_wins {
+                    (&ib, &prior_batch, record.ordering_value.clone())
+                } else {
+                    (&prior_batch, &ib, prior.ordering_value.clone())
+                };
+                Ok(Some(BufferedRecord::new_data(
+                    record.record_key.clone(),
+                    overlay_partial_over_prior(winner, loser, &union)?,
+                    ordering_value,
+                )))
+            })?;
+        } else if self.ignore_defaults || self.unavailable_value.is_some() {
+            // Full-schema partial-update (IGNORE_DEFAULTS or FILL_UNAVAILABLE),
+            // log-vs-log blend. Mirrors Java `EventTimePartialRecordMerger.deltaMerge`,
+            // which fills the merge WINNER from the loser in BOTH directions:
+            //   - new wins      → fill new from the prior (existing), store new.
+            //   - existing wins → fill existing from the new (incoming), store existing.
+            //
+            // Rationale: when ≥2 log updates to a key never touch the base, a
+            // default (IGNORE_DEFAULTS) / sentinel (FILL_UNAVAILABLE) column must be
+            // filled from the OTHER record, or it silently overwrites/retains the
+            // wrong value. Filling only new-from-prior (the
+            // previous behavior) missed the case where the HIGHER-ordering record
+            // arrives FIRST and wins: a later lower-ordering update carrying the real
+            // value was discarded, leaving the winner's default/sentinel column
+            // un-backfilled.
+            //
+            // The fill only rewrites default/sentinel columns and never touches
+            // `ordering_value`, so it cannot change the winner; a same-ordering tie
+            // keeps the incoming (new) as the winner, matching `should_keep_newer_record`.
+            let stored = match self.base.records.get(&key)? {
+                None => record, // no prior: nothing to fill from; store as-is.
+                Some(prior) => {
+                    let new_wins = self.base.record_merge_mode == "COMMIT_TIME_ORDERING"
+                        || should_keep_newer_record(&prior, &record);
+                    if new_wins {
+                        match prior.get_record() {
+                            Some(prior_batch) => self.fill_partial(record, &prior_batch, 0)?.0,
+                            // Prior is a delete tombstone → nothing to fill from.
+                            None => record,
+                        }
+                    } else {
+                        // Existing wins: back-fill existing from the incoming loser.
+                        match record.get_record() {
+                            Some(incoming_batch) => self.fill_partial(prior, &incoming_batch, 0)?.0,
+                            // Incoming is a tombstone (no columns) → keep existing.
+                            None => prior,
+                        }
+                    }
+                }
+            };
+            self.base.records.insert(key, stored)?;
+        } else {
+            // Plain (non-partial) log-vs-log merge. Single-probe merge (perf): probe
+            // `key` once via `merge_in_place` and overwrite in place. The merger only
+            // reads `existing` by reference. A2 semantics preserved: the merged
+            // BatchRef payload is stored in-memory (IPC serialization deferred to
+            // spill only).
+            let merger = &self.base.buffered_record_merger;
+            self.base
+                .records
+                .merge_in_place_owned(key, |existing| merger.delta_merge(&record, existing))?;
+        }
+
+        // Track peak merge-map size.
+        let len = self.base.records.len() as u64;
+        if len > self.base.merge_map_peak_entries {
+            self.base.merge_map_peak_entries = len;
+        }
+
+        Ok(())
     }
 }
 
@@ -1467,11 +1625,21 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
                 // grouping key. The map then pins only the block batches that
                 // have a surviving key (dropped otherwise when this loop ends).
                 let batch = Arc::new(batch);
+                // Every record of a block batch shares the batch's schema, so
+                // whether the records are partial is one question per batch,
+                // not a one-row slice per record.
+                let is_partial = match self.base.reader_schema.as_ref() {
+                    Some(target) => schema_is_partial(&batch.schema(), target),
+                    None => false,
+                };
                 let records = self
                     .record_context
                     .batch_to_buffered_records(&batch, self.base.delete_context.as_ref())?;
                 for (key, record) in records {
-                    self.process_next_data_record(record, &key)?;
+                    // A delete tombstone carries no columns, so it is never
+                    // partial whatever its block's schema says.
+                    let record_is_partial = is_partial && !record.is_delete();
+                    self.process_data_record(record, key, record_is_partial)?;
                 }
             }
         }
@@ -1490,118 +1658,14 @@ impl HoodieFileGroupRecordBuffer for KeyBasedFileGroupRecordBuffer {
     ///     .ifPresent(merged -> records.put(recordKey, merged.toBinary(recordContext)));
     /// ```
     fn process_next_data_record(&mut self, record: BufferedRecord, key: &str) -> Result<()> {
-        self.base.total_log_records += 1;
-
-        // Two mutually-exclusive log-vs-log fix-ups can rewrite the incoming record
-        // before the merge — a record is either a narrow KEEP_VALUES record or a
-        // full-schema FILL_UNAVAILABLE one, so partial is checked first and toasted
-        // is the `else`:
-        //
-        // Partial-update (IS_PARTIAL / KEEP_VALUES): the incoming record carries only
-        // a subset of columns; fold it together with the prior buffered record for
-        // this key, producing the UNION of their columns. The result stays narrower
-        // than the reader schema until a base row or later update supplies the rest,
-        // so base-vs-log can still fill the gaps. With no prior data record it stays
-        // narrow and is padded at the base/drain step.
-        let inc_is_partial = match (record.get_record(), self.base.reader_schema.as_ref()) {
-            (Some(ib), Some(target)) => schema_is_partial(&ib.schema(), target),
+        // The record's schema is its batch's, read without slicing the record
+        // out of it. The position-based buffer feeds every log record through
+        // here.
+        let inc_is_partial = match (record.schema(), self.base.reader_schema.as_ref()) {
+            (Some(schema), Some(target)) => schema_is_partial(&schema, target),
             _ => false,
         };
-        if inc_is_partial {
-            // Mirrors Java `DefaultSparkRecordMerger.partialMerge`, which folds in BOTH
-            // directions: the ordering WINNER supplies every column it carries and the
-            // loser only the columns the winner omits. The union takes the winner's
-            // ordering value, so a later update is compared against the winner's
-            // position on the timeline rather than the loser's.
-            //
-            // Single-probe merge (perf): the fold runs inside `merge_in_place`, which
-            // probes `key` once and overwrites the slot in place rather than
-            // get(probe+clone) → merge → insert(probe+clone+probe). A2 semantics
-            // preserved: the merged payload is stored in-memory (IPC serialization
-            // deferred to spill only).
-            let merger = &self.base.buffered_record_merger;
-            let commit_time_ordering = self.base.record_merge_mode == "COMMIT_TIME_ORDERING";
-            self.base.records.merge_in_place(key, |existing| {
-                // Folding needs columns on both sides. With no prior, or a prior that
-                // is a delete tombstone, the ordering comparison alone decides.
-                let Some((prior, prior_batch, ib)) = existing
-                    .and_then(|prior| Some((prior, prior.get_record()?, record.get_record()?)))
-                else {
-                    return merger.delta_merge(&record, existing);
-                };
-                let union = union_schema(&ib.schema(), &prior_batch.schema());
-                let new_wins = commit_time_ordering || should_keep_newer_record(prior, &record);
-                let (winner, loser, ordering_value) = if new_wins {
-                    (&ib, &prior_batch, record.ordering_value.clone())
-                } else {
-                    (&prior_batch, &ib, prior.ordering_value.clone())
-                };
-                Ok(Some(BufferedRecord::new_data(
-                    record.record_key.clone(),
-                    overlay_partial_over_prior(winner, loser, &union)?,
-                    ordering_value,
-                )))
-            })?;
-        } else if self.ignore_defaults || self.unavailable_value.is_some() {
-            // Full-schema partial-update (IGNORE_DEFAULTS or FILL_UNAVAILABLE),
-            // log-vs-log blend. Mirrors Java `EventTimePartialRecordMerger.deltaMerge`,
-            // which fills the merge WINNER from the loser in BOTH directions:
-            //   - new wins      → fill new from the prior (existing), store new.
-            //   - existing wins → fill existing from the new (incoming), store existing.
-            //
-            // Rationale: when ≥2 log updates to a key never touch the base, a
-            // default (IGNORE_DEFAULTS) / sentinel (FILL_UNAVAILABLE) column must be
-            // filled from the OTHER record, or it silently overwrites/retains the
-            // wrong value. Filling only new-from-prior (the
-            // previous behavior) missed the case where the HIGHER-ordering record
-            // arrives FIRST and wins: a later lower-ordering update carrying the real
-            // value was discarded, leaving the winner's default/sentinel column
-            // un-backfilled.
-            //
-            // The fill only rewrites default/sentinel columns and never touches
-            // `ordering_value`, so it cannot change the winner; a same-ordering tie
-            // keeps the incoming (new) as the winner, matching `should_keep_newer_record`.
-            let stored = match self.base.records.get(key)? {
-                None => record, // no prior: nothing to fill from; store as-is.
-                Some(prior) => {
-                    let new_wins = self.base.record_merge_mode == "COMMIT_TIME_ORDERING"
-                        || should_keep_newer_record(&prior, &record);
-                    if new_wins {
-                        match prior.get_record() {
-                            Some(prior_batch) => self.fill_partial(record, &prior_batch, 0)?.0,
-                            // Prior is a delete tombstone → nothing to fill from.
-                            None => record,
-                        }
-                    } else {
-                        // Existing wins: back-fill existing from the incoming loser.
-                        match record.get_record() {
-                            Some(incoming_batch) => self.fill_partial(prior, &incoming_batch, 0)?.0,
-                            // Incoming is a tombstone (no columns) → keep existing.
-                            None => prior,
-                        }
-                    }
-                }
-            };
-            self.base.records.insert(key.to_string(), stored)?;
-        } else {
-            // Plain (non-partial) log-vs-log merge. Single-probe merge (perf): probe
-            // `key` once via `merge_in_place` and overwrite in place. The merger only
-            // reads `existing` by reference. A2 semantics preserved: the merged
-            // BatchRef payload is stored in-memory (IPC serialization deferred to
-            // spill only).
-            let merger = &self.base.buffered_record_merger;
-            self.base
-                .records
-                .merge_in_place(key, |existing| merger.delta_merge(&record, existing))?;
-        }
-
-        // Track peak merge-map size.
-        let len = self.base.records.len() as u64;
-        if len > self.base.merge_map_peak_entries {
-            self.base.merge_map_peak_entries = len;
-        }
-
-        Ok(())
+        self.process_data_record(record, key.to_string(), inc_is_partial)
     }
 
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.processDeleteBlock(HoodieDeleteBlock)`.
