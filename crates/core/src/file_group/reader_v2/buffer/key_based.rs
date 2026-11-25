@@ -163,6 +163,14 @@ pub struct KeyBasedFileGroupRecordBuffer {
     /// back to [`DefaultRetain::OnNull`] (the behavior for a field with no
     /// declared default).
     default_retains: HashMap<String, DefaultRetain>,
+
+    /// Base-file positions that have a buffered log record, kept by the
+    /// position-based buffer while it merges by position. The position merge
+    /// kernel looks a base row up in the merge map only when its position is
+    /// here, so the rows no log record touches (almost all of them) cost a
+    /// bitmap probe instead of a decimal-string key and a hash lookup. `None`
+    /// means every row is looked up.
+    pub(super) position_filter: Option<roaring::RoaringTreemap>,
 }
 
 /// Per-field IGNORE_DEFAULTS retention rule, mirroring Java
@@ -391,7 +399,15 @@ impl KeyBasedFileGroupRecordBuffer {
             unavailable_value,
             ignore_defaults,
             default_retains,
+            position_filter: None,
         })
+    }
+
+    /// Whether the table carries a partial-update rule (`IGNORE_DEFAULTS` or an
+    /// unavailable-value sentinel) that reads the prior row when a log record
+    /// wins.
+    pub(super) fn has_partial_update_rules(&self) -> bool {
+        self.ignore_defaults || self.unavailable_value.is_some()
     }
 
     /// Mirrors Java's `KeyBasedFileGroupRecordBuffer.hasNextBaseRecord(T baseRecord)`.
@@ -539,6 +555,53 @@ impl KeyBasedFileGroupRecordBuffer {
             BaseMatch::Position => Some(base_row_position_array(base)?),
             BaseMatch::RecordKey => None,
         };
+        let position_filter = match base_match {
+            BaseMatch::Position => self.position_filter.take(),
+            BaseMatch::RecordKey => None,
+        };
+        let result = self.merge_one_base_batch_kernel_inner(
+            base,
+            target_schema,
+            base_match,
+            key_array.as_ref(),
+            position_array,
+            position_filter.as_ref(),
+        );
+        if position_filter.is_some() {
+            self.position_filter = position_filter;
+        }
+        result
+    }
+
+    /// The body of [`Self::merge_one_base_batch_kernel`], with the per-row key
+    /// sources resolved and the position filter borrowed out of `self`.
+    fn merge_one_base_batch_kernel_inner(
+        &mut self,
+        base: &RecordBatch,
+        target_schema: &SchemaRef,
+        base_match: BaseMatch,
+        key_array: Option<&StringArray>,
+        position_array: Option<&Int64Array>,
+        position_filter: Option<&roaring::RoaringTreemap>,
+    ) -> Result<Option<RecordBatch>> {
+        let num_rows = base.num_rows();
+        // A base batch none of whose positions has a log record merges to
+        // itself: skip the per-row loop.
+        if let (Some(positions), Some(filter)) = (position_array, position_filter)
+            && positions.null_count() == 0
+            && let (Some(lo), Some(hi)) = (
+                arrow::compute::min(positions),
+                arrow::compute::max(positions),
+            )
+            && lo >= 0
+            && filter.range_cardinality(lo as u64..=hi as u64) == 0
+        {
+            return Ok(Some(if base.schema() == *target_schema {
+                base.clone()
+            } else {
+                reconcile_batch_to_schema(base, target_schema)?
+            }));
+        }
         let orderings = self.record_context.ordering_accessor(base)?;
 
         // Bit-packed keep-mask (1 bit/row) built directly, vs a `Vec<bool>`
@@ -565,7 +628,14 @@ impl KeyBasedFileGroupRecordBuffer {
             let key: &str = match base_match {
                 BaseMatch::RecordKey => key_array.as_ref().unwrap().value(idx),
                 BaseMatch::Position => {
-                    position_key_buf = position_array.as_ref().unwrap().value(idx).to_string();
+                    let position = position_array.as_ref().unwrap().value(idx);
+                    if let Some(filter) = position_filter
+                        && (position < 0 || !filter.contains(position as u64))
+                    {
+                        keep.append(true);
+                        continue;
+                    }
+                    position_key_buf = position.to_string();
                     position_key_buf.as_str()
                 }
             };
