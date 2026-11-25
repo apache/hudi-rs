@@ -531,7 +531,10 @@ mod tests {
         let files = table.read_metadata_table_files_partition_arrow(&[]).await?;
         assert!(files.num_rows() > 0);
         assert!(counts.gets() > gets_before_mdt, "metadata table reads");
-        assert!(counts.heads() > after_open.1, "base and log file opens");
+        assert!(
+            counts.heads() > after_open.1,
+            "file opens that look a size up go through the injected store"
+        );
 
         let injected = Arc::as_ptr(&store) as *const ();
         let mdt = table

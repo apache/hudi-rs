@@ -433,6 +433,73 @@ impl Storage {
         ))
     }
 
+    /// [`Self::get_streaming_storage_reader`] for a caller that reads the file
+    /// from its start, such as a log file's block walk.
+    ///
+    /// The first window is fetched here, by range, and the response also says
+    /// how large the file is, which saves the size lookup the other open starts
+    /// with. A missing file fails here as it would there. Any other refusal (an
+    /// empty file has no byte 0), or a response that is not the window asked
+    /// for, falls back to that lookup. A caller that starts elsewhere, such as
+    /// an HFile's trailer, would pay for a window it does not read, and uses the
+    /// other open.
+    pub async fn get_streaming_storage_reader_from_start(
+        &self,
+        relative_path: &str,
+    ) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        let first = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(0..window_size)),
+            ..Default::default()
+        };
+        match obj_store.get_opts(&obj_path, first).await {
+            Ok(result) => {
+                // The window is trusted only when it is the start of the file
+                // and the file's size came with it, so a store that reports
+                // the range's length as the file's cannot cut the walk short.
+                let obj_meta = result.meta.clone();
+                let expected = 0..window_size.min(obj_meta.size);
+                if result.range == expected {
+                    match result.bytes().await {
+                        Ok(window) if window.len() as u64 == expected.end => {
+                            return Ok(StorageReader::new_streaming_with_first_window(
+                                obj_store,
+                                obj_meta,
+                                window_size,
+                                window,
+                            ));
+                        }
+                        Ok(window) => log::debug!(
+                            "'{relative_path}' returned {} bytes for its first window \
+                             of {expected:?}; looking its size up instead",
+                            window.len()
+                        ),
+                        Err(e) => log::debug!(
+                            "reading the first window of '{relative_path}' failed ({e}); \
+                             looking its size up instead"
+                        ),
+                    }
+                } else {
+                    log::debug!(
+                        "'{relative_path}' answered {:?} for its first window of \
+                         {expected:?}; looking its size up instead",
+                        result.range
+                    );
+                }
+            }
+            Err(e @ object_store::Error::NotFound { .. }) => return Err(e.into()),
+            Err(e) => log::debug!(
+                "fetching the first window of '{relative_path}' failed ({e}); \
+                 looking its size up instead"
+            ),
+        }
+        self.get_streaming_storage_reader(relative_path).await
+    }
+
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
         let dir_paths = self.list_dirs_as_obj_paths(subdir).await?;
         let mut dirs = Vec::new();
@@ -614,6 +681,75 @@ mod tests {
     use std::collections::HashSet;
     use std::fs::canonicalize;
     use std::path::Path;
+
+    /// Opening a file from its start costs one ranged GET and no HEAD, and the
+    /// reader then holds the file's whole size and bytes; an empty file falls
+    /// back to the size lookup, and a missing one fails without it.
+    #[tokio::test]
+    async fn opening_a_file_from_its_start_reads_its_first_window_for_its_size() {
+        use crate::storage::counting::CountingObjectStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("log"), &content).unwrap();
+        std::fs::write(dir.path().join("empty"), b"").unwrap();
+        let base_url = Url::from_directory_path(dir.path()).unwrap();
+        let open = |window: &str| {
+            let configs = Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+                (crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE, window),
+            ]));
+            let (store, counts) =
+                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+            (
+                Storage::new_with_object_store(base_url.clone(), store, configs),
+                counts,
+            )
+        };
+
+        // A window larger than the file, then one smaller, which refills.
+        for window in ["4096", "64"] {
+            let (storage, counts) = open(window);
+            let mut reader = storage
+                .get_streaming_storage_reader_from_start("log")
+                .await
+                .unwrap();
+            assert_eq!((counts.gets(), counts.heads()), (1, 0), "window {window}");
+            assert_eq!(reader.file_len(), content.len() as u64, "window {window}");
+            let read = reader.read_bytes(content.len() as u64).await.unwrap();
+            assert_eq!(read.as_ref(), content.as_slice(), "window {window}");
+        }
+
+        let (storage, counts) = open("4096");
+        let reader = storage
+            .get_streaming_storage_reader_from_start("empty")
+            .await
+            .unwrap();
+        assert_eq!(reader.file_len(), 0);
+        assert_eq!(
+            (counts.gets(), counts.heads()),
+            (1, 1),
+            "an empty file has no first byte to range over, so its size is looked up"
+        );
+
+        let (storage, counts) = open("4096");
+        let missing = storage
+            .get_streaming_storage_reader_from_start("missing")
+            .await
+            .expect_err("a missing file fails to open");
+        assert!(
+            matches!(
+                missing,
+                StorageError::ObjectStoreError(object_store::Error::NotFound { .. })
+            ),
+            "got {missing:?}"
+        );
+        assert_eq!(
+            (counts.gets(), counts.heads()),
+            (1, 0),
+            "a missing file fails on the first request"
+        );
+    }
 
     #[test]
     fn test_storage_new_error_no_base_path() {

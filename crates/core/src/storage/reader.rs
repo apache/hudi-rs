@@ -339,6 +339,20 @@ impl StorageReader {
         }
     }
 
+    /// [`Self::new_streaming`] with the window at the start of the file already
+    /// fetched, which a caller that had to learn the file's size can get from
+    /// the same request.
+    pub fn new_streaming_with_first_window(
+        object_store: Arc<dyn ObjectStore>,
+        object_meta: ObjectMeta,
+        window_size: u64,
+        window: Bytes,
+    ) -> Self {
+        let mut reader = Self::new_streaming(object_store, object_meta, window_size);
+        reader.window = window;
+        reader
+    }
+
     /// A fetcher over the same file, for reading a block's content later
     /// without re-opening it.
     pub fn block_fetcher(&self) -> LogBlockFetcher {

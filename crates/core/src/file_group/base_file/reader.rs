@@ -26,6 +26,7 @@ use arrow_schema::SchemaRef;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use parquet::file::metadata::ParquetMetaData;
 
 use crate::config::table::BaseFileFormatValue;
 use crate::statistics::StatisticsContainer;
@@ -142,6 +143,13 @@ pub struct BaseFileReadOptions {
     /// one: pruning removes base rows before a log merge could have updated them
     /// into a match. The caller installs it only when that cannot happen.
     pub row_group_selector: Option<RowGroupSelector>,
+    /// The file's footer, already fetched, so opening the file reads none.
+    ///
+    /// Only the Parquet reader honors this; other formats ignore it. A caller
+    /// that knows it will open the file after other I/O fetches the footer
+    /// alongside that I/O (see `ParquetBaseFileReader::fetch_metadata`) rather
+    /// than after it.
+    pub parquet_metadata: Option<Arc<ParquetMetaData>>,
 }
 
 // `row_filter` holds a closure, which has no `Debug`. Report whether one is set
@@ -156,6 +164,7 @@ impl std::fmt::Debug for BaseFileReadOptions {
             .field("row_filter", &self.row_filter.is_some())
             .field("row_index_column", &self.row_index_column)
             .field("row_group_selector", &self.row_group_selector.is_some())
+            .field("parquet_metadata", &self.parquet_metadata.is_some())
             .finish()
     }
 }
@@ -194,6 +203,13 @@ impl BaseFileReadOptions {
 
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = Some(batch_size);
+        self
+    }
+
+    /// Open the file with a footer fetched earlier. See
+    /// [`Self::parquet_metadata`].
+    pub fn with_parquet_metadata(mut self, metadata: Arc<ParquetMetaData>) -> Self {
+        self.parquet_metadata = Some(metadata);
         self
     }
 
