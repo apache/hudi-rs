@@ -130,6 +130,54 @@ fn unwrap_ordering_values(ordering: &ArrayRef) -> Result<ArrayRef> {
     arrow::compute::take(values.as_ref(), &indices, None).map_err(CoreError::ArrowError)
 }
 
+/// The most rows an Avro data block is decoded into per batch.
+const AVRO_DATA_BATCH_ROWS_MAX: usize = 65_536;
+
+/// What an Avro block's decoder is built from, besides the decoder itself.
+struct AvroBlockSetup {
+    registered: RegisteredWriterSchema,
+    /// The schema the block resolves to, or `None` to decode it as written.
+    reader_schema_json: Option<String>,
+    /// The schema a block is converted to after decoding, for a promotion Avro
+    /// cannot resolve.
+    rewrite_to: Option<Arc<Schema>>,
+}
+
+/// Every input [`AvroBlockSetup`] depends on. Compared in full rather than by
+/// a hash of the schema, so two different schemas can never share a setup.
+#[derive(PartialEq, Eq, Hash)]
+struct AvroBlockSetupKey {
+    writer_schema_json: String,
+    reader_schema_json: Option<String>,
+    projection: Option<Vec<String>>,
+    is_partial: bool,
+}
+
+/// Setups shared across decoders.
+///
+/// Working one out parses the writer schema to register and fingerprint it,
+/// narrows it to the projection, and parses both schemas again to check the
+/// promotions between them, and that took more time than decoding a typical
+/// block. A slice reads several log files, each through its own `Decoder`,
+/// and every block of a table's recent commits shares one writer schema, so
+/// a per-decoder cache saved little. The decoder itself is still built per
+/// block, because it carries per-stream state.
+static AVRO_BLOCK_SETUPS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<AvroBlockSetupKey, Arc<AvroBlockSetup>>>,
+> = std::sync::OnceLock::new();
+
+/// Setups kept before the cache starts over. A read needs one per writer
+/// schema and projection, so this is only a bound on a long-lived process.
+const AVRO_BLOCK_SETUPS_MAX: usize = 256;
+
+fn lock_setups() -> std::sync::MutexGuard<'static, HashMap<AvroBlockSetupKey, Arc<AvroBlockSetup>>>
+{
+    AVRO_BLOCK_SETUPS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[allow(dead_code)]
 pub struct Decoder {
     batch_size: usize,
@@ -147,28 +195,12 @@ pub struct Decoder {
     /// Columns a full Avro block is decoded to when no reader schema is set.
     /// See [`Decoder::with_projection`].
     projection: Option<Arc<Vec<String>>>,
-    /// The last writer schema narrowed to `projection`, and the result: `None`
-    /// when narrowing would drop nothing or could not produce a valid schema.
-    /// One entry, like `registered`.
-    narrowed: std::cell::RefCell<Option<(String, Option<Arc<str>>)>>,
     /// Whether an HFile block's records are decoded into Arrow batches rather
     /// than handed back as key-value pairs. See
     /// [`Decoder::with_hfile_as_records`].
     hfile_as_records: bool,
     /// Keys the caller asked for, pushed into the HFile block index.
     key_predicate: Option<crate::file_group::base_file::reader::KeyPredicate>,
-    /// The last writer schema parsed and fingerprinted, reused by the next block
-    /// that carries the same one.
-    ///
-    /// Registering is schema-sized: it parses the schema to fingerprint it, which
-    /// on the metadata table's 8 KB record schema is about half the cost of
-    /// building a decoder, and a log file's blocks normally all share one writer
-    /// schema. Holds only data, so unlike the decoder it is safe to share; the
-    /// decoder itself is still built per block because it carries per-stream state.
-    ///
-    /// `RefCell` because `decode_content` takes `&self`, and a `Decoder` is built
-    /// per scan and used sequentially.
-    registered: std::cell::RefCell<Option<(String, RegisteredWriterSchema)>>,
 }
 
 impl Decoder {
@@ -270,10 +302,8 @@ impl Decoder {
             repair_table_schema: None,
             reader_schema_json: None,
             projection: None,
-            narrowed: std::cell::RefCell::new(None),
             hfile_as_records: false,
             key_predicate: None,
-            registered: std::cell::RefCell::new(None),
         }
     }
     pub fn decode_content(
@@ -345,6 +375,7 @@ impl Decoder {
         writer_schema_json: &str,
         header: &HashMap<BlockMetadataKey, String>,
         narrow: bool,
+        batch_rows: usize,
     ) -> Result<AvroBlockDecoder> {
         // A partial-update block carries only the columns that were written, and
         // the merge needs to know which those are. Resolving it up to the table
@@ -361,10 +392,45 @@ impl Decoder {
         if is_partial {
             log::debug!("partial-update block: decoding at its own schema, not the table's");
         }
-        let narrowed = match (&self.reader_schema_json, &self.projection) {
-            (None, Some(columns)) if narrow && !is_partial => {
-                self.narrowed_for(writer_schema_json, columns)
-            }
+        let setup = self.avro_block_setup(writer_schema_json, is_partial, narrow)?;
+        let mut decoder = AvroBlockDecoder::try_new_with_registered(
+            &setup.registered,
+            setup.reader_schema_json.as_deref(),
+            batch_rows,
+        )?;
+        if let Some(rewrite_to) = &setup.rewrite_to {
+            decoder = decoder.with_rewrite_to(rewrite_to.clone());
+        }
+        Ok(decoder)
+    }
+
+    /// Everything a block's decoder is built from except the decoder itself:
+    /// the registered writer schema and the schema it resolves to. These depend
+    /// only on the block's writer schema and this decoder's settings, so they
+    /// come from [`AVRO_BLOCK_SETUPS`] and are worked out once per process for
+    /// each combination rather than once per block.
+    fn avro_block_setup(
+        &self,
+        writer_schema_json: &str,
+        is_partial: bool,
+        narrow: bool,
+    ) -> Result<Arc<AvroBlockSetup>> {
+        let narrow = narrow && !is_partial && self.reader_schema_json.is_none();
+        let key = AvroBlockSetupKey {
+            writer_schema_json: writer_schema_json.to_string(),
+            reader_schema_json: self.reader_schema_json.clone(),
+            projection: if narrow {
+                self.projection.as_deref().cloned()
+            } else {
+                None
+            },
+            is_partial,
+        };
+        if let Some(found) = lock_setups().get(&key) {
+            return Ok(found.clone());
+        }
+        let narrowed = match &self.projection {
+            Some(columns) if narrow => narrow_avro_record(writer_schema_json, columns),
             _ => None,
         };
         let reader_schema_json = if is_partial {
@@ -398,44 +464,17 @@ impl Decoder {
             None => (narrowed.as_deref(), None),
         };
 
-        // Registered once per writer schema rather than once per block. Compared,
-        // not hashed: a block with a different schema must not reuse another's
-        // fingerprint. One entry, since a log file normally carries one schema and
-        // a file that alternates simply re-registers rather than growing a map.
-        let registered = {
-            let mut slot = self.registered.borrow_mut();
-            match slot.as_ref() {
-                Some((json, reg)) if json == writer_schema_json => reg.clone(),
-                _ => {
-                    let reg = RegisteredWriterSchema::new(writer_schema_json)?;
-                    *slot = Some((writer_schema_json.to_string(), reg.clone()));
-                    reg
-                }
-            }
-        };
-        let mut decoder = AvroBlockDecoder::try_new_with_registered(
-            &registered,
-            reader_schema_json,
-            self.batch_size,
-        )?;
-        if let Some(rewrite_to) = rewrite_to {
-            decoder = decoder.with_rewrite_to(rewrite_to);
+        let setup = Arc::new(AvroBlockSetup {
+            registered: RegisteredWriterSchema::new(writer_schema_json)?,
+            reader_schema_json: reader_schema_json.map(str::to_string),
+            rewrite_to,
+        });
+        let mut setups = lock_setups();
+        if setups.len() >= AVRO_BLOCK_SETUPS_MAX {
+            setups.clear();
         }
-        Ok(decoder)
-    }
-
-    /// `writer_schema_json` narrowed to `columns`, computed once per writer
-    /// schema.
-    fn narrowed_for(&self, writer_schema_json: &str, columns: &[String]) -> Option<Arc<str>> {
-        let mut slot = self.narrowed.borrow_mut();
-        if let Some((json, narrowed)) = slot.as_ref()
-            && json == writer_schema_json
-        {
-            return narrowed.clone();
-        }
-        let narrowed = narrow_avro_record(writer_schema_json, columns).map(Arc::from);
-        *slot = Some((writer_schema_json.to_string(), narrowed.clone()));
-        narrowed
+        setups.insert(key, setup.clone());
+        Ok(setup)
     }
 
     /// An HFile block, in whichever shape the caller asked for.
@@ -460,7 +499,8 @@ impl Decoder {
                     .to_string(),
             )
         })?;
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header, false)?;
+        let mut decoder =
+            self.avro_decoder_for(writer_schema_json, header, false, self.batch_size)?;
         let mut decoded: Vec<arrow_array::RecordBatch> = Vec::new();
         for record in &records {
             if let Some(batch) = decoder.decode(&record.value)? {
@@ -527,9 +567,15 @@ impl Decoder {
         reader.read_exact(&mut record_count_buf)?;
         let record_count = u32::from_be_bytes(record_count_buf);
 
-        let mut decoder = self.avro_decoder_for(writer_schema_json, header, true)?;
+        // The block says how many records it holds, so it is decoded in batches
+        // of up to that many rather than `batch_size`: the decoder is rebuilt
+        // after every full batch (see `AvroBlockDecoder::decode`), and at
+        // `batch_size` rows a block of tens of thousands of records spent more
+        // time rebuilding it than decoding some of its columns.
+        let batch_rows = (record_count as usize).clamp(1, AVRO_DATA_BATCH_ROWS_MAX);
+        let mut decoder = self.avro_decoder_for(writer_schema_json, header, true, batch_rows)?;
         let mut batches =
-            RecordBatches::new_with_capacity(record_count as usize / self.batch_size + 1, 0);
+            RecordBatches::new_with_capacity(record_count as usize / batch_rows + 1, 0);
 
         // Each datum is framed by Hudi with a four-byte length, so the bodies
         // are read here and handed over one at a time.
@@ -1011,6 +1057,118 @@ mod tests {
         assert_eq!(again.data_batches[0].num_columns(), 3);
         Ok(())
     }
+    /// A data block decodes in one batch up to its record count rather than
+    /// in `batch_size` batches, and past the cap in batches of the cap, with
+    /// the union column intact across the decoder rebuild between them.
+    #[test]
+    fn an_avro_data_block_decodes_in_batches_of_its_record_count() -> Result<()> {
+        let schema_str = r#"{"type":"record","name":"BlockBatchRecord","fields":[
+            {"name":"id","type":"long"},
+            {"name":"name","type":["null","string"],"default":null}]}"#;
+        let writer_schema = apache_avro::Schema::parse_str(schema_str)?;
+        let block = |records: u32| -> Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&3u32.to_be_bytes());
+            buf.extend_from_slice(&records.to_be_bytes());
+            for i in 0..records as i64 {
+                let mut record = AvroRecord::new(&writer_schema).unwrap();
+                record.put("id", i);
+                record.put(
+                    "name",
+                    if i % 3 == 0 {
+                        AvroValue::Union(0, Box::new(AvroValue::Null))
+                    } else {
+                        AvroValue::Union(1, Box::new(AvroValue::String(format!("n{i}"))))
+                    },
+                );
+                let body = to_avro_datum(&writer_schema, record)?;
+                buf.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                buf.extend_from_slice(&body);
+            }
+            Ok(buf)
+        };
+        let header = HashMap::from([(BlockMetadataKey::Schema, schema_str.to_string())]);
+        let decoder = Decoder::new(Arc::new(HudiConfigs::empty()));
+
+        for (records, expected) in [
+            (0u32, vec![]),
+            (3_000, vec![3_000]),
+            (
+                AVRO_DATA_BATCH_ROWS_MAX as u32,
+                vec![AVRO_DATA_BATCH_ROWS_MAX],
+            ),
+            (
+                70_000,
+                vec![AVRO_DATA_BATCH_ROWS_MAX, 70_000 - AVRO_DATA_BATCH_ROWS_MAX],
+            ),
+        ] {
+            let batches =
+                decoder.decode_avro_record_content(block(records)?.as_slice(), &header)?;
+            let sizes: Vec<usize> = batches.data_batches.iter().map(|b| b.num_rows()).collect();
+            assert_eq!(sizes, expected, "{records} records");
+            let mut next_id = 0i64;
+            for batch in &batches.data_batches {
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                let names = batch
+                    .column_by_name("name")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for row in 0..batch.num_rows() {
+                    assert_eq!(ids.value(row), next_id);
+                    assert_eq!(names.is_null(row), next_id % 3 == 0, "id {next_id}");
+                    next_id += 1;
+                }
+            }
+            assert_eq!(next_id, records as i64);
+        }
+        Ok(())
+    }
+
+    /// A block setup is shared only between blocks whose writer schema,
+    /// reader schema, projection and partiality all match.
+    #[test]
+    fn avro_block_setups_are_shared_only_for_the_same_inputs() -> Result<()> {
+        let writer = r#"{"type":"record","name":"SetupKeyRecord","fields":[
+            {"name":"id","type":"long"},
+            {"name":"a","type":["null","string"],"default":null},
+            {"name":"b","type":["null","string"],"default":null}]}"#;
+        let configs = Arc::new(HudiConfigs::empty());
+        let projected = |columns: &[&str]| {
+            Decoder::new(configs.clone()).with_projection(Some(Arc::new(
+                columns.iter().map(|c| c.to_string()).collect(),
+            )))
+        };
+        let id_a = projected(&["id", "a"]);
+        let first = id_a.avro_block_setup(writer, false, true)?;
+        let again = projected(&["id", "a"]).avro_block_setup(writer, false, true)?;
+        assert!(
+            Arc::ptr_eq(&first, &again),
+            "a second decoder with the same inputs reuses the setup"
+        );
+        let id_b = projected(&["id", "b"]).avro_block_setup(writer, false, true)?;
+        assert!(!Arc::ptr_eq(&first, &id_b), "another projection");
+        let partial = id_a.avro_block_setup(writer, true, true)?;
+        assert!(!Arc::ptr_eq(&first, &partial), "a partial-update block");
+        assert!(
+            partial.reader_schema_json.is_none(),
+            "a partial-update block decodes at its own schema"
+        );
+        let whole = id_a.avro_block_setup(writer, false, false)?;
+        assert!(!Arc::ptr_eq(&first, &whole), "a block decoded whole");
+        assert_ne!(
+            first.reader_schema_json, whole.reader_schema_json,
+            "the narrowed block resolves to the projection"
+        );
+        Ok(())
+    }
+
     use crate::file_group::log_file::log_block::LogBlockVersion;
     use apache_avro::to_avro_datum;
     use apache_avro::types::Record as AvroRecord;
