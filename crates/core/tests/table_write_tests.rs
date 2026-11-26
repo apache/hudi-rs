@@ -4750,3 +4750,152 @@ async fn test_commit_seqno_uses_java_form() {
         ]
     );
 }
+
+/// Merge-on-read reads that project away the columns the merge decides on.
+/// `FileGroupReaderVersion` 2 is the reader that narrows the base file read to
+/// the projection; it must still read the ordering field and delete markers
+/// to merge.
+fn projected_v2_options() -> ReadOptions {
+    ReadOptions::new()
+        .with_hudi_option("hoodie.read.file.group.reader.version", "2")
+        .with_projection(vec!["id".to_string(), "value".to_string()])
+}
+
+fn assert_projected_to_id_and_value(batches: &[RecordBatch]) {
+    for batch in batches {
+        let names: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(names, vec!["id", "value"]);
+    }
+}
+
+/// A projection without the ordering field or `_hoodie_is_deleted` still
+/// merges by event time and still drops deleted rows: a stale update loses,
+/// a newer one wins, a newer delete removes the row and a stale delete does
+/// not.
+#[tokio::test]
+async fn test_merge_on_read_projection_without_ordering_or_delete_columns() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_flagged_batch(vec![
+            ("a", 1, 100, false),
+            ("b", 2, 100, false),
+            ("c", 3, 100, false),
+            ("d", 4, 100, false),
+            ("e", 5, 100, false),
+        ])])
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_flagged_batch(vec![
+            ("a", 10, 50, false),
+            ("b", 20, 150, false),
+            ("c", 30, 150, true),
+            ("d", 40, 50, true),
+        ])])
+        .await
+        .unwrap();
+
+    let full = table
+        .read(&ReadOptions::new().with_hudi_option("hoodie.read.file.group.reader.version", "2"))
+        .await
+        .unwrap();
+    let expected = vec![
+        ("a".to_string(), 1),
+        ("b".to_string(), 20),
+        ("d".to_string(), 4),
+        ("e".to_string(), 5),
+    ];
+    assert_eq!(rows_by_id(&full), expected);
+
+    let projected = table.read(&projected_v2_options()).await.unwrap();
+    assert_projected_to_id_and_value(&projected);
+    assert_eq!(rows_by_id(&projected), expected);
+}
+
+/// Rows are `(id, value, event_time, op)`.
+fn ordered_op_batch(rows: Vec<(&str, i64, i64, &str)>) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Int64, false),
+        Field::new("event_time", DataType::Int64, false),
+        Field::new("op", DataType::Utf8, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.0))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+            Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.3))),
+        ],
+    )
+    .unwrap()
+}
+
+/// A custom delete marker (`hoodie.payload.delete.field` /
+/// `hoodie.payload.delete.marker`) still deletes when the projection leaves
+/// its field out.
+#[tokio::test]
+async fn test_merge_on_read_projection_without_custom_delete_marker_column() {
+    let dir = tempdir().unwrap();
+    let mut table = Table::create(dir.path().to_str().unwrap())
+        .with_table_name("t")
+        .with_table_type(TableTypeValue::MergeOnRead)
+        .with_record_key_fields(["id"])
+        .with_ordering_fields(["event_time"])
+        .with_populates_meta_fields(true)
+        .create()
+        .await
+        .unwrap();
+    table
+        .append([ordered_op_batch(vec![
+            ("a", 1, 100, "I"),
+            ("b", 2, 100, "I"),
+            ("c", 3, 100, "I"),
+        ])])
+        .await
+        .unwrap();
+    table
+        .upsert([ordered_op_batch(vec![
+            ("a", 10, 150, "D"),
+            ("b", 20, 150, "U"),
+        ])])
+        .await
+        .unwrap();
+
+    let with_marker = |options: ReadOptions| {
+        options
+            .with_hudi_option("hoodie.payload.delete.field", "op")
+            .with_hudi_option("hoodie.payload.delete.marker", "D")
+    };
+    let expected = vec![("b".to_string(), 20), ("c".to_string(), 3)];
+    let full = table
+        .read(&with_marker(ReadOptions::new().with_hudi_option(
+            "hoodie.read.file.group.reader.version",
+            "2",
+        )))
+        .await
+        .unwrap();
+    assert_eq!(rows_by_id(&full), expected);
+
+    let projected = table
+        .read(&with_marker(projected_v2_options()))
+        .await
+        .unwrap();
+    assert_projected_to_id_and_value(&projected);
+    assert_eq!(rows_by_id(&projected), expected);
+}
