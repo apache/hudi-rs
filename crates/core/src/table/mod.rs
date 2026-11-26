@@ -3837,16 +3837,31 @@ mod tests {
     /// string and sorted, so two reads compare regardless of batch boundaries
     /// and row order.
     fn sorted_rows(batches: &[RecordBatch], columns: &[String]) -> Vec<String> {
+        use arrow::array::{Array, make_array};
         use arrow::util::display::array_value_to_string;
         let mut rows = Vec::new();
         for batch in batches {
             let arrays: Vec<_> = columns
                 .iter()
                 .map(|c| {
-                    batch
+                    let column = batch
                         .column_by_name(c)
                         .unwrap_or_else(|| panic!("column '{c}' missing from the read"))
-                        .clone()
+                        .clone();
+                    // Formatting a timestamp in a named zone such as "UTC" needs
+                    // arrow's chrono-tz, which a build without default features
+                    // leaves out, so the zone is dropped and the instant kept.
+                    match column.data_type() {
+                        DataType::Timestamp(unit, Some(_)) => make_array(
+                            column
+                                .to_data()
+                                .into_builder()
+                                .data_type(DataType::Timestamp(*unit, None))
+                                .build()
+                                .unwrap(),
+                        ),
+                        _ => column,
+                    }
                 })
                 .collect();
             for i in 0..batch.num_rows() {
