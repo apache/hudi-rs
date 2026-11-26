@@ -1263,6 +1263,7 @@ mod tests {
     use crate::file_group::log_file::log_block::{BlockMetadataKey, BlockType};
     use crate::file_group::log_file::log_format::LogFormatVersion;
     use crate::file_group::reader_v2::buffer::record_positions::ROW_INDEX_TEMPORARY_COLUMN_NAME;
+    #[cfg(feature = "spill-rocksdb")]
     use crate::file_group::reader_v2::buffer::spillable_map::CONFIG_MERGE_MAX_SIZE;
     use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
     use crate::file_group::record_batches::RecordBatches;
@@ -2101,10 +2102,9 @@ mod tests {
     }
 
     /// An update whose base row the base read never produces is emitted once
-    /// the base is exhausted, and a block that would outgrow the merge map's
-    /// budget hands the kept blocks to the map.
+    /// the base is exhausted.
     #[test]
-    fn vectorized_merge_drains_unmatched_updates_and_respects_budget() {
+    fn vectorized_merge_drains_unmatched_updates() {
         let mut buffer = build_buffer();
         let mut block =
             data_block_with_positions(&[("k1", 100, 9), ("k40", 4000, 9)], &[1, 40], BASE_INSTANT);
@@ -2125,7 +2125,14 @@ mod tests {
         let drained = buffer.drain_log_only_inserts(&target).unwrap().unwrap();
         assert_eq!(extract(&drained), vec![("k40".to_string(), 4000, 9)]);
         assert!(buffer.drain_log_only_inserts(&target).unwrap().is_none());
+    }
 
+    /// A block that would outgrow the merge map's budget hands the kept blocks
+    /// to the map.
+    // Exercises the on-disk spill tier, which only exists with the backend.
+    #[cfg(feature = "spill-rocksdb")]
+    #[test]
+    fn vectorized_merge_respects_budget() {
         let mut tiny = build_buffer_with_reader_config(&[(CONFIG_MERGE_MAX_SIZE, "1")]);
         let mut block = data_block_with_positions(&[("k1", 100, 9)], &[1], BASE_INSTANT);
         tiny.process_data_block(&mut block).unwrap();
@@ -2957,6 +2964,8 @@ mod tests {
 
         /// A read whose kept blocks outgrow the budget and then meets a block
         /// without positions ends on the key merge with the key merge's rows.
+        // Exercises the on-disk spill tier, which only exists with the backend.
+        #[cfg(feature = "spill-rocksdb")]
         #[test]
         fn budget_handoff_then_a_block_without_positions() {
             let schema = wide_schema(DataType::Int64);
