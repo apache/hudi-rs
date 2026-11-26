@@ -43,6 +43,12 @@ pub(crate) struct RequestCounts {
     gets: AtomicUsize,
     /// Metadata-only lookups.
     heads: AtomicUsize,
+    /// Listings, with or without a delimiter.
+    lists: AtomicUsize,
+    /// Whole-object and multipart writes.
+    puts: AtomicUsize,
+    /// Bytes returned by reads.
+    bytes_read: AtomicUsize,
 }
 
 impl RequestCounts {
@@ -52,6 +58,18 @@ impl RequestCounts {
 
     pub(crate) fn heads(&self) -> usize {
         self.heads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn lists(&self) -> usize {
+        self.lists.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn puts(&self) -> usize {
+        self.puts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bytes_read(&self) -> usize {
+        self.bytes_read.load(Ordering::Relaxed)
     }
 }
 
@@ -89,6 +107,7 @@ impl ObjectStore for CountingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
+        self.counts.puts.fetch_add(1, Ordering::Relaxed);
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -97,6 +116,7 @@ impl ObjectStore for CountingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        self.counts.puts.fetch_add(1, Ordering::Relaxed);
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -109,7 +129,13 @@ impl ObjectStore for CountingObjectStore {
         } else {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
         }
-        self.inner.get_opts(location, options).await
+        let head = options.head;
+        let result = self.inner.get_opts(location, options).await?;
+        if !head {
+            let read = (result.range.end - result.range.start) as usize;
+            self.counts.bytes_read.fetch_add(read, Ordering::Relaxed);
+        }
+        Ok(result)
     }
 
     fn delete_stream(
@@ -120,10 +146,12 @@ impl ObjectStore for CountingObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.counts.lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.counts.lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list_with_delimiter(prefix).await
     }
 
