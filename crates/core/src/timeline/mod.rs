@@ -49,7 +49,7 @@ use arrow_schema::Schema;
 use instant::Instant;
 
 use serde_json::{Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -119,9 +119,8 @@ impl Timeline {
 
     pub(crate) async fn new_from_storage(
         hudi_configs: Arc<HudiConfigs>,
-        storage_options: Arc<HashMap<String, String>>,
+        storage: Arc<Storage>,
     ) -> Result<Self> {
-        let storage = Storage::new(storage_options.clone(), hudi_configs.clone())?;
         let mut timeline = TimelineBuilder::new(hudi_configs, storage).build().await?;
         // Every state, not just completed: one listing then yields both the
         // completed commits and the archival boundary. See
@@ -1018,7 +1017,8 @@ mod tests {
             HudiTableConfig::BasePath,
             base_url.to_string(),
         )]));
-        let timeline = Timeline::new_from_storage(hudi_configs, Arc::new(HashMap::new()))
+        let storage = Storage::new(Arc::new(HashMap::new()), hudi_configs.clone()).unwrap();
+        let timeline = Timeline::new_from_storage(hudi_configs, storage)
             .await
             .unwrap();
 

@@ -56,20 +56,24 @@ pub(crate) async fn read_file_slice(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
+    base_file_size: Option<u64>,
     log_file_paths: Vec<String>,
     partition_path: String,
     pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<RecordBatch> {
     let mut reader = build_reader(
         hudi_configs,
         storage,
         base_file_path,
+        base_file_size,
         log_file_paths,
         partition_path,
         pushdown,
         data_schema,
+        requested_schema,
         completion_gate_inputs,
     )?;
 
@@ -86,20 +90,24 @@ pub(crate) async fn read_file_slice_stream(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
+    base_file_size: Option<u64>,
     log_file_paths: Vec<String>,
     partition_path: String,
     pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
     let mut reader = build_reader(
         hudi_configs,
         storage,
         base_file_path,
+        base_file_size,
         log_file_paths,
         partition_path,
         pushdown,
         data_schema,
+        requested_schema,
         completion_gate_inputs,
     )?;
 
@@ -113,10 +121,12 @@ fn build_reader(
     hudi_configs: Arc<HudiConfigs>,
     storage: Arc<Storage>,
     base_file_path: &str,
+    base_file_size: Option<u64>,
     log_file_paths: Vec<String>,
     partition_path: String,
     pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
@@ -150,7 +160,8 @@ fn build_reader(
         base_file_commit_time,
         log_file_paths,
         partition_path,
-    );
+    )
+    .with_base_file_size(base_file_size);
 
     // Defaults chosen to match what the existing reader returns: deletes are
     // applied but never emitted, output keeps merge order, and only completed
@@ -167,7 +178,7 @@ fn build_reader(
         input_split,
         reader_parameters,
         data_schema,
-        None,
+        requested_schema,
     )
 }
 

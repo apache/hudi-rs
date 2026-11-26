@@ -303,4 +303,24 @@ pub trait HoodieFileGroupRecordBuffer: Send + std::fmt::Debug {
     /// Mutates self by `mem::take`-ing the records map. Subsequent calls
     /// return `Ok(None)` (idempotent).
     fn drain_log_only_inserts(&mut self, target_schema: &SchemaRef) -> Result<Option<RecordBatch>>;
+
+    /// Called once the logs are scanned, before the base file is opened:
+    /// columns of `merge_schema` this buffer does not need from the base file
+    /// to merge it. The reader may leave them unread, filled with nulls (or
+    /// empty strings for a non-nullable string column), when the read's output
+    /// doesn't include them either and no filter reads them. The default needs
+    /// them all.
+    fn base_columns_unneeded(&mut self, merge_schema: &SchemaRef) -> Result<Vec<String>> {
+        let _ = merge_schema;
+        Ok(Vec::new())
+    }
+
+    /// Called once the logs are scanned, before the base file is opened:
+    /// whether this buffer merges each base batch by row position as a whole
+    /// (a filter and a gather), so its cost per batch does not grow with a
+    /// lookup per row and the base may be read in larger batches.
+    fn merges_base_by_position(&mut self, merge_schema: &SchemaRef) -> Result<bool> {
+        let _ = merge_schema;
+        Ok(false)
+    }
 }

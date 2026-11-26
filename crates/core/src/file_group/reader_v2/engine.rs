@@ -127,6 +127,19 @@ pub struct HoodieFileGroupReader {
     /// Valid block instants from log scanning.
     valid_block_instants: Vec<String>,
 
+    /// Columns of the merge schema left unread from the base file because
+    /// neither the merge nor the output needs them, and filled with a stand-in
+    /// (see [`stand_in_columns`]). Set after the log scan, before a merging
+    /// read opens the base file.
+    skip_base_columns: Vec<String>,
+
+    /// Rows per base batch. `MERGE_CHUNK_ROWS` unless the log scan settled on
+    /// the vectorized position-based merge, whose per-batch work is a filter
+    /// and a gather rather than a lookup per row, so the base is read in the
+    /// caller's batch size (`hoodie.read.stream.batch_size`) as a base-only
+    /// read would be, though never below `MERGE_CHUNK_ROWS`.
+    base_batch_rows: usize,
+
     /// Converter for engine records to [`BufferedRecord`].
     /// Mirrors Java's `BufferedRecordConverter<T> bufferedRecordConverter`.
     buffered_record_converter: Option<Box<dyn BufferedRecordConverter>>,
@@ -152,6 +165,10 @@ pub struct HoodieFileGroupReader {
 /// larger default upstream would multiply the blocking above with nothing
 /// failing. Measured by `spilled_merge_blocking_duration` (ignored; run with
 /// `--release --ignored --nocapture`).
+///
+/// The vectorized position-based merge is the exception: it merges a base
+/// batch with a filter and a gather, not a lookup per row, so a read that
+/// settles on it uses the caller's batch size instead (`base_batch_rows`).
 const MERGE_CHUNK_ROWS: usize = 1024;
 
 /// Base-file read options carrying an optional pushdown predicate, and the
@@ -205,6 +222,52 @@ impl BaseSource {
             batches: futures::stream::empty().boxed(),
         }
     }
+}
+
+/// Whether a merge column can be left unread from the base file: a nullable
+/// column is filled with nulls, a non-nullable string column with empty
+/// strings. Either stands in only for a column nothing downstream reads.
+fn can_stand_in(field: &arrow_schema::Field) -> bool {
+    field.is_nullable()
+        || matches!(
+            field.data_type(),
+            arrow_schema::DataType::Utf8 | arrow_schema::DataType::LargeUtf8
+        )
+}
+
+/// `batch` in `schema`, with each `skipped` column replaced by its stand-in:
+/// nulls when the field is nullable, empty strings when it is a non-nullable
+/// string.
+fn stand_in_columns(
+    batch: &arrow_array::RecordBatch,
+    schema: &SchemaRef,
+    skipped: &[String],
+) -> Result<arrow_array::RecordBatch> {
+    let rows = batch.num_rows();
+    let columns = schema
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| -> arrow_array::ArrayRef {
+            if !skipped.iter().any(|c| c == f.name()) || f.is_nullable() {
+                return batch.column(i).clone();
+            }
+            match f.data_type() {
+                arrow_schema::DataType::LargeUtf8 => Arc::new(arrow_array::LargeStringArray::new(
+                    arrow_buffer::OffsetBuffer::new_zeroed(rows),
+                    arrow_buffer::Buffer::from_vec(Vec::<u8>::new()),
+                    None,
+                )),
+                _ => Arc::new(arrow_array::StringArray::new(
+                    arrow_buffer::OffsetBuffer::new_zeroed(rows),
+                    arrow_buffer::Buffer::from_vec(Vec::<u8>::new()),
+                    None,
+                )),
+            }
+        })
+        .collect();
+    arrow_array::RecordBatch::try_new(schema.clone(), columns)
+        .map_err(|e| CoreError::ReadFileSliceError(format!("base column stand-in failed: {e}")))
 }
 
 /// `schema` without the internal row-position column.
@@ -391,6 +454,8 @@ impl HoodieFileGroupReader {
             read_stats: HoodieReadStats::default(),
             stream_stats: new_stream_stats_handle(),
             valid_block_instants: Vec::new(),
+            skip_base_columns: Vec::new(),
+            base_batch_rows: MERGE_CHUNK_ROWS,
             buffered_record_converter: None,
         })
     }
@@ -433,8 +498,9 @@ impl HoodieFileGroupReader {
     ///
     /// [`Self::read`] returns the whole file group as one batch, so peak memory
     /// tracks the base file. This reads the base file one bounded batch at a
-    /// time instead (`MERGE_CHUNK_ROWS` rows), merging and emitting a chunk
-    /// per batch.
+    /// time instead (`MERGE_CHUNK_ROWS` rows, or the caller's batch size under
+    /// the vectorized position-based merge), merging and emitting a chunk per
+    /// batch.
     ///
     /// Demand-driven: nothing is merged until the consumer asks for it, so the
     /// memory this adds over the merge map is one chunk. The previous shape ran
@@ -448,7 +514,14 @@ impl HoodieFileGroupReader {
     ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
         // Stage timing (perf harness): opening the base file. Only the open —
         // the per-row-group decode is paid lazily, inside the merge.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
+        let base = if self.defers_base_open() {
+            None
+        } else {
+            Some(profile_once!(
+                self.read_stats.base_read_us,
+                self.base_file_source().await
+            )?)
+        };
         Ok(self.init_record_iterators(base).await?.into_stream())
     }
 
@@ -463,7 +536,14 @@ impl HoodieFileGroupReader {
         // Stage timing (perf harness): only the open, same as `open_stream` —
         // the decode happens lazily while `collect_into_one_batch` drives the
         // stream, so it lands in the merge loop rather than in `base_read_us`.
-        let base = profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?;
+        let base = if self.defers_base_open() {
+            None
+        } else {
+            Some(profile_once!(
+                self.read_stats.base_read_us,
+                self.base_file_source().await
+            )?)
+        };
         let batch = self
             .init_record_iterators(base)
             .await?
@@ -492,6 +572,17 @@ impl HoodieFileGroupReader {
         self.read_stats.num_deletes = s.num_deletes;
     }
 
+    /// The batch size the caller asked for, or `MERGE_CHUNK_ROWS` when it set
+    /// none (or an unusable one).
+    fn caller_batch_rows(&self) -> usize {
+        self.reader_context
+            .hoodie_reader_config
+            .get(crate::config::read::HudiReadConfig::StreamBatchSize.as_ref())
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(MERGE_CHUNK_ROWS)
+    }
+
     /// Initialize record iterators: read base file + scan/merge log files,
     /// hand state to a [`FileGroupMergeStream`].
     ///
@@ -505,7 +596,19 @@ impl HoodieFileGroupReader {
     ///   └─ recordBufferLoader.getRecordBuffer(...)
     ///        → FileGroupMergeStream::new_buffered(...)
     /// ```
-    async fn init_record_iterators(&mut self, base: BaseSource) -> Result<FileGroupMergeStream> {
+    /// Whether the base file is opened after the log scan rather than before:
+    /// a merging read with a known merge schema, so the scan can say which
+    /// base columns the merge doesn't need.
+    fn defers_base_open(&self) -> bool {
+        self.input_split.has_log_files()
+            && self.input_split.base_file_path.is_some()
+            && self.schema_handler.required_schema.is_some()
+    }
+
+    async fn init_record_iterators(
+        &mut self,
+        base: Option<BaseSource>,
+    ) -> Result<FileGroupMergeStream> {
         log::debug!(
             "[HoodieFileGroupReader] initRecordIterators: partition={} base_file={} log_files={}",
             self.input_split.partition_path,
@@ -514,15 +617,6 @@ impl HoodieFileGroupReader {
                 .as_deref()
                 .unwrap_or("<none>"),
             self.input_split.log_file_paths.len(),
-        );
-
-        let BaseSource {
-            schema: base_source_schema,
-            batches: base_source,
-        } = base;
-        log::debug!(
-            "[HoodieFileGroupReader] base file source: schema_cols={}",
-            base_source_schema.fields().len(),
         );
 
         // The post-projection output schema is the same regardless of
@@ -534,6 +628,14 @@ impl HoodieFileGroupReader {
         // iterator that yields the base file batches directly.
         if self.input_split.is_base_only() {
             log::debug!("[HoodieFileGroupReader] no log files → Eager iterator");
+            let base = match base {
+                Some(base) => base,
+                None => self.base_file_source().await?,
+            };
+            let BaseSource {
+                schema: base_source_schema,
+                batches: base_source,
+            } = base;
 
             // The schema travels with the source, so it is known without
             // forcing a row-group decode. A log-only file group's source is
@@ -575,8 +677,55 @@ impl HoodieFileGroupReader {
             )
             .await?;
 
-        let record_buffer = load_result.record_buffer;
+        let mut record_buffer = load_result.record_buffer;
         self.valid_block_instants = load_result.valid_block_instants;
+
+        // A deferred base file is opened now that the scan says which base
+        // columns the merge can do without. A column is left unread only when
+        // the output doesn't carry it either and no filter is evaluated on the
+        // way, since a filter may read any merge column.
+        let base = match base {
+            Some(base) => base,
+            None => {
+                let merge_schema =
+                    self.schema_handler.required_schema.clone().ok_or_else(|| {
+                        CoreError::ReadFileSliceError(
+                            "internal: a deferred base open needs the merge schema".to_string(),
+                        )
+                    })?;
+                let unneeded = record_buffer.base_columns_unneeded(&merge_schema)?;
+                if record_buffer.merges_base_by_position(&merge_schema)? {
+                    self.base_batch_rows = self.caller_batch_rows().max(MERGE_CHUNK_ROWS);
+                }
+                let unfiltered = self.reader_context.row_filter_builder.is_none()
+                    && self.reader_context.row_group_selector.is_none()
+                    && self.reader_context.key_predicate.is_none();
+                self.skip_base_columns = match &post_projection_schema {
+                    Some(output) if unfiltered => unneeded
+                        .into_iter()
+                        .filter(|c| {
+                            !output
+                                .fields()
+                                .iter()
+                                .any(|f| f.name().eq_ignore_ascii_case(c))
+                        })
+                        .filter(|c| merge_schema.field_with_name(c).is_ok_and(can_stand_in))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                self.read_stats.base_columns_skipped = self.skip_base_columns.len() as u64;
+                profile_once!(self.read_stats.base_read_us, self.base_file_source().await)?
+            }
+        };
+        let BaseSource {
+            schema: base_source_schema,
+            batches: base_source,
+        } = base;
+        log::debug!(
+            "[HoodieFileGroupReader] base file source: schema_cols={} skipped={:?}",
+            base_source_schema.fields().len(),
+            self.skip_base_columns,
+        );
 
         // Anything this read expects that is quietly not done, said once, before
         // the rows come back looking unremarkable. Reported here rather than on
@@ -899,96 +1048,6 @@ impl HoodieFileGroupReader {
         //      promotions (float→double string-mediated so it is value-exact).
         // Step 3 is applied PER ROW-GROUP, so every base batch the merge
         // interleaves is already in `required_schema`.
-        let file_schema = self
-            .base_file_reader()?
-            .read_schema(&path)
-            .await
-            .map_err(|e| {
-                CoreError::ReadFileSliceError(format!(
-                    "Failed to read base file footer schema '{path}': {e:?}"
-                ))
-            })?;
-        // Intersection by *case-insensitive* name (Java/Spark resolve field names
-        // case-insensitively). Project under the FILE's actual name+type so the
-        // parquet reader finds the column; `project_batch_to_schema` (also
-        // case-insensitive) then evolves each batch to `required_schema`. A
-        // required column absent from the footer is skipped here and null-filled
-        // downstream; an ambiguous footer case-collision errors loudly.
-        let mut present: Vec<arrow_schema::FieldRef> =
-            Vec::with_capacity(required_schema.fields().len());
-        for rf in required_schema.fields() {
-            if let Some(idx) = crate::schema::batch_evolution::index_of_ci(&file_schema, rf.name())?
-            {
-                present.push(file_schema.fields()[idx].clone());
-            }
-        }
-        let present_len = present.len();
-        let intersection: arrow_schema::SchemaRef = Arc::new(arrow_schema::Schema::new(present));
-        log::debug!(
-            "[base-file-evolution] path={} file_cols={} required_cols={} intersect_cols={}",
-            path,
-            file_schema.fields().len(),
-            required_schema.fields().len(),
-            present_len
-        );
-
-        // Parquet evaluates a pushed predicate against the file's PHYSICAL values,
-        // before `project_batch_to_schema` runs. Sound only while a physical value
-        // means what its physical type says, which the apache/hudi#18132 repair
-        // breaks: the file labels a tz-aware column micros while the stored i64 is
-        // MILLIS, so a millis-semantics literal reads those rows as 1970 and the
-        // filter drops rows that match. The post-scan filter cannot restore them.
-        //
-        // Two gates, cheapest first. `repair_risk_columns` was decided ONCE per scan
-        // from the table schema and the predicate's own referenced columns, and is
-        // empty unless the predicate touches a tz-aware millis column — so the
-        // common scan never reaches the footer comparison below and never loses
-        // pushdown. The footer schema itself is already fetched unconditionally
-        // above, so gate 1 buys predicate scoping and the per-file name walk, not
-        // avoided IO.
-        //
-        // The table side is `table_schema`, NOT `required_schema`: a filter column
-        // absent from the projection is still decoded and still misread, because a
-        // `RowFilter` builder derives its own `ProjectionMask` from the parquet
-        // schema rather than from `intersection`.
-        let repair_conflict =
-            if pushdown_is_safe && !self.reader_context.repair_risk_columns.is_empty() {
-                let table_side = self
-                    .schema_handler
-                    .table_schema
-                    .as_ref()
-                    .unwrap_or(&required_schema);
-                crate::schema::batch_evolution::reinterpreted_columns(
-                    &file_schema,
-                    table_side,
-                    &self.reader_context.repair_risk_columns,
-                )?
-            } else {
-                Vec::new()
-            };
-
-        // ONE verdict, both consumers, withdrawn in one block. That is the same
-        // property the merge-safety gate is bound once for, one layer in: an edit
-        // to the condition cannot leave the row-group selector behind, and pruning
-        // is the one that must not be left behind — it drops rows before anything
-        // downstream can see them.
-        if !repair_conflict.is_empty() {
-            let volume = self.storage.read_volume();
-            // Counted for every withdrawal; `row_group_selector_suppressed` can
-            // only speak for a selector the caller actually installed.
-            volume.record_pushdown_suppressed_by_repair();
-            if row_group_selector.is_some() {
-                volume.record_selector_suppressed();
-            }
-            log::debug!(
-                "base file '{path}' needs a value-reinterpreting logical-type repair \
-                 on {repair_conflict:?} — skipping parquet RowFilter pushdown and \
-                 row-group pruning (post-merge filter still runs)"
-            );
-            row_filter = None;
-            row_group_selector = None;
-        }
-
         let base_read_schema: SchemaRef = if use_position {
             let mut fields: Vec<arrow_schema::FieldRef> =
                 required_schema.fields().iter().cloned().collect();
@@ -1009,35 +1068,192 @@ impl HoodieFileGroupReader {
             return Ok(BaseSource::empty(base_read_schema));
         }
 
+        // Everything below the footer decides is chosen inside the open, so the
+        // footer that answers the file's schema also serves the stream: one
+        // footer fetch per base file rather than two.
+        let table_side = self
+            .schema_handler
+            .table_schema
+            .clone()
+            .unwrap_or_else(|| required_schema.clone());
+        let repair_risk_columns = self.reader_context.repair_risk_columns.clone();
+        let skip_columns = self.skip_base_columns.clone();
+        let batch_rows = self.base_batch_rows;
+        let volume = self.storage.read_volume();
+        let choose_path = path.clone();
+        // The open speaks storage errors; a schema decision that fails here is
+        // kept whole and returned as itself once the open gives up.
+        let choose_error: Arc<std::sync::Mutex<Option<CoreError>>> = Arc::default();
+        let choose_error_slot = choose_error.clone();
+        let fail = move |e: CoreError| {
+            let message = e.to_string();
+            *choose_error_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(e);
+            crate::storage::error::StorageError::InvalidColumn(message)
+        };
+        let choose =
+            move |schemas: &crate::file_group::base_file::reader::FooterSchemas|
+                  -> crate::storage::error::Result<BaseFileReadOptions> {
+                // The footer's parquet schema, as `read_schema` gives it: the
+                // timestamp-repair check below was written against that, not
+                // against an embedded Arrow schema.
+                let file_schema = &schemas.file;
+                // Schema-evolution intersection (Java parity:
+                // HoodieParquetFileFormatHelper.buildImplicitSchemaChangeInfo):
+                //   1. diff footer schema vs required by name;
+                //   2. ask parquet only for the INTERSECTION (in the file's own types);
+                //   3. project to required per batch: null-fill added columns, cast
+                //      promotions (float→double string-mediated so it is value-exact).
+                // Step 3 is applied PER ROW-GROUP, so every base batch the merge
+                // interleaves is already in `required_schema`.
+                //
+                // Intersection by *case-insensitive* name (Java/Spark resolve field
+                // names case-insensitively). Project under the FILE's actual name+type
+                // so the parquet reader finds the column; `project_batch_to_schema`
+                // (also case-insensitive) then evolves each batch to
+                // `required_schema`. A required column absent from the footer is
+                // skipped here and null-filled downstream; an ambiguous footer
+                // case-collision errors loudly.
+                let mut present: Vec<arrow_schema::FieldRef> =
+                    Vec::with_capacity(required_schema.fields().len());
+                for rf in required_schema.fields() {
+                    // Left unread; `stand_in_columns` fills it after evolution.
+                    if skip_columns.iter().any(|c| c == rf.name()) {
+                        continue;
+                    }
+                    let idx = crate::schema::batch_evolution::index_of_ci(file_schema, rf.name())
+                        .map_err(&fail)?;
+                    if let Some(idx) = idx {
+                        present.push(file_schema.fields()[idx].clone());
+                    }
+                }
+                log::debug!(
+                    "[base-file-evolution] path={} file_cols={} required_cols={} intersect_cols={}",
+                    choose_path,
+                    file_schema.fields().len(),
+                    required_schema.fields().len(),
+                    present.len()
+                );
+
+                // Parquet evaluates a pushed predicate against the file's PHYSICAL
+                // values, before `project_batch_to_schema` runs. Sound only while a
+                // physical value means what its physical type says, which the
+                // apache/hudi#18132 repair breaks: the file labels a tz-aware column
+                // micros while the stored i64 is MILLIS, so a millis-semantics literal
+                // reads those rows as 1970 and the filter drops rows that match. The
+                // post-scan filter cannot restore them.
+                //
+                // `repair_risk_columns` was decided ONCE per scan from the table
+                // schema and the predicate's own referenced columns, and is empty
+                // unless the predicate touches a tz-aware millis column — so the
+                // common scan never reaches the footer comparison and never loses
+                // pushdown.
+                //
+                // The table side is `table_schema`, NOT `required_schema`: a filter
+                // column absent from the projection is still decoded and still
+                // misread, because a `RowFilter` builder derives its own
+                // `ProjectionMask` from the parquet schema rather than from the
+                // intersection.
+                let repair_conflict = if pushdown_is_safe && !repair_risk_columns.is_empty() {
+                    crate::schema::batch_evolution::reinterpreted_columns(
+                        file_schema,
+                        &table_side,
+                        &repair_risk_columns,
+                    )
+                    .map_err(&fail)?
+                } else {
+                    Vec::new()
+                };
+
+                // ONE verdict, both consumers, withdrawn in one block: an edit to the
+                // condition cannot leave the row-group selector behind, and pruning
+                // is the one that must not be left behind — it drops rows before
+                // anything downstream can see them.
+                if !repair_conflict.is_empty() {
+                    // Counted for every withdrawal; `row_group_selector_suppressed`
+                    // can only speak for a selector the caller actually installed.
+                    volume.record_pushdown_suppressed_by_repair();
+                    if row_group_selector.is_some() {
+                        volume.record_selector_suppressed();
+                    }
+                    log::debug!(
+                        "base file '{choose_path}' needs a value-reinterpreting logical-type \
+                     repair on {repair_conflict:?} — skipping parquet RowFilter \
+                     pushdown and row-group pruning (post-merge filter still runs)"
+                    );
+                    row_filter = None;
+                    row_group_selector = None;
+                }
+
+                // The gated RowFilter and row-group selector are both threaded
+                // through the intersection read. Only the SELECTOR skips IO: a
+                // RowFilter decides per row once the predicate columns are decoded.
+                // The filter builder resolves predicate columns by name and returns
+                // None when any referenced column is absent — safe even for
+                // evolved/added cols.
+                Ok(
+                    base_read_options(row_filter, row_group_selector, key_predicate, use_position)
+                        .with_batch_size(batch_rows)
+                        .with_projection(present.iter().map(|f| f.name())),
+                )
+            };
+
         // Open the base file as a stream. The whole file never lives in memory;
-        // one batch does. The gated RowFilter and row-group selector are both
-        // threaded through the intersection read. Only the SELECTOR skips IO: a
-        // RowFilter decides per row once the predicate columns are decoded. The
-        // filter builder resolves predicate columns by name and returns None when
-        // any referenced column is absent — safe even for evolved/added cols.
+        // one batch does.
+        let mut open_options = BaseFileReadOptions::new();
+        if use_position {
+            open_options = open_options.with_row_index_column(ROW_INDEX_TEMPORARY_COLUMN_NAME);
+        }
+        if let Some(size) = self.input_split.base_file_size {
+            open_options = open_options.with_known_file_size(size);
+        }
         let base_stream = self
             .base_file_reader()?
-            .read_stream(
-                &path,
-                base_read_options(
-                    row_filter.clone(),
-                    row_group_selector.clone(),
-                    key_predicate.clone(),
-                    use_position,
-                )
-                .with_projection(intersection.fields().iter().map(|f| f.name())),
-            )
+            .read_stream_with_schema(&path, open_options, Box::new(choose))
             .await
             .map_err(|e| {
-                CoreError::ReadFileSliceError(format!(
-                    "Failed to open base file stream '{path}': {e:?}"
-                ))
+                match choose_error
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take()
+                {
+                    Some(schema_error) => schema_error,
+                    None => CoreError::ReadFileSliceError(format!(
+                        "Failed to open base file stream '{path}': {e:?}"
+                    )),
+                }
             })?;
 
-        let evolve_to = base_read_schema.clone();
+        // A column left unread is evolved as nullable, then replaced by a
+        // stand-in that satisfies its real nullability (see `stand_in_columns`).
+        let skipped = self.skip_base_columns.clone();
+        let evolve_to = if skipped.is_empty() {
+            base_read_schema.clone()
+        } else {
+            Arc::new(arrow_schema::Schema::new_with_metadata(
+                base_read_schema
+                    .fields()
+                    .iter()
+                    .map(|f| {
+                        if skipped.iter().any(|c| c == f.name()) {
+                            Arc::new(f.as_ref().clone().with_nullable(true))
+                        } else {
+                            f.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+                base_read_schema.metadata().clone(),
+            ))
+        };
+        let read_schema = base_read_schema.clone();
         let evolved = futures::StreamExt::map(base_stream.into_stream(), move |b| match b {
             Ok(batch) => {
-                crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)
+                let batch =
+                    crate::schema::batch_evolution::project_batch_to_schema(&batch, &evolve_to)?;
+                if skipped.is_empty() {
+                    Ok(batch)
+                } else {
+                    stand_in_columns(&batch, &read_schema, &skipped)
+                }
             }
             Err(e) => Err(CoreError::from(e)),
         });
@@ -2325,7 +2541,9 @@ mod tests {
     /// the pin from the default — but a caller that passed a larger batch size
     /// through here (making `hoodie.read.stream.batch_size` effective on the
     /// merge path, say) would multiply every poll's cost, and this is what says
-    /// so out loud.
+    /// so out loud. The vectorized position-based merge, whose cost per batch is
+    /// a filter and a gather, is the one exception, and the open makes it
+    /// (`base_batch_rows`), not these options.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_merged_chunk_is_bounded_by_the_readers_own_batch_size() {
         // Every argument combination must carry the pin: the position-merge
@@ -2410,9 +2628,10 @@ mod tests {
         reader_context.latest_commit_time =
             crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
         reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
-        // Set on purpose: the knob is documented to size base-file-only slices
-        // and to have NO effect on a merged slice. The chunk assertions in the
-        // test below are what hold that, rather than a one-off measurement.
+        // Set on purpose: the knob sizes base-file-only slices and slices under
+        // the vectorized position-based merge, and has NO effect on a key-based
+        // merge. The chunk assertions in the test below are what hold that,
+        // rather than a one-off measurement.
         reader_context.hoodie_reader_config.insert(
             crate::config::read::HudiReadConfig::StreamBatchSize
                 .as_ref()
@@ -2465,7 +2684,7 @@ mod tests {
     /// synthetic, so nothing matches: every base row survives, the drain has
     /// nothing to emit, and the chunk cadence is exactly what the machine
     /// produced. `hoodie.read.stream.batch_size=8192` is set in the reader
-    /// config on purpose — the knob must have no effect on a merged slice.
+    /// config on purpose — the knob must have no effect on a key-based merge.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_the_chunk_bound_holds_on_a_slice_with_log_files() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3187,5 +3406,97 @@ mod tests {
             reader.reader_context.repair_risk_columns.is_empty(),
             "unset must leave the guard disarmed, not populated by accident"
         );
+    }
+
+    /// The base of a slice that settles on the vectorized position-based merge
+    /// is read in the caller's batch size, and a key-based merge keeps the
+    /// `MERGE_CHUNK_ROWS` bound, with the same rows either way.
+    #[tokio::test]
+    async fn the_position_merge_reads_the_base_in_the_callers_batch_size() {
+        use crate::file_group::base_file::parquet::ParquetBaseFileReader;
+        use arrow_array::cast::AsArray;
+        use arrow_schema::Schema;
+        use hudi_test::QuickstartTripsTable;
+
+        const BASE: &str =
+            "city=sf/fee86b18-67b1-4479-b517-075683aeb2d1-0_0-13-33_20260408053032350.parquet";
+        const LOG: &str =
+            "city=sf/.fee86b18-67b1-4479-b517-075683aeb2d1-0_20260408053037787.log.1_0-27-73";
+
+        let table_path = QuickstartTripsTable::V9Mor8I4UCommitTime.path_to_mor_avro();
+        let (_, storage) =
+            crate::file_group::reader_v2::harness::create_configs_and_storage(&table_path)
+                .await
+                .unwrap();
+        let data_schema: SchemaRef = Arc::new(
+            ParquetBaseFileReader::new(storage.clone())
+                .get_schema(BASE)
+                .await
+                .unwrap(),
+        );
+        let requested: SchemaRef = Arc::new(Schema::new(
+            ["id", "name", "age"]
+                .iter()
+                .map(|n| data_schema.field_with_name(n).unwrap().clone())
+                .collect::<Vec<_>>(),
+        ));
+
+        for use_record_position in [true, false] {
+            let mut reader_context = ReaderContext::empty();
+            reader_context.latest_commit_time =
+                crate::file_group::reader_v2::MAX_INSTANT_TIME.to_string();
+            reader_context.merge_mode = "COMMIT_TIME_ORDERING".to_string();
+            reader_context.table_config.insert(
+                HudiTableConfig::OrderingFields.as_ref().to_string(),
+                "ts".to_string(),
+            );
+            reader_context.hoodie_reader_config.insert(
+                crate::config::read::HudiReadConfig::StreamBatchSize
+                    .as_ref()
+                    .to_string(),
+                "8192".to_string(),
+            );
+            reader_context.rebuild_record_context("city=sf".to_string());
+            reader_context.has_log_files = true;
+            let mut reader = HoodieFileGroupReader::new(
+                Arc::new(reader_context),
+                storage.clone(),
+                InputSplit::new(
+                    Some(BASE.to_string()),
+                    Some("20260408053032350".to_string()),
+                    vec![LOG.to_string()],
+                    "city=sf".to_string(),
+                ),
+                ReaderParameters {
+                    use_record_position,
+                    ..Default::default()
+                },
+                Some(data_schema.clone()),
+                Some(requested.clone()),
+            )
+            .unwrap();
+            let mut stream = reader.open_stream().await.unwrap();
+            let mut names: Vec<String> = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.unwrap();
+                let column = batch.column_by_name("name").unwrap().as_string::<i32>();
+                names.extend(column.iter().map(|v| v.unwrap().to_string()));
+            }
+            names.sort();
+            assert_eq!(
+                names,
+                vec!["Alice-V2".to_string(), "Bob".to_string()],
+                "use_record_position={use_record_position}"
+            );
+            let expected = if use_record_position {
+                8192
+            } else {
+                MERGE_CHUNK_ROWS
+            };
+            assert_eq!(
+                reader.base_batch_rows, expected,
+                "use_record_position={use_record_position}"
+            );
+        }
     }
 }
