@@ -34,6 +34,9 @@ pub struct HoodieReadStats {
     pub total_log_blocks: u64,
     pub total_corrupt_log_blocks: u64,
     pub total_rollback_blocks: u64,
+    /// Merge columns left unread from the base file because the merge and the
+    /// output do without them (the record key under a position-based merge).
+    pub base_columns_skipped: u64,
 
     // ── Stage timings (perf harness) ───────────────────────
     // Cheap monotonic `Instant`-based accumulators wired at the matching

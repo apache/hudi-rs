@@ -247,6 +247,23 @@ impl futures::Stream for BaseFileStream {
     }
 }
 
+/// What a base file's footer says about its columns, for a read's chooser.
+#[derive(Debug, Clone)]
+pub struct FooterSchemas {
+    /// The schema the read's batches carry. For parquet it honours an Arrow
+    /// schema embedded in the file's metadata.
+    pub stream: arrow_schema::SchemaRef,
+    /// The schema [`BaseFileReader::read_schema`] returns: for parquet, the
+    /// conversion of the file's own parquet schema, without the embedded Arrow
+    /// schema.
+    pub file: arrow_schema::SchemaRef,
+}
+
+/// Decides a read's options once the file's schema is known; see
+/// [`BaseFileReader::read_stream_with_schema`].
+pub type ChooseReadOptions<'a> =
+    Box<dyn FnOnce(&FooterSchemas) -> Result<BaseFileReadOptions> + Send + 'a>;
+
 /// Trait for reading base files in a format-agnostic way.
 pub trait BaseFileReader: Send + Sync {
     /// Read all data from a base file, returning a single concatenated RecordBatch.
@@ -298,6 +315,38 @@ pub trait BaseFileReader: Send + Sync {
         relative_path: &'a str,
         options: BaseFileReadOptions,
     ) -> BoxFuture<'a, Result<BaseFileStream>>;
+
+    /// Open a base file once, letting the caller choose the read options from
+    /// the file's own schema before the stream is built.
+    ///
+    /// A read that reconciles to the table's schema has to see which columns
+    /// the file holds before it can project, and asking for the schema and then
+    /// for the stream opens the file twice: on an object store that is two
+    /// footer fetches per file. `choose` receives the file schema and returns
+    /// the options for the read.
+    ///
+    /// `open_options` carries what the open itself needs: a known file size and
+    /// the row-position column. Those two are taken from `open_options`
+    /// whatever `choose` returns, since the file is already open by then. The
+    /// default opens twice, which is what a caller would otherwise write by
+    /// hand; a format that can keep the open across the two overrides it.
+    fn read_stream_with_schema<'a>(
+        &'a self,
+        relative_path: &'a str,
+        open_options: BaseFileReadOptions,
+        choose: ChooseReadOptions<'a>,
+    ) -> BoxFuture<'a, Result<BaseFileStream>> {
+        Box::pin(async move {
+            let schema = self.read_schema(relative_path).await?;
+            let mut options = choose(&FooterSchemas {
+                stream: schema.clone(),
+                file: schema,
+            })?;
+            options.known_file_size = open_options.known_file_size;
+            options.row_index_column = open_options.row_index_column;
+            self.read_stream(relative_path, options).await
+        })
+    }
 
     /// Get file metadata and column statistics from a base file.
     fn get_metadata_and_stats<'a>(
