@@ -26,8 +26,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use object_store::path::Path as ObjPath;
-use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, parse_url_opts};
-use url::Url;
+use object_store::{
+    ObjectStore, ObjectStoreExt, ObjectStoreScheme, PutMode, PutOptions, PutPayload, parse_url_opts,
+};
+use url::{Position, Url};
 
 use crate::config::HudiConfigs;
 use crate::config::table::HudiTableConfig;
@@ -96,6 +98,9 @@ pub struct Storage {
     /// counters. The `object_store` inside could not carry them: it is shared
     /// even wider, so its counts would be everyone's.
     pub(crate) read_volume: Arc<ReadVolume>,
+    /// Whether `object_store` was supplied by the caller rather than built from
+    /// `options`, in which case `options` say nothing about the store.
+    pub(crate) object_store_injected: bool,
 }
 
 /// Read-volume counters for one [`Storage`]'s lifetime.
@@ -219,6 +224,16 @@ impl ReadVolume {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static OBJECT_STORES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn object_stores_built() -> usize {
+    OBJECT_STORES_BUILT.with(|n| n.get())
+}
+
 impl Storage {
     pub const CLOUD_STORAGE_PREFIXES: [&'static str; 3] = ["AWS_", "AZURE_", "GOOGLE_"];
 
@@ -226,29 +241,92 @@ impl Storage {
         options: Arc<HashMap<String, String>>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Result<Arc<Storage>> {
-        let base_url = match hudi_configs
+        let base_url = Self::base_url_of(&hudi_configs)?;
+        let object_store = Self::build_object_store(&base_url, &options)?;
+        Ok(Self::from_parts(
+            base_url,
+            object_store,
+            false,
+            options,
+            hudi_configs,
+        ))
+    }
+
+    /// A `Storage` for `hudi_configs`' base path and `options` that reuses this
+    /// one's object store when [`Self::new`] would build the same store.
+    ///
+    /// The store holds the resolved credentials and the connection pool, so
+    /// deriving every `Storage` of a table from one builds them once per table.
+    /// It is reused when the base path has the same store root and either the
+    /// store was injected or `options` are equal; otherwise a new store is built
+    /// from `options`.
+    pub(crate) fn derive(
+        &self,
+        options: Arc<HashMap<String, String>>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Result<Arc<Storage>> {
+        let base_url = Self::base_url_of(&hudi_configs)?;
+        let same_store = if self.object_store_injected {
+            injected_store_root(&self.base_url) == injected_store_root(&base_url)
+        } else {
+            self.options == options
+                && store_root(&self.base_url)
+                    .is_some_and(|root| store_root(&base_url) == Some(root))
+        };
+        let (object_store, injected) = if same_store {
+            (self.object_store.clone(), self.object_store_injected)
+        } else {
+            (Self::build_object_store(&base_url, &options)?, false)
+        };
+        Ok(Self::from_parts(
+            base_url,
+            object_store,
+            injected,
+            options,
+            hudi_configs,
+        ))
+    }
+
+    pub(crate) fn base_url_of(hudi_configs: &HudiConfigs) -> Result<Url> {
+        match hudi_configs
             .try_get(HudiTableConfig::BasePath)
             .map_err(|e| Creation(format!("{e}")))?
         {
-            Some(v) => v.to_url()?,
-            None => {
-                return Err(Creation(format!(
-                    "{} is required.",
-                    HudiTableConfig::BasePath.as_ref()
-                )));
-            }
-        };
+            Some(v) => Ok(v.to_url()?),
+            None => Err(Creation(format!(
+                "{} is required.",
+                HudiTableConfig::BasePath.as_ref()
+            ))),
+        }
+    }
 
-        match parse_url_opts(&base_url, options.as_ref()) {
-            Ok((object_store, _)) => Ok(Arc::new(Storage {
-                base_url: Arc::new(base_url),
-                object_store: Arc::new(object_store),
-                options,
-                hudi_configs,
-                read_volume: Arc::new(ReadVolume::default()),
-            })),
+    fn build_object_store(
+        base_url: &Url,
+        options: &HashMap<String, String>,
+    ) -> Result<Arc<dyn ObjectStore>> {
+        #[cfg(test)]
+        OBJECT_STORES_BUILT.with(|n| n.set(n.get() + 1));
+        match parse_url_opts(base_url, options) {
+            Ok((object_store, _)) => Ok(Arc::from(object_store)),
             Err(e) => Err(Creation(format!("Failed to create storage: {e}"))),
         }
+    }
+
+    fn from_parts(
+        base_url: Url,
+        object_store: Arc<dyn ObjectStore>,
+        object_store_injected: bool,
+        options: Arc<HashMap<String, String>>,
+        hudi_configs: Arc<HudiConfigs>,
+    ) -> Arc<Storage> {
+        Arc::new(Storage {
+            base_url: Arc::new(base_url),
+            object_store,
+            options,
+            hudi_configs,
+            read_volume: Arc::new(ReadVolume::default()),
+            object_store_injected,
+        })
     }
 
     /// Clone of this `Storage`'s read-volume counters, for a consumer that
@@ -257,26 +335,26 @@ impl Storage {
         self.read_volume.clone()
     }
 
-    /// Build storage over a caller-supplied object store.
+    /// Build storage over a caller-supplied object store, which [`Self::derive`]
+    /// then reuses for every base path under the same store root.
     ///
-    /// Test-only, so a test can wrap the real store and observe the requests a
-    /// reader makes. Note that a wrapper takes the trait's default `get_ranges`,
-    /// which coalesces, where `LocalFileSystem` overrides it and does not: the
-    /// counts a test sees are therefore the ones an object store would serve, not
-    /// the ones the local filesystem would.
-    #[cfg(test)]
+    /// Tests use it to wrap the real store and observe the requests a reader
+    /// makes. Note that a wrapper takes the trait's default `get_ranges`, which
+    /// coalesces, where `LocalFileSystem` overrides it and does not: the counts a
+    /// test sees are therefore the ones an object store would serve, not the ones
+    /// the local filesystem would.
     pub(crate) fn new_with_object_store(
         base_url: Url,
         object_store: Arc<dyn ObjectStore>,
         hudi_configs: Arc<HudiConfigs>,
     ) -> Arc<Storage> {
-        Arc::new(Storage {
-            base_url: Arc::new(base_url),
+        Self::from_parts(
+            base_url,
             object_store,
-            options: Arc::new(HashMap::new()),
+            true,
+            Arc::new(HashMap::new()),
             hudi_configs,
-            read_volume: Arc::new(ReadVolume::default()),
-        })
+        )
     }
 
     #[cfg(test)]
@@ -353,6 +431,73 @@ impl Storage {
             obj_meta,
             window_size,
         ))
+    }
+
+    /// [`Self::get_streaming_storage_reader`] for a caller that reads the file
+    /// from its start, such as a log file's block walk.
+    ///
+    /// The first window is fetched here, by range, and the response also says
+    /// how large the file is, which saves the size lookup the other open starts
+    /// with. A missing file fails here as it would there. Any other refusal (an
+    /// empty file has no byte 0), or a response that is not the window asked
+    /// for, falls back to that lookup. A caller that starts elsewhere, such as
+    /// an HFile's trailer, would pay for a window it does not read, and uses the
+    /// other open.
+    pub async fn get_streaming_storage_reader_from_start(
+        &self,
+        relative_path: &str,
+    ) -> Result<StorageReader> {
+        let obj_url = join_url_segments(&self.base_url, &[relative_path])?;
+        let obj_path = ObjPath::from_url_path(obj_url.path())?;
+        let obj_store = self.object_store.clone();
+        let window_size = crate::storage::reader::stream_window_size(&self.hudi_configs)
+            .map_err(StorageError::ReaderError)?;
+        let first = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(0..window_size)),
+            ..Default::default()
+        };
+        match obj_store.get_opts(&obj_path, first).await {
+            Ok(result) => {
+                // The window is trusted only when it is the start of the file
+                // and the file's size came with it, so a store that reports
+                // the range's length as the file's cannot cut the walk short.
+                let obj_meta = result.meta.clone();
+                let expected = 0..window_size.min(obj_meta.size);
+                if result.range == expected {
+                    match result.bytes().await {
+                        Ok(window) if window.len() as u64 == expected.end => {
+                            return Ok(StorageReader::new_streaming_with_first_window(
+                                obj_store,
+                                obj_meta,
+                                window_size,
+                                window,
+                            ));
+                        }
+                        Ok(window) => log::debug!(
+                            "'{relative_path}' returned {} bytes for its first window \
+                             of {expected:?}; looking its size up instead",
+                            window.len()
+                        ),
+                        Err(e) => log::debug!(
+                            "reading the first window of '{relative_path}' failed ({e}); \
+                             looking its size up instead"
+                        ),
+                    }
+                } else {
+                    log::debug!(
+                        "'{relative_path}' answered {:?} for its first window of \
+                         {expected:?}; looking its size up instead",
+                        result.range
+                    );
+                }
+            }
+            Err(e @ object_store::Error::NotFound { .. }) => return Err(e.into()),
+            Err(e) => log::debug!(
+                "fetching the first window of '{relative_path}' failed ({e}); \
+                 looking its size up instead"
+            ),
+        }
+        self.get_streaming_storage_reader(relative_path).await
     }
 
     pub async fn list_dirs(&self, subdir: Option<&str>) -> Result<Vec<String>> {
@@ -474,6 +619,30 @@ impl Storage {
     }
 }
 
+/// The key [`Storage::derive`] compares to decide whether two base URLs may
+/// share an object store: scheme and authority, plus the first path segment
+/// when `object_store` takes the bucket or container from the path. Two URLs
+/// with equal keys get the same store from `parse_url_opts` given the same
+/// options. `None` when `object_store` does not recognize the URL, which never
+/// shares.
+fn store_root(url: &Url) -> Option<String> {
+    let (_, store_path) = ObjectStoreScheme::parse(url).ok()?;
+    let full_path = ObjPath::from_url_path(url.path()).ok()?;
+    let authority = &url[..Position::BeforePath];
+    if store_path == full_path {
+        return Some(authority.to_string());
+    }
+    let bucket = full_path.parts().next()?;
+    Some(format!("{authority}/{}", bucket.as_ref()))
+}
+
+/// [`store_root`] for a `Storage` over an injected store, falling back to the
+/// scheme and authority for a URL `object_store` does not recognise: the caller
+/// chose the scheme, and nothing is built from it.
+fn injected_store_root(url: &Url) -> String {
+    store_root(url).unwrap_or_else(|| url[..Position::BeforePath].to_string())
+}
+
 /// Get relative paths of leaf directories under a given directory.
 ///
 /// **Example**
@@ -513,6 +682,75 @@ mod tests {
     use std::fs::canonicalize;
     use std::path::Path;
 
+    /// Opening a file from its start costs one ranged GET and no HEAD, and the
+    /// reader then holds the file's whole size and bytes; an empty file falls
+    /// back to the size lookup, and a missing one fails without it.
+    #[tokio::test]
+    async fn opening_a_file_from_its_start_reads_its_first_window_for_its_size() {
+        use crate::storage::counting::CountingObjectStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let content: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(dir.path().join("log"), &content).unwrap();
+        std::fs::write(dir.path().join("empty"), b"").unwrap();
+        let base_url = Url::from_directory_path(dir.path()).unwrap();
+        let open = |window: &str| {
+            let configs = Arc::new(HudiConfigs::new([
+                (HudiTableConfig::BasePath.as_ref(), base_url.as_str()),
+                (crate::storage::reader::CONFIG_DFS_BUFFER_MAX_SIZE, window),
+            ]));
+            let (store, counts) =
+                CountingObjectStore::new(Arc::new(object_store::local::LocalFileSystem::new()));
+            (
+                Storage::new_with_object_store(base_url.clone(), store, configs),
+                counts,
+            )
+        };
+
+        // A window larger than the file, then one smaller, which refills.
+        for window in ["4096", "64"] {
+            let (storage, counts) = open(window);
+            let mut reader = storage
+                .get_streaming_storage_reader_from_start("log")
+                .await
+                .unwrap();
+            assert_eq!((counts.gets(), counts.heads()), (1, 0), "window {window}");
+            assert_eq!(reader.file_len(), content.len() as u64, "window {window}");
+            let read = reader.read_bytes(content.len() as u64).await.unwrap();
+            assert_eq!(read.as_ref(), content.as_slice(), "window {window}");
+        }
+
+        let (storage, counts) = open("4096");
+        let reader = storage
+            .get_streaming_storage_reader_from_start("empty")
+            .await
+            .unwrap();
+        assert_eq!(reader.file_len(), 0);
+        assert_eq!(
+            (counts.gets(), counts.heads()),
+            (1, 1),
+            "an empty file has no first byte to range over, so its size is looked up"
+        );
+
+        let (storage, counts) = open("4096");
+        let missing = storage
+            .get_streaming_storage_reader_from_start("missing")
+            .await
+            .expect_err("a missing file fails to open");
+        assert!(
+            matches!(
+                missing,
+                StorageError::ObjectStoreError(object_store::Error::NotFound { .. })
+            ),
+            "got {missing:?}"
+        );
+        assert_eq!(
+            (counts.gets(), counts.heads()),
+            (1, 0),
+            "a missing file fails on the first request"
+        );
+    }
+
     #[test]
     fn test_storage_new_error_no_base_path() {
         let options = Arc::new(HashMap::new());
@@ -545,6 +783,157 @@ mod tests {
             "Should return error when no base path is invalid."
         );
         assert!(matches!(result.unwrap_err(), Creation(_)));
+    }
+
+    fn configs_at(base_path: &str) -> Arc<HudiConfigs> {
+        Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_path)]))
+    }
+
+    fn options(pairs: &[(&str, &str)]) -> Arc<HashMap<String, String>> {
+        Arc::new(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn derive_shares_the_store_under_the_same_root_and_options() {
+        let opts = options(&[("aws_region", "us-west-2")]);
+        let table = Storage::new(opts.clone(), configs_at("s3://bucket-a/warehouse/t1")).unwrap();
+        let before = object_stores_built();
+
+        let same_path = table
+            .derive(opts.clone(), configs_at("s3://bucket-a/warehouse/t1"))
+            .unwrap();
+        let metadata_table = table
+            .derive(
+                options(&[("aws_region", "us-west-2")]),
+                configs_at("s3://bucket-a/warehouse/t1/.hoodie/metadata"),
+            )
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&table.object_store, &same_path.object_store));
+        assert!(Arc::ptr_eq(
+            &table.object_store,
+            &metadata_table.object_store
+        ));
+        assert_eq!(object_stores_built(), before, "no store is built to share");
+        assert_eq!(
+            metadata_table.base_url.as_str(),
+            "s3://bucket-a/warehouse/t1/.hoodie/metadata",
+            "the derived storage keeps its own base path"
+        );
+    }
+
+    #[test]
+    fn derive_builds_a_new_store_for_another_bucket_or_options() {
+        let opts = options(&[("aws_region", "us-west-2")]);
+        let table = Storage::new(opts.clone(), configs_at("s3://bucket-a/t1")).unwrap();
+
+        let other_bucket = table
+            .derive(opts.clone(), configs_at("s3://bucket-b/t1"))
+            .unwrap();
+        let other_options = table
+            .derive(
+                options(&[("aws_region", "eu-west-1")]),
+                configs_at("s3://bucket-a/t1"),
+            )
+            .unwrap();
+        let other_scheme = table
+            .derive(opts.clone(), configs_at("gs://bucket-a/t1"))
+            .unwrap();
+
+        for derived in [&other_bucket, &other_options, &other_scheme] {
+            assert!(
+                !Arc::ptr_eq(&table.object_store, &derived.object_store),
+                "{} must not share the store of {}",
+                derived.base_url,
+                table.base_url
+            );
+        }
+    }
+
+    #[test]
+    fn derive_reuses_an_injected_store_under_the_same_root_whatever_the_options() {
+        let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+        let table = Storage::new_with_object_store(
+            Url::parse("s3://bucket-a/warehouse/t1").unwrap(),
+            store.clone(),
+            configs_at("s3://bucket-a/warehouse/t1"),
+        );
+        let before = object_stores_built();
+
+        let metadata_table = table
+            .derive(
+                options(&[("aws_region", "us-west-2")]),
+                configs_at("s3://bucket-a/warehouse/t1/.hoodie/metadata"),
+            )
+            .unwrap();
+        let from_metadata_table = metadata_table
+            .derive(
+                options(&[("aws_region", "eu-west-1")]),
+                configs_at("s3://bucket-a/warehouse/t1/.hoodie/metadata"),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&store, &metadata_table.object_store));
+        assert!(
+            Arc::ptr_eq(&store, &from_metadata_table.object_store),
+            "a storage derived from a reused injected store reuses it too"
+        );
+        assert_eq!(object_stores_built(), before);
+
+        let other_bucket = table
+            .derive(
+                options(&[("aws_region", "us-west-2")]),
+                configs_at("s3://bucket-b/t1"),
+            )
+            .unwrap();
+        assert!(!Arc::ptr_eq(&store, &other_bucket.object_store));
+        assert!(!other_bucket.object_store_injected);
+        assert_eq!(object_stores_built(), before + 1);
+    }
+
+    #[tokio::test]
+    async fn derive_reads_through_the_shared_store_at_its_own_base_path() {
+        let root = canonicalize(Path::new("tests/data")).unwrap();
+        let table = Storage::new_with_base_url(Url::from_directory_path(&root).unwrap()).unwrap();
+        let sub_dir = root.join("timeline/commits_stub");
+        let derived = table
+            .derive(
+                table.options.clone(),
+                configs_at(Url::from_directory_path(&sub_dir).unwrap().as_str()),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&table.object_store, &derived.object_store));
+
+        let via_derived: HashSet<String> =
+            derived.list_dirs(None).await.unwrap().into_iter().collect();
+        let via_root: HashSet<String> = table
+            .list_dirs(Some("timeline/commits_stub"))
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert!(!via_derived.is_empty());
+        assert_eq!(via_derived, via_root);
+    }
+
+    #[test]
+    fn store_root_includes_a_bucket_carried_in_the_path() {
+        let root = |s: &str| store_root(&Url::parse(s).unwrap());
+        assert_eq!(root("s3://bucket/a/b").as_deref(), Some("s3://bucket"));
+        assert_eq!(root("file:///tmp/a").as_deref(), Some("file://"));
+        assert_eq!(
+            root("https://acct.blob.core.windows.net/container/a/b").as_deref(),
+            Some("https://acct.blob.core.windows.net/container")
+        );
+        assert_ne!(
+            root("https://acct.blob.core.windows.net/c1/t"),
+            root("https://acct.blob.core.windows.net/c2/t")
+        );
+        assert_eq!(root("unknown://host/a"), None);
     }
 
     #[tokio::test]

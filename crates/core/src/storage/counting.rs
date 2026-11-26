@@ -43,6 +43,14 @@ pub(crate) struct RequestCounts {
     gets: AtomicUsize,
     /// Metadata-only lookups.
     heads: AtomicUsize,
+    /// Listings, with or without a delimiter.
+    lists: AtomicUsize,
+    /// Whole-object and multipart writes.
+    puts: AtomicUsize,
+    /// Bytes returned by reads.
+    bytes_read: AtomicUsize,
+    /// Metadata lookups and reads per object, keyed by its path.
+    by_path: std::sync::Mutex<std::collections::HashMap<String, (usize, usize)>>,
 }
 
 impl RequestCounts {
@@ -50,8 +58,30 @@ impl RequestCounts {
         self.gets.load(Ordering::Relaxed)
     }
 
+    /// Metadata lookups and reads made against the one object whose path ends
+    /// with `suffix`, as `(heads, gets)`.
+    pub(crate) fn requests_to(&self, suffix: &str) -> (usize, usize) {
+        let by_path = self.by_path.lock().unwrap_or_else(|p| p.into_inner());
+        by_path
+            .iter()
+            .filter(|(path, _)| path.ends_with(suffix))
+            .fold((0, 0), |(h, g), (_, (ph, pg))| (h + ph, g + pg))
+    }
+
     pub(crate) fn heads(&self) -> usize {
         self.heads.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn lists(&self) -> usize {
+        self.lists.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn puts(&self) -> usize {
+        self.puts.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn bytes_read(&self) -> usize {
+        self.bytes_read.load(Ordering::Relaxed)
     }
 }
 
@@ -89,6 +119,7 @@ impl ObjectStore for CountingObjectStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
+        self.counts.puts.fetch_add(1, Ordering::Relaxed);
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -97,6 +128,7 @@ impl ObjectStore for CountingObjectStore {
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
+        self.counts.puts.fetch_add(1, Ordering::Relaxed);
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -109,7 +141,26 @@ impl ObjectStore for CountingObjectStore {
         } else {
             self.counts.gets.fetch_add(1, Ordering::Relaxed);
         }
-        self.inner.get_opts(location, options).await
+        {
+            let mut by_path = self
+                .counts
+                .by_path
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let entry = by_path.entry(location.to_string()).or_default();
+            if options.head {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+        let head = options.head;
+        let result = self.inner.get_opts(location, options).await?;
+        if !head {
+            let read = (result.range.end - result.range.start) as usize;
+            self.counts.bytes_read.fetch_add(read, Ordering::Relaxed);
+        }
+        Ok(result)
     }
 
     fn delete_stream(
@@ -120,10 +171,12 @@ impl ObjectStore for CountingObjectStore {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        self.counts.lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list(prefix)
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        self.counts.lists.fetch_add(1, Ordering::Relaxed);
         self.inner.list_with_delimiter(prefix).await
     }
 

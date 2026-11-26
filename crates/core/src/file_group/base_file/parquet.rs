@@ -35,7 +35,9 @@ use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, RowNumber, parquet_to_arrow_schema};
 use parquet::file::metadata::ParquetMetaData;
 
-use super::reader::{BaseFileReadOptions, BaseFileReader, BaseFileStream};
+use super::reader::{
+    BaseFileReadOptions, BaseFileReader, BaseFileStream, ChooseReadOptions, FooterSchemas,
+};
 use crate::schema::parquet_list_norm::normalize_parquet_metadata;
 use crate::statistics::StatisticsContainer;
 use crate::storage::ReadVolume;
@@ -93,6 +95,26 @@ impl<R: AsyncFileReader> AsyncFileReader for CountingReader<R> {
     }
 }
 
+/// Bytes fetched from the end of a file for its footer in one request.
+///
+/// Without a hint the reader asks for the 8-byte footer length first and then
+/// for the footer, two round trips per file. A Hudi base file's footer carries
+/// the record-key bloom filter as a key-value entry, which alone is about 860 KB
+/// at the writer's default 60,000 entries and grows with the configured count,
+/// so 1.5 MiB serves such a footer in one request with room to spare. A larger
+/// footer costs one more request, as it would without the hint.
+///
+/// Used only by the stream reads, which go on to read the file's data, and only
+/// on a file at least [`FOOTER_HINT_MIN_FILE_SIZE`] long. A footer-only open
+/// (planning-time statistics, a schema lookup) reads the footer by its length,
+/// and a smaller file would be fetched whole by the hint and then again chunk
+/// by chunk.
+const FOOTER_SIZE_HINT: usize = 1536 * 1024;
+
+/// The smallest file the footer hint is used on: four times the hint, so the
+/// bytes it fetches past the footer stay a small share of the file.
+const FOOTER_HINT_MIN_FILE_SIZE: u64 = 4 * FOOTER_SIZE_HINT as u64;
+
 /// The builder every read here is driven from: a parquet object reader with the
 /// read-volume counters wrapped around it.
 #[allow(deprecated)]
@@ -135,15 +157,67 @@ impl ParquetBaseFileReader {
         Ok(options.with_virtual_columns(vec![row_number])?)
     }
 
+    /// Fetch a file's footer, and its size, to open it later with
+    /// [`BaseFileReadOptions::with_parquet_metadata`] and
+    /// [`BaseFileReadOptions::with_known_file_size`].
+    ///
+    /// A merging read opens its base file only once the log scan has said which
+    /// columns the merge needs, and the footer it then fetches is one more round
+    /// trip after the scan's. Fetched alongside the scan instead, the open
+    /// starts from it.
+    pub(crate) async fn fetch_metadata(
+        &self,
+        relative_path: &str,
+        known_file_size: Option<u64>,
+    ) -> Result<(Arc<ParquetMetaData>, u64)> {
+        let (obj_path, file_size) = self
+            .object_path_knowing(relative_path, known_file_size)
+            .await?;
+        let metadata = Self::object_reader(&self.storage, obj_path, file_size, true)
+            .get_metadata(None)
+            .await?;
+        Ok((metadata, file_size))
+    }
+
+    #[allow(deprecated)]
+    fn object_reader(
+        storage: &Storage,
+        obj_path: ObjPath,
+        file_size: u64,
+        footer_hint: bool,
+    ) -> ParquetObjectReader {
+        let reader = ParquetObjectReader::new(storage.object_store.clone(), obj_path)
+            .with_file_size(file_size);
+        if footer_hint && file_size >= FOOTER_HINT_MIN_FILE_SIZE {
+            reader.with_footer_size_hint(FOOTER_SIZE_HINT)
+        } else {
+            reader
+        }
+    }
+
+    async fn object_path_knowing(
+        &self,
+        relative_path: &str,
+        known_file_size: Option<u64>,
+    ) -> Result<(ObjPath, u64)> {
+        match known_file_size {
+            Some(size) => {
+                let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+                Ok((ObjPath::from_url_path(obj_url.path())?, size))
+            }
+            None => self.object_path_and_size(relative_path).await,
+        }
+    }
+
     async fn open_builder_with_size(
         &self,
         obj_path: ObjPath,
         file_size: u64,
         row_index_column: Option<&str>,
+        footer_hint: bool,
+        prefetched: Option<Arc<ParquetMetaData>>,
     ) -> Result<CountedBuilder> {
-        #[allow(deprecated)]
-        let mut reader = ParquetObjectReader::new(self.storage.object_store.clone(), obj_path)
-            .with_file_size(file_size);
+        let mut reader = Self::object_reader(&self.storage, obj_path, file_size, footer_hint);
 
         // A parquet-avro writer with `write-old-list-structure=true` encodes an
         // `array<map>` as a legacy 2-level list whose element is a REPEATED map
@@ -151,7 +225,10 @@ impl ParquetBaseFileReader {
         // schema — "Map cannot be repeated". The footer parse itself does not,
         // so the schema is rewritten in between and every reader built from this
         // metadata accepts the file. The column chunks are untouched.
-        let raw = reader.get_metadata(None).await?;
+        let raw = match prefetched {
+            Some(metadata) => metadata,
+            None => reader.get_metadata(None).await?,
+        };
         let normalized = normalize_parquet_metadata(raw);
         let arrow_metadata = ArrowReaderMetadata::try_new(
             normalized,
@@ -174,8 +251,105 @@ impl ParquetBaseFileReader {
         row_index_column: Option<&str>,
     ) -> Result<CountedBuilder> {
         let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
-        self.open_builder_with_size(obj_path, file_size, row_index_column)
+        self.open_builder_with_size(obj_path, file_size, row_index_column, false, None)
             .await
+    }
+
+    /// Open a file for a stream read, with the footer size hint, skipping the
+    /// size lookup when the caller already has it. The listing that produced
+    /// the file slice recorded the size, so asking the store again is a
+    /// metadata round trip for nothing.
+    ///
+    /// A known size that no longer matches the file fails the open (a read past
+    /// its end, or a footer that does not parse). That open is retried once
+    /// with the size looked up, so a stale size costs a request rather than
+    /// the read.
+    async fn open_for_stream(
+        &self,
+        relative_path: &str,
+        row_index_column: Option<&str>,
+        known_file_size: Option<u64>,
+        prefetched: Option<Arc<ParquetMetaData>>,
+    ) -> Result<CountedBuilder> {
+        if let Some(size) = known_file_size {
+            let obj_url = join_url_segments(&self.storage.base_url, &[relative_path])?;
+            let obj_path = ObjPath::from_url_path(obj_url.path())?;
+            match self
+                .open_builder_with_size(obj_path, size, row_index_column, true, prefetched)
+                .await
+            {
+                Ok(builder) => return Ok(builder),
+                Err(e) => log::debug!(
+                    "opening '{relative_path}' at its known size {size} failed ({e}); \
+                     looking the size up and retrying"
+                ),
+            }
+            let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
+            return self
+                .open_builder_with_size(obj_path, file_size, row_index_column, true, None)
+                .await;
+        }
+        let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
+        self.open_builder_with_size(obj_path, file_size, row_index_column, true, prefetched)
+            .await
+    }
+
+    /// The schema the stream built from this footer will yield, less the
+    /// virtual row-position column, which is the reader's and not the file's.
+    ///
+    /// The arrow reader's schema rather than a bare parquet-to-arrow
+    /// conversion: the two differ on a file with an embedded Arrow schema, and
+    /// a caller comparing this against a table schema to decide whether each
+    /// batch needs reconciling must see the types the batches will carry.
+    fn stream_schema(
+        builder: &CountedBuilder,
+        row_index_column: Option<&str>,
+    ) -> arrow_schema::SchemaRef {
+        let schema = builder.schema();
+        let Some(name) = row_index_column else {
+            return schema.clone();
+        };
+        let fields: Vec<arrow_schema::FieldRef> = schema
+            .fields()
+            .iter()
+            .filter(|f| f.name() != name)
+            .cloned()
+            .collect();
+        Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        ))
+    }
+
+    /// Build the stream from an open builder; shared by both stream entry points
+    /// so they cannot wire the row-position column or the volume counters
+    /// differently.
+    fn stream_from_builder(
+        &self,
+        builder: CountedBuilder,
+        options: &BaseFileReadOptions,
+    ) -> Result<BaseFileStream> {
+        let builder = self.apply_options(builder, options)?;
+        let full_schema = builder.schema().clone();
+        let stream = builder.build()?;
+        let schema = Self::schema_with_row_index(
+            stream.schema(),
+            &full_schema,
+            options.row_index_column.as_deref(),
+        )?;
+        // Rows the stream actually yields — after any row filter. Against
+        // `file_rows` this is the read's selectivity; against `bytes_read`,
+        // what that selectivity cost.
+        let volume = self.storage.read_volume.clone();
+        let mapped_stream = stream
+            .map(move |result| {
+                let batch = result.map_err(StorageError::from)?;
+                volume.add_rows_out(batch.num_rows() as u64);
+                Ok(batch)
+            })
+            .boxed();
+
+        Ok(BaseFileStream::new(schema, mapped_stream))
     }
 
     fn apply_options(
@@ -335,29 +509,47 @@ impl BaseFileReader for ParquetBaseFileReader {
     ) -> BoxFuture<'a, Result<BaseFileStream>> {
         Box::pin(async move {
             let builder = self
-                .open_builder(relative_path, options.row_index_column.as_deref())
+                .open_for_stream(
+                    relative_path,
+                    options.row_index_column.as_deref(),
+                    options.known_file_size,
+                    options.parquet_metadata.clone(),
+                )
                 .await?;
-            let builder = self.apply_options(builder, &options)?;
-            let full_schema = builder.schema().clone();
-            let stream = builder.build()?;
-            let schema = Self::schema_with_row_index(
-                stream.schema(),
-                &full_schema,
-                options.row_index_column.as_deref(),
-            )?;
-            // Rows the stream actually yields — after any row filter. Against
-            // `file_rows` this is the read's selectivity; against `bytes_read`,
-            // what that selectivity cost.
-            let volume = self.storage.read_volume.clone();
-            let mapped_stream = stream
-                .map(move |result| {
-                    let batch = result.map_err(StorageError::from)?;
-                    volume.add_rows_out(batch.num_rows() as u64);
-                    Ok(batch)
-                })
-                .boxed();
+            self.stream_from_builder(builder, &options)
+        })
+    }
 
-            Ok(BaseFileStream::new(schema, mapped_stream))
+    /// One footer fetch serves both the schema the caller chooses by and the
+    /// stream it then reads.
+    fn read_stream_with_schema<'a>(
+        &'a self,
+        relative_path: &'a str,
+        open_options: BaseFileReadOptions,
+        choose: ChooseReadOptions<'a>,
+    ) -> BoxFuture<'a, Result<BaseFileStream>> {
+        Box::pin(async move {
+            let builder = self
+                .open_for_stream(
+                    relative_path,
+                    open_options.row_index_column.as_deref(),
+                    open_options.known_file_size,
+                    open_options.parquet_metadata.clone(),
+                )
+                .await?;
+            let schemas = FooterSchemas {
+                stream: Self::stream_schema(&builder, open_options.row_index_column.as_deref()),
+                file: Arc::new(parquet_to_arrow_schema(
+                    builder.metadata().file_metadata().schema_descr(),
+                    None,
+                )?),
+            };
+            let mut options = choose(&schemas)?;
+            // The open already honoured these; the chosen options cannot change
+            // how the file was opened, only what is read from it.
+            options.row_index_column = open_options.row_index_column;
+            options.known_file_size = open_options.known_file_size;
+            self.stream_from_builder(builder, &options)
         })
     }
 
@@ -378,7 +570,7 @@ impl BaseFileReader for ParquetBaseFileReader {
         Box::pin(async move {
             let (obj_path, file_size) = self.object_path_and_size(relative_path).await?;
             let builder = self
-                .open_builder_with_size(obj_path, file_size, None)
+                .open_builder_with_size(obj_path, file_size, None, false, None)
                 .await?;
             let parquet_meta = builder.metadata().as_ref();
 
@@ -804,5 +996,119 @@ mod tests {
             all.num_rows(),
             "a format that cannot seek by key must return every row, not fewer"
         );
+    }
+
+    /// Writes a file of `rows` distinct longs whose footer carries a
+    /// `bloom_len`-byte key-value entry, reads it all through a counting store
+    /// with the size given as `known_size`, and returns the file size and the
+    /// HEAD and GET counts.
+    async fn read_counting_requests(
+        bloom_len: usize,
+        rows: i64,
+        known_size: impl Fn(u64) -> Option<u64>,
+    ) -> (u64, usize, usize) {
+        use crate::storage::counting::CountingObjectStore;
+        use arrow_array::{Int64Array, RecordBatch};
+        #[allow(unused_imports)]
+        use object_store::ObjectStore;
+        use object_store::PutPayload;
+        use parquet::arrow::ArrowWriter;
+        use parquet::file::metadata::KeyValue;
+        use parquet::file::properties::WriterProperties;
+
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64)),
+            ))],
+        )
+        .unwrap();
+        let bloom = KeyValue::new(
+            "org.apache.hudi.bloomfilter".to_string(),
+            "A".repeat(bloom_len),
+        );
+        let properties = WriterProperties::builder()
+            .set_key_value_metadata(Some(vec![bloom]))
+            .set_dictionary_enabled(false)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(properties)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        let file_size = bytes.len() as u64;
+
+        let memory = object_store::memory::InMemory::new();
+        memory
+            .put(
+                &ObjPath::from("table/bloom.parquet"),
+                PutPayload::from(bytes),
+            )
+            .await
+            .unwrap();
+        let (store, counts) = CountingObjectStore::new(Arc::new(memory));
+        let storage = Storage::new_with_object_store(
+            Url::parse("memory:///table/").unwrap(),
+            store,
+            Arc::new(crate::config::HudiConfigs::empty()),
+        );
+        let mut options = BaseFileReadOptions::default();
+        if let Some(size) = known_size(file_size) {
+            options = options.with_known_file_size(size);
+        }
+        let read = ParquetBaseFileReader::new(storage)
+            .read_data("bloom.parquet", options)
+            .await
+            .unwrap();
+        assert_eq!(read.num_rows() as i64, rows);
+        (file_size, counts.heads(), counts.gets())
+    }
+
+    /// A footer holding a Hudi-sized bloom filter arrives in one request on a
+    /// file large enough for the footer hint: with the size known, the read
+    /// sends no metadata lookup, one footer fetch and one column chunk.
+    #[tokio::test]
+    async fn test_a_large_bloom_filter_footer_is_fetched_in_one_request() {
+        let (size, heads, gets) = read_counting_requests(862_724, 1_000_000, Some).await;
+        assert!(size >= FOOTER_HINT_MIN_FILE_SIZE, "{size} bytes");
+        assert_eq!(heads, 0, "a known size needs no metadata lookup");
+        assert_eq!(gets, 2, "one footer fetch and one column chunk");
+    }
+
+    /// A footer larger than the hint takes one more request for the rest of
+    /// it, as it would without the hint.
+    #[tokio::test]
+    async fn test_a_footer_larger_than_the_hint_takes_two_requests() {
+        let (_, heads, gets) =
+            read_counting_requests(FOOTER_SIZE_HINT + 256 * 1024, 1_000_000, Some).await;
+        assert_eq!(heads, 0);
+        assert_eq!(gets, 3, "two footer fetches and one column chunk");
+    }
+
+    /// A file below the hint's minimum is not fetched whole for its footer: the
+    /// footer is read by its length, in two requests.
+    #[tokio::test]
+    async fn test_a_small_file_reads_its_footer_by_length() {
+        let (size, heads, gets) = read_counting_requests(1_000, 1_000, Some).await;
+        assert!(size < FOOTER_HINT_MIN_FILE_SIZE);
+        assert_eq!(heads, 0);
+        assert_eq!(
+            gets, 3,
+            "the footer length, the footer and one column chunk"
+        );
+    }
+
+    /// A known size that is wrong fails the first open, which is retried with
+    /// the size looked up: the read succeeds at the cost of one metadata lookup.
+    #[tokio::test]
+    async fn test_a_stale_known_size_is_retried_with_a_lookup() {
+        let (_, heads, _) = read_counting_requests(1_000, 1_000, |size| Some(size + 4096)).await;
+        assert_eq!(heads, 1, "the retry looks the size up once");
+        let (_, heads, _) = read_counting_requests(1_000, 1_000, |size| Some(size - 1)).await;
+        assert_eq!(heads, 1, "the retry looks the size up once");
     }
 }

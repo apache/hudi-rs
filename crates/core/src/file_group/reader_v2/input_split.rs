@@ -42,6 +42,10 @@ pub struct InputSplit {
 
     /// Partition path for this file group (e.g. "year=2024/month=01").
     pub partition_path: String,
+
+    /// Size of the base file in bytes, when the listing that produced the split
+    /// knows it, so opening the file needs no size lookup.
+    pub base_file_size: Option<u64>,
 }
 
 /// CDC log-file suffix. Mirrors Java's `HoodieCDCUtils.CDC_LOGFILE_SUFFIX` (".cdc").
@@ -70,7 +74,14 @@ impl InputSplit {
             base_file_commit_time,
             log_file_paths,
             partition_path,
+            base_file_size: None,
         }
+    }
+
+    /// Records the base file's size, known from the listing.
+    pub fn with_base_file_size(mut self, base_file_size: Option<u64>) -> Self {
+        self.base_file_size = base_file_size;
+        self
     }
 
     /// Drop CDC log files from the scan list.

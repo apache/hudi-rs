@@ -104,7 +104,9 @@ impl LogFileReader {
         storage: Arc<Storage>,
         relative_path: &str,
     ) -> Result<Self> {
-        let reader = storage.get_streaming_storage_reader(relative_path).await?;
+        let reader = storage
+            .get_streaming_storage_reader_from_start(relative_path)
+            .await?;
         let timezone: String = hudi_configs
             .get_or_default(HudiTableConfig::TimelineTimezone)
             .into();
@@ -743,8 +745,8 @@ mod tests {
         );
         assert_eq!(
             (gets, heads),
-            (1, 1),
-            "one window fill and the size lookup, and nothing else"
+            (1, 0),
+            "one window fill, which also sizes the file, and nothing else"
         );
 
         // Smaller than the file: the walk cannot hold the content, so blocks defer

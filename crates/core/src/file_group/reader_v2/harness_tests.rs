@@ -35,6 +35,7 @@ use crate::fg_case_test;
 use crate::file_group::reader_v2::MAX_INSTANT_TIME;
 use crate::file_group::reader_v2::engine::HoodieFileGroupReader;
 use crate::file_group::reader_v2::input_split::InputSplit;
+use crate::file_group::reader_v2::read_stats::HoodieReadStats;
 use crate::file_group::reader_v2::reader_context::ReaderContext;
 use crate::file_group::reader_v2::reader_parameters::ReaderParameters;
 use crate::file_group::reader_v2::schema_handler::FileGroupReaderSchemaHandler;
@@ -1266,6 +1267,125 @@ fg_case_test!(
             sort_key: "id",
             columns: &["id", "name", "age"],
             rows: &[&["1", "Alice-V2", "31"], &["2", "Bob", "25"]],
+        },
+        ..Default::default()
+    }
+);
+
+// The record-key skip, end to end. A position-merged read whose output leaves
+// out the record key reads the base file without it; projecting the key, or
+// a filter that may read it, keeps it in the base read. The rows match the
+// unskipped read either way.
+fn requested_id_name_age() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("age", DataType::Int32, true),
+    ]))
+}
+
+fn requested_key_id_name_age() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("_hoodie_record_key", DataType::Utf8, true),
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("age", DataType::Int32, true),
+    ]))
+}
+
+fn expect_key_skipped(s: &HoodieReadStats) -> std::result::Result<(), String> {
+    if s.base_columns_skipped == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected the record key left unread, got {} skipped",
+            s.base_columns_skipped
+        ))
+    }
+}
+
+fn expect_nothing_skipped(s: &HoodieReadStats) -> std::result::Result<(), String> {
+    if s.base_columns_skipped == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "expected every merge column read, got {} skipped",
+            s.base_columns_skipped
+        ))
+    }
+}
+
+fg_case_test!(
+    harness_position_merge_leaves_the_record_key_unread,
+    FgReaderCase {
+        name: "position_merge_leaves_the_record_key_unread",
+        fixture: QuickstartTripsTable::V9Mor8I4UCommitTime,
+        partition: "city=sf",
+        base_file: I8I4U_SF_BASE,
+        log_files: &[I8I4U_SF_LOG],
+        schema: SchemaSpec::Projection(requested_id_name_age()),
+        expect_output_columns: Some(&["id", "name", "age"]),
+        reader_parameters: Some(ReaderParameters {
+            use_record_position: true,
+            ..Default::default()
+        }),
+        expect_stats: Some(expect_key_skipped),
+        expected: Expected::Rows {
+            sort_key: "id",
+            columns: &["id", "name", "age"],
+            rows: &[&["1", "Alice-V2", "31"], &["2", "Bob", "25"]],
+        },
+        ..Default::default()
+    }
+);
+
+fg_case_test!(
+    harness_position_merge_reads_a_projected_record_key,
+    FgReaderCase {
+        name: "position_merge_reads_a_projected_record_key",
+        fixture: QuickstartTripsTable::V9Mor8I4UCommitTime,
+        partition: "city=sf",
+        base_file: I8I4U_SF_BASE,
+        log_files: &[I8I4U_SF_LOG],
+        schema: SchemaSpec::Projection(requested_key_id_name_age()),
+        expect_output_columns: Some(&["_hoodie_record_key", "id", "name", "age"]),
+        reader_parameters: Some(ReaderParameters {
+            use_record_position: true,
+            ..Default::default()
+        }),
+        expect_stats: Some(expect_nothing_skipped),
+        expected: Expected::Rows {
+            sort_key: "id",
+            columns: &["_hoodie_record_key", "id", "name", "age"],
+            rows: &[&["1", "1", "Alice-V2", "31"], &["2", "2", "Bob", "25"]],
+        },
+        ..Default::default()
+    }
+);
+
+fg_case_test!(
+    harness_position_merge_with_a_filter_reads_the_record_key,
+    FgReaderCase {
+        name: "position_merge_with_a_filter_reads_the_record_key",
+        fixture: QuickstartTripsTable::V9Mor8I4UCommitTime,
+        partition: "city=sf",
+        base_file: I8I4U_SF_BASE,
+        log_files: &[I8I4U_SF_LOG],
+        expect_output_columns: Some(&["id", "name", "age"]),
+        reader_parameters: Some(ReaderParameters {
+            use_record_position: true,
+            ..Default::default()
+        }),
+        row_filter: Some(RowFilterSpec {
+            column: "_hoodie_record_key",
+            predicate: FilterPredicate::Eq("1"),
+            mor_pk_safe: true,
+        }),
+        expect_stats: Some(expect_nothing_skipped),
+        expected: Expected::Rows {
+            sort_key: "id",
+            columns: &["id", "name", "age"],
+            rows: &[&["1", "Alice-V2", "31"]],
         },
         ..Default::default()
     }
