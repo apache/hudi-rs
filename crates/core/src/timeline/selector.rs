@@ -91,6 +91,14 @@ impl InstantRange {
         self.explicit_instants.is_some()
     }
 
+    /// Whether this range can leave out records an earlier commit wrote: it has
+    /// a start bound or admits by membership. A range with an end bound alone
+    /// excludes only later instants, which a file slice read up to that end
+    /// already leaves out.
+    pub fn is_bounded_below(&self) -> bool {
+        self.start_timestamp.is_some() || self.explicit_instants.is_some()
+    }
+
     /// Create a new [InstantRange] with a closed end timestamp range.
     pub fn up_to(end_timestamp: &str, timezone: &str) -> Self {
         Self::new(

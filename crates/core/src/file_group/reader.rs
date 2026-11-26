@@ -100,7 +100,11 @@ impl FileGroupReader {
     ///
     /// This API does **not** use [`OptionResolver`] that loads table properties
     /// from storage to resolve options — callers supply final configs.
+    ///
+    /// The reader's storage is derived from `shared` when given, reusing its
+    /// object store if the options match.
     pub(crate) fn new_with_overrides(
+        shared: Option<&Storage>,
         hudi_configs: Arc<HudiConfigs>,
         extra_hudi_opts: HashMap<String, String>,
         storage_opts: HashMap<String, String>,
@@ -108,7 +112,11 @@ impl FileGroupReader {
         let mut final_opts = hudi_configs.as_options();
         final_opts.extend(extra_hudi_opts);
         let hudi_configs = Arc::new(HudiConfigs::new(final_opts));
-        let storage = Storage::new(Arc::new(storage_opts), hudi_configs.clone())?;
+        let storage_opts = Arc::new(storage_opts);
+        let storage = match shared {
+            Some(shared) => shared.derive(storage_opts, hudi_configs.clone())?,
+            None => Storage::new(storage_opts, hudi_configs.clone())?,
+        };
         let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
@@ -174,10 +182,10 @@ impl FileGroupReader {
         V: Into<String>,
     {
         let mut resolver = OptionResolver::new_with_options(base_uri, options);
-        resolver.resolve_options().await?;
+        let storage = resolver.resolve_options_with_storage(None).await?;
         let hudi_configs = Arc::new(HudiConfigs::new(resolver.hudi_options));
         Self::reject_scan_budget(&hudi_configs)?;
-        let storage = Storage::new(Arc::new(resolver.storage_options), hudi_configs.clone())?;
+        let storage = storage.derive(Arc::new(resolver.storage_options), hudi_configs.clone())?;
         let format = BaseFileFormatValue::resolve_from_configs(&hudi_configs, None)?;
         let base_file_reader = Self::create_optional_base_file_reader(&storage, &format)?;
 
@@ -391,6 +399,91 @@ impl FileGroupReader {
         )
     }
 
+    /// The columns a slice read has to produce before the caller's filters and
+    /// projection run: the projection, plus any filter column it leaves out, plus
+    /// `_hoodie_commit_time` when an incremental read narrows rows by commit time.
+    /// `None` when the caller asked for every column.
+    ///
+    /// Partition filter fields are left out only when the table drops partition
+    /// columns from its files; otherwise they are still in the parquet data (a
+    /// timestamp-based key generator's source column, for one), and leaving them
+    /// out would silently drop a legitimate row filter.
+    fn read_projection(&self, options: &ReadOptions) -> Result<Option<Vec<String>>> {
+        let Some(projection) = options.projection.as_ref() else {
+            return Ok(None);
+        };
+        let drops_partition_columns: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::DropsPartitionFields)
+            .into();
+        let dropped_partition_columns: Vec<String> = if drops_partition_columns {
+            self.hudi_configs
+                .get_or_default(HudiTableConfig::PartitionFields)
+                .into()
+        } else {
+            Vec::new()
+        };
+        let populates_meta_fields: bool = self
+            .hudi_configs
+            .get_or_default(HudiTableConfig::PopulatesMetaFields)
+            .into();
+        let needs_commit_time_col = populates_meta_fields
+            && self
+                .hudi_configs
+                .try_get(HudiReadConfig::StartTimestamp)?
+                .is_some();
+        let mut combined: Vec<String> = projection.clone();
+        for filter in &options.filters {
+            let field = filter.field.as_str();
+            if dropped_partition_columns.iter().any(|p| p == field) {
+                continue;
+            }
+            if !combined.iter().any(|c| c == field) {
+                combined.push(field.to_string());
+            }
+        }
+        if needs_commit_time_col {
+            let commit_time = MetaField::CommitTime.as_ref().to_string();
+            if !combined.iter().any(|c| c == &commit_time) {
+                combined.push(commit_time);
+            }
+        }
+        Ok(Some(combined))
+    }
+
+    /// The schema the merge-on-read reader is asked to produce: the table schema
+    /// narrowed to [`Self::read_projection`]. The reader adds whatever the merge
+    /// itself needs (record key, ordering and delete-marker fields) and reads
+    /// only those columns from the base file. `None`, meaning every column, when
+    /// the caller asked for every column or named one the table schema lacks, so
+    /// such a read fails or succeeds exactly as an unprojected one does.
+    fn v2_requested_schema(
+        &self,
+        options: &ReadOptions,
+        data_schema: &arrow_schema::SchemaRef,
+    ) -> Result<Option<arrow_schema::SchemaRef>> {
+        let Some(columns) = self.read_projection(options)? else {
+            return Ok(None);
+        };
+        let projection = options.projection.as_deref().unwrap_or_default();
+        if projection
+            .iter()
+            .any(|name| data_schema.column_with_name(name).is_none())
+        {
+            return Ok(None);
+        }
+        let fields: Vec<_> = data_schema
+            .fields()
+            .iter()
+            .filter(|f| columns.iter().any(|c| c == f.name()))
+            .cloned()
+            .collect();
+        Ok(Some(Arc::new(arrow_schema::Schema::new_with_metadata(
+            fields,
+            data_schema.metadata().clone(),
+        ))))
+    }
+
     /// Read one slice through the merge-on-read reader.
     ///
     /// The caller's filters reach the parquet reader as a pushdown (see
@@ -422,6 +515,7 @@ impl FileGroupReader {
         // slice, and which reader served the table is not news N times over.
         log::debug!("reading '{base_file_path}' with file group reader version 2");
         let pushdown = self.filter_pushdown(options, &data_schema, !log_file_paths.is_empty());
+        let requested_schema = self.v2_requested_schema(options, &data_schema)?;
         let merged = crate::file_group::reader_v2::adapter::read_file_slice(
             self.hudi_configs.clone(),
             self.storage.clone(),
@@ -430,6 +524,7 @@ impl FileGroupReader {
             partition_path,
             pushdown,
             Some(data_schema),
+            requested_schema,
             self.completion_gate_inputs.clone(),
         )
         .await?;
@@ -876,6 +971,7 @@ impl FileGroupReader {
         // Per file slice — see the eager sibling.
         log::debug!("streaming '{base_file_path}' with file group reader version 2");
         let pushdown = self.filter_pushdown(options, &data_schema, !log_file_paths.is_empty());
+        let requested_schema = self.v2_requested_schema(options, &data_schema)?;
         let merged = crate::file_group::reader_v2::adapter::read_file_slice_stream(
             self.hudi_configs.clone(),
             self.storage.clone(),
@@ -884,6 +980,7 @@ impl FileGroupReader {
             partition_path,
             pushdown,
             Some(data_schema),
+            requested_schema,
             self.completion_gate_inputs.clone(),
         )
         .await?;
@@ -924,61 +1021,8 @@ impl FileGroupReader {
             read_options = read_options.with_known_file_size(size);
         }
 
-        // If projection is set, widen the base file read to also include any columns
-        // we need post-read but the user didn't request:
-        //   - filter fields, so the row-level mask can evaluate them
-        //   - `_hoodie_commit_time`, when commit-time filtering is active
-        //     (PopulatesMetaFields + StartTimestamp)
-        // The widened columns are dropped by the final projection step below.
-        //
-        // We only exclude partition column filter fields from widening when
-        // `hoodie.datasource.write.drop.partition.columns` is enabled — otherwise
-        // partition columns are still present in parquet (e.g. with timestamp-based
-        // keygen, the source data column is also configured as a partition field).
-        // Excluding them unconditionally would silently drop legitimate row filters
-        // on those columns.
-        let drops_partition_columns: bool = self
-            .hudi_configs
-            .get_or_default(HudiTableConfig::DropsPartitionFields)
-            .into();
-        let dropped_partition_columns: Vec<String> = if drops_partition_columns {
-            self.hudi_configs
-                .get_or_default(HudiTableConfig::PartitionFields)
-                .into()
-        } else {
-            Vec::new()
-        };
-        let needs_commit_time_col: bool = {
-            let populates_meta_fields: bool = self
-                .hudi_configs
-                .get_or_default(HudiTableConfig::PopulatesMetaFields)
-                .into();
-            let has_start_ts = self
-                .hudi_configs
-                .try_get(HudiReadConfig::StartTimestamp)?
-                .is_some();
-            populates_meta_fields && has_start_ts
-        };
         let final_projection = options.projection.clone();
-        let read_projection = options.projection.as_ref().map(|proj| {
-            let mut combined: Vec<String> = proj.clone();
-            for filter in &options.filters {
-                let field = filter.field.as_str();
-                if dropped_partition_columns.iter().any(|p| p == field) {
-                    continue;
-                }
-                if !combined.iter().any(|c| c == field) {
-                    combined.push(field.to_string());
-                }
-            }
-            if needs_commit_time_col {
-                let commit_time = MetaField::CommitTime.as_ref().to_string();
-                if !combined.iter().any(|c| c == &commit_time) {
-                    combined.push(commit_time);
-                }
-            }
-            combined
-        });
+        let read_projection = self.read_projection(options)?;
         // The base file's own columns, needed only when this read has to be
         // reconciled to the table's schema — see `stream_target_schema`. Reading
         // the footer costs one request; the eager merge-on-read path already pays
@@ -1590,6 +1634,24 @@ mod tests {
         Ok(())
     }
 
+    /// A reader opened from a base URI reads the table properties and the slice
+    /// through one object store. The counter is thread-local, which holds on the
+    /// current-thread runtime `#[tokio::test]` uses.
+    #[tokio::test]
+    async fn new_with_options_builds_one_object_store() -> Result<()> {
+        let (base_uri, base_file_name) = v8np_base_uri_and_first_parquet();
+        let before = crate::storage::object_stores_built();
+
+        let reader = FileGroupReader::new_with_options(&base_uri, empty_options()).await?;
+        let batch = reader
+            .read_file_slice_from_paths(&base_file_name, Vec::<&str>::new(), &ReadOptions::new())
+            .await?;
+        assert!(batch.num_rows() > 0);
+
+        assert_eq!(crate::storage::object_stores_built() - before, 1);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_read_file_slice_from_paths_eager_with_real_base_file() -> Result<()> {
         // Real-fixture eager read covers: option resolution, base-file-only branch,
@@ -1693,8 +1755,12 @@ mod tests {
                 BaseFileFormatValue::HFile.as_ref(),
             ),
         ]));
-        let reader =
-            FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())?;
+        let reader = FileGroupReader::new_with_overrides(
+            None,
+            hudi_configs,
+            HashMap::new(),
+            HashMap::new(),
+        )?;
 
         let result = reader
             .read_file_slice_from_paths(
@@ -1753,7 +1819,7 @@ mod tests {
     /// Helper to create a FileGroupReader without using block_on (safe for async tests).
     fn create_test_reader(base_uri: &str) -> Result<FileGroupReader> {
         let hudi_configs = Arc::new(HudiConfigs::new([(HudiTableConfig::BasePath, base_uri)]));
-        FileGroupReader::new_with_overrides(hudi_configs, HashMap::new(), HashMap::new())
+        FileGroupReader::new_with_overrides(None, hudi_configs, HashMap::new(), HashMap::new())
     }
 
     /// Returns a (base_uri, base_file_name) tuple for the V8Nonpartitioned
@@ -2108,8 +2174,12 @@ mod tests {
             HudiTableConfig::BasePath,
             get_metadata_table_base_uri().as_str(),
         )]));
-        let metadata_table_reader =
-            FileGroupReader::new_with_overrides(metadata_configs, HashMap::new(), HashMap::new())?;
+        let metadata_table_reader = FileGroupReader::new_with_overrides(
+            None,
+            metadata_configs,
+            HashMap::new(),
+            HashMap::new(),
+        )?;
         assert!(metadata_table_reader.is_metadata_table());
 
         Ok(())
@@ -2509,7 +2579,8 @@ mod file_group_reader_version_tests {
             HudiTableConfig::BasePath.as_ref(),
             super::tests::get_metadata_table_base_uri(),
         )]));
-        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let reader =
+            FileGroupReader::new_with_overrides(None, configs, HashMap::new(), HashMap::new())?;
         let err = reader.version_two_unsupported_reason(false).unwrap_err();
         assert!(
             matches!(err, CoreError::Unsupported(ref m) if m.contains("metadata table")),
@@ -2934,7 +3005,8 @@ mod file_group_reader_version_tests {
                 "true".to_string(),
             ),
         ]));
-        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let reader =
+            FileGroupReader::new_with_overrides(None, configs, HashMap::new(), HashMap::new())?;
 
         assert!(
             reader
@@ -2967,7 +3039,8 @@ mod file_group_reader_version_tests {
                 "2".to_string(),
             ),
         ]));
-        let reader = FileGroupReader::new_with_overrides(configs, HashMap::new(), HashMap::new())?;
+        let reader =
+            FileGroupReader::new_with_overrides(None, configs, HashMap::new(), HashMap::new())?;
         assert!(reader.is_metadata_table());
         assert_eq!(
             reader.file_group_reader_version()?,

@@ -60,6 +60,7 @@ pub(crate) async fn read_file_slice(
     partition_path: String,
     pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<RecordBatch> {
     let mut reader = build_reader(
@@ -70,6 +71,7 @@ pub(crate) async fn read_file_slice(
         partition_path,
         pushdown,
         data_schema,
+        requested_schema,
         completion_gate_inputs,
     )?;
 
@@ -90,6 +92,7 @@ pub(crate) async fn read_file_slice_stream(
     partition_path: String,
     pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<futures::stream::BoxStream<'static, Result<RecordBatch>>> {
     let mut reader = build_reader(
@@ -100,6 +103,7 @@ pub(crate) async fn read_file_slice_stream(
         partition_path,
         pushdown,
         data_schema,
+        requested_schema,
         completion_gate_inputs,
     )?;
 
@@ -117,6 +121,7 @@ fn build_reader(
     partition_path: String,
     pushdown: Option<FilterPushdown>,
     data_schema: Option<SchemaRef>,
+    requested_schema: Option<SchemaRef>,
     completion_gate_inputs: Option<Arc<CompletionGateInputs>>,
 ) -> Result<HoodieFileGroupReader> {
     let has_log_files = !log_file_paths.is_empty();
@@ -167,7 +172,7 @@ fn build_reader(
         input_split,
         reader_parameters,
         data_schema,
-        None,
+        requested_schema,
     )
 }
 
