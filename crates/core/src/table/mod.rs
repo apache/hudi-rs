@@ -2376,6 +2376,15 @@ mod tests {
         assert_eq!(actual, "MERGE_ON_READ");
         let actual: String = configs.get(TableName).unwrap().into();
         assert_eq!(actual, "trips");
+        // Hudi's DFSPropertiesConfiguration splits each line on the delimiter
+        // without Properties unescaping, so backslashes reach the value as written.
+        assert_eq!(
+            configs
+                .as_options()
+                .get("hoodie.write.lock.filesystem.path")
+                .map(String::as_str),
+            Some(r"C:\tmp\hudi\lock")
+        );
         unsafe {
             env::remove_var(HUDI_CONF_DIR);
         }
