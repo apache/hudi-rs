@@ -309,30 +309,54 @@ impl TimestampBasedKeyGenerator {
 
     /// Parses a datetime literal by its own spelling: RFC 3339 / ISO 8601 with an offset,
     /// a naive datetime (`T` or space separated, optional fractional seconds), or a date.
-    /// Naive spellings are taken as UTC, matching the `DATE_STRING` path when no input
-    /// timezone is configured.
+    /// Naive spellings are taken as UTC; see [`Self::has_ambiguous_naive_literal`] for the
+    /// case where that would be wrong.
     fn parse_datetime_literal(value: &str) -> Option<DateTime<Utc>> {
+        Self::parse_offset_literal(value)
+            .or_else(|| Self::parse_naive_literal(value).map(|naive| Utc.from_utc_datetime(&naive)))
+    }
+
+    /// Parses a datetime literal that carries its own UTC offset.
+    fn parse_offset_literal(value: &str) -> Option<DateTime<Utc>> {
         if let Ok(dt) = DateTime::parse_from_rfc3339(value) {
             return Some(dt.with_timezone(&Utc));
         }
-        for format in [
+        [
             "%Y-%m-%d %H:%M:%S%.f%:z",
             "%Y-%m-%dT%H:%M:%S%.f%z",
             "%Y-%m-%d %H:%M:%S%.f%z",
-        ] {
-            if let Ok(dt) = DateTime::parse_from_str(value, format) {
-                return Some(dt.with_timezone(&Utc));
-            }
-        }
-        for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
-            if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
-                return Some(Utc.from_utc_datetime(&naive));
-            }
-        }
-        NaiveDate::parse_from_str(value, "%Y-%m-%d")
-            .ok()
-            .and_then(|date| date.and_hms_opt(0, 0, 0))
-            .map(|naive| Utc.from_utc_datetime(&naive))
+        ]
+        .into_iter()
+        .find_map(|format| DateTime::parse_from_str(value, format).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+    }
+
+    /// Parses a datetime or date literal that names no offset.
+    fn parse_naive_literal(value: &str) -> Option<NaiveDateTime> {
+        ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+            .into_iter()
+            .find_map(|format| NaiveDateTime::parse_from_str(value, format).ok())
+            .or_else(|| {
+                NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|date| date.and_hms_opt(0, 0, 0))
+            })
+    }
+
+    /// Whether `value` is a naive literal that the fallback would have to read as UTC
+    /// although the source column holds local time in `input.timezone`. The literal's
+    /// wall-clock time then names a different instant than the same value in the column,
+    /// so the partition bound could be off and prune a partition that holds matching rows;
+    /// the filter must not prune.
+    fn has_ambiguous_naive_literal(&self, value: &str) -> bool {
+        matches!(
+            self.timestamp_type,
+            TimestampType::DateString | TimestampType::Mixed
+        ) && self.input_timezone.is_some()
+            && self.parse_source_encoded(value).is_err()
+            && !self.is_spelled_in_input_format(value)
+            && Self::parse_offset_literal(value).is_none()
+            && Self::parse_naive_literal(value).is_some()
     }
 
     /// Whether `value` is spelled in the configured `DATE_STRING`/`MIXED` input format.
@@ -559,6 +583,13 @@ impl KeyGeneratorFilterTransformer for TimestampBasedKeyGenerator {
         match filter.operator {
             // Many timestamps share one partition, so excluding a timestamp cannot exclude it.
             ExprOperator::Ne | ExprOperator::NotIn => Ok(vec![]),
+            _ if filter
+                .values
+                .iter()
+                .any(|v| self.has_ambiguous_naive_literal(v)) =>
+            {
+                Ok(vec![])
+            }
             ExprOperator::Eq => {
                 let dt = self.parse_timestamp(&filter.values[0])?;
                 let path = self.format_partition_path(&dt);
@@ -1205,6 +1236,37 @@ mod tests {
         assert_eq!(
             partition_path_for(&keygen, "2023-04-01"),
             "ts_str=2023/04/01/00"
+        );
+    }
+
+    /// With `input.timezone` set, the column holds local time, so a naive literal spelled
+    /// differently from `input.dateformat` cannot be placed on the instant line without
+    /// guessing; the filter skips pruning rather than risk excluding a matching partition.
+    #[test]
+    fn test_transform_filter_skips_pruning_for_naive_fallback_literal_with_input_timezone() {
+        let mut configs = create_test_configs_date_string().as_options();
+        configs.insert(
+            "hoodie.keygen.timebased.timezone".into(),
+            "Asia/Tokyo".into(),
+        );
+        let keygen = TimestampBasedKeyGenerator::from_configs(&HudiConfigs::new(configs)).unwrap();
+        for operator in [ExprOperator::Eq, ExprOperator::In, ExprOperator::Gte] {
+            for literal in ["2023-04-01T12:30:00", "2023-04-01 12:30:00", "2023-04-01"] {
+                let filter = Filter {
+                    field: keygen.source_field.clone(),
+                    operator,
+                    values: vec![literal.to_string()],
+                };
+                assert!(
+                    keygen.transform_filter(&filter).unwrap().is_empty(),
+                    "{operator:?} {literal}"
+                );
+            }
+        }
+        // A literal with its own offset or in input.dateformat still prunes.
+        assert_eq!(
+            partition_path_for(&keygen, "2023-04-01T12:01:00.123+0900"),
+            "ts_str=2023/04/01/12"
         );
     }
 
