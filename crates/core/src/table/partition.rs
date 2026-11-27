@@ -130,24 +130,37 @@ impl PartitionPruner {
         // correct for a genuine data-column predicate but is also how a partition predicate
         // silently disappears when its key generator could not rewrite it. Dropping it
         // quietly then reads as a successful unfiltered scan, so record every drop.
+        let keygen_source_field = if keygen_unavailable {
+            let fields: Vec<String> = hudi_configs
+                .get_or_default(HudiTableConfig::PartitionFields)
+                .into();
+            fields.into_iter().next()
+        } else {
+            None
+        };
         let mut unapplied_filters = Vec::new();
         let mut and_filters: Vec<SchemableFilter> = Vec::new();
         for filter in &transformed_filters {
             match SchemableFilter::try_from((filter.clone(), partition_schema)) {
                 Ok(bound) => and_filters.push(bound),
                 Err(e) => {
-                    log::warn!(
-                        "Filter on `{}` does not apply to the partition schema ({e}); it will \
-                         not prune any partition{}.",
-                        filter.field,
-                        if keygen_unavailable {
-                            ", because this table's key-generator configuration could not be \
-                             loaded and the filter was therefore never rewritten to a \
-                             partition-path predicate"
-                        } else {
-                            ""
-                        }
-                    );
+                    // Only a filter on the timestamp source field was lost to the
+                    // keygen failure; any other unbindable filter is a data-column
+                    // predicate, which legitimately prunes nothing.
+                    if keygen_unavailable && keygen_source_field.as_deref() == Some(&filter.field) {
+                        log::warn!(
+                            "Filter on `{}` will not prune any partition: this table's \
+                             key-generator configuration could not be loaded, so the filter \
+                             was never rewritten to a partition-path predicate ({e}).",
+                            filter.field
+                        );
+                    } else {
+                        log::debug!(
+                            "Filter on `{}` does not apply to the partition schema ({e}); \
+                             it will not prune any partition.",
+                            filter.field
+                        );
+                    }
                     unapplied_filters.push(filter.clone());
                 }
             }
@@ -264,12 +277,12 @@ impl PartitionPruner {
                     ));
                 }
                 Err(e) => {
-                    log::warn!(
+                    // Reported per affected filter in `new`, so a query that does not
+                    // touch the timestamp column is not warned about.
+                    log::debug!(
                         "Table declares TimestampBasedKeyGenerator but one could not be built \
                          ({e}); the hoodie.keygen.timebased.* options are writer-side and may \
-                         not be present in hoodie.properties. Filters on the timestamp source \
-                         column cannot be rewritten into partition-path predicates and will \
-                         not prune; every partition will be read."
+                         not be present in hoodie.properties."
                     );
                     return Ok((filters.to_vec(), true));
                 }
