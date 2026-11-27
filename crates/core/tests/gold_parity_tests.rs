@@ -85,10 +85,16 @@ const NULL_TOKEN: &str = "<null>";
 /// being compared.
 const EXPECTED_WITHOUT_GOLD: &[&str] = &[
     "table_hfile_log_block [MorAvro]",
+    // Partition-pruning fixtures. They exist to pin the on-disk partition path shape a
+    // hive-style timestamp key generator produces, which is asserted directly in
+    // table_read_tests, so they carry no Hudi read snapshot.
+    "v6_timebasedkeygen_hivestyle_day [Cow]",
+    "v6_timebasedkeygen_hivestyle_hour [Cow]",
     "v9_lance_nonhivestyle [MorAvro]",
     "v9_lance_nonpartitioned [Cow]",
     "v9_lance_txns_nonpart [Cow]",
     "v9_lance_txns_simple [Cow]",
+    "v9_timebasedkeygen_hivestyle_epochmicros [Cow]",
     "v9_trips_lance [Cow]",
     "v9_trips_lance [MorAvro]",
 ];
